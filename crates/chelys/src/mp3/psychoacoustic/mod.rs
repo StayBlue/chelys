@@ -346,12 +346,21 @@ impl PsychoacousticModel {
         // Spec gap: clause C.1.5.3.2.1 does not give the base of `log`. The
         // natural logarithm matches the tonality conversion beside it, and the
         // formula is written with the C double literal `1.`, for which `log`
-        // would be the natural logarithm, though neither settles it.
+        // would be the natural logarithm, though neither settles it. Against
+        // the spec's switching threshold of 1800, the natural logarithm lets
+        // the entropy separate attacks from steady signals; with the decimal
+        // logarithm, impulses and quiet bursts stay below it. A change of
+        // energy scale cannot stand in for the base: it moves the entropy of
+        // attacks much more than that of steady signals.
         //
         // Spec reading: the formula is taken as printed, with no floor. A
         // partition whose threshold exceeds its energy plus one subtracts from
         // the sum, so silence and quiet passages, whose upper partitions sit
-        // below the large thresholds in quiet there, get a negative entropy.
+        // below the large thresholds in quiet there, get a negative entropy:
+        // -348 for silence at 44.1 kHz. Flooring each partition at zero would
+        // give silence +557 instead, as partitions whose threshold is below
+        // one count even with no energy, and that is enough for the bit
+        // reservoir to lend silence bits at 64 and 128 kbit/s.
         let perceptual_entropy = -self
             .partitions
             .iter()
