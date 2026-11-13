@@ -4,18 +4,18 @@ version = 4
 
 [[package]]
 name = "chelys"
-version = "0.1.0"
+version = "0.0.1"
 
 [[package]]
 name = "chelys-cli"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "chelys",
 ]
 
 [[package]]
 name = "chelys-conformance"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "chelys",
 ]
