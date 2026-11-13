@@ -78,7 +78,11 @@ pub fn coding_bands(block_type: BlockType, sampling_frequency: SamplingFrequency
 /// Spec gap: Table B.8 ends with short band 11, and the standard does not
 /// say how the lines above it, which have no scalefactor, are ordered. They
 /// are sent as one more band up to line 192 of each window, window by
-/// window.
+/// window. Settled by decoding with ffmpeg (black box): with a tone in those
+/// lines, the conformance test
+/// `short_blocks_round_trip_at_every_sampling_frequency` decodes at over
+/// 45 dB SNR at every sampling frequency, and at about 10 dB with the lines
+/// interleaved across the windows instead.
 pub fn short_coding_order(
     xr: &[f64; GRANULE_LINES],
     sampling_frequency: SamplingFrequency,

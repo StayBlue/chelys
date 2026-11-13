@@ -86,7 +86,12 @@ fn pcm_round_trips_at_every_sampling_frequency() {
 /// order (above the last band too), and the default Huffman regions of
 /// switched windows all to agree with the decoder. Every block type and every change between them that
 /// figure C.7 allows is covered; so is a stream of short blocks only, which
-/// starts with one.
+/// starts with one. (Interleaving the lines above the last short band
+/// across the windows drops this to about 10 dB.)
+///
+/// This is the evidence for the gap in the standard that the reordering of
+/// short blocks marks as settled by decoding with ffmpeg: the order of the
+/// lines above the last short scalefactor band.
 #[test]
 fn short_blocks_round_trip_at_every_sampling_frequency() {
     use BlockType::*;

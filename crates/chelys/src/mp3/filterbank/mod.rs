@@ -43,7 +43,10 @@ const LONG_BLOCK_GAIN: f64 = LONG_BLOCK as f64 / 4.0;
 /// The same scaling for short blocks: the decoder's short IMDCT (clause
 /// 2.4.3.4.10.2) returns each windowed short block scaled by `n / 4 = 3`.
 /// Start and stop blocks are long blocks, scaled by 9, so each side of
-/// their overlap with a short block comes back at unity.
+/// their overlap with a short block comes back at unity. The conformance
+/// test `short_blocks_round_trip_at_every_sampling_frequency` decodes short
+/// blocks, and every change of block type, at over 45 dB SNR with this
+/// scaling.
 const SHORT_BLOCK_GAIN: f64 = SHORT_BLOCK as f64 / 4.0;
 
 /// Table B.9: the coefficients `c_i` of the aliasing butterflies.
