@@ -1,3 +1,6 @@
+// Copyright (c) 2026 StayBlue
+// SPDX-License-Identifier: MIT
+
 //! The optional `crc_check` word (clauses 2.4.1.4 and 2.4.3.1, figure A.9).
 
 /// `G(X) = X^16 + X^15 + X^2 + 1`, without the implicit X^16 term.

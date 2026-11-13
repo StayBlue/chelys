@@ -1,3 +1,6 @@
+// Copyright (c) 2026 StayBlue
+// SPDX-License-Identifier: MIT
+
 //! Table B.7, "Huffman codes for Layer III", transcribed as printed.
 //!
 //! Each entry is `(x, y, hlen, hcod)` or `(vwxy, hlen, hcod)` in the order of

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 StayBlue
+// SPDX-License-Identifier: MIT
+
 //! Psychoacoustic model 2 (clause D.2) as adapted for Layer III in clause
 //! C.1.5.3.2.1, figures C.6.a to C.6.d.
 //!

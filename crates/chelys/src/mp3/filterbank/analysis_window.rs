@@ -1,3 +1,6 @@
+// Copyright (c) 2026 StayBlue
+// SPDX-License-Identifier: MIT
+
 //! Table C.1, "Coefficients C_i of the analysis window", transcribed as
 //! printed, four coefficients per row.
 

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 StayBlue
+// SPDX-License-Identifier: MIT
+
 //! Joint stereo for Layer III (Annex G.2): MS stereo, with when to switch it
 //! on, the MS matrix and the limitation of the side channel's bandwidth, and
 //! intensity stereo, with the bands it codes and their positions. The

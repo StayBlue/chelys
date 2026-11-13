@@ -1,3 +1,6 @@
+// Copyright (c) 2026 StayBlue
+// SPDX-License-Identifier: MIT
+
 //! Quantisation of frequency lines (clause C.1.5.4.4.1) and the inner
 //! iteration loop that sets the step size (clause C.1.5.4.4, figure C.9.c).
 

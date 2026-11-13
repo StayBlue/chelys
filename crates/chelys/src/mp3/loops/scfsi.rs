@@ -1,3 +1,6 @@
+// Copyright (c) 2026 StayBlue
+// SPDX-License-Identifier: MIT
+
 //! The calculation of the scalefactor selection information, `scfsi`
 //! (clause C.1.5.4.2.3): which scfsi bands of a frame's second granule take
 //! over the first granule's scalefactors.

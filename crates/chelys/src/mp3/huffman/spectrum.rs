@@ -1,3 +1,6 @@
+// Copyright (c) 2026 StayBlue
+// SPDX-License-Identifier: MIT
+
 //! Huffman coding of one granule's quantised spectrum, `Huffmancodebits()`
 //! (clauses 2.4.1.7 and 2.4.2.7), partitioned and with tables chosen as in the
 //! inner iteration loop (clauses C.1.5.4.4.3 to C.1.5.4.4.8).

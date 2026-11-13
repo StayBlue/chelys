@@ -1,3 +1,6 @@
+// Copyright (c) 2026 StayBlue
+// SPDX-License-Identifier: MIT
+
 use chelys::mp3::header::{Bitrate, Mode, SamplingFrequency};
 use chelys::mp3::{SAMPLES_PER_FRAME, StreamConfig, encode_silence};
 use chelys_conformance::ffmpeg::{self, StreamInfo};

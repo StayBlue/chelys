@@ -1,3 +1,6 @@
+// Copyright (c) 2026 StayBlue
+// SPDX-License-Identifier: MIT
+
 //! Layer III scalefactor bands (Table B.8).
 //!
 //! The tables are transcribed as printed: `(scalefactor band, width of band,

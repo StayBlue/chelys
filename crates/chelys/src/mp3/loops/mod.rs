@@ -1,3 +1,6 @@
+// Copyright (c) 2026 StayBlue
+// SPDX-License-Identifier: MIT
+
 //! The Layer III iteration loops (clause C.1.5.4): the outer loop, which
 //! shapes the quantisation noise with scalefactors, around the inner loop,
 //! which fits the granule to the available bits.

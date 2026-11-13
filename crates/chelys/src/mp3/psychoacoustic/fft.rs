@@ -1,3 +1,6 @@
+// Copyright (c) 2026 StayBlue
+// SPDX-License-Identifier: MIT
+
 //! The "standard forward FFT" of clause D.2.4 b): an iterative radix-2
 //! decimation-in-time transform, `X(k) = sum x(n) e^(-2 pi i k n / N)`, without
 //! normalisation.

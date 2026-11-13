@@ -1,3 +1,6 @@
+// Copyright (c) 2026 StayBlue
+// SPDX-License-Identifier: MIT
+
 //! Huffman-coded spectra decoded by ffmpeg.
 //!
 //! Most checks encode the same quantised values in different but equally

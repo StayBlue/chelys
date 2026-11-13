@@ -1,3 +1,6 @@
+// Copyright (c) 2026 StayBlue
+// SPDX-License-Identifier: MIT
+
 //! Most-significant-bit-first bit output, as used by the `bslbf` and `uimsbf`
 //! mnemonics (clause 2.2.6).
 

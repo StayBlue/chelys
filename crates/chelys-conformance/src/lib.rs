@@ -1,3 +1,6 @@
+// Copyright (c) 2026 StayBlue
+// SPDX-License-Identifier: MIT
+
 //! Harness for checking chelys output against external decoders.
 //!
 //! The decoders are run as separate programs and treated strictly as black

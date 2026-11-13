@@ -1,3 +1,6 @@
+// Copyright (c) 2026 StayBlue
+// SPDX-License-Identifier: MIT
+
 //! Encodes raw PCM from stdin as MPEG-1 Layer III on stdout. Input formats are
 //! left to other tools, for example:
 //!

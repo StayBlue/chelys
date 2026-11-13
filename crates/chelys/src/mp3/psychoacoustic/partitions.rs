@@ -1,3 +1,6 @@
+// Copyright (c) 2026 StayBlue
+// SPDX-License-Identifier: MIT
+
 //! The threshold calculation partitions of psychoacoustic model 2 for Layer
 //! III long and short blocks (Table C.7) and their conversion to scalefactor
 //! bands (Table C.8).

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 StayBlue
+// SPDX-License-Identifier: MIT
+
 //! Layer III scalefactors: their meaning in the requantization formula
 //! (clause 2.4.3.4.7.1), their transmission with `scalefac_compress` (clause
 //! 2.4.2.7), and preemphasis (Table B.6). Mixed blocks are not used.

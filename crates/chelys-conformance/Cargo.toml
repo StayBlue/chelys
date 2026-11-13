@@ -3,6 +3,7 @@ name = "chelys-conformance"
 description = "Checks chelys output against external decoders used as black boxes."
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 publish = false
 
 [dependencies]

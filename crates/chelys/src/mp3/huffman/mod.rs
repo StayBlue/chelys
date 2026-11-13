@@ -1,3 +1,6 @@
+// Copyright (c) 2026 StayBlue
+// SPDX-License-Identifier: MIT
+
 //! Layer III Huffman coding: the code tables (Table B.7) and their use by
 //! `Huffmancodebits()` (clauses 2.4.1.7 and 2.4.2.7).
 

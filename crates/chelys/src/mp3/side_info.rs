@@ -1,3 +1,6 @@
+// Copyright (c) 2026 StayBlue
+// SPDX-License-Identifier: MIT
+
 //! Layer III side information (clauses 2.4.1.7 and 2.4.2.7).
 
 use crate::bitstream::BitWriter;

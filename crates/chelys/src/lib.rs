@@ -1,3 +1,6 @@
+// Copyright (c) 2026 StayBlue
+// SPDX-License-Identifier: MIT
+
 //! Research audio encoders implemented from their specifications.
 //!
 //! Clause, table and figure references in the `mp3` module refer to

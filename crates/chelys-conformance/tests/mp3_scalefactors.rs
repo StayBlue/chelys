@@ -1,3 +1,6 @@
+// Copyright (c) 2026 StayBlue
+// SPDX-License-Identifier: MIT
+
 //! Scalefactors decoded by ffmpeg.
 //!
 //! The decoder divides a band by `2^(scalefac_multiplier * (scalefac_l +

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 StayBlue
+// SPDX-License-Identifier: MIT
+
 //! The window switching decision (clause C.1.5.3.2, figure C.7) and the
 //! delay of the model's output by one granule that lets it be made (figure
 //! C.6.a).

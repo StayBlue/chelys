@@ -1,3 +1,6 @@
+// Copyright (c) 2026 StayBlue
+// SPDX-License-Identifier: MIT
+
 //! The 32-bit frame header (clauses 2.4.1.3 and 2.4.2.3) and the frame length
 //! it implies (clause 2.4.3.1).
 

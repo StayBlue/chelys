@@ -1,3 +1,6 @@
+// Copyright (c) 2026 StayBlue
+// SPDX-License-Identifier: MIT
+
 //! The analysis half of the Layer III hybrid filterbank: the polyphase
 //! subband filter (clause C.1.3, figure C.4) followed by the MDCT, with the
 //! window and transform of the normal, start, short or stop block type, and

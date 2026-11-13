@@ -1,3 +1,6 @@
+// Copyright (c) 2026 StayBlue
+// SPDX-License-Identifier: MIT
+
 //! The bit reservoir (clause C.1.5.4.2.2): main data bits a granule leaves
 //! unused are saved for later granules, and handed out again where the
 //! psychoacoustic model asks for more than the average.

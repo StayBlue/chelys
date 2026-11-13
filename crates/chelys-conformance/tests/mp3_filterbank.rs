@@ -1,3 +1,6 @@
+// Copyright (c) 2026 StayBlue
+// SPDX-License-Identifier: MIT
+
 //! PCM through the analysis filterbank, decoded by ffmpeg and compared with
 //! the input.
 

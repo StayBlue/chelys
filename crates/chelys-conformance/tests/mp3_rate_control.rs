@@ -1,3 +1,6 @@
+// Copyright (c) 2026 StayBlue
+// SPDX-License-Identifier: MIT
+
 //! PCM encoded at a fixed bitrate by the inner iteration loop, decoded by
 //! ffmpeg.
 
