@@ -1,0 +1,68 @@
+use chelys::mp3::header::{Bitrate, Mode, SamplingFrequency};
+use chelys::mp3::{SAMPLES_PER_FRAME, StreamConfig, encode_silence};
+use chelys_conformance::ffmpeg::{self, StreamInfo};
+
+#[test]
+fn ffmpeg_decodes_silence_in_every_configuration() {
+    let modes = [
+        Mode::SingleChannel,
+        Mode::Stereo,
+        Mode::DualChannel,
+        Mode::JointStereo {
+            intensity_stereo: false,
+            ms_stereo: true,
+        },
+    ];
+    let frames = 50;
+    for sampling_frequency in SamplingFrequency::ALL {
+        for bitrate in Bitrate::all() {
+            for mode in modes {
+                for crc_protected in [false, true] {
+                    let config = StreamConfig {
+                        bitrate,
+                        sampling_frequency,
+                        mode,
+                        crc_protected,
+                    };
+                    let stream = encode_silence(&config, frames);
+
+                    let expected = StreamInfo {
+                        codec_name: "mp3".to_owned(),
+                        sample_rate: sampling_frequency.hz(),
+                        channels: mode.channels(),
+                    };
+                    assert_eq!(ffmpeg::probe_mp3(&stream), expected, "{config:?}");
+
+                    let decoded = ffmpeg::decode_mp3(&stream);
+                    assert_eq!(decoded.diagnostics, "", "{config:?}");
+                    assert_eq!(
+                        decoded.samples.len(),
+                        frames * SAMPLES_PER_FRAME * mode.channels(),
+                        "{config:?}"
+                    );
+                    assert!(decoded.samples.iter().all(|&s| s == 0), "{config:?}");
+                }
+            }
+        }
+    }
+}
+
+/// Guards the oracle itself: if ffmpeg stopped checking CRCs, a wrong
+/// `crc_check` would pass the test above unnoticed.
+#[test]
+fn ffmpeg_reports_a_corrupted_crc() {
+    let config = StreamConfig {
+        bitrate: Bitrate::from_kbps(128).unwrap(),
+        sampling_frequency: SamplingFrequency::Hz44100,
+        mode: Mode::Stereo,
+        crc_protected: true,
+    };
+    let mut stream = encode_silence(&config, 5);
+    stream[5] ^= 1; // low byte of the first frame's crc_check
+    let decoded = ffmpeg::decode_mp3(&stream);
+    assert!(
+        decoded.diagnostics.contains("CRC mismatch"),
+        "ffmpeg reported: {:?}",
+        decoded.diagnostics
+    );
+}

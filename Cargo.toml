@@ -1,0 +1,10 @@
+[workspace]
+resolver = "3"
+members = ["crates/chelys", "crates/chelys-conformance"]
+# Plain `cargo test` stays fast and hermetic; run the decoder-backed checks
+# with `cargo test --workspace` or `-p chelys-conformance`.
+default-members = ["crates/chelys"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"

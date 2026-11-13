@@ -1,0 +1,9 @@
+[package]
+name = "chelys-conformance"
+description = "Checks chelys output against external decoders used as black boxes."
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+chelys = { path = "../chelys" }
