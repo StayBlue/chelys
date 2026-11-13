@@ -1,0 +1,23 @@
+# chelys
+
+> [!WARNING]
+> chelys is experimental. It is not meant for daily use: its output has not
+> been compared with that of established encoders, and its API may change at
+> any time.
+
+chelys is an MP3 encoder: it encodes PCM audio as MPEG-1 Audio Layer III. It
+is written from the standard, ISO/IEC 11172-3, alone, without reference to the
+source code of other encoders or decoders.
+
+## Usage
+
+The command-line encoder reads raw interleaved 32-bit float PCM from stdin and
+writes MP3 to stdout. Other tools convert from other formats, for example:
+
+```sh
+ffmpeg -i song.flac -f f32le -ar 44100 -ac 2 - \
+  | cargo run --release -p chelys-cli -- --sample-rate 44100 --channels 2 > song.mp3
+```
+
+Run it with `--help` for the bitrates, sampling frequencies and stereo modes it
+supports.

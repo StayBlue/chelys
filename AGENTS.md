@@ -12,6 +12,17 @@ agent may propose an entry, but must ask and wait for the user to decide.
 
 *User, 2026-11-12, when this file was created.*
 
+## Changing the README
+
+Additions and changes to `README.md` require an explicit decision by the user,
+as for this file. Do not add or change anything in it because it seems to
+follow from the user's intent, from a choice made for one case, or from how
+earlier work was done. An agent may propose a change, but must ask and wait for
+the user to decide.
+
+*User, 2026-11-13, when the README was written: the same rule as for this
+file.*
+
 ## Clean room
 
 chelys is implemented from ISO/IEC 11172-3 and its official corrigenda only.
