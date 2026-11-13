@@ -18,11 +18,12 @@ const LONG_BLOCK: usize = 2 * SUBBAND_SAMPLES;
 /// The decoder's long-block IMDCT (clause 2.4.3.4.10.2) with windowing and
 /// overlap-add returns the encoder's MDCT input (clause C.1.5.3.3) scaled by
 /// `n / 4 = 9`, since neither transform is normalised, so the MDCT output is
-/// divided by 9. Clause C.1.5.4.1 leaves this scaling to the implementation
-/// as part of its "system constant". With the polyphase analysis and
-/// synthesis filters also at unity gain, which the standard does not state
-/// but the decoded round trip confirms, the result is on the scale of the
-/// decoder's requantised values `xr` (clause 2.4.3.4.7.1).
+/// divided by 9. Clause C.1.5.4.1 leaves this scaling to the implementation as
+/// part of its "system constant".
+///
+/// Spec gap: the standard does not state the gain of the polyphase analysis
+/// and synthesis filters. Taking both as unity, the result is on the scale of
+/// the decoder's requantised values `xr` (clause 2.4.3.4.7.1).
 const LONG_BLOCK_GAIN: f64 = LONG_BLOCK as f64 / 4.0;
 
 /// Table B.9: the coefficients `c_i` of the aliasing butterflies.
@@ -92,11 +93,11 @@ impl Filterbank {
         for (time, samples) in pcm.chunks_exact(SUBBANDS).enumerate() {
             let subbands = self.subband_samples(samples.try_into().unwrap());
             for (subband, &sample) in subbands.iter().enumerate() {
-                // The decoder negates every odd time sample of every odd
-                // subband to compensate for the frequency inversion of the
+                // Spec gap: the decoder negates every odd time sample of every
+                // odd subband to compensate for the frequency inversion of the
                 // polyphase filterbank (clause 2.4.3.4.10.5). Annex C does not
-                // mention it, but the encoder has to apply the same inversion
-                // for the decoder to restore the input.
+                // mention it for the encoder, which is taken to apply the same
+                // inversion so that the decoder restores the input.
                 let invert = subband % 2 == 1 && time % 2 == 1;
                 current[subband][time] = if invert { -sample } else { sample };
             }

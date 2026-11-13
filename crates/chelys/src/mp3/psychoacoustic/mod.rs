@@ -46,15 +46,16 @@ const RPELEV2: f64 = 16.0;
 /// normalised by `1 / N`, so that the energies are on the scale of the
 /// threshold in quiet `qthr` of Table C.7.
 ///
-/// The standard does not say what scale `qthr` is on. Clause D.2.4 l) puts
-/// the absolute thresholds of Table D.4 relative to a sine of +-1/2 LSB and
-/// asks for them to be converted "after considering the FFT normalization
-/// actually used", and Table D.4 sets 0 dB at 96 dB below the energy of a
-/// sine of amplitude 32 760. With 16-bit samples and a `1 / N` FFT, such a
-/// sine peaks at an energy of `(32 760 / 4)^2` in the Hann-windowed spectrum,
-/// putting 0 dB at about 0.017. Table C.7's lowest per-line threshold, about
-/// 0.009, then lies near the bottom of Table D.4 (-5 dB), as a threshold in
-/// quiet should. An unnormalised FFT would put it 60 dB lower.
+/// Spec gap: the standard does not say what scale `qthr` is on. Clause
+/// D.2.4 l) puts the absolute thresholds of Table D.4 relative to a sine of
+/// +-1/2 LSB and asks for them to be converted "after considering the FFT
+/// normalization actually used", and Table D.4 sets 0 dB at 96 dB below the
+/// energy of a sine of amplitude 32 760. With 16-bit samples and a `1 / N`
+/// FFT, such a sine peaks at an energy of `(32 760 / 4)^2` in the
+/// Hann-windowed spectrum, putting 0 dB at about 0.017. Table C.7's lowest
+/// per-line threshold, about 0.009, then lies near the bottom of Table D.4
+/// (-5 dB), as a threshold in quiet should. An unnormalised FFT would put it
+/// 60 dB lower.
 const PCM_SCALE: f64 = 32_768.0;
 
 /// The samples the model keeps: the current granule and the two before it.
@@ -63,27 +64,29 @@ const HISTORY: usize = 3 * GRANULE_LINES;
 /// Where in the history the filterbank's current block is centred, so that
 /// the analysis is centred on it as clause D.2.1 b) asks.
 ///
-/// The filterbank returns the block formed by the subband samples of the
-/// previous granule and the current one. Subband sample `t` of a granule is
-/// computed with input sample `32 t + 31` of that granule newest, and the
-/// analysis window (Table C.1) is symmetric about the 256th sample back, so
-/// it is centred on sample `32 t - 225`. The block runs from sample 0 of the
-/// previous granule, centred on sample `-576 - 225 = -801` of the current
-/// one, to sample 17 of the current granule, centred on `32 * 17 - 225 =
-/// 319`, so its middle is sample -241. The Hann windows are centred half a
-/// sample earlier, which does not matter at this resolution.
+/// Spec gap: clause D.2.1 b) asks for the centring but leaves the delay to the
+/// implementation. It is derived here from this encoder's filterbank. The
+/// filterbank returns the block formed by the subband samples of the previous
+/// granule and the current one. Subband sample `t` of a granule is computed
+/// with input sample `32 t + 31` of that granule newest, and the analysis
+/// window (Table C.1) is symmetric about the 256th sample back, so it is
+/// centred on sample `32 t - 225`. The block runs from sample 0 of the
+/// previous granule, centred on sample `-576 - 225 = -801` of the current one,
+/// to sample 17 of the current granule, centred on `32 * 17 - 225 = 319`, so
+/// its middle is sample -241. The Hann windows are centred half a sample
+/// earlier, which does not matter at this resolution.
 const BLOCK_CENTRE: usize = 2 * GRANULE_LINES - 241;
 
 /// The spreading function of clause D.2.3 as changed for Layer III in clause
 /// C.1.5.3.2.1: the spread from Bark value `i` into Bark value `j`.
 ///
-/// Clause C.1.5.3.2.1 prints the change as "If j >= i tmpy = 3,0 (j-i), else
-/// tmpy = 1,5 (j-i)". Read literally, as a replacement of `tmpy`, the spread
-/// would grow without bound towards high frequencies, so it is read as a
-/// change to the scaling of `tmpx`, which `tmpx = 1,05 (j-i)` sets in clause
-/// D.2.3. The two factors are also swapped here: the `norm` column of Table
-/// C.7 matches the reciprocal of the spread summed over the partitions, as
-/// in clause D.2.4 f), to within the rounding of the table only with a
+/// Spec reading: clause C.1.5.3.2.1 prints the change as "If j >= i tmpy = 3,0
+/// (j-i), else tmpy = 1,5 (j-i)". Read literally, as a replacement of `tmpy`,
+/// the spread would grow without bound towards high frequencies, so it is read
+/// as a change to the scaling of `tmpx`, which `tmpx = 1,05 (j-i)` sets in
+/// clause D.2.3. The two factors are also swapped here: the `norm` column of
+/// Table C.7 matches the reciprocal of the spread summed over the partitions,
+/// as in clause D.2.4 f), to within the rounding of the table only with a
 /// factor of 1.5 towards higher frequencies and 3.0 towards lower ones. With
 /// the factors as printed it is off by up to 0.37.
 ///
@@ -104,7 +107,9 @@ pub(crate) fn spreading_function(i: f64, j: f64) -> f64 {
 pub struct Masking {
     /// The ratio of the allowed noise to the signal energy in each long
     /// scalefactor band, `ratio(sb) = thm(sb) / en(sb)` (figure C.6.c).
-    /// Infinite for a band in which the spectrum has no energy.
+    ///
+    /// Spec gap: infinite for a band in which the spectrum has no energy,
+    /// which the standard does not provide for.
     pub ratio: [f64; LONG_BANDS],
     /// The perceptual entropy `pe` (clause C.1.5.3.2.1).
     pub perceptual_entropy: f64,
@@ -112,10 +117,13 @@ pub struct Masking {
 
 impl Masking {
     /// The allowed distortion of each scalefactor band,
-    /// `xmin(sb) = ratio(sb) * en(sb) / bw(sb)` (clause C.1.5.4.1), where `en(sb)` is the energy of
-    /// the band's lines in `xr` and `bw(sb)` their number. This is a mean
-    /// energy per line, as is the distortion `xfsf` it is compared with
-    /// (clause C.1.5.4.3.3). A band whose lines are all zero allows none.
+    /// `xmin(sb) = ratio(sb) * en(sb) / bw(sb)` (clause C.1.5.4.1).
+    ///
+    /// Spec reading: `en(sb)` is taken as the energy of the band's lines in
+    /// `xr` and `bw(sb)` as their number, so that `xmin` is a mean energy per
+    /// line on the scale of the distortion `xfsf` it is compared with (clause
+    /// C.1.5.4.3.3). Spec gap: a band whose lines are all zero allows none,
+    /// where its ratio would make the product undefined.
     pub fn allowed_distortion(
         &self,
         xr: &[f64; GRANULE_LINES],
@@ -197,8 +205,9 @@ impl Analysis {
             let distance = (x.re - predicted_r * predicted_f.cos())
                 .hypot(x.im - predicted_r * predicted_f.sin());
             let scale = polar.r + predicted_r.abs();
-            // Silence that was predicted to stay silent: the line has no
-            // energy, so its unpredictability carries no weight.
+            // Spec gap: silence that was predicted to stay silent divides zero
+            // by zero. The line has no energy, so its unpredictability carries
+            // no weight and any value does.
             c.push(if scale == 0.0 { 0.0 } else { distance / scale });
             r.push(polar.r);
             current.push(polar);
@@ -284,12 +293,15 @@ impl PsychoacousticModel {
                 ecb += eb[bb] * spreading[b];
                 ct += cb[bb] * spreading[b];
             }
-            // With no energy, ln(0) makes the partition fully tonal.
+            // Spec gap: with no energy `ct / ecb` is undefined. Taking it as 0
+            // makes ln(0) give a fully tonal partition, whose threshold is
+            // zero anyway.
             let cbb = if ecb == 0.0 { 0.0 } else { ct / ecb };
             let tb = (CONV1 + CONV2 * cbb.ln()).clamp(0.0, 1.0);
             let snr = f64::max(p.minval, TMN * tb + NMT * (1.0 - tb));
-            // Figure C.6.b prints the exponent as SNR(b)/10; clause D.2.4 i)
-            // has the sign that puts the threshold below the energy.
+            // Spec reading: figure C.6.b prints the exponent as SNR(b)/10;
+            // clause D.2.4 i) has the sign that puts the threshold below the
+            // energy.
             nb.push(ecb * p.norm * 10f64.powf(-snr / 10.0));
         }
 
@@ -297,17 +309,27 @@ impl PsychoacousticModel {
         // over the last granule's and RPELEV2 over the one before, and never
         // falls below the threshold in quiet.
         //
-        // This deliberately departs from figure C.6.b, which takes the maximum
-        // of all four terms (clause C.1.5.3.2.1 gives only the constants). As
-        // printed, the step could only raise the threshold, never lower it, so
-        // it could not control pre-echo, its stated purpose. For any steady
-        // signal it would also give 16 nb, 12 dB above the SNR that TMN and
-        // NMT ask for. With the minimum over `nb` and its history, steady
-        // signals keep their threshold, and a granule with an attack after
-        // quieter ones gets a lower threshold, keeping the quantisation noise
-        // that spreads before the attack small. RPELEV < RPELEV2 also fits
-        // limits on growth over one and two granules, rather than a memory in
-        // which the older granule weighs more.
+        // Spec reading: this deliberately departs from figure C.6.b, which
+        // takes the maximum of all four terms (clause C.1.5.3.2.1 gives only
+        // the constants). As printed, the step could only raise the threshold,
+        // never lower it, so it could not control pre-echo, its stated
+        // purpose. For any steady signal it would also give 16 nb, 12 dB above
+        // the SNR that TMN and NMT ask for. With the minimum over `nb` and its
+        // history, steady signals keep their threshold, and a granule with an
+        // attack after quieter ones gets a lower threshold, keeping the
+        // quantisation noise that spreads before the attack small. RPELEV <
+        // RPELEV2 also fits limits on growth over one and two granules, rather
+        // than a memory in which the older granule weighs more.
+        //
+        // The perceptual entropy, computed from this threshold, bears it out
+        // against the spec's own window switching threshold of 1800 (clause
+        // C.1.5.3.2). For decaying noise bursts after silence or over a quiet
+        // tone, the minimum puts the entropy of a granule at every attack
+        // above 1800, at all three sampling frequencies, with either the
+        // natural or the decimal logarithm, and with the energy scale moved by
+        // +6, -6 or -20 dB. The printed maximum misses up to all of them.
+        // Neither exceeds 1800 on steady tones, noise, a crescendo or a
+        // tremolo.
         let thr: Vec<f64> = self
             .partitions
             .iter()
@@ -321,10 +343,15 @@ impl PsychoacousticModel {
             .collect();
         self.nb_before_last = std::mem::replace(&mut self.nb_last, nb);
 
-        // Clause C.1.5.3.2.1 does not give the base of `log`. The natural
-        // logarithm matches the tonality conversion beside it, and the formula
-        // is written with the C double literal `1.`, for which `log` would be
-        // the natural logarithm, though neither settles it.
+        // Spec gap: clause C.1.5.3.2.1 does not give the base of `log`. The
+        // natural logarithm matches the tonality conversion beside it, and the
+        // formula is written with the C double literal `1.`, for which `log`
+        // would be the natural logarithm, though neither settles it.
+        //
+        // Spec reading: the formula is taken as printed, with no floor. A
+        // partition whose threshold exceeds its energy plus one subtracts from
+        // the sum, so silence and quiet passages, whose upper partitions sit
+        // below the large thresholds in quiet there, get a negative entropy.
         let perceptual_entropy = -self
             .partitions
             .iter()

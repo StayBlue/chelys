@@ -141,10 +141,11 @@ impl SpectrumCoding {
     }
 }
 
-/// SUBDIVIDE (clause C.1.5.4.4.6), with the simple strategy the clause
-/// suggests: a third of the scalefactor bands spanned by `big_values` go to
-/// region 0 and a quarter to region 2, the last, partly covered band counting
-/// as a whole one. Returns `(region0_count, region1_count)`.
+/// SUBDIVIDE (clause C.1.5.4.4.6). Spec gap: the clause leaves the split to
+/// the implementation; this is the simple strategy it suggests: a third of the
+/// scalefactor bands spanned by `big_values` go to region 0 and a quarter to
+/// region 2, the last, partly covered band counting as a whole one. Returns
+/// `(region0_count, region1_count)`.
 fn subdivide(big_values: usize, bands: &[Band; LONG_BANDS]) -> (u8, u8) {
     let lines = 2 * big_values;
     if lines == 0 {
@@ -158,9 +159,10 @@ fn subdivide(big_values: usize, bands: &[Band; LONG_BANDS]) -> (u8, u8) {
     ((region0 - 1) as u8, (region1 - 1) as u8)
 }
 
-/// Chooses a table for a region's `values` as clause C.1.5.4.4.7 suggests:
-/// the smallest table size that can code their maximum magnitude, and among
-/// the tables of that size the one needing the fewest bits.
+/// Chooses a table for a region's `values`. Spec gap: clause C.1.5.4.4.7
+/// leaves the choice open; this is what it suggests: the smallest table size
+/// that can code their maximum magnitude, and among the tables of that size
+/// the one needing the fewest bits.
 fn select_table(values: &[i32]) -> u8 {
     let max = values.iter().map(|v| v.unsigned_abs()).max().unwrap_or(0);
     let candidates =

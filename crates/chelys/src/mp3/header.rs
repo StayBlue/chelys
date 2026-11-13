@@ -171,10 +171,12 @@ fn slots_per_frame(bitrate: Bitrate, sampling_frequency: SamplingFrequency) -> (
 }
 
 /// Decides `padding_bit` frame by frame so that the mean frame length matches
-/// the bitrate exactly: after `k` frames the total length is
-/// `floor(k * 144 * bit_rate / sampling_frequency)` slots, which meets the
-/// "(+0, -1 slot)" bound of clause 2.4.2.3. That clause's sample procedure
-/// ("can be used") pads at different frames and is not followed here.
+/// the bitrate exactly: after `k` frames the total length is `floor(k * 144 *
+/// bit_rate / sampling_frequency)` slots, which meets the "(+0, -1 slot)"
+/// bound of clause 2.4.2.3.
+///
+/// Spec gap: that clause's sample procedure ("can be used") is optional; it
+/// pads at different frames and is not followed here.
 #[derive(Debug)]
 pub struct PaddingSchedule {
     remainder_step: u32,

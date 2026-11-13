@@ -23,23 +23,23 @@ const PREEMPHASIS_BANDS: std::ops::Range<usize> = LONG_BANDS - 4..LONG_BANDS;
 /// scalefactor would pass its limit (clause C.1.5.4.3.6), and returns the
 /// saved result: the last one whose distortion was measured.
 ///
-/// Figure C.9.b asks whether any band has "more than the allowed
+/// Spec reading: figure C.9.b asks whether any band has "more than the allowed
 /// distortion" after the amplification. That is read as a question about the
-/// distortion measured in the iteration against the allowance it was
-/// measured with. Comparing it with the allowances just raised would end the
-/// loop as soon as raising them sufficed, and restoring the saved
-/// scalefactors would then undo the amplification it was meant to keep.
+/// distortion measured in the iteration against the allowance it was measured
+/// with. Comparing it with the allowances just raised would end the loop as
+/// soon as raising them sufficed, and restoring the saved scalefactors would
+/// then undo the amplification it was meant to keep.
 ///
-/// Clause C.1.5.4.3.4 leaves the choice of preemphasis to the
-/// implementation and suggests the rule used here: `preflag` is set if,
-/// after the first inner loop, all of the upper four bands exceed their
-/// `xmin`.
+/// Spec gap: clause C.1.5.4.3.4 leaves the choice of preemphasis to the
+/// implementation and suggests the rule used here: `preflag` is set if, after
+/// the first inner loop, all of the upper four bands exceed their `xmin`.
 ///
 /// `scalefac_scale` starts at 0. Clause C.1.5.4.3 switches it to 1 when the
 /// scalefactors would otherwise pass their limits (figure C.9.b leaves this
-/// out); the scalefactors are then converted to the coarser step, rounding
-/// up so that no band is amplified less than before. Only when they would
-/// pass the limits again does the loop stop.
+/// out). Spec gap: the clause says only that the scalefactors are then
+/// "corrected accordingly"; here they are converted to the coarser step
+/// rounding up, so that no band is amplified less than before. Only when they
+/// would pass the limits again does the loop stop.
 ///
 /// The amplified lines are recomputed from `xr` each iteration rather than
 /// multiplied incrementally as clause C.1.5.4.3 describes; the result is

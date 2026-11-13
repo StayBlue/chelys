@@ -5,8 +5,8 @@ use crate::mp3::header::SamplingFrequency;
 use crate::mp3::huffman::MAX_MAGNITUDE;
 use crate::mp3::{GRANULE_LINES, QuantizedGranule, scalefactor_bands};
 
-/// Clause C.1.5.4.1 sets `global_gain = qquant + system_constant` and leaves
-/// the constant to the implementation. The decoder requantises with
+/// Spec gap: clause C.1.5.4.1 sets `global_gain = qquant + system_constant`
+/// and leaves the constant to the implementation. The decoder requantises with
 /// `2^((global_gain - 210) / 4)` (clause 2.4.3.4.7.1), so with `xr` on the
 /// decoder's scale, taking `qquant + quantanf = global_gain - 210` in the
 /// quantizer of clause C.1.5.4.4.1 makes it the inverse of the decoder's
@@ -61,16 +61,17 @@ impl<'a> Lines<'a> {
 /// `available_bits`, or returns `None` if not even the largest step does.
 ///
 /// The loop raises the step size one `global_gain` at a time until the
-/// quantised values are within the range of the tables (clause C.1.5.4.4.2;
-/// the decision in figure C.9.c has its "y" and "n" swapped relative to that
-/// text) and their bits fit. Clause C.1.5.4.2.1 leaves the starting step,
-/// `quantanf`, to the implementation, asking only that the first iteration
-/// need more bits than are available and suggesting it be chosen to save
-/// iterations. Here the search starts from `start_gain` if given, as the
-/// outer loop does with the step of its last iteration, and otherwise from a
-/// bisection of the whole range. Either way it ends on a step that fits with
-/// the next finer step not fitting, as the loop of figure C.9.c would started
-/// from that finer step.
+/// quantised values are within the range of the tables (clause C.1.5.4.4.2)
+/// and their bits fit. Spec reading: the decision in figure C.9.c has its "y"
+/// and "n" swapped relative to that text, which is followed.
+///
+/// Spec gap: clause C.1.5.4.2.1 leaves the starting step, `quantanf`, to the
+/// implementation, asking only that the first iteration need more bits than
+/// are available and suggesting it be chosen to save iterations. Here the
+/// search starts from `start_gain` if given, as the outer loop does with the
+/// step of its last iteration, and otherwise from a bisection of the whole
+/// range. Either way it ends on a step that fits with the next finer step not
+/// fitting, as the loop of figure C.9.c would started from that finer step.
 ///
 /// A granule whose lines are all zero skips the loop (figure C.9.a).
 pub fn inner_loop(
@@ -120,8 +121,10 @@ pub fn inner_loop(
     attempt(fits)
 }
 
-/// A step size near the finest that fits, by bisection over the whole range
-/// assuming that larger steps never need more bits.
+/// A step size near the finest that fits, by bisection over the whole range.
+/// Spec gap: this assumes that larger steps never need more bits, which the
+/// Huffman tables do not quite guarantee; the search in [`inner_loop`] then
+/// ends on a step whose next finer step does not fit.
 fn bisect(attempt: &impl Fn(u8) -> Option<QuantizedGranule>) -> u8 {
     if attempt(0).is_some() {
         return 0;
