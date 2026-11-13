@@ -73,17 +73,20 @@ marker phrases were proposed by the agent and approved by the user.*
 ## mpg123 and LAME as sources of evidence
 
 mpg123 and LAME may also be used as black-box decoders for evidence, as
-ffmpeg is. Evidence from them is documented in the same way: say "Settled by
-decoding with" and name every decoder the evidence was taken from, for
-example "Settled by decoding with ffmpeg, mpg123 and LAME (black box)", and
-name the test that provides it. Record the versions of mpg123 and LAME that
-the evidence was recorded with in the `chelys-conformance` crate's
-documentation, next to ffmpeg's (currently mpg123 1.33.7 and LAME 4.0), and
-update them when the evidence is recorded again with other versions.
+ffmpeg is. They are optional: evidence need not be checked against them, but
+may be, for example where decoders could disagree. Evidence from them is
+documented in the same way: say "Settled by decoding with" and name every
+decoder the evidence was taken from, for example "Settled by decoding with
+ffmpeg, mpg123 and LAME (black box)", and name the test that provides it.
+Record the versions of mpg123 and LAME that the evidence was recorded with
+in the `chelys-conformance` crate's documentation, next to ffmpeg's
+(currently mpg123 1.33.7 and LAME 4.0), and update them when the evidence is
+recorded again with other versions.
 
 *User, 2026-11-13: mpg123 and LAME evidence added as approved sources, when
 they disagreed with ffmpeg on intensity stereo at the lower sampling
 frequencies. The wording was written by the agent.*
+*User, 2026-11-13: they may be used, but do not have to be.*
 
 ## Commits for ffmpeg evidence
 
