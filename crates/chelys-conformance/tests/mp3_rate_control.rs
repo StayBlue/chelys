@@ -184,3 +184,51 @@ fn main_data_spans_frames_after_quiet_passages() {
         assert!(snr > 40.0, "quiet passage {passage}: {snr:.1} dB");
     }
 }
+
+/// Short blocks keep the quantisation noise of an attack from spreading
+/// back over the long window before it. A quiet tone is interrupted by
+/// bursts of noise 30 dB louder, starting early and late in a granule. With
+/// long blocks only, the noise rises to about -60 dBFS from 1024 samples
+/// before each burst; with window switching it stays far below that until
+/// the last few hundred samples, which the short windows and the polyphase
+/// filter span.
+#[test]
+fn attacks_switch_to_short_blocks_and_shorten_pre_echo() {
+    const DELAY: usize = 1057;
+    let fs = 44_100.0;
+    let attacks = [22_050 + 162 - 22_050 % 576, 44_100 + 461 - 44_100 % 576];
+    let mut seed = 1u64;
+    let input: Vec<f64> = (0..66_150)
+        .map(|t| {
+            let tone = 0.02 * (TAU * 440.0 * t as f64 / fs).sin();
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            let noise = (seed >> 11) as f64 / (1u64 << 52) as f64 - 1.0;
+            let burst: f64 = attacks
+                .iter()
+                .filter(|&&a| t >= a)
+                .map(|&a| 0.6 * (-((t - a) as f64) / (0.03 * fs)).exp() * noise)
+                .sum();
+            tone + burst
+        })
+        .collect();
+    let stream = encode_pcm(
+        &config(128, SamplingFrequency::Hz44100, Mode::SingleChannel),
+        &[&input],
+    );
+    let decoded = ffmpeg::decode_mp3(&stream);
+    assert_eq!(decoded.diagnostics, "");
+    for a in attacks {
+        for start in (a - 1024..a - 512).step_by(32) {
+            let noise = (start..start + 32)
+                .map(|t| (f64::from(decoded.samples[t + DELAY]) - input[t]).powi(2))
+                .sum::<f64>()
+                / 32.0;
+            let db = 10.0 * noise.log10();
+            assert!(
+                db < -80.0,
+                "attack at {a}: {db:.1} dBFS of noise {} samples before it",
+                a - start
+            );
+        }
+    }
+}

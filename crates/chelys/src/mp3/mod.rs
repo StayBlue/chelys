@@ -17,7 +17,7 @@ use std::ops::Range;
 use crate::bitstream::BitWriter;
 use header::{Bitrate, Emphasis, Header, Mode, PaddingSchedule, SamplingFrequency};
 use huffman::{QuadTable, SpectrumCoding};
-use psychoacoustic::PsychoacousticModel;
+use psychoacoustic::switching::BlockSwitching;
 use reservoir::Reservoir;
 use scalefactors::Scalefactors;
 use side_info::{GRANULES, GranuleChannel, SideInfo, Window};
@@ -131,14 +131,17 @@ impl FrameWriter {
     }
 }
 
-/// One granule of one channel, quantised and ready for coding. Long blocks
-/// only.
+/// One granule of one channel, quantised and ready for coding.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct QuantizedGranule {
+    pub block_type: BlockType,
     /// The quantizer step size; see the requantization formula in clause
     /// 2.4.3.4.7.1.
     pub global_gain: u8,
     pub scalefactors: Scalefactors,
+    /// The quantised values in the order they are sent: by frequency, or for
+    /// short blocks by scalefactor band, window and frequency (clause
+    /// 2.4.2.7).
     pub values: [i32; GRANULE_LINES],
     pub coding: SpectrumCoding,
 }
@@ -155,24 +158,54 @@ impl QuantizedGranule {
             .scalefactors
             .compress()
             .expect("scalefactors within their limits");
-        let bands = scalefactor_bands::long_bands(sampling_frequency);
-        scalefactors::part2_length(compress) + self.coding.bit_count(&self.values, bands)
+        let bands = scalefactor_bands::coding_bands(self.block_type, sampling_frequency);
+        self.scalefactors.part2_length(compress) + self.coding.bit_count(&self.values, &bands)
     }
 
-    /// Partitions `values` and chooses Huffman tables for them (clause
-    /// C.1.5.4.4). The scalefactors are all zero.
+    /// Partitions `values` of a granule of `block_type` and chooses Huffman
+    /// tables for them (clause C.1.5.4.4). The scalefactors are all zero.
     pub fn new(
         global_gain: u8,
         values: [i32; GRANULE_LINES],
+        block_type: BlockType,
         sampling_frequency: SamplingFrequency,
     ) -> Self {
-        let coding =
-            SpectrumCoding::choose(&values, scalefactor_bands::long_bands(sampling_frequency));
+        let bands = scalefactor_bands::coding_bands(block_type, sampling_frequency);
+        let coding = SpectrumCoding::choose(&values, block_type, &bands);
         Self {
+            block_type,
             global_gain,
-            scalefactors: Scalefactors::default(),
+            scalefactors: Scalefactors::new(block_type),
             values,
             coding,
+        }
+    }
+
+    /// The side information's `window_switching_flag` and the fields that
+    /// depend on it.
+    ///
+    /// Spec gap: Annex C does not say how to choose `subblock_gain`, which
+    /// sets a coarser step for one short window. It is always 0: the outer
+    /// loop's scalefactors shape the noise of each window instead.
+    fn window(&self) -> Window {
+        let coding = &self.coding;
+        let block_type = match self.block_type {
+            BlockType::Normal => {
+                return Window::Normal {
+                    table_select: coding.table_select,
+                    region0_count: coding.region0_count,
+                    region1_count: coding.region1_count,
+                };
+            }
+            BlockType::Start => side_info::BlockType::Start,
+            BlockType::Short => side_info::BlockType::Short,
+            BlockType::Stop => side_info::BlockType::End,
+        };
+        Window::Switched {
+            block_type,
+            mixed_block_flag: false,
+            table_select: [coding.table_select[0], coding.table_select[1]],
+            subblock_gain: [0; 3],
         }
     }
 }
@@ -210,7 +243,6 @@ fn frame_contents(
     frame: &[Vec<QuantizedGranule>],
     main_data_begin: usize,
 ) -> (SideInfo, Vec<u8>) {
-    let bands = scalefactor_bands::long_bands(sampling_frequency);
     let mut side_info = SideInfo {
         main_data_begin: u16::try_from(main_data_begin).expect("main_data_begin is 9 bits"),
         ..SideInfo::default()
@@ -224,7 +256,10 @@ fn frame_contents(
                 .compress()
                 .expect("scalefactors within their limits");
             scalefactors.write(scalefac_compress, &mut main_data);
-            channel.coding.write(&channel.values, bands, &mut main_data);
+            let bands = scalefactor_bands::coding_bands(channel.block_type, sampling_frequency);
+            channel
+                .coding
+                .write(&channel.values, &bands, &mut main_data);
             let part2_3_length = main_data.bit_len() - start;
             assert!(
                 part2_3_length <= MAX_PART2_3_LENGTH,
@@ -236,11 +271,7 @@ fn frame_contents(
                 big_values: coding.big_values as u16,
                 global_gain: channel.global_gain,
                 scalefac_compress,
-                window: Window::Normal {
-                    table_select: coding.table_select,
-                    region0_count: coding.region0_count,
-                    region1_count: coding.region1_count,
-                },
+                window: channel.window(),
                 preflag: scalefactors.preflag,
                 scalefac_scale: scalefactors.scalefac_scale,
                 count1table_select: coding.count1_table == QuadTable::B,
@@ -285,42 +316,43 @@ pub fn encode_granules(config: &StreamConfig, granules: &[Vec<QuantizedGranule>]
 /// Encodes PCM, one slice of samples (nominally -1.0 to 1.0) per channel, at
 /// the configured bitrate.
 ///
-/// Psychoacoustic model 2 sets the distortion each scalefactor band allows
-/// and the perceptual entropy of each granule. Each granule of each channel
-/// gets an equal share of its frame's main data, the `mean_bits` of clause
-/// C.1.5.3.4, plus what the bit reservoir lends it, and the iteration loops
-/// shape the quantisation noise to the allowed distortion within those bits.
-/// The input is padded with silence to whole frames, plus one more frame to
-/// flush the filterbank.
+/// Psychoacoustic model 2 chooses each granule's block type, switching to
+/// short blocks for attacks, and sets the distortion each scalefactor band
+/// allows and the perceptual entropy of each granule. Each granule of each
+/// channel gets an equal share of its frame's main data, the `mean_bits` of
+/// clause C.1.5.3.4, plus what the bit reservoir lends it, and the iteration
+/// loops shape the quantisation noise to the allowed distortion within those
+/// bits. The input is padded with silence to whole frames, plus one more
+/// frame to flush the filterbank.
 ///
 /// # Panics
 ///
 /// If the channel count does not match the configured mode.
 pub fn encode_pcm(config: &StreamConfig, channels: &[&[f64]]) -> Vec<u8> {
     let fs = config.sampling_frequency;
-    let mut models: Vec<_> = channels
-        .iter()
-        .map(|_| PsychoacousticModel::new(fs))
-        .collect();
+    let mut models: Vec<_> = channels.iter().map(|_| BlockSwitching::new(fs)).collect();
     let reservoir = Reservoir::new(config.header(true).frame_len());
     encode_filtered(
         config,
         channels,
         reservoir,
-        |channel, pcm, xr, mean_bits, reservoir| {
-            let masking = models[channel].granule(pcm);
+        |channel, pcm| {
+            let masking = models[channel].granule(pcm)?;
+            Some((masking.block_type(), masking))
+        },
+        |masking, xr, mean_bits, reservoir| {
             let xmin = masking.allowed_distortion(xr, fs);
             let available_bits = reservoir
-                .granule_bits(mean_bits, masking.perceptual_entropy)
+                .granule_bits(mean_bits, masking.perceptual_entropy())
                 .min(MAX_PART2_3_LENGTH);
-            loops::quantize_granule(xr, &xmin, available_bits, fs)
+            loops::quantize_granule(xr, &xmin, masking.block_type(), available_bits, fs)
         },
     )
 }
 
-/// Encodes PCM like [`encode_pcm`], but quantises every granule with the same
-/// `global_gain` instead of fitting it to the bitrate, and without a bit
-/// reservoir.
+/// Encodes PCM like [`encode_pcm`], but with long blocks only, quantising
+/// every granule with the same `global_gain` instead of fitting it to the
+/// bitrate, and without a bit reservoir.
 ///
 /// # Panics
 ///
@@ -331,28 +363,60 @@ pub fn encode_pcm_with_global_gain(
     global_gain: u8,
     channels: &[&[f64]],
 ) -> Vec<u8> {
-    encode_filtered(config, channels, Reservoir::disabled(), |_, _, xr, _, _| {
-        let values = loops::quantize(xr, global_gain)
-            .unwrap_or_else(|| panic!("a granule is too loud for global_gain {global_gain}"));
-        QuantizedGranule::new(global_gain, values, config.sampling_frequency)
-    })
+    encode_with_block_types(config, global_gain, channels, |_, _| BlockType::Normal)
+}
+
+/// Encodes PCM like [`encode_pcm_with_global_gain`], with the block type of
+/// each granule given by `block_type(channel, granule)`. The block types must
+/// follow each other as figure C.7 allows.
+///
+/// # Panics
+///
+/// As [`encode_pcm_with_global_gain`].
+pub fn encode_with_block_types(
+    config: &StreamConfig,
+    global_gain: u8,
+    channels: &[&[f64]],
+    mut block_type: impl FnMut(usize, usize) -> BlockType,
+) -> Vec<u8> {
+    let mut next = vec![0usize; channels.len()];
+    encode_filtered(
+        config,
+        channels,
+        Reservoir::disabled(),
+        |channel, _| {
+            // Called once ahead of the first granule, whose type it gives
+            // on the second call.
+            let granule = next[channel].checked_sub(1);
+            next[channel] += 1;
+            granule.map(|g| {
+                let block_type = block_type(channel, g);
+                (block_type, block_type)
+            })
+        },
+        |block_type, xr, _, _| {
+            let values = loops::quantize(xr, global_gain)
+                .unwrap_or_else(|| panic!("a granule is too loud for global_gain {global_gain}"));
+            QuantizedGranule::new(global_gain, values, block_type, config.sampling_frequency)
+        },
+    )
 }
 
 /// Runs each channel through its filterbank granule by granule, quantises
-/// each granule with `quantize`, and writes the frames. `quantize` is given
-/// the channel, the granule's PCM and lines, its share of the frame's main
+/// each granule with `quantize`, and writes the frames.
+///
+/// `look_ahead` is given each channel's PCM one granule ahead of the
+/// filterbank, starting with the first granule before any is filtered, and
+/// returns the block type and analysis of the granule before the one it is
+/// given: `None` only for the first. `quantize` is given that analysis, the
+/// granule's lines in the order they are sent, its share of the frame's main
 /// data and the bit reservoir, which accounts for the bits it then uses.
-fn encode_filtered(
+fn encode_filtered<A>(
     config: &StreamConfig,
     channels: &[&[f64]],
     mut reservoir: Reservoir,
-    mut quantize: impl FnMut(
-        usize,
-        &[f64; GRANULE_LINES],
-        &[f64; GRANULE_LINES],
-        usize,
-        &Reservoir,
-    ) -> QuantizedGranule,
+    mut look_ahead: impl FnMut(usize, &[f64; GRANULE_LINES]) -> Option<(BlockType, A)>,
+    mut quantize: impl FnMut(A, &[f64; GRANULE_LINES], usize, &Reservoir) -> QuantizedGranule,
 ) -> Vec<u8> {
     assert_eq!(
         channels.len(),
@@ -361,10 +425,17 @@ fn encode_filtered(
     );
     let samples = channels.iter().map(|c| c.len()).max().unwrap_or(0);
     let frames = samples.div_ceil(SAMPLES_PER_FRAME) + 1;
+    let granule_pcm = |channel: usize, granule: usize| -> [f64; GRANULE_LINES] {
+        let offset = granule * GRANULE_LINES;
+        std::array::from_fn(|t| channels[channel].get(offset + t).copied().unwrap_or(0.0))
+    };
     let mut filterbanks: Vec<_> = channels
         .iter()
         .map(|_| filterbank::Filterbank::new())
         .collect();
+    for channel in 0..channels.len() {
+        assert!(look_ahead(channel, &granule_pcm(channel, 0)).is_none());
+    }
     let fs = config.sampling_frequency;
     let mut padding = PaddingSchedule::new(config.bitrate, fs);
     let mut writer = FrameWriter::default();
@@ -377,12 +448,18 @@ fn encode_filtered(
         let mean_bits = slot_bits / shares;
         let mut granules = Vec::with_capacity(GRANULES);
         for gr in 0..GRANULES {
-            let offset = (frame * GRANULES + gr) * GRANULE_LINES;
+            let index = frame * GRANULES + gr;
             let mut granule = Vec::with_capacity(channels.len());
-            for (channel, (pcm, filterbank)) in channels.iter().zip(&mut filterbanks).enumerate() {
-                let pcm = std::array::from_fn(|t| pcm.get(offset + t).copied().unwrap_or(0.0));
-                let xr = filterbank.granule(&pcm, BlockType::Normal);
-                let quantized = quantize(channel, &pcm, &xr, mean_bits, &reservoir);
+            for (channel, filterbank) in filterbanks.iter_mut().enumerate() {
+                let (block_type, analysis) = look_ahead(channel, &granule_pcm(channel, index + 1))
+                    .expect("the granule before has been analysed");
+                let xr = filterbank.granule(&granule_pcm(channel, index), block_type);
+                let xr = match block_type {
+                    BlockType::Short => scalefactor_bands::short_coding_order(&xr, fs),
+                    _ => xr,
+                };
+                let quantized = quantize(analysis, &xr, mean_bits, &reservoir);
+                assert_eq!(quantized.block_type, block_type);
                 reservoir.granule_done(mean_bits, quantized.bit_len(fs));
                 granule.push(quantized);
             }
@@ -398,7 +475,12 @@ fn encode_filtered(
 /// Encodes `frames` frames of digital silence. Every granule codes to
 /// nothing, so each frame is zero-filled after its side information.
 pub fn encode_silence(config: &StreamConfig, frames: usize) -> Vec<u8> {
-    let silent = QuantizedGranule::new(0, [0; GRANULE_LINES], config.sampling_frequency);
+    let silent = QuantizedGranule::new(
+        0,
+        [0; GRANULE_LINES],
+        BlockType::Normal,
+        config.sampling_frequency,
+    );
     let granule = vec![silent; config.mode.channels()];
     encode_granules(config, &vec![granule; frames * GRANULES])
 }

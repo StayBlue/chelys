@@ -1,12 +1,15 @@
 //! Huffman coding of one granule's quantised spectrum, `Huffmancodebits()`
 //! (clauses 2.4.1.7 and 2.4.2.7), partitioned and with tables chosen as in the
-//! inner iteration loop (clauses C.1.5.4.4.3 to C.1.5.4.4.8). Long blocks
-//! only.
+//! inner iteration loop (clauses C.1.5.4.4.3 to C.1.5.4.4.8).
+//!
+//! The values are given in the order they are sent, and the scalefactor
+//! bands as [`coding_bands`](crate::mp3::scalefactor_bands::coding_bands)
+//! gives them for the granule's block type.
 
 use super::{PairTable, QuadTable, pair_table};
 use crate::bitstream::BitWriter;
-use crate::mp3::GRANULE_LINES;
-use crate::mp3::scalefactor_bands::{Band, LONG_BANDS};
+use crate::mp3::scalefactor_bands::Band;
+use crate::mp3::{BlockType, GRANULE_LINES};
 
 /// The largest magnitude allowed in the `big_values` partition (clause
 /// 2.4.2.7).
@@ -21,19 +24,24 @@ pub struct SpectrumCoding {
     /// Quadruples in the `count1` partition that follows. Not transmitted: the
     /// decoder infers it from `part2_3_length`.
     pub count1: usize,
+    /// For granules with `window_switching_flag` set only the first two are
+    /// sent, as region 2 is empty.
     pub table_select: [u8; 3],
+    /// Sent only without `window_switching_flag`; otherwise they hold the
+    /// defaults the decoder sets (clause 2.4.2.7).
     pub region0_count: u8,
     pub region1_count: u8,
     pub count1_table: QuadTable,
 }
 
 impl SpectrumCoding {
-    /// Partitions `values` and chooses tables following clause C.1.5.4.4.
+    /// Partitions `values` of a granule of `block_type` and chooses tables
+    /// following clause C.1.5.4.4.
     ///
     /// # Panics
     ///
     /// If a magnitude exceeds [`MAX_MAGNITUDE`].
-    pub fn choose(values: &[i32; GRANULE_LINES], bands: &[Band; LONG_BANDS]) -> Self {
+    pub fn choose(values: &[i32; GRANULE_LINES], block_type: BlockType, bands: &[Band]) -> Self {
         assert!(
             values.iter().all(|v| v.unsigned_abs() <= MAX_MAGNITUDE),
             "quantised magnitudes are limited to {MAX_MAGNITUDE}"
@@ -60,7 +68,15 @@ impl SpectrumCoding {
             QuadTable::A
         };
 
-        let (region0_count, region1_count) = subdivide(big_values, bands);
+        // With window_switching_flag set, region0_count and region1_count are
+        // not sent but set by default: region 0 holds 8 long bands, or 9
+        // short bands counted once per window, and region 1 the rest (clause
+        // 2.4.2.7).
+        let (region0_count, region1_count) = match block_type {
+            BlockType::Normal => subdivide(big_values, bands),
+            BlockType::Start | BlockType::Stop => (7, 36),
+            BlockType::Short => (8, 36),
+        };
         let mut coding = Self {
             big_values,
             count1,
@@ -81,7 +97,7 @@ impl SpectrumCoding {
     /// holds `region0_count + 1` scalefactor bands and region 1 the next
     /// `region1_count + 1` (clause 2.4.2.7); all three end at `big_values`
     /// pairs at the latest.
-    pub fn region_ends(&self, bands: &[Band; LONG_BANDS]) -> [usize; 3] {
+    pub fn region_ends(&self, bands: &[Band]) -> [usize; 3] {
         let lines = 2 * self.big_values;
         let region0_bands = usize::from(self.region0_count) + 1;
         let region1_bands = usize::from(self.region1_count) + 1;
@@ -95,7 +111,7 @@ impl SpectrumCoding {
 
     /// The bits [`write`](Self::write) produces for `values`, counted as in
     /// clauses C.1.5.4.4.5 and C.1.5.4.4.8.
-    pub fn bit_count(&self, values: &[i32; GRANULE_LINES], bands: &[Band; LONG_BANDS]) -> usize {
+    pub fn bit_count(&self, values: &[i32; GRANULE_LINES], bands: &[Band]) -> usize {
         let mut bits = 0;
         let mut start = 0;
         for (region, end) in self.region_ends(bands).into_iter().enumerate() {
@@ -114,12 +130,7 @@ impl SpectrumCoding {
     ///
     /// If a value cannot be coded with the table selected for it, or lies
     /// above the `count1` partition without being zero.
-    pub fn write(
-        &self,
-        values: &[i32; GRANULE_LINES],
-        bands: &[Band; LONG_BANDS],
-        w: &mut BitWriter,
-    ) {
+    pub fn write(&self, values: &[i32; GRANULE_LINES], bands: &[Band], w: &mut BitWriter) {
         let mut start = 0;
         for (region, end) in self.region_ends(bands).into_iter().enumerate() {
             let table_select = self.table_select[region];
@@ -146,7 +157,7 @@ impl SpectrumCoding {
 /// scalefactor bands spanned by `big_values` go to region 0 and a quarter to
 /// region 2, the last, partly covered band counting as a whole one. Returns
 /// `(region0_count, region1_count)`.
-fn subdivide(big_values: usize, bands: &[Band; LONG_BANDS]) -> (u8, u8) {
+fn subdivide(big_values: usize, bands: &[Band]) -> (u8, u8) {
     let lines = 2 * big_values;
     if lines == 0 {
         return (0, 0);
@@ -268,9 +279,9 @@ fn write_quad(table: QuadTable, quad: &[i32], w: &mut BitWriter) {
 mod tests {
     use super::*;
     use crate::mp3::header::SamplingFrequency;
-    use crate::mp3::scalefactor_bands::long_bands;
+    use crate::mp3::scalefactor_bands::{coding_bands, long_bands};
 
-    fn bands() -> &'static [Band; LONG_BANDS] {
+    fn bands() -> &'static [Band] {
         long_bands(SamplingFrequency::Hz44100)
     }
 
@@ -291,7 +302,7 @@ mod tests {
     #[test]
     fn silence_codes_to_nothing() {
         let values = [0; GRANULE_LINES];
-        let coding = SpectrumCoding::choose(&values, bands());
+        let coding = SpectrumCoding::choose(&values, BlockType::Normal, bands());
         assert_eq!(coding.big_values, 0);
         assert_eq!(coding.count1, 0);
         assert_eq!(coding.table_select, [0; 3]);
@@ -303,7 +314,7 @@ mod tests {
     fn partitions_into_big_values_count1_and_zeros() {
         // Pairs: (5, 0) (0, 1); quadruples: (1, -1, 0, 0) (0, 0, 0, 1); then zeros.
         let values = spectrum(&[5, 0, 0, 1, 1, -1, 0, 0, 0, 0, 0, 1]);
-        let coding = SpectrumCoding::choose(&values, bands());
+        let coding = SpectrumCoding::choose(&values, BlockType::Normal, bands());
         assert_eq!(coding.big_values, 2);
         assert_eq!(coding.count1, 2);
     }
@@ -312,7 +323,7 @@ mod tests {
     fn zeros_inside_the_top_nonzero_pair_stay_in_count1() {
         // Zero pairs are counted whole: line 9 is zero but line 8 is not.
         let values = spectrum(&[2, 0, 0, 0, 0, 0, 0, 0, 1, 0]);
-        let coding = SpectrumCoding::choose(&values, bands());
+        let coding = SpectrumCoding::choose(&values, BlockType::Normal, bands());
         assert_eq!((coding.big_values, coding.count1), (1, 2));
     }
 
@@ -333,11 +344,31 @@ mod tests {
     #[test]
     fn region_ends_stop_at_big_values() {
         let values = spectrum(&[3; 40]);
-        let coding = SpectrumCoding::choose(&values, bands());
+        let coding = SpectrumCoding::choose(&values, BlockType::Normal, bands());
         assert_eq!(coding.big_values, 20);
         // 40 lines span bands 0 to 8 (band 9 starts at 44): 3 / 4 / 2 bands.
         assert_eq!((coding.region0_count, coding.region1_count), (2, 3));
         assert_eq!(coding.region_ends(bands()), [12, 30, 40]);
+    }
+
+    /// With window switching the regions are fixed: region 0 ends after 8
+    /// long bands, or for short blocks after short band 2 in all three
+    /// windows, and region 1 takes the rest of `big_values`.
+    #[test]
+    fn switched_windows_use_the_default_regions() {
+        let fs = SamplingFrequency::Hz44100;
+        let values = spectrum(&[3; 200]);
+        for block_type in [BlockType::Start, BlockType::Stop] {
+            let coding = SpectrumCoding::choose(&values, block_type, long_bands(fs));
+            assert_eq!(
+                coding.region_ends(long_bands(fs)),
+                [long_bands(fs)[8].start, 200, 200]
+            );
+            assert_eq!(coding.table_select[2], 0);
+        }
+        let short = coding_bands(BlockType::Short, fs);
+        let coding = SpectrumCoding::choose(&values, BlockType::Short, &short);
+        assert_eq!(coding.region_ends(&short), [36, 200, 200]);
     }
 
     #[test]
@@ -392,7 +423,7 @@ mod tests {
                 _ => 0,
             };
         }
-        let coding = SpectrumCoding::choose(&values, bands());
+        let coding = SpectrumCoding::choose(&values, BlockType::Normal, bands());
         assert_eq!(
             written(&values, &coding).len(),
             coding.bit_count(&values, bands())

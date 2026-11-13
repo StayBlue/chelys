@@ -29,6 +29,30 @@ impl SwitchedMasking {
             Self::Stop(_) => BlockType::Stop,
         }
     }
+
+    pub fn perceptual_entropy(&self) -> f64 {
+        match self {
+            Self::Normal(masking) | Self::Start(masking) | Self::Stop(masking) => {
+                masking.perceptual_entropy
+            }
+            Self::Short(masking) => masking.perceptual_entropy,
+        }
+    }
+
+    /// The allowed distortion of each scalefactor of the granule, in the
+    /// order they are sent, from its lines `xr` in the order they are sent.
+    pub fn allowed_distortion(
+        &self,
+        xr: &[f64; GRANULE_LINES],
+        sampling_frequency: SamplingFrequency,
+    ) -> Vec<f64> {
+        match self {
+            Self::Normal(masking) | Self::Start(masking) | Self::Stop(masking) => {
+                masking.allowed_distortion(xr, sampling_frequency).to_vec()
+            }
+            Self::Short(masking) => masking.allowed_distortion(xr, sampling_frequency).to_vec(),
+        }
+    }
 }
 
 /// Psychoacoustic model 2 with window switching for one channel. Its output

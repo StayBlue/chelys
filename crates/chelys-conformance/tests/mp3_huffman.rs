@@ -8,7 +8,7 @@
 
 use chelys::mp3::header::{Bitrate, Mode, SamplingFrequency};
 use chelys::mp3::huffman::{MAX_MAGNITUDE, QuadTable, SpectrumCoding, pair_table};
-use chelys::mp3::{GRANULE_LINES, QuantizedGranule, StreamConfig, encode_granules};
+use chelys::mp3::{BlockType, GRANULE_LINES, QuantizedGranule, StreamConfig, encode_granules};
 use chelys_conformance::ffmpeg;
 
 type Spectrum = [i32; GRANULE_LINES];
@@ -30,9 +30,27 @@ fn decode(
     spectra: [&Spectrum; 2],
     adjust: impl Fn(&mut SpectrumCoding, &Spectrum),
 ) -> Vec<f32> {
+    decode_blocks(
+        sampling_frequency,
+        global_gain,
+        spectra,
+        BlockType::Normal,
+        adjust,
+    )
+}
+
+/// [`decode`] with every granule of `block_type`.
+fn decode_blocks(
+    sampling_frequency: SamplingFrequency,
+    global_gain: u8,
+    spectra: [&Spectrum; 2],
+    block_type: BlockType,
+    adjust: impl Fn(&mut SpectrumCoding, &Spectrum),
+) -> Vec<f32> {
     let granules: Vec<_> = spectra
         .map(|values| {
-            let mut granule = QuantizedGranule::new(global_gain, *values, sampling_frequency);
+            let mut granule =
+                QuantizedGranule::new(global_gain, *values, block_type, sampling_frequency);
             adjust(&mut granule.coding, values);
             vec![granule]
         })
@@ -231,6 +249,39 @@ fn region_boundaries_match_the_decoder_at_every_sampling_frequency() {
             ));
         }
         assert_all_equal(&results);
+    }
+}
+
+/// With window switching the region boundaries are not sent: region 0 holds
+/// 8 long scalefactor bands, or for short blocks 9 short ones counted once
+/// per window, and region 1 the rest of `big_values` (clause 2.4.2.7). Two
+/// tables, one per region, decode like one if the decoder agrees.
+#[test]
+fn switched_window_regions_match_the_decoder_at_every_sampling_frequency() {
+    let mut rng = Rng(13);
+    let mut values = [0; GRANULE_LINES];
+    for v in &mut values[..560] {
+        *v = rng.signed(1);
+    }
+    values[559] = 1;
+    for fs in SamplingFrequency::ALL {
+        for block_type in [BlockType::Start, BlockType::Short, BlockType::Stop] {
+            let both = [&values, &values];
+            let results = vec![
+                (
+                    format!("one table, {block_type:?} at {fs:?}"),
+                    decode_blocks(fs, 180, both, block_type, |c, v| all_pairs(c, v, 1)),
+                ),
+                (
+                    format!("two tables, {block_type:?} at {fs:?}"),
+                    decode_blocks(fs, 180, both, block_type, |coding, values| {
+                        all_pairs(coding, values, 1);
+                        coding.table_select = [3, 1, 0];
+                    }),
+                ),
+            ];
+            assert_all_equal(&results);
+        }
     }
 }
 

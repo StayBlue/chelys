@@ -3,7 +3,7 @@
 
 use crate::mp3::header::SamplingFrequency;
 use crate::mp3::huffman::MAX_MAGNITUDE;
-use crate::mp3::{GRANULE_LINES, QuantizedGranule, scalefactor_bands};
+use crate::mp3::{BlockType, GRANULE_LINES, QuantizedGranule, scalefactor_bands};
 
 /// Spec gap: clause C.1.5.4.1 sets `global_gain = qquant + system_constant`
 /// and leaves the constant to the implementation. The decoder requantises with
@@ -57,7 +57,8 @@ impl<'a> Lines<'a> {
 }
 
 /// The inner iteration loop (clause C.1.5.4.4, figure C.9.c): quantises
-/// `xr` with the smallest step size whose Huffman coding fits in
+/// `xr`, the lines of a granule of `block_type` in the order they are sent,
+/// with the smallest step size whose Huffman coding fits in
 /// `available_bits`, or returns `None` if not even the largest step does.
 ///
 /// The loop raises the step size one `global_gain` at a time until the
@@ -77,6 +78,7 @@ impl<'a> Lines<'a> {
 pub fn inner_loop(
     xr: &[f64; GRANULE_LINES],
     available_bits: usize,
+    block_type: BlockType,
     sampling_frequency: SamplingFrequency,
     start_gain: Option<u8>,
 ) -> Option<QuantizedGranule> {
@@ -84,15 +86,16 @@ pub fn inner_loop(
         return Some(QuantizedGranule::new(
             0,
             [0; GRANULE_LINES],
+            block_type,
             sampling_frequency,
         ));
     }
-    let bands = scalefactor_bands::long_bands(sampling_frequency);
+    let bands = scalefactor_bands::coding_bands(block_type, sampling_frequency);
     let lines = Lines::new(xr);
     let attempt = |global_gain: u8| {
         let values = lines.quantize(global_gain)?;
-        let granule = QuantizedGranule::new(global_gain, values, sampling_frequency);
-        let fits = granule.coding.bit_count(&granule.values, bands) <= available_bits;
+        let granule = QuantizedGranule::new(global_gain, values, block_type, sampling_frequency);
+        let fits = granule.coding.bit_count(&granule.values, &bands) <= available_bits;
         fits.then_some(granule)
     };
 
@@ -208,12 +211,13 @@ mod tests {
         let bands = scalefactor_bands::long_bands(fs);
         let xr = tone_granule();
         for available in [100, 400, 1500, 4000] {
-            let granule = inner_loop(&xr, available, fs, None).unwrap();
+            let granule = inner_loop(&xr, available, BlockType::Normal, fs, None).unwrap();
             let bits = granule.coding.bit_count(&granule.values, bands);
             assert!(bits <= available, "{bits} bits for {available}");
             // One step finer either leaves the tables' range or needs too many bits.
             let finer = quantize(&xr, granule.global_gain - 1).map(|values| {
-                let finer = QuantizedGranule::new(granule.global_gain - 1, values, fs);
+                let finer =
+                    QuantizedGranule::new(granule.global_gain - 1, values, BlockType::Normal, fs);
                 finer.coding.bit_count(&finer.values, bands)
             });
             assert!(finer.is_none_or(|bits| bits > available), "{available}");
@@ -225,9 +229,11 @@ mod tests {
     fn inner_loop_ends_on_the_same_step_from_any_start() {
         let fs = SamplingFrequency::Hz44100;
         let xr = tone_granule();
-        let expected = inner_loop(&xr, 800, fs, None).unwrap().global_gain;
+        let expected = inner_loop(&xr, 800, BlockType::Normal, fs, None)
+            .unwrap()
+            .global_gain;
         for start in [0, 100, expected - 1, expected, expected + 1, 200, 255] {
-            let granule = inner_loop(&xr, 800, fs, Some(start)).unwrap();
+            let granule = inner_loop(&xr, 800, BlockType::Normal, fs, Some(start)).unwrap();
             assert_eq!(granule.global_gain, expected, "from {start}");
         }
     }
@@ -236,13 +242,19 @@ mod tests {
     fn inner_loop_gives_up_when_nothing_fits() {
         // Lines so loud that even the largest step leaves 1s in every pair.
         let xr = [1e6; GRANULE_LINES];
-        assert!(inner_loop(&xr, 10, SamplingFrequency::Hz44100, None).is_none());
+        assert!(inner_loop(&xr, 10, BlockType::Normal, SamplingFrequency::Hz44100, None).is_none());
     }
 
     #[test]
     fn inner_loop_skips_silence() {
-        let granule =
-            inner_loop(&[0.0; GRANULE_LINES], 0, SamplingFrequency::Hz32000, None).unwrap();
+        let granule = inner_loop(
+            &[0.0; GRANULE_LINES],
+            0,
+            BlockType::Short,
+            SamplingFrequency::Hz32000,
+            None,
+        )
+        .unwrap();
         assert!(granule.values.iter().all(|&v| v == 0));
         assert_eq!(granule.coding.big_values, 0);
     }
@@ -250,7 +262,7 @@ mod tests {
     #[test]
     fn inner_loop_fits_even_with_no_bits() {
         let fs = SamplingFrequency::Hz48000;
-        let granule = inner_loop(&tone_granule(), 0, fs, None).unwrap();
+        let granule = inner_loop(&tone_granule(), 0, BlockType::Normal, fs, None).unwrap();
         let bands = scalefactor_bands::long_bands(fs);
         assert_eq!(granule.coding.bit_count(&granule.values, bands), 0);
     }

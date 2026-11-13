@@ -5,6 +5,7 @@
 //! consistency is checked at compile time.
 
 use super::header::SamplingFrequency;
+use super::{BlockType, GRANULE_LINES};
 
 /// The frequency lines `start..start + width` of one scalefactor band. Short
 /// block indices count the 192 lines of a single short window.
@@ -23,6 +24,10 @@ impl Band {
 
 pub const LONG_BANDS: usize = 21;
 pub const SHORT_BANDS: usize = 12;
+/// The short windows of a short block.
+pub const SHORT_WINDOWS: usize = 3;
+/// The lines of one short window.
+const SHORT_WINDOW_LINES: usize = GRANULE_LINES / SHORT_WINDOWS;
 
 /// The bands for long windows (block types 0, 1 and 3).
 pub fn long_bands(sampling_frequency: SamplingFrequency) -> &'static [Band; LONG_BANDS] {
@@ -40,6 +45,63 @@ pub fn short_bands(sampling_frequency: SamplingFrequency) -> &'static [Band; SHO
         SamplingFrequency::Hz44100 => &SHORT_44100,
         SamplingFrequency::Hz48000 => &SHORT_48000,
     }
+}
+
+/// The lines of each scalefactor of a granule of `block_type`, in the order
+/// in which both the scalefactors and the Huffman coded values are sent
+/// (clauses 2.4.1.7 and 2.4.2.7): the long bands for block types 0, 1 and 3,
+/// and for short blocks each short band three times, once per window, as
+/// `3 * sfb + window`, a band's windows following each other. Lines past the
+/// last range have no scalefactor.
+pub fn coding_bands(block_type: BlockType, sampling_frequency: SamplingFrequency) -> Vec<Band> {
+    if block_type != BlockType::Short {
+        return long_bands(sampling_frequency).to_vec();
+    }
+    short_bands(sampling_frequency)
+        .iter()
+        .flat_map(|band| {
+            (0..SHORT_WINDOWS).map(move |window| Band {
+                start: SHORT_WINDOWS * band.start + window * band.width,
+                width: band.width,
+            })
+        })
+        .collect()
+}
+
+/// Reorders the lines of a short block from the subband order of the
+/// filterbank (see
+/// [`Filterbank::granule`](super::filterbank::Filterbank::granule)) into the
+/// order of the bitstream: by scalefactor band, then window, then frequency
+/// (clause 2.4.2.7). The decoder undoes this before its IMDCT (clause
+/// 2.4.3.4.8).
+///
+/// Spec gap: Table B.8 ends with short band 11, and the standard does not
+/// say how the lines above it, which have no scalefactor, are ordered. They
+/// are sent as one more band up to line 192 of each window, window by
+/// window.
+pub fn short_coding_order(
+    xr: &[f64; GRANULE_LINES],
+    sampling_frequency: SamplingFrequency,
+) -> [f64; GRANULE_LINES] {
+    let bands = short_bands(sampling_frequency);
+    let last = bands[SHORT_BANDS - 1].end();
+    let top = Band {
+        start: last,
+        width: SHORT_WINDOW_LINES - last,
+    };
+    let mut ordered = [0.0; GRANULE_LINES];
+    let mut next = 0;
+    for band in bands.iter().chain([&top]) {
+        for window in 0..SHORT_WINDOWS {
+            for line in band.start..band.end() {
+                // Line `line` of a window lies in subband `line / 6`, at
+                // `18 * subband + 6 * window + line % 6`.
+                ordered[next] = xr[18 * (line / 6) + 6 * window + line % 6];
+                next += 1;
+            }
+        }
+    }
+    ordered
 }
 
 /// Builds a band table from printed rows, checking that the bands are
@@ -201,6 +263,31 @@ mod tests {
         for fs in SamplingFrequency::ALL {
             assert!(long_bands(fs)[LONG_BANDS - 1].end() <= 576, "{fs:?}");
             assert!(short_bands(fs)[SHORT_BANDS - 1].end() <= 192, "{fs:?}");
+        }
+    }
+
+    /// Reordering a short block moves every line exactly once, and puts
+    /// each scalefactor's lines where [`coding_bands`] says.
+    #[test]
+    fn short_coding_order_is_a_permutation_matching_the_coding_bands() {
+        for fs in SamplingFrequency::ALL {
+            let xr: [f64; GRANULE_LINES] = std::array::from_fn(|i| i as f64);
+            let ordered = short_coding_order(&xr, fs);
+            let mut seen = ordered.map(|x| x as usize);
+            seen.sort_unstable();
+            assert!(seen.iter().enumerate().all(|(i, &x)| i == x), "{fs:?}");
+
+            let ranges = coding_bands(BlockType::Short, fs);
+            assert_eq!(ranges.len(), SHORT_BANDS * SHORT_WINDOWS);
+            for (index, range) in ranges.iter().enumerate() {
+                let (sfb, window) = (index / SHORT_WINDOWS, index % SHORT_WINDOWS);
+                let band = short_bands(fs)[sfb];
+                for (offset, &x) in ordered[range.start..range.end()].iter().enumerate() {
+                    let line = band.start + offset;
+                    let expected = 18 * (line / 6) + 6 * window + line % 6;
+                    assert_eq!(x as usize, expected, "{fs:?} sfb {sfb} window {window}");
+                }
+            }
         }
     }
 

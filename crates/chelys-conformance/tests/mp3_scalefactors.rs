@@ -12,8 +12,8 @@
 
 use chelys::mp3::header::{Bitrate, Mode, SamplingFrequency};
 use chelys::mp3::scalefactor_bands::{self, LONG_BANDS};
-use chelys::mp3::scalefactors::{PRETAB, Scalefactors};
-use chelys::mp3::{GRANULE_LINES, QuantizedGranule, StreamConfig, encode_granules};
+use chelys::mp3::scalefactors::{PRETAB, Scalefac, Scalefactors};
+use chelys::mp3::{BlockType, GRANULE_LINES, QuantizedGranule, StreamConfig, encode_granules};
 use chelys_conformance::ffmpeg;
 
 const GLOBAL_GAIN: u8 = 150;
@@ -39,10 +39,16 @@ impl Rng {
     }
 }
 
-/// Values of -1, 0 or 1 in every line of bands 0 to 20; band 21, which has
-/// no scalefactor, stays empty.
-fn spectrum(rng: &mut Rng, sampling_frequency: SamplingFrequency) -> [i32; GRANULE_LINES] {
-    let end = scalefactor_bands::long_bands(sampling_frequency)[LONG_BANDS - 1].end();
+/// Values of -1, 0 or 1 in every line that has a scalefactor in a granule of
+/// `block_type`, in the order they are sent; the lines above, which have
+/// none, stay empty.
+fn spectrum(
+    rng: &mut Rng,
+    block_type: BlockType,
+    sampling_frequency: SamplingFrequency,
+) -> [i32; GRANULE_LINES] {
+    let bands = scalefactor_bands::coding_bands(block_type, sampling_frequency);
+    let end = bands.iter().map(|band| band.end()).max().unwrap();
     std::array::from_fn(|i| if i < end { rng.next(3) as i32 - 1 } else { 0 })
 }
 
@@ -51,12 +57,13 @@ fn spectrum(rng: &mut Rng, sampling_frequency: SamplingFrequency) -> [i32; GRANU
 fn compensate(
     values: &[i32; GRANULE_LINES],
     scalefactors: &Scalefactors,
+    block_type: BlockType,
     gain_steps: u8,
     sampling_frequency: SamplingFrequency,
 ) -> [i32; GRANULE_LINES] {
     let mut values = *values;
     let common = (f64::from(gain_steps) / 4.0).exp2();
-    for (sb, band) in scalefactor_bands::long_bands(sampling_frequency)
+    for (sb, band) in scalefactor_bands::coding_bands(block_type, sampling_frequency)
         .iter()
         .enumerate()
     {
@@ -79,12 +86,23 @@ fn decode(
     scalefactors: &Scalefactors,
     gain_steps: u8,
 ) -> Vec<f32> {
+    let block_type = match scalefactors.scalefac {
+        Scalefac::Long(_) => BlockType::Normal,
+        Scalefac::Short(_) => BlockType::Short,
+    };
     let granules: Vec<_> = spectra
         .iter()
         .map(|values| {
-            let values = compensate(values, scalefactors, gain_steps, sampling_frequency);
+            let values = compensate(
+                values,
+                scalefactors,
+                block_type,
+                gain_steps,
+                sampling_frequency,
+            );
             let global_gain = GLOBAL_GAIN + gain_steps;
-            let mut granule = QuantizedGranule::new(global_gain, values, sampling_frequency);
+            let mut granule =
+                QuantizedGranule::new(global_gain, values, block_type, sampling_frequency);
             granule.scalefactors = scalefactors.clone();
             vec![granule]
         })
@@ -114,7 +132,10 @@ fn assert_close(label: &str, samples: &[f32], expected: &[f32]) {
 fn scalefactors_divide_their_bands() {
     for fs in SamplingFrequency::ALL {
         let mut rng = Rng(0x5CA1_EFAC);
-        let spectra = [spectrum(&mut rng, fs), spectrum(&mut rng, fs)];
+        let spectra = [
+            spectrum(&mut rng, BlockType::Normal, fs),
+            spectrum(&mut rng, BlockType::Normal, fs),
+        ];
         let expected = decode(fs, &spectra, &Scalefactors::default(), 0);
 
         let mut variants = Vec::new();
@@ -122,7 +143,7 @@ fn scalefactors_divide_their_bands() {
         // which slen1 can hold.
         for _ in 0..3 {
             let mut scalefactors = Scalefactors::default();
-            for scalefac in &mut scalefactors.scalefac_l[..11] {
+            for scalefac in &mut scalefactors.values_mut()[..11] {
                 *scalefac = 8 * rng.next(2) as u8;
             }
             variants.push(("scalefac_scale 0", scalefactors, 0));
@@ -133,7 +154,7 @@ fn scalefactors_divide_their_bands() {
                 scalefac_scale: true,
                 ..Scalefactors::default()
             };
-            for scalefac in &mut scalefactors.scalefac_l {
+            for scalefac in scalefactors.values_mut() {
                 *scalefac = 4 * rng.next(2) as u8;
             }
             variants.push(("scalefac_scale 1", scalefactors, 0));
@@ -145,7 +166,7 @@ fn scalefactors_divide_their_bands() {
             preflag: true,
             ..Scalefactors::default()
         };
-        for (scalefac, pretab) in scalefactors.scalefac_l.iter_mut().zip(PRETAB) {
+        for (scalefac, pretab) in scalefactors.values_mut().iter_mut().zip(PRETAB) {
             *scalefac = 4 - pretab;
         }
         variants.push(("preflag", scalefactors, 0));
@@ -153,7 +174,7 @@ fn scalefactors_divide_their_bands() {
         // 3 steps for the narrower field widths.
         for (scalefac, scalefac_scale) in [(1, true), (2, false), (3, false), (2, true)] {
             let scalefactors = Scalefactors {
-                scalefac_l: [scalefac; LONG_BANDS],
+                scalefac: Scalefac::Long([scalefac; LONG_BANDS]),
                 scalefac_scale,
                 preflag: false,
             };
@@ -164,6 +185,63 @@ fn scalefactors_divide_their_bands() {
             let samples = decode(fs, &spectra, scalefactors, *gain_steps);
             assert_close(
                 &format!("{fs:?} {label} {scalefactors:?}"),
+                &samples,
+                &expected,
+            );
+        }
+    }
+}
+
+/// Short blocks send `scalefac_s[sfb][window]` for short bands 0 to 11, the
+/// windows of a band together, bands 0 to 5 with `slen1` (clause 2.4.2.7).
+/// Each must divide its own band in its own window, which also needs the
+/// values to be sent by band, window and frequency.
+#[test]
+fn short_scalefactors_divide_their_band_and_window() {
+    for fs in SamplingFrequency::ALL {
+        let mut rng = Rng(0x5401_7B1C);
+        let spectra = [
+            spectrum(&mut rng, BlockType::Short, fs),
+            spectrum(&mut rng, BlockType::Short, fs),
+        ];
+        let short = Scalefactors::new(BlockType::Short);
+        let expected = decode(fs, &spectra, &short, 0);
+
+        let mut variants = Vec::new();
+        // scalefac_scale 0: 8 steps in random bands and windows sent with
+        // slen1, which can hold them.
+        for _ in 0..3 {
+            let mut scalefactors = short.clone();
+            for scalefac in &mut scalefactors.values_mut()[..18] {
+                *scalefac = 8 * rng.next(2) as u8;
+            }
+            variants.push(("scalefac_scale 0", scalefactors, 0));
+        }
+        // scalefac_scale 1: 4 steps in any band and window.
+        for _ in 0..3 {
+            let mut scalefactors = Scalefactors {
+                scalefac_scale: true,
+                ..short.clone()
+            };
+            for scalefac in scalefactors.values_mut() {
+                *scalefac = 4 * rng.next(2) as u8;
+            }
+            variants.push(("scalefac_scale 1", scalefactors, 0));
+        }
+        // The same scalefactor everywhere, undone by global_gain.
+        for (scalefac, scalefac_scale) in [(1, true), (2, false), (3, false)] {
+            let mut scalefactors = Scalefactors {
+                scalefac_scale,
+                ..short.clone()
+            };
+            scalefactors.values_mut().fill(scalefac);
+            let gain_steps = if scalefac_scale { 4 } else { 2 } * scalefac;
+            variants.push(("uniform", scalefactors, gain_steps));
+        }
+        for (label, scalefactors, gain_steps) in &variants {
+            let samples = decode(fs, &spectra, scalefactors, *gain_steps);
+            assert_close(
+                &format!("{fs:?} short {label} {scalefactors:?}"),
                 &samples,
                 &expected,
             );

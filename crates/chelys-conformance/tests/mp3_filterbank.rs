@@ -4,7 +4,7 @@
 use std::f64::consts::TAU;
 
 use chelys::mp3::header::{Bitrate, Mode, SamplingFrequency};
-use chelys::mp3::{StreamConfig, encode_pcm_with_global_gain};
+use chelys::mp3::{BlockType, StreamConfig, encode_pcm_with_global_gain, encode_with_block_types};
 use chelys_conformance::ffmpeg;
 
 fn config(sampling_frequency: SamplingFrequency, mode: Mode) -> StreamConfig {
@@ -77,6 +77,45 @@ fn pcm_round_trips_at_every_sampling_frequency() {
         assert_eq!(decoded.diagnostics, "");
         let (lag, snr) = align(&input, &decoded.samples, 1, 0);
         assert!(snr > 50.0, "{fs:?}: {snr:.1} dB at lag {lag}");
+    }
+}
+
+/// Short blocks round trip nearly as well as long ones (with a slightly
+/// coarser quantizer, so that the extra tone fits), which needs the short
+/// windows and MDCT, their scaling, the reordering into scalefactor band
+/// order (above the last band too), and the default Huffman regions of
+/// switched windows all to agree with the decoder. Every block type and every change between them that
+/// figure C.7 allows is covered; so is a stream of short blocks only, which
+/// starts with one.
+#[test]
+fn short_blocks_round_trip_at_every_sampling_frequency() {
+    use BlockType::*;
+    const CYCLE: [BlockType; 13] = [
+        Normal, Normal, Start, Short, Short, Stop, Normal, Start, Short, Stop, Start, Short, Stop,
+    ];
+    for fs in SamplingFrequency::ALL {
+        // A tone above the last short scalefactor band of Table B.8 at every
+        // sampling frequency, in the lines that have no scalefactor.
+        let rate = f64::from(fs.hz());
+        let input: Vec<f64> = tones(fs, 1.0, 0.0)
+            .iter()
+            .enumerate()
+            .map(|(t, x)| x + 0.08 * (TAU * 0.85 * rate / 2.0 * t as f64 / rate).sin())
+            .collect();
+        let config = config(fs, Mode::SingleChannel);
+        for (label, pattern) in [
+            (
+                "every transition",
+                &(|_, g: usize| CYCLE[g % CYCLE.len()]) as &dyn Fn(usize, usize) -> BlockType,
+            ),
+            ("short only", &|_, _| Short),
+        ] {
+            let stream = encode_with_block_types(&config, 154, &[&input], pattern);
+            let decoded = ffmpeg::decode_mp3(&stream);
+            assert_eq!(decoded.diagnostics, "");
+            let (lag, snr) = align(&input, &decoded.samples, 1, 0);
+            assert!(snr > 45.0, "{fs:?} {label}: {snr:.1} dB at lag {lag}");
+        }
     }
 }
 

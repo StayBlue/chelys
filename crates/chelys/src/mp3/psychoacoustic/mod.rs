@@ -14,9 +14,10 @@ pub mod switching;
 
 use std::f64::consts::PI;
 
+use super::BlockType;
 use super::GRANULE_LINES;
 use super::header::SamplingFrequency;
-use super::scalefactor_bands::{self, LONG_BANDS, SHORT_BANDS};
+use super::scalefactor_bands::{self, LONG_BANDS, SHORT_BANDS, SHORT_WINDOWS};
 use fft::{Complex, Fft};
 use partitions::{BandWeights, Partition, ShortPartition};
 
@@ -25,8 +26,6 @@ const LONG_FFT: usize = 1024;
 /// C.1.5.3.2.1, "General considerations").
 const SHORT_FFT: usize = 256;
 const SHORT_SHIFT: usize = 192;
-/// The short blocks, and short windows, of a granule.
-pub const SHORT_WINDOWS: usize = 3;
 
 /// The unpredictability `cw` comes from the long FFT below this line, from
 /// the short FFT below [`SHORT_CW_LINES`], and is 0.4 above (clause
@@ -159,6 +158,32 @@ pub struct ShortMasking {
     /// The perceptual entropy `pe`, which figure C.6.a computes from the
     /// long-block threshold whatever the block type.
     pub perceptual_entropy: f64,
+}
+
+impl ShortMasking {
+    /// The allowed distortion of each short scalefactor band of each window,
+    /// `xmin = ratio * en / bw` as for long blocks (see
+    /// [`Masking::allowed_distortion`]), in the order the scalefactors are
+    /// sent: `3 * sfb + window`. `xr` holds the lines in the order they are
+    /// sent too (see
+    /// [`short_coding_order`](scalefactor_bands::short_coding_order)).
+    pub fn allowed_distortion(
+        &self,
+        xr: &[f64; GRANULE_LINES],
+        sampling_frequency: SamplingFrequency,
+    ) -> [f64; SHORT_BANDS * SHORT_WINDOWS] {
+        let bands = scalefactor_bands::coding_bands(BlockType::Short, sampling_frequency);
+        std::array::from_fn(|index| {
+            let band = bands[index];
+            let energy: f64 = xr[band.start..band.end()].iter().map(|x| x * x).sum();
+            let ratio = self.ratio[index % SHORT_WINDOWS][index / SHORT_WINDOWS];
+            if energy == 0.0 {
+                0.0
+            } else {
+                ratio * energy / band.width as f64
+            }
+        })
+    }
 }
 
 /// The magnitude `r` and phase `f` of one FFT line (clause D.2.4 b)).
