@@ -1,7 +1,8 @@
 // Copyright (c) 2026 StayBlue
 // SPDX-License-Identifier: MIT
 
-//! Layer III scalefactor bands (Table B.8).
+//! Layer III scalefactor bands (Table B.8, and Table B.2 of ISO/IEC 13818-3
+//! for the lower sampling frequencies).
 //!
 //! The tables are transcribed as printed: `(scalefactor band, width of band,
 //! index of start, index of end)`, with the end index inclusive. Their
@@ -136,6 +137,37 @@ const fn bands<const N: usize>(rows: [(usize, usize, usize, usize); N]) -> [Band
     bands
 }
 
+/// Builds a band table, as [`bands`] does, from the printed rows of one of
+/// the tables of Table B.2 of ISO/IEC 13818-3. Each ends with one more row,
+/// `top`, that carries on to the last of `lines`.
+///
+/// Table B.2 has 22 long and 13 short bands, but the scalefactor of the last
+/// "is set to a fixed value and is not transmitted", so 21 and 12 are sent.
+/// The last row is kept apart as the lines with no scalefactor sent, like
+/// the lines above Table B.8: it is checked, but not kept as a band.
+///
+/// Spec gap: the standard does not give the fixed value. The encoder leaves
+/// these lines unamplified, as for a scalefactor of 0.
+const fn bands_with_top<const N: usize>(
+    rows: [(usize, usize, usize, usize); N],
+    top: (usize, usize, usize, usize),
+    lines: usize,
+) -> [Band; N] {
+    let bands = bands(rows);
+    let (sfb, width, start, end) = top;
+    assert!(sfb == N, "top row out of order");
+    assert!(
+        start == bands[N - 1].start + bands[N - 1].width,
+        "top row does not start where the last band ended"
+    );
+    assert!(
+        end + 1 - start == width,
+        "width does not match start and end"
+    );
+    assert!(end + 1 == lines, "top row does not end the lines");
+    bands
+}
+
 // Table B.8a, 32 kHz.
 
 const LONG_32000: [Band; LONG_BANDS] = bands([
@@ -259,6 +291,201 @@ const SHORT_48000: [Band; SHORT_BANDS] = bands([
     (11, 26, 100, 125),
 ]);
 
+// Table B.2 of ISO/IEC 13818-3, 16 kHz.
+
+/// As printed, the same as the table for 22.05 kHz.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the LSF sampling frequencies are not supported yet"
+    )
+)]
+const LONG_16000: [Band; LONG_BANDS] = bands_with_top(
+    [
+        (0, 6, 0, 5),
+        (1, 6, 6, 11),
+        (2, 6, 12, 17),
+        (3, 6, 18, 23),
+        (4, 6, 24, 29),
+        (5, 6, 30, 35),
+        (6, 8, 36, 43),
+        (7, 10, 44, 53),
+        (8, 12, 54, 65),
+        (9, 14, 66, 79),
+        (10, 16, 80, 95),
+        (11, 20, 96, 115),
+        (12, 24, 116, 139),
+        (13, 28, 140, 167),
+        (14, 32, 168, 199),
+        (15, 38, 200, 237),
+        (16, 46, 238, 283),
+        (17, 52, 284, 335),
+        (18, 60, 336, 395),
+        (19, 68, 396, 463),
+        (20, 58, 464, 521),
+    ],
+    (21, 54, 522, 575),
+    GRANULE_LINES,
+);
+
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the LSF sampling frequencies are not supported yet"
+    )
+)]
+const SHORT_16000: [Band; SHORT_BANDS] = bands_with_top(
+    [
+        (0, 4, 0, 3),
+        (1, 4, 4, 7),
+        (2, 4, 8, 11),
+        (3, 6, 12, 17),
+        (4, 8, 18, 25),
+        (5, 10, 26, 35),
+        (6, 12, 36, 47),
+        (7, 14, 48, 61),
+        (8, 18, 62, 79),
+        (9, 24, 80, 103),
+        (10, 30, 104, 133),
+        (11, 40, 134, 173),
+    ],
+    (12, 18, 174, 191),
+    SHORT_WINDOW_LINES,
+);
+
+// Table B.2 of ISO/IEC 13818-3, 22.05 kHz.
+
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the LSF sampling frequencies are not supported yet"
+    )
+)]
+const LONG_22050: [Band; LONG_BANDS] = bands_with_top(
+    [
+        (0, 6, 0, 5),
+        (1, 6, 6, 11),
+        (2, 6, 12, 17),
+        (3, 6, 18, 23),
+        (4, 6, 24, 29),
+        (5, 6, 30, 35),
+        (6, 8, 36, 43),
+        (7, 10, 44, 53),
+        (8, 12, 54, 65),
+        (9, 14, 66, 79),
+        (10, 16, 80, 95),
+        (11, 20, 96, 115),
+        (12, 24, 116, 139),
+        (13, 28, 140, 167),
+        (14, 32, 168, 199),
+        (15, 38, 200, 237),
+        (16, 46, 238, 283),
+        (17, 52, 284, 335),
+        (18, 60, 336, 395),
+        (19, 68, 396, 463),
+        (20, 58, 464, 521),
+    ],
+    (21, 54, 522, 575),
+    GRANULE_LINES,
+);
+
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the LSF sampling frequencies are not supported yet"
+    )
+)]
+const SHORT_22050: [Band; SHORT_BANDS] = bands_with_top(
+    [
+        (0, 4, 0, 3),
+        (1, 4, 4, 7),
+        (2, 4, 8, 11),
+        (3, 6, 12, 17),
+        (4, 6, 18, 23),
+        (5, 8, 24, 31),
+        (6, 10, 32, 41),
+        (7, 14, 42, 55),
+        (8, 18, 56, 73),
+        (9, 26, 74, 99),
+        (10, 32, 100, 131),
+        (11, 42, 132, 173),
+    ],
+    (12, 18, 174, 191),
+    SHORT_WINDOW_LINES,
+);
+
+// Table B.2 of ISO/IEC 13818-3, 24 kHz.
+
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the LSF sampling frequencies are not supported yet"
+    )
+)]
+const LONG_24000: [Band; LONG_BANDS] = bands_with_top(
+    [
+        (0, 6, 0, 5),
+        (1, 6, 6, 11),
+        (2, 6, 12, 17),
+        (3, 6, 18, 23),
+        (4, 6, 24, 29),
+        (5, 6, 30, 35),
+        (6, 8, 36, 43),
+        (7, 10, 44, 53),
+        (8, 12, 54, 65),
+        (9, 14, 66, 79),
+        (10, 16, 80, 95),
+        (11, 18, 96, 113),
+        (12, 22, 114, 135),
+        (13, 26, 136, 161),
+        (14, 32, 162, 193),
+        (15, 38, 194, 231),
+        (16, 46, 232, 277),
+        (17, 54, 278, 331),
+        (18, 62, 332, 393),
+        (19, 70, 394, 463),
+        (20, 76, 464, 539),
+    ],
+    (21, 36, 540, 575),
+    GRANULE_LINES,
+);
+
+/// Spec reading: this table alone prints each end index one past the last
+/// line of its band, so that it equals the next band's start index (4, 8,
+/// 12, ..., 192). Its widths and start indices agree with each other and with
+/// 192 lines, so the end indices are read as misprints and transcribed here
+/// one lower, inclusive like those of every other table.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the LSF sampling frequencies are not supported yet"
+    )
+)]
+const SHORT_24000: [Band; SHORT_BANDS] = bands_with_top(
+    [
+        (0, 4, 0, 3),
+        (1, 4, 4, 7),
+        (2, 4, 8, 11),
+        (3, 6, 12, 17),
+        (4, 8, 18, 25),
+        (5, 10, 26, 35),
+        (6, 12, 36, 47),
+        (7, 14, 48, 61),
+        (8, 18, 62, 79),
+        (9, 24, 80, 103),
+        (10, 32, 104, 135),
+        (11, 44, 136, 179),
+    ],
+    (12, 12, 180, 191),
+    SHORT_WINDOW_LINES,
+);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -326,5 +553,17 @@ mod tests {
             short_bands(SamplingFrequency::Hz44100)[SHORT_BANDS - 1].end(),
             136
         );
+    }
+
+    /// The bands of the lower sampling frequencies end where the top rows of
+    /// Table B.2 of ISO/IEC 13818-3 begin.
+    #[test]
+    fn lsf_bands_end_below_the_top_rows() {
+        let ends = |long: &[Band; LONG_BANDS], short: &[Band; SHORT_BANDS]| {
+            (long[LONG_BANDS - 1].end(), short[SHORT_BANDS - 1].end())
+        };
+        assert_eq!(ends(&LONG_16000, &SHORT_16000), (522, 174));
+        assert_eq!(ends(&LONG_22050, &SHORT_22050), (522, 174));
+        assert_eq!(ends(&LONG_24000, &SHORT_24000), (540, 180));
     }
 }
