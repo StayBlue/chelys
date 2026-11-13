@@ -40,7 +40,7 @@ fn ffmpeg_decodes_silence_in_every_configuration() {
                         frames * SAMPLES_PER_FRAME * mode.channels(),
                         "{config:?}"
                     );
-                    assert!(decoded.samples.iter().all(|&s| s == 0), "{config:?}");
+                    assert!(decoded.samples.iter().all(|&s| s == 0.0), "{config:?}");
                 }
             }
         }

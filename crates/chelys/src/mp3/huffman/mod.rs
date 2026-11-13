@@ -1,7 +1,10 @@
-//! Layer III Huffman code tables (Table B.7), as used by `Huffmancodebits()`
-//! (clauses 2.4.1.7 and 2.4.2.7).
+//! Layer III Huffman coding: the code tables (Table B.7) and their use by
+//! `Huffmancodebits()` (clauses 2.4.1.7 and 2.4.2.7).
 
+mod spectrum;
 mod tables;
+
+pub use spectrum::{MAX_MAGNITUDE, SpectrumCoding};
 
 /// A Huffman code word: the low `len` bits of `bits`, written most significant
 /// first.

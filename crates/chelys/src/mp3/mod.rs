@@ -8,10 +8,14 @@ pub mod side_info;
 
 use crate::bitstream::BitWriter;
 use header::{Bitrate, Emphasis, Header, Mode, PaddingSchedule, SamplingFrequency};
-use side_info::SideInfo;
+use huffman::{QuadTable, SpectrumCoding};
+use side_info::{GRANULES, GranuleChannel, SideInfo, Window};
 
 /// Two granules of 576 samples per channel (clause 2.4.2.1).
 pub const SAMPLES_PER_FRAME: usize = 1152;
+
+/// Frequency lines in a granule (clause 2.1.70).
+pub const GRANULE_LINES: usize = 576;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StreamConfig {
@@ -55,17 +59,59 @@ pub fn write_frame(header: &Header, side_info: &SideInfo, main_data: &[u8], out:
     out.resize(end, 0);
 }
 
-/// Encodes `frames` frames of digital silence.
+/// One granule of one channel, quantised and ready for Huffman coding. Long
+/// blocks only, without scalefactors.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QuantizedGranule {
+    /// The quantizer step size; see the requantization formula in clause
+    /// 2.4.3.4.7.1.
+    pub global_gain: u8,
+    pub values: [i32; GRANULE_LINES],
+    pub coding: SpectrumCoding,
+}
+
+impl QuantizedGranule {
+    /// Partitions `values` and chooses Huffman tables for them (clause
+    /// C.1.5.4.4).
+    pub fn new(
+        global_gain: u8,
+        values: [i32; GRANULE_LINES],
+        sampling_frequency: SamplingFrequency,
+    ) -> Self {
+        let coding =
+            SpectrumCoding::choose(&values, scalefactor_bands::long_bands(sampling_frequency));
+        Self {
+            global_gain,
+            values,
+            coding,
+        }
+    }
+}
+
+/// Encodes quantised granules, given in order with one entry per channel,
+/// into frames of two granules each.
 ///
-/// Every granule has `part2_3_length == 0`, so no scalefactors or Huffman
-/// data are present and the remainder of each frame is zero-filled ancillary
-/// data.
-pub fn encode_silence(config: &StreamConfig, frames: usize) -> Vec<u8> {
-    let side_info = SideInfo::default();
+/// Main data is not shared between frames: `main_data_begin` is always 0.
+///
+/// # Panics
+///
+/// If the granules do not divide into frames for the configured channels, or
+/// a frame's granules do not fit in it.
+pub fn encode_granules(config: &StreamConfig, granules: &[Vec<QuantizedGranule>]) -> Vec<u8> {
+    let channels = config.mode.channels();
+    assert!(
+        granules.len().is_multiple_of(GRANULES),
+        "a frame holds {GRANULES} granules"
+    );
+    assert!(
+        granules.iter().all(|g| g.len() == channels),
+        "each granule needs one entry per channel"
+    );
+    let bands = scalefactor_bands::long_bands(config.sampling_frequency);
     let mut padding = PaddingSchedule::new(config.bitrate, config.sampling_frequency);
     let mut out = Vec::new();
 
-    for _ in 0..frames {
+    for frame in granules.chunks_exact(GRANULES) {
         let header = Header {
             crc_protected: config.crc_protected,
             bitrate: config.bitrate,
@@ -77,10 +123,46 @@ pub fn encode_silence(config: &StreamConfig, frames: usize) -> Vec<u8> {
             original: false,
             emphasis: Emphasis::None,
         };
-        write_frame(&header, &side_info, &[], &mut out);
+        let mut side_info = SideInfo::default();
+        let mut main_data = BitWriter::new();
+        for (gr, granule) in frame.iter().enumerate() {
+            for (ch, channel) in granule.iter().enumerate() {
+                let start = main_data.bit_len();
+                channel.coding.write(&channel.values, bands, &mut main_data);
+                let part2_3_length = main_data.bit_len() - start;
+                assert!(
+                    part2_3_length < 1 << 12,
+                    "{part2_3_length} bits overflow the 12-bit part2_3_length"
+                );
+                let coding = &channel.coding;
+                side_info.granules[gr][ch] = GranuleChannel {
+                    part2_3_length: part2_3_length as u16,
+                    big_values: coding.big_values as u16,
+                    global_gain: channel.global_gain,
+                    scalefac_compress: 0,
+                    window: Window::Normal {
+                        table_select: coding.table_select,
+                        region0_count: coding.region0_count,
+                        region1_count: coding.region1_count,
+                    },
+                    preflag: false,
+                    scalefac_scale: false,
+                    count1table_select: coding.count1_table == QuadTable::B,
+                };
+            }
+        }
+        write_frame(&header, &side_info, &main_data.into_bytes(), &mut out);
     }
 
     out
+}
+
+/// Encodes `frames` frames of digital silence. Every granule codes to
+/// nothing, so each frame is zero-filled after its side information.
+pub fn encode_silence(config: &StreamConfig, frames: usize) -> Vec<u8> {
+    let silent = QuantizedGranule::new(0, [0; GRANULE_LINES], config.sampling_frequency);
+    let granule = vec![silent; config.mode.channels()];
+    encode_granules(config, &vec![granule; frames * GRANULES])
 }
 
 #[cfg(test)]

@@ -5,8 +5,8 @@ use std::process::{Command, Output};
 use crate::TempFile;
 
 pub struct Decoded {
-    /// Interleaved signed 16-bit PCM.
-    pub samples: Vec<i16>,
+    /// Interleaved 32-bit float PCM, as the decoder produced it.
+    pub samples: Vec<f32>,
     /// Anything the decoder logged at error level.
     pub diagnostics: String,
 }
@@ -25,12 +25,12 @@ pub fn decode_mp3(stream: &[u8]) -> Decoded {
         .args(["-nostdin", "-v", "error", "-err_detect", "crccheck"])
         .args(["-f", "mp3", "-i"])
         .arg(file.path())
-        .args(["-f", "s16le", "-acodec", "pcm_s16le", "-"]));
+        .args(["-f", "f32le", "-acodec", "pcm_f32le", "-"]));
     Decoded {
         samples: output
             .stdout
-            .chunks_exact(2)
-            .map(|b| i16::from_le_bytes([b[0], b[1]]))
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
             .collect(),
         diagnostics: String::from_utf8_lossy(&output.stderr).into_owned(),
     }
