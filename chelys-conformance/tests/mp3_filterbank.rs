@@ -105,11 +105,13 @@ fn pcm_round_trips_at_every_sampling_frequency() {
 /// switched windows all to agree with the decoder. Every block type and every change between them that
 /// figure C.7 allows is covered; so is a stream of short blocks only, which
 /// starts with one. (Interleaving the lines above the last short band
-/// across the windows drops this to about 10 dB.)
+/// across the windows drops this to between 2 and 12 dB.)
 ///
-/// This is the evidence for the gap in the standard that the reordering of
-/// short blocks marks as settled by decoding with ffmpeg: the order of the
-/// lines above the last short scalefactor band.
+/// This is the evidence for two gaps in the standard that the scalefactor
+/// bands mark as settled by decoding with ffmpeg: the order of the lines
+/// above the last short scalefactor band, and at the lower sampling
+/// frequencies the fixed scalefactor of the last band of Table B.2 of
+/// ISO/IEC 13818-3.
 #[test]
 fn short_blocks_round_trip_at_every_sampling_frequency() {
     use BlockType::*;

@@ -91,8 +91,9 @@ pub fn coding_bands(block_type: BlockType, sampling_frequency: SamplingFrequency
 /// window. Settled by decoding with ffmpeg (black box): with a tone in those
 /// lines, the conformance test
 /// `short_blocks_round_trip_at_every_sampling_frequency` decodes at over
-/// 45 dB SNR at every sampling frequency, and at about 10 dB with the lines
-/// interleaved across the windows instead.
+/// 45 dB SNR at every sampling frequency, the lower ones of ISO/IEC 13818-3
+/// included, and at 2 to 12 dB with the lines interleaved across the windows
+/// instead.
 pub fn short_coding_order(
     xr: &[f64; GRANULE_LINES],
     sampling_frequency: SamplingFrequency,
@@ -153,7 +154,10 @@ const fn bands<const N: usize>(rows: [(usize, usize, usize, usize); N]) -> [Band
 /// the lines above Table B.8: it is checked, but not kept as a band.
 ///
 /// Spec gap: the standard does not give the fixed value. The encoder leaves
-/// these lines unamplified, as for a scalefactor of 0.
+/// these lines unamplified, as for a scalefactor of 0. Settled by decoding
+/// with ffmpeg (black box): with a tone in those lines, the conformance test
+/// `short_blocks_round_trip_at_every_sampling_frequency` decodes long and
+/// short blocks at the lower sampling frequencies at over 45 dB SNR.
 const fn bands_with_top<const N: usize>(
     rows: [(usize, usize, usize, usize); N],
     top: (usize, usize, usize, usize),
