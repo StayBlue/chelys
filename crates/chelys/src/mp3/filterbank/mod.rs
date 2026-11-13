@@ -24,6 +24,11 @@ const LONG_BLOCK: usize = 2 * SUBBAND_SAMPLES;
 /// Spec gap: the standard does not state the gain of the polyphase analysis
 /// and synthesis filters. Taking both as unity, the result is on the scale of
 /// the decoder's requantised values `xr` (clause 2.4.3.4.7.1).
+///
+/// Settled by decoding with ffmpeg (black box): the conformance test
+/// `pcm_round_trips_at_every_sampling_frequency` decodes the input back at
+/// over 50 dB SNR with this scaling. Doubling the constant brings that down
+/// to 6 dB, as halving the output should.
 const LONG_BLOCK_GAIN: f64 = LONG_BLOCK as f64 / 4.0;
 
 /// Table B.9: the coefficients `c_i` of the aliasing butterflies.
@@ -98,6 +103,11 @@ impl Filterbank {
                 // polyphase filterbank (clause 2.4.3.4.10.5). Annex C does not
                 // mention it for the encoder, which is taken to apply the same
                 // inversion so that the decoder restores the input.
+                //
+                // Settled by decoding with ffmpeg (black box): without the
+                // inversion, the conformance test
+                // `pcm_round_trips_at_every_sampling_frequency` decodes at
+                // about 1 dB SNR instead of over 50 dB.
                 let invert = subband % 2 == 1 && time % 2 == 1;
                 current[subband][time] = if invert { -sample } else { sample };
             }

@@ -3,6 +3,11 @@
 //! The decoders are run as separate programs and treated strictly as black
 //! boxes: only their observable output is used. A missing decoder is a test
 //! failure, not a skip.
+//!
+//! Where the standard leaves a gap that a decoded test settled, the library
+//! says "Settled by decoding with ffmpeg" and names the test. That evidence
+//! was recorded with ffmpeg n9.0.2; another version could decode
+//! differently.
 
 pub mod ffmpeg;
 

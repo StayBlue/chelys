@@ -63,7 +63,11 @@ fn align(input: &[f64], output: &[f32], channels: usize, channel: usize) -> (usi
 /// needs the filterbank, the encoder's frequency inversion and aliasing
 /// butterflies, and the scaling to the decoder's `xr` all to be right.
 /// (Leaving out the inversion drops this to about 1 dB, the butterflies to
-/// about 10 dB.)
+/// about 10 dB, and doubling the scaling to 6 dB.)
+///
+/// This is the evidence for two gaps in the standard that the filterbank
+/// marks as settled by decoding with ffmpeg: the gain of the polyphase
+/// filters and the encoder's frequency inversion.
 #[test]
 fn pcm_round_trips_at_every_sampling_frequency() {
     for fs in SamplingFrequency::ALL {
