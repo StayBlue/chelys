@@ -481,7 +481,7 @@ impl PsychoacousticModel {
                 let ecb: f64 = (self.short_spreading.iter().zip(&eb))
                     .map(|(spreading, eb)| eb * spreading[b])
                     .sum();
-                let nbb = ecb * self.short_norm[b] * 10f64.powf(p.snr / 10.0);
+                let nbb = ecb * self.short_norm[b] * p.snr.ratio();
                 p.qthr.max(nbb)
             })
             .collect();
@@ -715,7 +715,7 @@ mod tests {
             let partitions = partitions::short_partitions(fs);
             for (w, ratio) in short.ratio.iter().enumerate() {
                 for (sb, band) in partitions::short_band_weights(fs).iter().enumerate() {
-                    let snr = partitions[band.bu..=band.bo].iter().map(|p| p.snr);
+                    let snr = partitions[band.bu..=band.bo].iter().map(|p| p.snr.db());
                     let (low, high) =
                         snr.fold((f64::MAX, f64::MIN), |(l, h), s| (l.min(s), h.max(s)));
                     let db = 10.0 * ratio[sb].log10();
