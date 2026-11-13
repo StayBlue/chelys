@@ -6,6 +6,7 @@ use crate::mp3::header::SamplingFrequency;
 use crate::mp3::scalefactor_bands::{self, Band, LONG_BANDS};
 use crate::mp3::scalefactors::{PRETAB, Scalefactors};
 use crate::mp3::side_info::SCFSI_BANDS;
+use crate::mp3::stereo::IntensityPositions;
 use crate::mp3::{BlockType, GRANULE_LINES, QuantizedGranule};
 
 /// The scalefactors of a frame's first granule, and the scfsi bands in which
@@ -14,6 +15,15 @@ use crate::mp3::{BlockType, GRANULE_LINES, QuantizedGranule};
 pub struct Reuse<'a> {
     pub first: &'a Scalefactors,
     pub scfsi: [bool; SCFSI_BANDS],
+}
+
+/// A granule quantised by the iteration loops.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Outcome {
+    pub granule: QuantizedGranule,
+    /// Whether the distortion of every scalefactor band sent is within its
+    /// allowance: whether the granule had the bits it needed.
+    pub within_allowance: bool,
 }
 
 /// The upper scalefactor bands whose distortion decides preemphasis.
@@ -57,6 +67,14 @@ const PREEMPHASIS_BANDS: std::ops::Range<usize> = LONG_BANDS - 4..LONG_BANDS;
 /// limit. Should the lines not quantise at all with the scalefactors taken
 /// over, the granule is coded without `scfsi`.
 ///
+/// With `intensity`, the granule is the right channel of a frame coded in
+/// intensity stereo, whose zero part sends intensity stereo positions in
+/// place of scalefactors (see [`IntensityPositions::mark`]). Those bands'
+/// lines quantise to zero whatever their scalefactors, so the loop works
+/// with scalefactors as usual, and each result is marked before its bits are
+/// counted. If the marks take more bits than the scalefactors they replace,
+/// the inner loop runs again with that many fewer bits.
+///
 /// `scalefac_scale` starts at 0. Clause C.1.5.4.3 switches it to 1 when the
 /// scalefactors would otherwise pass their limits (figure C.9.b leaves this
 /// out). Spec gap: the clause says only that the scalefactors are then
@@ -71,7 +89,9 @@ const PREEMPHASIS_BANDS: std::ops::Range<usize> = LONG_BANDS - 4..LONG_BANDS;
 /// # Panics
 ///
 /// If `xr` cannot be quantised even without scalefactors, which takes lines
-/// far beyond the decoder's output range.
+/// far beyond the decoder's output range, or the marks of `intensity` take
+/// more than `available_bits`, which takes fewer than
+/// [`MAX_POSITION_BITS`](crate::mp3::stereo::MAX_POSITION_BITS).
 pub fn outer_loop(
     xr: &[f64; GRANULE_LINES],
     xmin: &[f64],
@@ -79,10 +99,15 @@ pub fn outer_loop(
     available_bits: usize,
     sampling_frequency: SamplingFrequency,
     reuse: Option<Reuse>,
-) -> QuantizedGranule {
+    intensity: Option<&IntensityPositions>,
+) -> Outcome {
     let bands = scalefactor_bands::coding_bands(block_type, sampling_frequency);
     assert_eq!(xmin.len(), bands.len(), "one xmin per scalefactor");
     let reuse = reuse.filter(|reuse| reuse.scfsi.contains(&true));
+    assert!(
+        reuse.is_none() || intensity.is_none(),
+        "intensity stereo positions are not taken over with scfsi"
+    );
     let mut scalefactors = Scalefactors::new(block_type);
     if let Some(reuse) = reuse {
         assert_ne!(block_type, BlockType::Short, "short blocks have no scfsi");
@@ -95,20 +120,21 @@ pub fn outer_loop(
             }
         }
     }
-    let mut saved: Option<QuantizedGranule> = None;
+    let mut saved: Option<Outcome> = None;
     let mut start_gain = None;
 
     loop {
         let amplified = amplify(xr, &scalefactors, &bands);
-        let compress = scalefactors
-            .compress()
-            .expect("scalefactors are kept within their limits");
-        let granule = available_bits
-            .checked_sub(scalefactors.part2_length(compress))
-            .and_then(|bits| {
-                inner_loop(&amplified, bits, block_type, sampling_frequency, start_gain)
-            });
-        let Some(mut granule) = granule else {
+        let granule = fit(
+            &amplified,
+            &scalefactors,
+            block_type,
+            available_bits,
+            sampling_frequency,
+            start_gain,
+            intensity,
+        );
+        let Some(granule) = granule else {
             if saved.is_none() && reuse.is_some() {
                 return outer_loop(
                     xr,
@@ -117,11 +143,11 @@ pub fn outer_loop(
                     available_bits,
                     sampling_frequency,
                     None,
+                    intensity,
                 );
             }
             return saved.expect("lines without scalefactors always quantise");
         };
-        granule.scalefactors = scalefactors.clone();
         start_gain = Some(granule.global_gain);
 
         let distortion = distortion(&amplified, &granule, &bands);
@@ -134,7 +160,10 @@ pub fn outer_loop(
         let violated = (0..bands.len())
             .any(|sb| scalefactors.sent(sb) && distortion[sb] > measured_against[sb]);
         let first = saved.is_none();
-        saved = Some(granule);
+        saved = Some(Outcome {
+            granule,
+            within_allowance: !violated,
+        });
 
         // C.1.5.4.3.4: preemphasis, which raises the allowed distortion of the
         // preemphasised bands along with their lines.
@@ -172,6 +201,47 @@ pub fn outer_loop(
         }
     }
     saved.expect("the loop runs at least once")
+}
+
+/// The inner loop for the lines `amplified` by `scalefactors`, in at most
+/// `available_bits` with the scalefactors, marked for intensity stereo if
+/// `intensity` is given. `None` if they do not fit.
+fn fit(
+    amplified: &[f64; GRANULE_LINES],
+    scalefactors: &Scalefactors,
+    block_type: BlockType,
+    available_bits: usize,
+    sampling_frequency: SamplingFrequency,
+    start_gain: Option<u8>,
+    intensity: Option<&IntensityPositions>,
+) -> Option<QuantizedGranule> {
+    let compress = scalefactors
+        .compress()
+        .expect("scalefactors are kept within their limits");
+    let mut huffman_bits = available_bits.checked_sub(scalefactors.part2_length(compress))?;
+    loop {
+        let mut granule = inner_loop(
+            amplified,
+            huffman_bits,
+            block_type,
+            sampling_frequency,
+            start_gain,
+        )?;
+        granule.scalefactors = scalefactors.clone();
+        let Some(intensity) = intensity else {
+            return Some(granule);
+        };
+        intensity.mark(
+            &mut granule.scalefactors,
+            &granule.values,
+            sampling_frequency,
+        );
+        let bits = granule.bit_len(sampling_frequency);
+        if bits <= available_bits {
+            return Some(granule);
+        }
+        huffman_bits = huffman_bits.checked_sub(bits - available_bits)?;
+    }
 }
 
 /// `xr` with each scalefactor band multiplied by its amplification. Lines
@@ -265,7 +335,9 @@ mod tests {
             1500,
             FS,
             None,
-        );
+            None,
+        )
+        .granule;
         assert_eq!(granule.scalefactors, Scalefactors::default());
         let inner = inner_loop(&xr, 1500, BlockType::Normal, FS, None).unwrap();
         assert_eq!(granule.global_gain, inner.global_gain);
@@ -287,7 +359,7 @@ mod tests {
                 f64::INFINITY
             }
         });
-        let granule = outer_loop(&xr, &xmin, BlockType::Normal, 1500, FS, None);
+        let granule = outer_loop(&xr, &xmin, BlockType::Normal, 1500, FS, None, None).granule;
         assert!(total_bits(&granule) <= 1500);
         for sb in 4..8 {
             assert!(granule.scalefactors.values()[sb] > 0, "band {sb}");
@@ -304,7 +376,16 @@ mod tests {
     fn ends_within_the_limits_when_nothing_can_be_met() {
         let xr = spectrum();
         for bits in [60, 300, 1500, 4000] {
-            let granule = outer_loop(&xr, &[0.0; LONG_BANDS], BlockType::Normal, bits, FS, None);
+            let granule = outer_loop(
+                &xr,
+                &[0.0; LONG_BANDS],
+                BlockType::Normal,
+                bits,
+                FS,
+                None,
+                None,
+            )
+            .granule;
             assert!(total_bits(&granule) <= bits, "{bits}");
             assert!(granule.scalefactors.compress().is_some(), "{bits}");
         }
@@ -326,14 +407,16 @@ mod tests {
             }
         });
         assert!(
-            outer_loop(&xr, &xmin, BlockType::Normal, 1500, FS, None)
+            outer_loop(&xr, &xmin, BlockType::Normal, 1500, FS, None, None)
+                .granule
                 .scalefactors
                 .preflag
         );
         let mut xmin = xmin;
         xmin[LONG_BANDS - 1] = f64::INFINITY;
         assert!(
-            !outer_loop(&xr, &xmin, BlockType::Normal, 1500, FS, None)
+            !outer_loop(&xr, &xmin, BlockType::Normal, 1500, FS, None, None)
+                .granule
                 .scalefactors
                 .preflag
         );
@@ -366,7 +449,9 @@ mod tests {
                 bits,
                 FS,
                 Some(reuse),
-            );
+                None,
+            )
+            .granule;
             let scalefactors = &granule.scalefactors;
             assert_eq!(scalefactors.scfsi, scfsi);
             assert!(scalefactors.preflag && !scalefactors.scalefac_scale);
@@ -393,9 +478,48 @@ mod tests {
         };
         let xmin = [1e-9; LONG_BANDS];
         assert_eq!(
-            outer_loop(&xr, &xmin, BlockType::Normal, 1500, FS, Some(reuse)),
-            outer_loop(&xr, &xmin, BlockType::Normal, 1500, FS, None)
+            outer_loop(&xr, &xmin, BlockType::Normal, 1500, FS, Some(reuse), None),
+            outer_loop(&xr, &xmin, BlockType::Normal, 1500, FS, None, None)
         );
+    }
+
+    /// The right channel of a frame in intensity stereo sends its marks in
+    /// place of the scalefactors of its zero part, within its bits, even
+    /// when the marks need wider fields than the scalefactors did.
+    #[test]
+    fn intensity_marks_fit_in_the_bits() {
+        let bands = scalefactor_bands::long_bands(FS);
+        let mut xr = spectrum();
+        xr[bands[12].start..].fill(0.0);
+        let positions = IntensityPositions::new(&spectrum(), &xr, 12, FS);
+        for bits in [80, 150, 300, 1500] {
+            let outcome = outer_loop(
+                &xr,
+                &[0.0; LONG_BANDS],
+                BlockType::Normal,
+                bits,
+                FS,
+                None,
+                Some(&positions),
+            );
+            let granule = &outcome.granule;
+            assert!(total_bits(granule) <= bits, "{bits}");
+            assert!(!outcome.within_allowance, "{bits}");
+            let mut marked = granule.scalefactors.clone();
+            positions.mark(&mut marked, &granule.values, FS);
+            assert_eq!(marked, granule.scalefactors, "{bits}");
+            assert_ne!(granule.scalefactors.values()[20], 0, "{bits}");
+        }
+        let outcome = outer_loop(
+            &xr,
+            &[f64::INFINITY; LONG_BANDS],
+            BlockType::Normal,
+            1500,
+            FS,
+            None,
+            Some(&positions),
+        );
+        assert!(outcome.within_allowance);
     }
 
     /// The conversion to `scalefac_scale` never amplifies a band less.

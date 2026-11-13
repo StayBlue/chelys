@@ -217,38 +217,35 @@ const MAX_PART2_3_LENGTH: usize = (1 << 12) - 1;
 
 impl StreamConfig {
     fn header(&self, padding: bool) -> Header {
-        self.frame_header(padding, false)
+        self.frame_header(padding, false, false)
     }
 
-    /// Whether the configured mode allows MS stereo: joint stereo with
-    /// `ms_stereo` set.
-    ///
-    /// # Panics
-    ///
-    /// If it asks for intensity stereo, which is not implemented.
-    fn ms_stereo_allowed(&self) -> bool {
+    /// Whether the configured mode allows MS stereo and intensity stereo:
+    /// joint stereo with `ms_stereo` or `intensity_stereo` set, in that order.
+    fn joint_stereo(&self) -> (bool, bool) {
         match self.mode {
             Mode::JointStereo {
                 intensity_stereo,
                 ms_stereo,
-            } => {
-                assert!(!intensity_stereo, "intensity stereo is not implemented");
-                ms_stereo
-            }
-            _ => false,
+            } => (ms_stereo, intensity_stereo),
+            _ => (false, false),
         }
     }
 
-    /// The header of a frame, with `mode_extension` switching MS stereo on
-    /// for this frame alone if `ms_stereo` is set.
-    fn frame_header(&self, padding: bool, ms_stereo: bool) -> Header {
+    /// The header of a frame, with `mode_extension` switching MS stereo and
+    /// intensity stereo on for this frame alone if `ms_stereo` and
+    /// `intensity_stereo` are set.
+    fn frame_header(&self, padding: bool, ms_stereo: bool, intensity_stereo: bool) -> Header {
         let mode = match self.mode {
             Mode::JointStereo { .. } => Mode::JointStereo {
-                intensity_stereo: false,
+                intensity_stereo,
                 ms_stereo,
             },
             mode => {
-                assert!(!ms_stereo, "MS stereo needs the joint stereo mode");
+                assert!(
+                    !ms_stereo && !intensity_stereo,
+                    "MS and intensity stereo need the joint stereo mode"
+                );
                 mode
             }
         };
@@ -371,12 +368,16 @@ pub fn encode_granules(config: &StreamConfig, granules: &[Vec<QuantizedGranule>]
 /// bits. The input is padded with silence to whole frames, plus one more
 /// frame to flush the filterbank.
 ///
+/// In joint stereo, frames whose channels are alike are coded in MS stereo
+/// if the mode allows it, and frames short of bits are coded in intensity
+/// stereo if the mode allows that (Annex G.2).
+///
 /// # Panics
 ///
 /// If the channel count does not match the configured mode.
 pub fn encode_pcm(config: &StreamConfig, channels: &[&[f64]]) -> Vec<u8> {
     let fs = config.sampling_frequency;
-    let ms_allowed = config.ms_stereo_allowed();
+    let (ms_allowed, intensity_allowed) = config.joint_stereo();
     let mut models: Vec<_> = channels.iter().map(|_| BlockSwitching::new(fs)).collect();
     // Each channel's first granule of the frame, for scfsi in the second.
     let mut first: Vec<Option<(GranuleSummary, Scalefactors)>> = vec![None; channels.len()];
@@ -389,31 +390,66 @@ pub fn encode_pcm(config: &StreamConfig, channels: &[&[f64]]) -> Vec<u8> {
             let masking = models[channel].granule(pcm)?;
             Some((masking.block_type(), (masking, Vec::new())))
         },
-        |frame| {
+        |mut frame, mean_bits, reservoir| {
             for granule in frame.iter_mut() {
                 for filtered in granule.iter_mut() {
                     let (masking, xmin) = &mut filtered.analysis;
                     *xmin = masking.allowed_distortion(&filtered.xr, fs);
                 }
             }
-            ms_allowed && middle_side_frame(frame, fs)
-        },
-        |channel, gr, (masking, xmin), xr, mean_bits, reservoir| {
-            let block_type = masking.block_type();
-            let available_bits = reservoir
-                .granule_bits(mean_bits, masking.perceptual_entropy())
-                .min(MAX_PART2_3_LENGTH);
-            let summary = GranuleSummary::new(xr, &xmin, block_type, fs);
-            let reuse = match (gr, &first[channel]) {
-                (1, Some((first_summary, first_scalefactors))) => Some(loops::Reuse {
-                    first: first_scalefactors,
-                    scfsi: scfsi::select(first_summary, &summary),
-                }),
-                _ => None,
+            let ms_stereo = ms_allowed && middle_side_frame(&frame);
+            let bounds = if intensity_allowed && intensity_frame(&frame) {
+                stereo::intensity_bounds(fs).to_vec()
+            } else {
+                Vec::new()
             };
-            let granule = loops::quantize_granule(xr, &xmin, block_type, available_bits, fs, reuse);
-            first[channel] = (gr == 0).then(|| (summary, granule.scalefactors.clone()));
-            granule
+            // Annex G.1: if the frame needs more bits than it has, more and
+            // more bands are coded in intensity stereo, down to the lowest
+            // bound, and the last tried is kept even if the frame still needs
+            // more. Bounds that would not lower the bits are not tried.
+            let mut plain_reservoir = reservoir.clone();
+            let mut plain_first = first.clone();
+            let (plain, mut within_allowance) = quantize_frame(
+                &frame,
+                ms_stereo,
+                None,
+                mean_bits,
+                &mut plain_reservoir,
+                &mut plain_first,
+                fs,
+            );
+            let mut tried = None;
+            for bound in bounds {
+                if within_allowance {
+                    break;
+                }
+                let Some(intensity) = IntensityTry::new(&frame, &plain, bound, fs) else {
+                    continue;
+                };
+                let mut tried_reservoir = reservoir.clone();
+                let mut tried_first = first.clone();
+                let granules;
+                (granules, within_allowance) = quantize_frame(
+                    &frame,
+                    ms_stereo,
+                    Some(&intensity),
+                    mean_bits,
+                    &mut tried_reservoir,
+                    &mut tried_first,
+                    fs,
+                );
+                tried = Some((granules, tried_reservoir, tried_first));
+            }
+            let intensity_stereo = tried.is_some();
+            let (granules, kept_reservoir, kept_first) =
+                tried.unwrap_or((plain, plain_reservoir, plain_first));
+            *reservoir = kept_reservoir;
+            first = kept_first;
+            CodedFrame {
+                granules,
+                ms_stereo,
+                intensity_stereo,
+            }
         },
     )
 }
@@ -422,19 +458,18 @@ pub fn encode_pcm(config: &StreamConfig, channels: &[&[f64]]) -> Vec<u8> {
 /// of its scalefactors, in the order they are sent.
 type Analysis = (SwitchedMasking, Vec<f64>);
 
-/// Decides whether to code a stereo frame in MS stereo (Annex G.2), and if
-/// so turns its left and right lines into middle and side lines, with the
-/// allowed distortion of each.
+/// The earlier scalefactors of each channel that the second granule of a
+/// frame may take over with scfsi: its first granule's summary and
+/// scalefactors.
+type FirstGranules = [Option<(GranuleSummary, Scalefactors)>];
+
+/// Whether to code a stereo frame in MS stereo (Annex G.2 a)).
 ///
 /// The normative decoding needs both channels of a granule to have the same
 /// block type in MS stereo (clause 2.4.3.4.9). Spec gap: Annex G does not
 /// say what to do when they do not; such frames are coded in left/right
-/// stereo. The perceptual entropy each channel's bits are reckoned from
-/// stays that of the left and right channels.
-fn middle_side_frame(
-    frame: &mut [Vec<Filtered<Analysis>>],
-    sampling_frequency: SamplingFrequency,
-) -> bool {
+/// stereo.
+fn middle_side_frame(frame: &[Vec<Filtered<Analysis>>]) -> bool {
     let same_types = frame
         .iter()
         .all(|granule| granule[0].block_type == granule[1].block_type);
@@ -447,21 +482,192 @@ fn middle_side_frame(
             )
         })
         .collect();
-    if !same_types || !stereo::ms_stereo(&spectra) {
-        return false;
+    same_types && stereo::ms_stereo(&spectra)
+}
+
+/// Whether a stereo frame may be coded in intensity stereo.
+///
+/// Spec gap: the standard asks for the same block type in both channels
+/// only for MS stereo (clause 2.4.3.4.9), and does not say how intensity
+/// stereo applies to short blocks: clause 2.4.3.4.9.3 finds the bound from
+/// the right channel's zero part, and short blocks are sent by band and
+/// then window (clause 2.4.3.4.8), so that the zero part could begin in any
+/// window of a band. As intensity stereo moves the left channel's lines
+/// into the right channel's synthesis, whose window should then be the
+/// same, frames are coded in it only if each granule has the same long
+/// block type in both channels.
+fn intensity_frame(frame: &[Vec<Filtered<Analysis>>]) -> bool {
+    frame.iter().all(|granule| {
+        let block_type = granule[0].block_type;
+        block_type != BlockType::Short && granule[1].block_type == block_type
+    })
+}
+
+/// A try at coding a frame in intensity stereo: the positions of each of
+/// its granules, and the bits the right channel of each keeps.
+///
+/// Spec gap: Annex G does not say how to share the bits between the
+/// channels in intensity stereo. In Layers I and II a combined subband is
+/// allotted bits once, the higher of its two channels' allocations (Annex
+/// G.1), but the Layer III iteration loops spend all the bits each channel
+/// is given (clause C.1.5.4.4): the right
+/// channel would spend the bits of the bands it no longer codes on those it
+/// still does, while the left channel codes the sum of both on the bits it
+/// had for itself alone. So the right channel keeps only the bits it spent
+/// below the bound when the frame was coded without intensity stereo, and
+/// those its scalefactors then take, marked with its intensity stereo
+/// positions, or the most the marks can take if that is more. The left
+/// channel gets what that leaves of the right channel's share of the
+/// frame.
+struct IntensityTry {
+    positions: Vec<stereo::IntensityPositions>,
+    right_bits: Vec<usize>,
+}
+
+impl IntensityTry {
+    /// The try at coding `frame` in intensity stereo from long scalefactor
+    /// band `bound`, given its granules as coded without it, `plain`.
+    ///
+    /// Spec reading: Annex G.1 codes bands in intensity stereo to lower the
+    /// bits a frame needs. When the right channel's bits from the bound up
+    /// in `plain` are no more than its intensity stereo positions would take,
+    /// the bound would not lower them, and there is no try: `None`. This is
+    /// so at low bitrates, where the right channel's upper bands often
+    /// quantise to zero without intensity stereo.
+    fn new(
+        frame: &[Vec<Filtered<Analysis>>],
+        plain: &[Vec<QuantizedGranule>],
+        bound: usize,
+        sampling_frequency: SamplingFrequency,
+    ) -> Option<Self> {
+        let fs = sampling_frequency;
+        let bands = scalefactor_bands::long_bands(fs);
+        let start = bands[bound].start;
+        let positions: Vec<_> = frame
+            .iter()
+            .map(|granule| {
+                stereo::IntensityPositions::new(&granule[0].xr, &granule[1].xr, bound, fs)
+            })
+            .collect();
+        let right_bits: Vec<usize> = (plain.iter().zip(&positions))
+            .map(|(granule, positions)| {
+                let right = &granule[1];
+                let below = right.coding.bit_count_below(&right.values, bands, start);
+                // Its scalefactors as they would be sent with those values:
+                // all of them, as it will not use scfsi, and marked.
+                let mut values = right.values;
+                values[start..].fill(0);
+                let mut scalefactors = right.scalefactors.clone();
+                scalefactors.scfsi = [false; side_info::SCFSI_BANDS];
+                positions.mark(&mut scalefactors, &values, fs);
+                let compress = scalefactors
+                    .compress()
+                    .expect("scalefactors within their limits");
+                // Enough for the marks if fewer bits leave more bands zero.
+                (scalefactors.part2_length(compress) + below).max(stereo::MAX_POSITION_BITS)
+            })
+            .collect();
+        let plain_bits: usize = plain.iter().map(|granule| granule[1].bit_len(fs)).sum();
+        (right_bits.iter().sum::<usize>() < plain_bits).then_some(Self {
+            positions,
+            right_bits,
+        })
     }
-    for granule in frame.iter_mut() {
-        let [left, right] = &mut granule[..] else {
-            unreachable!("MS stereo has two channels")
-        };
-        let (middle, mut side) = stereo::middle_side(&left.xr, &right.xr);
-        stereo::limit_side(&mut side, left.block_type, sampling_frequency);
-        let xmin = stereo::middle_side_distortion(&left.analysis.1, &right.analysis.1);
-        (left.xr, right.xr) = (middle, side);
-        left.analysis.1.clone_from(&xmin);
-        right.analysis.1 = xmin;
+}
+
+/// Quantises a frame's granules, in MS stereo if `ms_stereo` is set and in
+/// intensity stereo as `intensity` gives, and accounts for their bits in the
+/// reservoir. Returns them, and whether each was within its allowed
+/// distortion.
+///
+/// The perceptual entropy each channel's bits are reckoned from stays that
+/// of the left and right channels; in intensity stereo the two then share
+/// them as [`IntensityTry`] describes.
+///
+/// Spec gap: Annex G does not say how to find the allowed distortion of
+/// the channels coded in MS or intensity stereo; see
+/// [`stereo::middle_side_distortion`] and
+/// [`stereo::IntensityPositions::sum_distortion`].
+///
+/// Spec gap: scfsi would have the second granule take over the first
+/// granule's intensity stereo positions, which follow the signal of each
+/// granule (Annex G.2 c)). In intensity stereo the right channel does not
+/// use scfsi.
+fn quantize_frame(
+    frame: &[Vec<Filtered<Analysis>>],
+    ms_stereo: bool,
+    intensity: Option<&IntensityTry>,
+    mean_bits: usize,
+    reservoir: &mut Reservoir,
+    first: &mut FirstGranules,
+    sampling_frequency: SamplingFrequency,
+) -> (Vec<Vec<QuantizedGranule>>, bool) {
+    let fs = sampling_frequency;
+    let mut within_allowance = true;
+    let mut granules = Vec::with_capacity(frame.len());
+    for (gr, granule) in frame.iter().enumerate() {
+        let mut lines: Vec<_> = granule
+            .iter()
+            .map(|f| (f.xr, f.analysis.1.clone()))
+            .collect();
+        let positions = intensity.map(|intensity| &intensity.positions[gr]);
+        if ms_stereo || positions.is_some() {
+            let [(left, left_xmin), (right, right_xmin)] = &mut lines[..] else {
+                unreachable!("joint stereo has two channels")
+            };
+            if ms_stereo {
+                (*left, *right) = stereo::middle_side(left, right);
+                stereo::limit_side(right, granule[0].block_type, fs);
+                let joint = stereo::middle_side_distortion(left_xmin, right_xmin);
+                left_xmin.clone_from(&joint);
+                *right_xmin = joint;
+            }
+            if let Some(positions) = positions {
+                positions.code(&granule[0].xr, &granule[1].xr, [left, right], fs);
+                let (left_alone, right_alone) = (&granule[0].analysis.1, &granule[1].analysis.1);
+                for (sb, xmin) in left_xmin.iter_mut().enumerate().skip(positions.bound()) {
+                    *xmin = positions.sum_distortion(sb, left_alone[sb], right_alone[sb]);
+                }
+            }
+        }
+        // The right channel's bits are reckoned before the left channel takes
+        // any, and need not all be there after; it gets no more than the
+        // reservoir then gives it. The left channel gets only what the right
+        // leaves of its share of the frame, which the right then returns.
+        let right_bits = intensity.map(|intensity| intensity.right_bits[gr]);
+        let mut quantized = Vec::with_capacity(granule.len());
+        for (channel, (filtered, (xr, xmin))) in granule.iter().zip(&lines).enumerate() {
+            let block_type = filtered.block_type;
+            let mut available_bits =
+                reservoir.granule_bits(mean_bits, filtered.analysis.0.perceptual_entropy());
+            if let Some(right_bits) = right_bits {
+                available_bits = match channel {
+                    0 => available_bits + mean_bits.saturating_sub(right_bits),
+                    _ => available_bits.min(right_bits),
+                };
+            }
+            let available_bits = available_bits.min(MAX_PART2_3_LENGTH);
+            let intensity = positions.filter(|_| channel == 1);
+            let summary = GranuleSummary::new(xr, xmin, block_type, fs);
+            let reuse = match (gr, &first[channel]) {
+                (1, Some((first_summary, first_scalefactors))) if intensity.is_none() => {
+                    Some(loops::Reuse {
+                        first: first_scalefactors,
+                        scfsi: scfsi::select(first_summary, &summary),
+                    })
+                }
+                _ => None,
+            };
+            let outcome =
+                loops::quantize_granule(xr, xmin, block_type, available_bits, fs, reuse, intensity);
+            first[channel] = (gr == 0).then(|| (summary, outcome.granule.scalefactors.clone()));
+            reservoir.granule_done(mean_bits, outcome.granule.bit_len(fs));
+            within_allowance &= outcome.within_allowance;
+            quantized.push(outcome.granule);
+        }
+        granules.push(quantized);
     }
-    true
+    (granules, within_allowance)
 }
 
 /// Encodes PCM like [`encode_pcm`], but with long blocks only, quantising
@@ -488,13 +694,17 @@ pub fn encode_pcm_with_global_gain(
 ///
 /// # Panics
 ///
-/// As [`encode_pcm_with_global_gain`].
+/// As [`encode_pcm_with_global_gain`], and if the mode allows intensity
+/// stereo.
 pub fn encode_with_block_types(
     config: &StreamConfig,
     global_gain: u8,
     channels: &[&[f64]],
     mut block_type: impl FnMut(usize, usize) -> BlockType,
 ) -> Vec<u8> {
+    let (ms_stereo, intensity_stereo) = config.joint_stereo();
+    assert!(!intensity_stereo, "intensity stereo needs encode_pcm");
+    let fs = config.sampling_frequency;
     let mut next = vec![0usize; channels.len()];
     encode_filtered(
         config,
@@ -510,26 +720,39 @@ pub fn encode_with_block_types(
                 (block_type, block_type)
             })
         },
-        |frame| {
-            if !config.ms_stereo_allowed() {
-                return false;
-            }
+        |mut frame, mean_bits, reservoir| {
+            let mut granules = Vec::with_capacity(frame.len());
             for granule in frame.iter_mut() {
-                let [left, right] = &mut granule[..] else {
-                    unreachable!("MS stereo has two channels")
-                };
-                assert_eq!(
-                    left.block_type, right.block_type,
-                    "MS stereo needs one block type"
-                );
-                (left.xr, right.xr) = stereo::middle_side(&left.xr, &right.xr);
+                if ms_stereo {
+                    let [left, right] = &mut granule[..] else {
+                        unreachable!("MS stereo has two channels")
+                    };
+                    assert_eq!(
+                        left.block_type, right.block_type,
+                        "MS stereo needs one block type"
+                    );
+                    (left.xr, right.xr) = stereo::middle_side(&left.xr, &right.xr);
+                }
+                let quantized: Vec<_> = granule
+                    .iter()
+                    .map(|filtered| {
+                        let values =
+                            loops::quantize(&filtered.xr, global_gain).unwrap_or_else(|| {
+                                panic!("a granule is too loud for global_gain {global_gain}")
+                            });
+                        let granule =
+                            QuantizedGranule::new(global_gain, values, filtered.block_type, fs);
+                        reservoir.granule_done(mean_bits, granule.bit_len(fs));
+                        granule
+                    })
+                    .collect();
+                granules.push(quantized);
             }
-            true
-        },
-        |_, _, block_type, xr, _, _| {
-            let values = loops::quantize(xr, global_gain)
-                .unwrap_or_else(|| panic!("a granule is too loud for global_gain {global_gain}"));
-            QuantizedGranule::new(global_gain, values, block_type, config.sampling_frequency)
+            CodedFrame {
+                granules,
+                ms_stereo,
+                intensity_stereo: false,
+            }
         },
     )
 }
@@ -542,32 +765,31 @@ struct Filtered<A> {
     xr: [f64; GRANULE_LINES],
 }
 
+/// A frame's granules, quantised, with one entry per channel each, and the
+/// joint stereo coding they use.
+struct CodedFrame {
+    granules: Vec<Vec<QuantizedGranule>>,
+    ms_stereo: bool,
+    intensity_stereo: bool,
+}
+
 /// Runs each channel through its filterbank granule by granule, quantises
-/// each granule with `quantize`, and writes the frames.
+/// each frame with `quantize`, and writes the frames.
 ///
 /// `look_ahead` is given each channel's PCM one granule ahead of the
 /// filterbank, starting with the first granule before any is filtered, and
 /// returns the block type and analysis of the granule before the one it is
-/// given: `None` only for the first. `joint` is given each frame's granules,
-/// indexed `[gr][ch]`, once all are filtered, may change them, and returns
-/// whether the frame is coded in MS stereo. `quantize` is then given the
-/// channel, the granule's index in its frame, its analysis, its lines, its
-/// share of the frame's main data and the bit reservoir, which accounts for
-/// the bits it then uses.
+/// given: `None` only for the first. `quantize` is given each frame's
+/// granules, indexed `[gr][ch]`, once all are filtered, the share of the
+/// frame's main data of each granule of each channel, and the bit
+/// reservoir. It quantises the granules, accounting in the reservoir for
+/// the bits each uses.
 fn encode_filtered<A>(
     config: &StreamConfig,
     channels: &[&[f64]],
     mut reservoir: Reservoir,
     mut look_ahead: impl FnMut(usize, &[f64; GRANULE_LINES]) -> Option<(BlockType, A)>,
-    mut joint: impl FnMut(&mut [Vec<Filtered<A>>]) -> bool,
-    mut quantize: impl FnMut(
-        usize,
-        usize,
-        A,
-        &[f64; GRANULE_LINES],
-        usize,
-        &Reservoir,
-    ) -> QuantizedGranule,
+    mut quantize: impl FnMut(Vec<Vec<Filtered<A>>>, usize, &mut Reservoir) -> CodedFrame,
 ) -> Vec<u8> {
     assert_eq!(
         channels.len(),
@@ -593,7 +815,7 @@ fn encode_filtered<A>(
     let mut main_data_begin = 0;
 
     for frame in 0..frames {
-        let mut filtered: Vec<Vec<Filtered<A>>> = (0..GRANULES)
+        let filtered: Vec<Vec<Filtered<A>>> = (0..GRANULES)
             .map(|gr| {
                 let index = frame * GRANULES + gr;
                 (filterbanks.iter_mut().enumerate())
@@ -615,28 +837,21 @@ fn encode_filtered<A>(
                     .collect()
             })
             .collect();
-        let ms_stereo = joint(&mut filtered);
-        let header = config.frame_header(padding.next_padding(), ms_stereo);
-        let slot_bits = main_data_bits(&header);
+        // mode_extension does not change the frame's length.
+        let padded = padding.next_padding();
+        let slot_bits = main_data_bits(&config.header(padded));
         let shares = GRANULES * channels.len();
         let mean_bits = slot_bits / shares;
-        let mut granules = Vec::with_capacity(GRANULES);
-        for (gr, granule) in filtered.into_iter().enumerate() {
-            let mut quantized_granule = Vec::with_capacity(channels.len());
-            for (channel, filtered) in granule.into_iter().enumerate() {
-                let Filtered {
-                    block_type,
-                    analysis,
-                    xr,
-                } = filtered;
-                let quantized = quantize(channel, gr, analysis, &xr, mean_bits, &reservoir);
-                assert_eq!(quantized.block_type, block_type);
-                reservoir.granule_done(mean_bits, quantized.bit_len(fs));
-                quantized_granule.push(quantized);
-            }
-            granules.push(quantized_granule);
-        }
-        let (side_info, main_data) = frame_contents(fs, &granules, main_data_begin);
+        let block_types: Vec<BlockType> = filtered.iter().flatten().map(|f| f.block_type).collect();
+        let coded = quantize(filtered, mean_bits, &mut reservoir);
+        assert!(
+            (coded.granules.iter().flatten())
+                .map(|q| q.block_type)
+                .eq(block_types),
+            "the granules keep their block types"
+        );
+        let header = config.frame_header(padded, coded.ms_stereo, coded.intensity_stereo);
+        let (side_info, main_data) = frame_contents(fs, &coded.granules, main_data_begin);
         writer.write(&header, &side_info, &main_data);
         main_data_begin = reservoir.end_frame(slot_bits - shares * mean_bits);
     }

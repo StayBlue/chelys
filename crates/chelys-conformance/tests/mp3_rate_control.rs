@@ -270,18 +270,35 @@ fn steady_tones_share_scalefactors_between_granules() {
     assert!(snr > 25.0, "{snr:.1} dB");
 }
 
-/// Whether each frame of a stream is coded in MS stereo: bit 1 of its
-/// `mode_extension` (clause 2.4.2.3).
-fn ms_stereo_frames(stream: &[u8]) -> Vec<bool> {
+/// The `mode_extension` of each frame of a stream (clause 2.4.2.3).
+fn mode_extensions(stream: &[u8]) -> Vec<u8> {
     let mut frames = Vec::new();
     let mut at = 0;
     while at + 4 <= stream.len() {
         let header = &stream[at..];
         assert_eq!(header[0], 0xFF, "no syncword at {at}");
-        frames.push(header[3] >> 5 & 1 == 1);
+        frames.push(header[3] >> 4 & 0b11);
         at += frame_len(header);
     }
     frames
+}
+
+/// Whether each frame of a stream is coded in MS stereo: bit 1 of its
+/// `mode_extension`.
+fn ms_stereo_frames(stream: &[u8]) -> Vec<bool> {
+    mode_extensions(stream)
+        .iter()
+        .map(|e| e & 0b10 != 0)
+        .collect()
+}
+
+/// Whether each frame of a stream is coded in intensity stereo: bit 0 of
+/// its `mode_extension`.
+fn intensity_stereo_frames(stream: &[u8]) -> Vec<bool> {
+    mode_extensions(stream)
+        .iter()
+        .map(|e| e & 0b01 != 0)
+        .collect()
 }
 
 fn frame_len(header: &[u8]) -> usize {
@@ -358,4 +375,89 @@ fn alike_channels_use_ms_stereo() {
         let stream = encode_pcm(&config(64, fs, joint), &channels);
         assert!(ms_stereo_frames(&stream).iter().all(|&on| !on), "{label}");
     }
+}
+
+/// The amplitude of the sine at `frequency` in the decoded `channel` of a
+/// stereo stream at 44.1 kHz, over its steady middle part.
+fn amplitude(samples: &[f32], channel: usize, frequency: f64) -> f64 {
+    let range = 4608..samples.len() / 2 - 4608;
+    let n = range.len() as f64;
+    let (cos, sin) = range.fold((0.0, 0.0), |(c, s), t| {
+        let y = f64::from(samples[2 * t + channel]);
+        let phase = TAU * frequency * t as f64 / 44_100.0;
+        (c + y * phase.cos(), s + y * phase.sin())
+    });
+    2.0 * cos.hypot(sin) / n
+}
+
+/// With intensity stereo allowed, frames short of bits code their upper
+/// bands in intensity stereo (Annex G.2 c)), alone or with MS stereo below
+/// them. A low tone the same in both channels, and tones at 12 and 18 kHz
+/// with the right channel at half the left, at 64 kbit/s: the low tone
+/// stays the same in both channels. The upper tones decode at the levels
+/// that the nearest intensity stereo position gives: 2 to 1 in amplitude
+/// lies at 63.4 degrees, nearest position 4 (60 degrees), which splits the
+/// sum of the channels, 1.5 times the left, as `tan(60) / (1 + tan(60))`
+/// and `1 / (1 + tan(60))`. The tone at 12 kHz lies in the highest
+/// scalefactor band but one, above every bound, and the tone at 18 kHz
+/// above the highest band.
+///
+/// With MS stereo on as well, the side channel is zero below the bound, so
+/// that every band there is marked as not coded in intensity stereo, and
+/// the low tone is coded in the middle channel alone.
+///
+/// Without intensity stereo allowed, no frame is coded in it.
+#[test]
+fn intensity_stereo_keeps_the_level_of_each_channel() {
+    let fs = SamplingFrequency::Hz44100;
+    let tones = |levels: [(f64, f64); 3]| -> Vec<f64> {
+        (0..2 * 44_100)
+            .map(|t| {
+                (levels.iter())
+                    .map(|(f, a)| a * (TAU * f * t as f64 / 44_100.0).sin())
+                    .sum()
+            })
+            .collect()
+    };
+    let left = tones([(440.0, 0.2), (12_000.0, 0.2), (18_000.0, 0.1)]);
+    let right = tones([(440.0, 0.2), (12_000.0, 0.1), (18_000.0, 0.05)]);
+    let ratio = (60f64).to_radians().tan();
+    let (left_share, right_share) = (ratio / (1.0 + ratio), 1.0 / (1.0 + ratio));
+
+    for ms_stereo in [false, true] {
+        let mode = Mode::JointStereo {
+            intensity_stereo: true,
+            ms_stereo,
+        };
+        let stream = encode_pcm(&config(64, fs, mode), &[&left, &right]);
+        let intensity = intensity_stereo_frames(&stream);
+        assert!(
+            intensity.iter().filter(|&&on| on).count() > intensity.len() * 9 / 10,
+            "MS {ms_stereo}: {intensity:?}"
+        );
+        let decoded = ffmpeg::decode_mp3(&stream);
+        assert_eq!(decoded.diagnostics, "", "MS {ms_stereo}");
+        let expected = [
+            (440.0, 0.2, 0.2),
+            (12_000.0, 0.3 * left_share, 0.3 * right_share),
+            (18_000.0, 0.15 * left_share, 0.15 * right_share),
+        ];
+        for (frequency, left_level, right_level) in expected {
+            for (channel, level) in [(0, left_level), (1, right_level)] {
+                let decoded = amplitude(&decoded.samples, channel, frequency);
+                assert!(
+                    (decoded / level - 1.0).abs() < 0.1,
+                    "MS {ms_stereo}, {frequency} Hz, channel {channel}: \
+                     {decoded:.4} for {level:.4}"
+                );
+            }
+        }
+    }
+
+    let joint = Mode::JointStereo {
+        intensity_stereo: false,
+        ms_stereo: true,
+    };
+    let stream = encode_pcm(&config(64, fs, joint), &[&left, &right]);
+    assert!(intensity_stereo_frames(&stream).iter().all(|&on| !on));
 }

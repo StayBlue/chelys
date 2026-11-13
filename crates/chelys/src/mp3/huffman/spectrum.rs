@@ -112,16 +112,33 @@ impl SpectrumCoding {
     /// The bits [`write`](Self::write) produces for `values`, counted as in
     /// clauses C.1.5.4.4.5 and C.1.5.4.4.8.
     pub fn bit_count(&self, values: &[i32; GRANULE_LINES], bands: &[Band]) -> usize {
+        self.bit_count_below(values, bands, GRANULE_LINES)
+    }
+
+    /// The bits of [`bit_count`](Self::bit_count) that code the pairs and
+    /// quadruples starting below line `end`.
+    ///
+    /// # Panics
+    ///
+    /// If `end` is odd.
+    pub fn bit_count_below(
+        &self,
+        values: &[i32; GRANULE_LINES],
+        bands: &[Band],
+        end: usize,
+    ) -> usize {
+        assert!(end.is_multiple_of(2), "pairs start on even lines");
         let mut bits = 0;
         let mut start = 0;
-        for (region, end) in self.region_ends(bands).into_iter().enumerate() {
+        for (region, region_end) in self.region_ends(bands).into_iter().enumerate() {
             let table_select = self.table_select[region];
             let table = pair_table(table_select)
                 .unwrap_or_else(|| panic!("table {table_select} is not used"));
-            bits += pair_bits(table, &values[start..end]);
-            start = end;
+            bits += pair_bits(table, &values[start..region_end.min(end).max(start)]);
+            start = region_end;
         }
-        bits + quad_bits(self.count1_table, &values[start..start + 4 * self.count1])
+        let quads = end.saturating_sub(start).div_ceil(4).min(self.count1);
+        bits + quad_bits(self.count1_table, &values[start..start + 4 * quads])
     }
 
     /// Writes the `Huffmancodebits()` of `values` (clause 2.4.1.7).
@@ -428,5 +445,33 @@ mod tests {
             written(&values, &coding).len(),
             coding.bit_count(&values, bands())
         );
+    }
+    /// The bits below a line grow from none to all, count the pairs before
+    /// the quadruples, and count a quadruple that starts below the line
+    /// whole.
+    #[test]
+    fn bits_below_a_line_count_what_starts_below_it() {
+        let mut values = [0; GRANULE_LINES];
+        for (i, v) in values.iter_mut().enumerate() {
+            *v = match i {
+                0..100 => [0, 1, -2, 7, 0, -15, 40, 1, 0, -1][i % 10],
+                100..300 => [1, 0, -1, 0, 0][i % 5],
+                _ => 0,
+            };
+        }
+        let coding = SpectrumCoding::choose(&values, BlockType::Normal, bands());
+        let below = |end| coding.bit_count_below(&values, bands(), end);
+        let total = coding.bit_count(&values, bands());
+        assert_eq!(below(0), 0);
+        assert_eq!(below(GRANULE_LINES), total);
+        let counts: Vec<usize> = (0..=GRANULE_LINES).step_by(2).map(below).collect();
+        assert!(counts.windows(2).all(|w| w[0] <= w[1]));
+        let count1_start = 2 * coding.big_values;
+        let quads = &values[count1_start..count1_start + 4 * coding.count1];
+        let quad_total = quad_bits(coding.count1_table, quads);
+        assert_eq!(below(count1_start), total - quad_total);
+        let first_quad = quad_bits(coding.count1_table, &quads[..4]);
+        assert_eq!(below(count1_start + 2), total - quad_total + first_quad);
+        assert_eq!(below(count1_start + 4 * coding.count1), total);
     }
 }

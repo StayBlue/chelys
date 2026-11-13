@@ -25,7 +25,7 @@ const BORROW_SHARE: f64 = 0.6;
 /// The fill is kept in bits, and can dip below zero within a frame for
 /// granules quantised without regard to it; a frame must end with a fill
 /// of zero or more.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Reservoir {
     bits: isize,
     max_bytes: usize,

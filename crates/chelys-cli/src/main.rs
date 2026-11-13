@@ -13,7 +13,7 @@ use chelys::mp3::{StreamConfig, encode_pcm};
 
 const USAGE: &str = "\
 usage: chelys --sample-rate HZ --channels N [--bitrate KBPS] [--joint-stereo]
-              < input.f32 > output.mp3
+              [--intensity-stereo] < input.f32 > output.mp3
 
 Reads interleaved 32-bit little-endian float PCM from stdin and writes MPEG-1
 Layer III to stdout.
@@ -23,18 +23,29 @@ Layer III to stdout.
   --bitrate KBPS     32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256
                      or 320 (default 128)
   --joint-stereo     code each frame of two channels in MS stereo where the
-                     channels are alike (default: left/right stereo)";
+                     channels are alike (default: left/right stereo)
+  --intensity-stereo code the upper bands of each frame of two channels in
+                     intensity stereo where the frame is short of bits,
+                     keeping only the level of each channel there and not
+                     its fine structure; for low bitrates (default: off)";
 
 struct Options {
     sampling_frequency: SamplingFrequency,
     channels: usize,
     bitrate: Bitrate,
     joint_stereo: bool,
+    /// Off unless asked for, following ffmpeg's command line: its MP3
+    /// encoder offers no switch for intensity stereo, and with its defaults
+    /// it coded no frame in it, at 32 to 128 kbit/s, when observed from the
+    /// frame headers of its output (ffmpeg n9.0.2). Intensity stereo trades
+    /// the stereo image above its bound for bits, a trade for low bitrates,
+    /// which content that relies on the image may not want even there.
+    intensity_stereo: bool,
 }
 
 fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
     let (mut sample_rate, mut channels, mut bitrate) = (None, None, 128);
-    let mut joint_stereo = false;
+    let (mut joint_stereo, mut intensity_stereo) = (false, false);
     let mut args = args.into_iter();
     while let Some(flag) = args.next() {
         let mut value = |name: &str| -> Result<u32, String> {
@@ -48,6 +59,7 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
             "--channels" => channels = Some(value("--channels")?),
             "--bitrate" => bitrate = value("--bitrate")?,
             "--joint-stereo" => joint_stereo = true,
+            "--intensity-stereo" => intensity_stereo = true,
             // An empty message asks for the usage text alone.
             "-h" | "--help" => return Err(String::new()),
             other => return Err(format!("unknown argument: {other}")),
@@ -66,11 +78,15 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
     if joint_stereo && channels != 2 {
         return Err("--joint-stereo needs two channels".to_owned());
     }
+    if intensity_stereo && channels != 2 {
+        return Err("--intensity-stereo needs two channels".to_owned());
+    }
     Ok(Options {
         sampling_frequency,
         channels,
         bitrate,
         joint_stereo,
+        intensity_stereo,
     })
 }
 
@@ -106,12 +122,16 @@ fn main() -> ExitCode {
     let config = StreamConfig {
         bitrate: options.bitrate,
         sampling_frequency: options.sampling_frequency,
-        mode: match (options.channels, options.joint_stereo) {
-            (1, _) => Mode::SingleChannel,
-            (_, false) => Mode::Stereo,
-            (_, true) => Mode::JointStereo {
-                intensity_stereo: false,
-                ms_stereo: true,
+        mode: match (
+            options.channels,
+            options.joint_stereo,
+            options.intensity_stereo,
+        ) {
+            (1, _, _) => Mode::SingleChannel,
+            (_, false, false) => Mode::Stereo,
+            (_, ms_stereo, intensity_stereo) => Mode::JointStereo {
+                intensity_stereo,
+                ms_stereo,
             },
         },
         crc_protected: false,
