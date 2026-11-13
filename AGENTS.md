@@ -56,3 +56,14 @@ when the evidence is recorded again with another version.
 
 *User, 2026-11-12: document where ffmpeg filled gaps left by the standard. The
 marker phrases were proposed by the agent and approved by the user.*
+
+## Commits for ffmpeg evidence
+
+Commit "Settled by decoding with ffmpeg" evidence, and the note on the test
+that provides it, separately from the feature that the evidence is for, as a
+`docs:` commit after it. `Spec gap:` and `Spec reading:` markers stay in the
+feature's commit.
+
+*User, 2026-11-12, when committing short blocks: two commits, one for the
+ffmpeg evidence, as with the earlier evidence. The entry was proposed by the
+agent and approved by the user.*
