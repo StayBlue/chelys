@@ -7,6 +7,13 @@ name = "chelys"
 version = "0.1.0"
 
 [[package]]
+name = "chelys-cli"
+version = "0.1.0"
+dependencies = [
+ "chelys",
+]
+
+[[package]]
 name = "chelys-conformance"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,13 @@
+[package]
+name = "chelys-cli"
+description = "Encodes raw PCM from stdin with chelys."
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[[bin]]
+name = "chelys"
+path = "src/main.rs"
+
+[dependencies]
+chelys = { path = "../chelys" }
