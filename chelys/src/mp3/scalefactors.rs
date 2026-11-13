@@ -213,6 +213,11 @@ impl ZeroPart {
 /// a band sent in no bits the intensity stereo position zero, so a field of
 /// no bits has no illegal position.
 ///
+/// Settled by decoding with ffmpeg, mpg123 and LAME (black box): all three
+/// decode a band whose position is sent in no bits at position 0, the same
+/// level in both channels. The conformance test is
+/// `positions_7_and_16_are_read_as_illegal`.
+///
 /// The encoder never sends these marks at the lower sampling frequencies: it
 /// codes such a frame without intensity stereo (see `quantize_frame`). They
 /// are still given here, as the standard has them, so that the bits the right

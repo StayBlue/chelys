@@ -14,6 +14,12 @@
 //! `k_r` in the right; a band read as not coded in intensity stereo decodes
 //! it in the left channel alone. The level of each channel, against that of
 //! the same line coded in left/right stereo, tells the two apart.
+//!
+//! This is the evidence for sending no marks at the lower sampling
+//! frequencies, for keeping positions below 16 and off 7, and for reading a
+//! position sent in no bits as 0, which `quantize_frame`, the intensity
+//! stereo positions and the scalefactors mark as settled by decoding with
+//! ffmpeg, mpg123 and LAME.
 
 use chelys::mp3::header::{Bitrate, Mode, SamplingFrequency};
 use chelys::mp3::scalefactor_bands::{self, LONG_BANDS};

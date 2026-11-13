@@ -140,6 +140,11 @@ const I0: f64 = std::f64::consts::FRAC_1_SQRT_2;
 /// Spec reading: clause 2.4.3.2 of ISO/IEC 13818-3 allows positions up to
 /// 30, in a field of 5 bits, but not every decoder reads them so. Positions
 /// are kept below 16.
+///
+/// Settled by decoding with ffmpeg, mpg123 and LAME (black box): ffmpeg
+/// reads position 16 as illegal, and mpg123 and LAME read it as a position;
+/// all three read 13, 14 and 15 as positions. The conformance test is
+/// `positions_7_and_16_are_read_as_illegal`.
 const MAX_STEPS: i32 = 7;
 
 /// The steps of `i0` that a position at the lower sampling frequencies never
@@ -148,6 +153,13 @@ const MAX_STEPS: i32 = 7;
 /// Spec reading: position 7 is a position in a field of 4 or 5 bits (clause
 /// 2.4.3.2 of ISO/IEC 13818-3), but not every decoder reads it so. A band
 /// whose nearest position is 7 takes the nearer of 5 and 9.
+///
+/// Settled by decoding with ffmpeg, mpg123 and LAME (black box): mpg123 and
+/// LAME read position 7 as illegal in a field of 4 bits, and ffmpeg reads it
+/// as a position; all three read 5 as a position. The conformance test is
+/// `positions_7_and_16_are_read_as_illegal`, and
+/// `marks_are_read_as_illegal_in_different_fields` shows mpg123 and LAME
+/// reading 7 as illegal in a field of 3 bits too.
 const SKIPPED_STEPS: i32 = -4;
 
 /// The `bound` of Layers I and II in intensity stereo: the subband from
@@ -308,6 +320,13 @@ impl IntensityPositions {
     /// above the highest band by its position. The conformance test
     /// `intensity_stereo_keeps_the_level_of_each_channel` fails then.
     ///
+    /// Settled by decoding with ffmpeg, mpg123 and LAME (black box): at
+    /// 22.05 kHz and 48 kbit/s, a 10.5 kHz tone, above the highest band, with
+    /// the right channel at half the left decodes within 10% of its level in
+    /// each channel in all three, as the highest band's position gives. The
+    /// conformance test is
+    /// `intensity_stereo_keeps_the_level_of_each_channel_at_the_lower_sampling_frequencies`.
+    ///
     /// # Panics
     ///
     /// If `bound` is not a long scalefactor band. Short blocks are not coded
@@ -355,6 +374,12 @@ impl IntensityPositions {
     /// signal panned between the channels, as intensity stereo takes it to
     /// be, at the level difference its position gives, that sends the
     /// louder channel's lines.
+    ///
+    /// Settled by decoding with ffmpeg, mpg123 and LAME (black box): at
+    /// 22.05 kHz and 48 kbit/s, tones at positions 0 and 4 decode within 10%
+    /// of their level in each channel in all three, where the sum unscaled
+    /// would decode 1.5 or 2 times too loud. The conformance test is
+    /// `intensity_stereo_keeps_the_level_of_each_channel_at_the_lower_sampling_frequencies`.
     pub fn code(
         &self,
         left: &[f64; GRANULE_LINES],

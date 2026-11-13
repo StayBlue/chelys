@@ -552,7 +552,12 @@ fn intensity_stereo_keeps_the_level_of_each_channel() {
 /// frequencies, so no frame is coded in intensity stereo, and every tone
 /// below the bounds keeps its level.
 ///
-/// Each stream is decoded with ffmpeg, mpg123 and LAME.
+/// Each stream is decoded with ffmpeg, mpg123 and LAME. This is the evidence
+/// for the position of the lines above the highest band and the scaling of
+/// the sum at the lower sampling frequencies, and, with
+/// `marks_are_read_as_illegal_in_different_fields`, for sending no marks
+/// there, which the intensity stereo positions and `quantize_frame` mark as
+/// settled by decoding with ffmpeg, mpg123 and LAME.
 #[test]
 fn intensity_stereo_keeps_the_level_of_each_channel_at_the_lower_sampling_frequencies() {
     let fs = SamplingFrequency::Hz22050;

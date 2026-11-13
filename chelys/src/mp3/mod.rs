@@ -746,6 +746,17 @@ impl IntensityTry {
 /// right channel would need one, with no nonzero value in the band just
 /// below the bound, is coded from a lower bound or without intensity stereo.
 ///
+/// Settled by decoding with ffmpeg, mpg123 and LAME (black box): of the
+/// marks of fields of 1 to 5 bits, 1, 3, 7, 15 and 31, ffmpeg reads only 31
+/// as illegal and the others as positions, and mpg123 and LAME read only 7
+/// as illegal and the others as positions; a marked band is then decoded in
+/// intensity stereo. The conformance test is
+/// `marks_are_read_as_illegal_in_different_fields`. In MS stereo, with the
+/// side channel zero below every bound, no frame is coded in intensity
+/// stereo, and all three decode every tone at its level; the conformance
+/// test is
+/// `intensity_stereo_keeps_the_level_of_each_channel_at_the_lower_sampling_frequencies`.
+///
 /// The perceptual entropy each channel's bits are reckoned from stays that
 /// of the left and right channels; in intensity stereo the two then share
 /// them as [`IntensityTry`] describes.
