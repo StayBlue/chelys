@@ -357,6 +357,13 @@ impl IntensityPositions {
     /// conformance test is
     /// `intensity_stereo_keeps_the_level_of_each_channel_at_the_lower_sampling_frequencies`.
     ///
+    /// Settled by decoding with ffmpeg, mpg123 and LAME (black box): at 44.1
+    /// and 22.05 kHz, a line of a short block above band 11, the highest
+    /// short band, decodes in all three at the position sent for band 11 of
+    /// its own window, with a different position in each window. The
+    /// conformance test is
+    /// `lines_above_the_short_bands_take_the_position_of_the_highest_band`.
+    ///
     /// # Panics
     ///
     /// If `bound` is not a scalefactor band of `block_type`.
@@ -509,6 +516,16 @@ impl IntensityPositions {
     /// in the order the values are sent, would read the same bands as
     /// coded in intensity stereo, as the bound is the same in every window
     /// and the bands marked would at most be read as scalefactors of zeros.
+    ///
+    /// Settled by decoding with ffmpeg, mpg123 and LAME (black box): at 44.1
+    /// and 22.05 kHz, with the right channel's last nonzero value in band 6
+    /// of its third window, a line in band 3 of the first window decodes in
+    /// all three at the position sent for it, and in band 3 of the third
+    /// window in the left channel alone. At 44.1 kHz, with the bound at band
+    /// 8, a line in a band below it marked in its window decodes in the left
+    /// channel alone, and a line from the bound at its position. The
+    /// conformance tests are `short_blocks_find_the_bound_in_each_window`
+    /// and `short_blocks_mark_bands_in_each_window`.
     ///
     /// Spec reading: Annex G.2 c) asks for the mark in every band of zeros
     /// outside the intensity coded part. Only the bands of the zero part

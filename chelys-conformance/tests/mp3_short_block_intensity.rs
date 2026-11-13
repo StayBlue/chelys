@@ -177,6 +177,10 @@ fn readings(fs: SamplingFrequency, left_line: usize, right: &QuantizedGranule) -
 /// frequencies (clause 2.4.3.2 of ISO/IEC 13818-3), and says that ISO/IEC
 /// 11172-3 does so too. ffmpeg, mpg123 and LAME find it so at 44.1 and
 /// 22.05 kHz.
+///
+/// This is the evidence for finding the zero part in each window, which the
+/// intensity stereo positions mark as settled by decoding with ffmpeg,
+/// mpg123 and LAME.
 #[test]
 fn short_blocks_find_the_bound_in_each_window() {
     for (fs, position) in [
@@ -205,6 +209,10 @@ fn short_blocks_find_the_bound_in_each_window() {
 /// ISO/IEC 11172-3, and bands 8 to 11 send position 2. A line in band 5 of
 /// the second window is not decoded in intensity stereo, in band 9 it is,
 /// and in band 1 of the first window, in the nonzero part, it is not.
+///
+/// This is the evidence, with `short_blocks_find_the_bound_in_each_window`,
+/// for marking the bands of each window apart, which the intensity stereo
+/// positions mark as settled by decoding with ffmpeg, mpg123 and LAME.
 #[test]
 fn short_blocks_mark_bands_in_each_window() {
     let fs = SamplingFrequency::Hz44100;
@@ -237,6 +245,10 @@ fn short_blocks_mark_bands_in_each_window() {
 /// The standard does not say how a decoder treats the lines above the
 /// highest band in intensity stereo. ffmpeg, mpg123 and LAME give them the
 /// position of that window's highest band, at 44.1 and 22.05 kHz.
+///
+/// This is the evidence for the position of the lines above the highest
+/// band of short blocks, which the intensity stereo positions mark as
+/// settled by decoding with ffmpeg, mpg123 and LAME.
 #[test]
 fn lines_above_the_short_bands_take_the_position_of_the_highest_band() {
     for (fs, highest) in [
