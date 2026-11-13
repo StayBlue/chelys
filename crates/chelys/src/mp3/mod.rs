@@ -17,6 +17,7 @@ use std::ops::Range;
 use crate::bitstream::BitWriter;
 use header::{Bitrate, Emphasis, Header, Mode, PaddingSchedule, SamplingFrequency};
 use huffman::{QuadTable, SpectrumCoding};
+use loops::scfsi::{self, GranuleSummary};
 use psychoacoustic::switching::BlockSwitching;
 use reservoir::Reservoir;
 use scalefactors::Scalefactors;
@@ -252,6 +253,15 @@ fn frame_contents(
         for (ch, channel) in granule.iter().enumerate() {
             let start = main_data.bit_len();
             let scalefactors = &channel.scalefactors;
+            // scfsi is sent once per frame and applies to its second granule.
+            if gr == 0 {
+                assert!(
+                    !scalefactors.scfsi.contains(&true),
+                    "the first granule of a frame sends all its scalefactors"
+                );
+            } else {
+                side_info.scfsi[ch] = scalefactors.scfsi;
+            }
             let scalefac_compress = scalefactors
                 .compress()
                 .expect("scalefactors within their limits");
@@ -331,6 +341,8 @@ pub fn encode_granules(config: &StreamConfig, granules: &[Vec<QuantizedGranule>]
 pub fn encode_pcm(config: &StreamConfig, channels: &[&[f64]]) -> Vec<u8> {
     let fs = config.sampling_frequency;
     let mut models: Vec<_> = channels.iter().map(|_| BlockSwitching::new(fs)).collect();
+    // Each channel's first granule of the frame, for scfsi in the second.
+    let mut first: Vec<Option<(GranuleSummary, Scalefactors)>> = vec![None; channels.len()];
     let reservoir = Reservoir::new(config.header(true).frame_len());
     encode_filtered(
         config,
@@ -340,12 +352,23 @@ pub fn encode_pcm(config: &StreamConfig, channels: &[&[f64]]) -> Vec<u8> {
             let masking = models[channel].granule(pcm)?;
             Some((masking.block_type(), masking))
         },
-        |masking, xr, mean_bits, reservoir| {
+        |channel, gr, masking, xr, mean_bits, reservoir| {
+            let block_type = masking.block_type();
             let xmin = masking.allowed_distortion(xr, fs);
             let available_bits = reservoir
                 .granule_bits(mean_bits, masking.perceptual_entropy())
                 .min(MAX_PART2_3_LENGTH);
-            loops::quantize_granule(xr, &xmin, masking.block_type(), available_bits, fs)
+            let summary = GranuleSummary::new(xr, &xmin, block_type, fs);
+            let reuse = match (gr, &first[channel]) {
+                (1, Some((first_summary, first_scalefactors))) => Some(loops::Reuse {
+                    first: first_scalefactors,
+                    scfsi: scfsi::select(first_summary, &summary),
+                }),
+                _ => None,
+            };
+            let granule = loops::quantize_granule(xr, &xmin, block_type, available_bits, fs, reuse);
+            first[channel] = (gr == 0).then(|| (summary, granule.scalefactors.clone()));
+            granule
         },
     )
 }
@@ -394,7 +417,7 @@ pub fn encode_with_block_types(
                 (block_type, block_type)
             })
         },
-        |block_type, xr, _, _| {
+        |_, _, block_type, xr, _, _| {
             let values = loops::quantize(xr, global_gain)
                 .unwrap_or_else(|| panic!("a granule is too loud for global_gain {global_gain}"));
             QuantizedGranule::new(global_gain, values, block_type, config.sampling_frequency)
@@ -408,15 +431,23 @@ pub fn encode_with_block_types(
 /// `look_ahead` is given each channel's PCM one granule ahead of the
 /// filterbank, starting with the first granule before any is filtered, and
 /// returns the block type and analysis of the granule before the one it is
-/// given: `None` only for the first. `quantize` is given that analysis, the
-/// granule's lines in the order they are sent, its share of the frame's main
-/// data and the bit reservoir, which accounts for the bits it then uses.
+/// given: `None` only for the first. `quantize` is given the channel, the
+/// granule's index in its frame, that analysis, the granule's lines in the
+/// order they are sent, its share of the frame's main data and the bit
+/// reservoir, which accounts for the bits it then uses.
 fn encode_filtered<A>(
     config: &StreamConfig,
     channels: &[&[f64]],
     mut reservoir: Reservoir,
     mut look_ahead: impl FnMut(usize, &[f64; GRANULE_LINES]) -> Option<(BlockType, A)>,
-    mut quantize: impl FnMut(A, &[f64; GRANULE_LINES], usize, &Reservoir) -> QuantizedGranule,
+    mut quantize: impl FnMut(
+        usize,
+        usize,
+        A,
+        &[f64; GRANULE_LINES],
+        usize,
+        &Reservoir,
+    ) -> QuantizedGranule,
 ) -> Vec<u8> {
     assert_eq!(
         channels.len(),
@@ -458,7 +489,7 @@ fn encode_filtered<A>(
                     BlockType::Short => scalefactor_bands::short_coding_order(&xr, fs),
                     _ => xr,
                 };
-                let quantized = quantize(analysis, &xr, mean_bits, &reservoir);
+                let quantized = quantize(channel, gr, analysis, &xr, mean_bits, &reservoir);
                 assert_eq!(quantized.block_type, block_type);
                 reservoir.granule_done(mean_bits, quantized.bit_len(fs));
                 granule.push(quantized);

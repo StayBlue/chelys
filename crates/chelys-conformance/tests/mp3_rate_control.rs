@@ -113,15 +113,15 @@ fn silence_codes_to_nothing() {
     assert!(decoded.samples.iter().all(|&s| s == 0.0));
 }
 
-/// The `main_data_begin` of each frame of a stream with unpadded and padded
-/// frames of MPEG-1 Layer III, read from the headers (clauses 2.4.2.3 and
+/// The side information of each frame of a stream with unpadded and padded
+/// frames of MPEG-1 Layer III, found from the headers (clauses 2.4.2.3 and
 /// 2.4.2.7).
-fn main_data_begins(stream: &[u8]) -> Vec<usize> {
+fn side_infos(stream: &[u8]) -> Vec<&[u8]> {
     const KBPS: [u32; 15] = [
         0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320,
     ];
     const HZ: [u32; 3] = [44_100, 48_000, 32_000];
-    let mut begins = Vec::new();
+    let mut side_infos = Vec::new();
     let mut at = 0;
     while at + 6 <= stream.len() {
         let header = &stream[at..];
@@ -130,11 +130,27 @@ fn main_data_begins(stream: &[u8]) -> Vec<usize> {
         let hz = HZ[usize::from((header[2] >> 2) & 3)];
         let padding = usize::from((header[2] >> 1) & 1);
         let crc = if header[1] & 1 == 0 { 2 } else { 0 };
-        let side_info = &header[4 + crc..];
-        begins.push((usize::from(side_info[0]) << 1) | usize::from(side_info[1] >> 7));
+        side_infos.push(&header[4 + crc..]);
         at += (144_000 * kbps / hz) as usize + padding;
     }
-    begins
+    side_infos
+}
+
+/// The `main_data_begin` of each frame.
+fn main_data_begins(stream: &[u8]) -> Vec<usize> {
+    side_infos(stream)
+        .iter()
+        .map(|side_info| (usize::from(side_info[0]) << 1) | usize::from(side_info[1] >> 7))
+        .collect()
+}
+
+/// The four `scfsi` bits of each frame of a single-channel stream, after the
+/// 9 bits of `main_data_begin` and 5 of `private_bits` (clause 2.4.1.7).
+fn single_channel_scfsi(stream: &[u8]) -> Vec<u8> {
+    side_infos(stream)
+        .iter()
+        .map(|side_info| ((side_info[1] & 0b11) << 2) | (side_info[2] >> 6))
+        .collect()
 }
 
 /// Quiet passages leave bits for the loud passages after them: main data
@@ -231,4 +247,25 @@ fn attacks_switch_to_short_blocks_and_shorten_pre_echo() {
             );
         }
     }
+}
+
+/// In steady passages the second granule of a frame takes over the first
+/// granule's scalefactors in some scfsi bands, and the stream still decodes
+/// as well as the bitrate allows.
+#[test]
+fn steady_tones_share_scalefactors_between_granules() {
+    let fs = SamplingFrequency::Hz44100;
+    let input = tones(44_100.0, 1.0);
+    let stream = encode_pcm(&config(128, fs, Mode::SingleChannel), &[&input]);
+    let scfsi = single_channel_scfsi(&stream);
+    let sharing = scfsi.iter().filter(|&&bits| bits != 0).count();
+    assert!(
+        sharing > scfsi.len() / 2,
+        "{sharing} of {} frames use scfsi: {scfsi:?}",
+        scfsi.len()
+    );
+    let decoded = ffmpeg::decode_mp3(&stream);
+    assert_eq!(decoded.diagnostics, "");
+    let snr = snr(&input, &decoded.samples, 1, 0);
+    assert!(snr > 25.0, "{snr:.1} dB");
 }

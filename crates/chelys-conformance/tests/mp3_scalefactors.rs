@@ -86,6 +86,24 @@ fn decode(
     scalefactors: &Scalefactors,
     gain_steps: u8,
 ) -> Vec<f32> {
+    decode_with_scfsi(
+        sampling_frequency,
+        spectra,
+        scalefactors,
+        gain_steps,
+        [false; 4],
+    )
+}
+
+/// [`decode`], with the second granule of each frame taking over the first
+/// granule's scalefactors in the scfsi bands of `scfsi`.
+fn decode_with_scfsi(
+    sampling_frequency: SamplingFrequency,
+    spectra: &[[i32; GRANULE_LINES]; 2],
+    scalefactors: &Scalefactors,
+    gain_steps: u8,
+    scfsi: [bool; 4],
+) -> Vec<f32> {
     let block_type = match scalefactors.scalefac {
         Scalefac::Long(_) => BlockType::Normal,
         Scalefac::Short(_) => BlockType::Short,
@@ -104,6 +122,11 @@ fn decode(
             let mut granule =
                 QuantizedGranule::new(global_gain, values, block_type, sampling_frequency);
             granule.scalefactors = scalefactors.clone();
+            granule
+        })
+        .zip([[false; 4], scfsi])
+        .map(|(mut granule, scfsi)| {
+            granule.scalefactors.scfsi = scfsi;
             vec![granule]
         })
         .cycle()
@@ -176,7 +199,7 @@ fn scalefactors_divide_their_bands() {
             let scalefactors = Scalefactors {
                 scalefac: Scalefac::Long([scalefac; LONG_BANDS]),
                 scalefac_scale,
-                preflag: false,
+                ..Scalefactors::default()
             };
             let gain_steps = if scalefac_scale { 4 } else { 2 } * scalefac;
             variants.push(("uniform", scalefactors, gain_steps));
@@ -245,6 +268,38 @@ fn short_scalefactors_divide_their_band_and_window() {
                 &samples,
                 &expected,
             );
+        }
+    }
+}
+
+/// With `scfsi` set, the second granule of a frame does not send the
+/// scalefactors of that scfsi band but takes over the first granule's
+/// (clauses 2.4.1.7 and 2.4.2.7). Encoded either way, the same scalefactors
+/// decode alike.
+#[test]
+fn scfsi_takes_over_the_first_granules_scalefactors() {
+    for fs in SamplingFrequency::ALL {
+        let mut rng = Rng(0x5CF5_1000);
+        let spectra = [
+            spectrum(&mut rng, BlockType::Normal, fs),
+            spectrum(&mut rng, BlockType::Normal, fs),
+        ];
+        let mut scalefactors = Scalefactors {
+            scalefac_scale: true,
+            ..Scalefactors::default()
+        };
+        for scalefac in scalefactors.values_mut() {
+            *scalefac = 4 * rng.next(2) as u8;
+        }
+        let expected = decode(fs, &spectra, &scalefactors, 0);
+        for scfsi in [
+            [true, false, false, false],
+            [false, true, true, false],
+            [false, false, false, true],
+            [true; 4],
+        ] {
+            let samples = decode_with_scfsi(fs, &spectra, &scalefactors, 0, scfsi);
+            assert_close(&format!("{fs:?} scfsi {scfsi:?}"), &samples, &expected);
         }
     }
 }

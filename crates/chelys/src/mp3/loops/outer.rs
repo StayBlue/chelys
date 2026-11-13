@@ -1,11 +1,20 @@
 //! The outer iteration loop, or distortion control loop (clause C.1.5.4.3,
-//! figure C.9.b), without `scfsi`.
+//! figure C.9.b).
 
 use super::inner::{inner_loop, step_size};
 use crate::mp3::header::SamplingFrequency;
 use crate::mp3::scalefactor_bands::{self, Band, LONG_BANDS};
 use crate::mp3::scalefactors::{PRETAB, Scalefactors};
+use crate::mp3::side_info::SCFSI_BANDS;
 use crate::mp3::{BlockType, GRANULE_LINES, QuantizedGranule};
+
+/// The scalefactors of a frame's first granule, and the scfsi bands in which
+/// the second granule takes them over (clause C.1.5.4.2.3).
+#[derive(Clone, Copy, Debug)]
+pub struct Reuse<'a> {
+    pub first: &'a Scalefactors,
+    pub scfsi: [bool; SCFSI_BANDS],
+}
 
 /// The upper scalefactor bands whose distortion decides preemphasis.
 const PREEMPHASIS_BANDS: std::ops::Range<usize> = LONG_BANDS - 4..LONG_BANDS;
@@ -38,6 +47,16 @@ const PREEMPHASIS_BANDS: std::ops::Range<usize> = LONG_BANDS - 4..LONG_BANDS;
 /// the first inner loop, all of the upper four bands exceed their `xmin`.
 /// Short blocks never use it (clause 2.4.2.7).
 ///
+/// With `reuse` in at least one scfsi band, the second granule of a frame
+/// takes over the first granule's `preflag` and `scalefac_scale`
+/// (`ifqstep`), and its scalefactors in those bands, which are then never
+/// amplified (clauses C.1.5.4.3.4 and C.1.5.4.3.5). Spec reading: as those
+/// bands cannot be amplified, their distortion does not keep the loop going;
+/// and as `ifqstep` must stay that of the first granule, the loop stops,
+/// rather than switching `scalefac_scale`, when a scalefactor would pass its
+/// limit. Should the lines not quantise at all with the scalefactors taken
+/// over, the granule is coded without `scfsi`.
+///
 /// `scalefac_scale` starts at 0. Clause C.1.5.4.3 switches it to 1 when the
 /// scalefactors would otherwise pass their limits (figure C.9.b leaves this
 /// out). Spec gap: the clause says only that the scalefactors are then
@@ -59,10 +78,23 @@ pub fn outer_loop(
     block_type: BlockType,
     available_bits: usize,
     sampling_frequency: SamplingFrequency,
+    reuse: Option<Reuse>,
 ) -> QuantizedGranule {
     let bands = scalefactor_bands::coding_bands(block_type, sampling_frequency);
     assert_eq!(xmin.len(), bands.len(), "one xmin per scalefactor");
+    let reuse = reuse.filter(|reuse| reuse.scfsi.contains(&true));
     let mut scalefactors = Scalefactors::new(block_type);
+    if let Some(reuse) = reuse {
+        assert_ne!(block_type, BlockType::Short, "short blocks have no scfsi");
+        scalefactors.preflag = reuse.first.preflag;
+        scalefactors.scalefac_scale = reuse.first.scalefac_scale;
+        scalefactors.scfsi = reuse.scfsi;
+        for (sb, scalefac) in scalefactors.values_mut().iter_mut().enumerate() {
+            if reuse.scfsi[crate::mp3::scalefactors::scfsi_band(sb)] {
+                *scalefac = reuse.first.values()[sb];
+            }
+        }
+    }
     let mut saved: Option<QuantizedGranule> = None;
     let mut start_gain = None;
 
@@ -77,6 +109,16 @@ pub fn outer_loop(
                 inner_loop(&amplified, bits, block_type, sampling_frequency, start_gain)
             });
         let Some(mut granule) = granule else {
+            if saved.is_none() && reuse.is_some() {
+                return outer_loop(
+                    xr,
+                    xmin,
+                    block_type,
+                    available_bits,
+                    sampling_frequency,
+                    None,
+                );
+            }
             return saved.expect("lines without scalefactors always quantise");
         };
         granule.scalefactors = scalefactors.clone();
@@ -89,7 +131,8 @@ pub fn outer_loop(
                 .collect()
         };
         let measured_against = allowed_for(&scalefactors);
-        let violated = (0..bands.len()).any(|sb| distortion[sb] > measured_against[sb]);
+        let violated = (0..bands.len())
+            .any(|sb| scalefactors.sent(sb) && distortion[sb] > measured_against[sb]);
         let first = saved.is_none();
         saved = Some(granule);
 
@@ -97,6 +140,7 @@ pub fn outer_loop(
         // preemphasised bands along with their lines.
         if first
             && block_type != BlockType::Short
+            && reuse.is_none()
             && PREEMPHASIS_BANDS
                 .clone()
                 .all(|sb| distortion[sb] > measured_against[sb])
@@ -106,8 +150,9 @@ pub fn outer_loop(
 
         // C.1.5.4.3.5: amplify the bands with more than the allowed distortion.
         let allowed = allowed_for(&scalefactors);
+        let sent: Vec<bool> = (0..bands.len()).map(|sb| scalefactors.sent(sb)).collect();
         for (sb, scalefac) in scalefactors.values_mut().iter_mut().enumerate() {
-            if allowed[sb] - distortion[sb] < 0.0 {
+            if sent[sb] && allowed[sb] - distortion[sb] < 0.0 {
                 *scalefac += 1;
             }
         }
@@ -117,7 +162,7 @@ pub fn outer_loop(
             break;
         }
         if exceeds_limits(&scalefactors) {
-            if scalefactors.scalefac_scale {
+            if scalefactors.scalefac_scale || reuse.is_some() {
                 break;
             }
             scalefactors = coarser(&scalefactors);
@@ -170,7 +215,8 @@ fn distortion(
 }
 
 fn exceeds_limits(scalefactors: &Scalefactors) -> bool {
-    (scalefactors.values().iter().enumerate()).any(|(sb, &s)| s > scalefactors.limit(sb))
+    (scalefactors.values().iter().enumerate())
+        .any(|(sb, &s)| scalefactors.sent(sb) && s > scalefactors.limit(sb))
 }
 
 /// The scalefactors with `scalefac_scale` set: each band gets the smallest
@@ -218,6 +264,7 @@ mod tests {
             BlockType::Normal,
             1500,
             FS,
+            None,
         );
         assert_eq!(granule.scalefactors, Scalefactors::default());
         let inner = inner_loop(&xr, 1500, BlockType::Normal, FS, None).unwrap();
@@ -240,7 +287,7 @@ mod tests {
                 f64::INFINITY
             }
         });
-        let granule = outer_loop(&xr, &xmin, BlockType::Normal, 1500, FS);
+        let granule = outer_loop(&xr, &xmin, BlockType::Normal, 1500, FS, None);
         assert!(total_bits(&granule) <= 1500);
         for sb in 4..8 {
             assert!(granule.scalefactors.values()[sb] > 0, "band {sb}");
@@ -257,7 +304,7 @@ mod tests {
     fn ends_within_the_limits_when_nothing_can_be_met() {
         let xr = spectrum();
         for bits in [60, 300, 1500, 4000] {
-            let granule = outer_loop(&xr, &[0.0; LONG_BANDS], BlockType::Normal, bits, FS);
+            let granule = outer_loop(&xr, &[0.0; LONG_BANDS], BlockType::Normal, bits, FS, None);
             assert!(total_bits(&granule) <= bits, "{bits}");
             assert!(granule.scalefactors.compress().is_some(), "{bits}");
         }
@@ -279,16 +326,75 @@ mod tests {
             }
         });
         assert!(
-            outer_loop(&xr, &xmin, BlockType::Normal, 1500, FS)
+            outer_loop(&xr, &xmin, BlockType::Normal, 1500, FS, None)
                 .scalefactors
                 .preflag
         );
         let mut xmin = xmin;
         xmin[LONG_BANDS - 1] = f64::INFINITY;
         assert!(
-            !outer_loop(&xr, &xmin, BlockType::Normal, 1500, FS)
+            !outer_loop(&xr, &xmin, BlockType::Normal, 1500, FS, None)
                 .scalefactors
                 .preflag
+        );
+    }
+
+    /// The second granule takes over the first granule's scalefactors in
+    /// the scfsi bands and its `preflag` and `scalefac_scale`, and never
+    /// amplifies those bands, however far their distortion exceeds `xmin`.
+    /// The loop still ends, within its bits.
+    #[test]
+    fn scfsi_bands_keep_the_first_granules_scalefactors() {
+        let xr = spectrum();
+        let mut first = Scalefactors {
+            preflag: true,
+            ..Scalefactors::default()
+        };
+        for (sb, scalefac) in first.values_mut().iter_mut().enumerate() {
+            *scalefac = (sb % 4) as u8;
+        }
+        let scfsi = [true, false, true, false];
+        for bits in [300, 1500] {
+            let reuse = Reuse {
+                first: &first,
+                scfsi,
+            };
+            let granule = outer_loop(
+                &xr,
+                &[0.0; LONG_BANDS],
+                BlockType::Normal,
+                bits,
+                FS,
+                Some(reuse),
+            );
+            let scalefactors = &granule.scalefactors;
+            assert_eq!(scalefactors.scfsi, scfsi);
+            assert!(scalefactors.preflag && !scalefactors.scalefac_scale);
+            for sb in (0..6).chain(11..16) {
+                assert_eq!(scalefactors.values()[sb], first.values()[sb], "band {sb}");
+            }
+            assert!((6..11).any(|sb| scalefactors.values()[sb] != first.values()[sb]));
+            assert!(total_bits(&granule) <= bits, "{bits}");
+        }
+    }
+
+    /// Without any scfsi band, reuse changes nothing.
+    #[test]
+    fn reuse_without_scfsi_is_ignored() {
+        let xr = spectrum();
+        let first = Scalefactors {
+            preflag: true,
+            scalefac_scale: true,
+            ..Scalefactors::default()
+        };
+        let reuse = Reuse {
+            first: &first,
+            scfsi: [false; SCFSI_BANDS],
+        };
+        let xmin = [1e-9; LONG_BANDS];
+        assert_eq!(
+            outer_loop(&xr, &xmin, BlockType::Normal, 1500, FS, Some(reuse)),
+            outer_loop(&xr, &xmin, BlockType::Normal, 1500, FS, None)
         );
     }
 

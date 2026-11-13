@@ -5,6 +5,19 @@
 use crate::bitstream::BitWriter;
 use crate::mp3::BlockType;
 use crate::mp3::scalefactor_bands::{LONG_BANDS, SHORT_BANDS, SHORT_WINDOWS};
+use crate::mp3::side_info::SCFSI_BANDS;
+
+/// The long scalefactor bands of each scfsi band: `SCFSI_STARTS[band]` up to
+/// `SCFSI_STARTS[band + 1]` (clause 2.4.2.7).
+pub const SCFSI_STARTS: [usize; SCFSI_BANDS + 1] = [0, 6, 11, 16, 21];
+
+/// The scfsi band of long scalefactor band `sb`.
+pub fn scfsi_band(sb: usize) -> usize {
+    SCFSI_STARTS[1..]
+        .iter()
+        .position(|&end| sb < end)
+        .expect("a long scalefactor band")
+}
 
 /// Long scalefactor bands 0 to 10 are sent with `slen1` bits, 11 to 20 with
 /// `slen2`; short bands 0 to 5 with `slen1`, 6 to 11 with `slen2` (clause
@@ -54,6 +67,10 @@ pub struct Scalefactors {
     /// Never set for short blocks (clause 2.4.2.7).
     pub preflag: bool,
     pub scalefac_scale: bool,
+    /// The scfsi bands whose scalefactors the second granule of a frame takes
+    /// over from the first, and so does not send (clause 2.4.2.7). Always
+    /// clear in the first granule and for short blocks.
+    pub scfsi: [bool; SCFSI_BANDS],
 }
 
 impl Default for Scalefactors {
@@ -73,7 +90,26 @@ impl Scalefactors {
             scalefac,
             preflag: false,
             scalefac_scale: false,
+            scfsi: [false; SCFSI_BANDS],
         }
+    }
+
+    /// Whether scalefactor `index` of [`values`](Self::values) is sent, rather
+    /// than taken over from the first granule.
+    pub fn sent(&self, index: usize) -> bool {
+        match self.scalefac {
+            Scalefac::Long(_) => !self.scfsi[scfsi_band(index)],
+            Scalefac::Short(_) => true,
+        }
+    }
+
+    /// The scalefactors sent with `slen1` and with `slen2`.
+    fn sent_values(&self) -> (Vec<u8>, Vec<u8>) {
+        let sent = (self.values().iter().enumerate()).filter(|&(index, _)| self.sent(index));
+        let (low, high): (Vec<_>, Vec<_>) =
+            sent.partition(|&(index, _)| index < self.slen1_count());
+        let values = |pairs: Vec<(usize, &u8)>| pairs.into_iter().map(|(_, &v)| v).collect();
+        (values(low), values(high))
     }
 
     /// The scalefactors in the order they are sent: `scalefac_l[sfb]` at
@@ -137,16 +173,16 @@ impl Scalefactors {
         (self.multiplier() * steps).exp2()
     }
 
-    /// The `scalefac_compress` whose field widths hold the scalefactors in
-    /// the fewest bits, or `None` if a scalefactor is above its
+    /// The `scalefac_compress` whose field widths hold the scalefactors sent
+    /// in the fewest bits, or `None` if one is above its
     /// [`limit`](Self::limit).
     pub fn compress(&self) -> Option<u8> {
         let bits = |values: &[u8]| {
             let max = values.iter().copied().max().unwrap_or(0);
             u8::BITS - max.leading_zeros()
         };
-        let (low, high) = self.values().split_at(self.slen1_count());
-        let (need1, need2) = (bits(low), bits(high));
+        let (low, high) = self.sent_values();
+        let (need1, need2) = (bits(&low), bits(&high));
         (0..16u8)
             .filter(|&c| {
                 let (slen1, slen2) = SCALEFAC_COMPRESS[usize::from(c)];
@@ -155,15 +191,18 @@ impl Scalefactors {
             .min_by_key(|&c| self.part2_length(c))
     }
 
-    /// Writes the scalefactors of a granule without `scfsi` (clause 2.4.1.7)
-    /// with the field widths of `scalefac_compress`.
+    /// Writes the scalefactors sent (clause 2.4.1.7) with the field widths of
+    /// `scalefac_compress`.
     ///
     /// # Panics
     ///
-    /// If a scalefactor does not fit its field.
+    /// If a scalefactor sent does not fit its field.
     pub fn write(&self, scalefac_compress: u8, w: &mut BitWriter) {
         let (slen1, slen2) = SCALEFAC_COMPRESS[usize::from(scalefac_compress)];
         for (index, &scalefac) in self.values().iter().enumerate() {
+            if !self.sent(index) {
+                continue;
+            }
             let slen = if index < self.slen1_count() {
                 slen1
             } else {
@@ -177,15 +216,14 @@ impl Scalefactors {
         }
     }
 
-    /// `part2_length` without `scfsi`: the scalefactors sent with `slen1`
-    /// times `slen1` plus the rest times `slen2`, `11 * slen1 + 10 * slen2`
-    /// for long blocks and `18 * slen1 + 18 * slen2` for short ones (clause
-    /// 2.4.2.7).
+    /// `part2_length`: the scalefactors sent with `slen1` times `slen1` plus
+    /// those sent with `slen2` times `slen2`; without `scfsi`, `11 * slen1 +
+    /// 10 * slen2` for long blocks and `18 * slen1 + 18 * slen2` for short
+    /// ones (clause 2.4.2.7).
     pub fn part2_length(&self, scalefac_compress: u8) -> usize {
         let (slen1, slen2) = SCALEFAC_COMPRESS[usize::from(scalefac_compress)];
-        let count1 = self.slen1_count();
-        let count2 = self.values().len() - count1;
-        count1 * slen1 as usize + count2 * slen2 as usize
+        let (low, high) = self.sent_values();
+        low.len() * slen1 as usize + high.len() * slen2 as usize
     }
 }
 
@@ -248,6 +286,24 @@ mod tests {
         scalefactors.scalefac_scale = true;
         assert_eq!(scalefactors.amplification(18), 32.0);
         assert_eq!(scalefactors.amplification(0), 1.0);
+    }
+
+    /// With scfsi, the scfsi bands' scalefactors are neither sent nor
+    /// counted, nor do they limit the field widths.
+    #[test]
+    fn scfsi_bands_are_not_sent() {
+        let mut scalefactors = Scalefactors::default();
+        scalefactors.values_mut()[2] = 15;
+        scalefactors.values_mut()[12] = 1;
+        scalefactors.scfsi = [true, false, false, false];
+        // Bands 0 to 5 are not sent: slen1 needs no bits for bands 6 to 10.
+        let compress = scalefactors.compress().unwrap();
+        assert_eq!(SCALEFAC_COMPRESS[usize::from(compress)], (0, 1));
+        assert_eq!(scalefactors.part2_length(compress), 10);
+        let mut w = BitWriter::new();
+        scalefactors.write(compress, &mut w);
+        assert_eq!(w.bit_len(), 10);
+        assert_eq!((scfsi_band(5), scfsi_band(6), scfsi_band(20)), (0, 1, 3));
     }
 
     /// Short blocks send 36 scalefactors, `scalefac_s[sfb][window]` with
