@@ -5,9 +5,11 @@
 > been compared with that of established encoders, and its API may change at
 > any time.
 
-chelys is an MP3 encoder: it encodes PCM audio as MPEG-1 Audio Layer III. It
-is written from the standard, ISO/IEC 11172-3, alone, without reference to the
-source code of other encoders or decoders.
+chelys is an MP3 encoder: it encodes PCM audio as MPEG-1 Audio Layer III, and
+at the lower sampling frequencies of 16, 22.05 and 24 kHz as MPEG-2 Audio
+Layer III. It is written from the standards, ISO/IEC 11172-3 and ISO/IEC
+13818-3, alone, without reference to the source code of other encoders or
+decoders.
 
 ## Usage
 
