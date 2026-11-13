@@ -3,6 +3,7 @@
 mod crc;
 pub mod header;
 pub mod huffman;
+pub mod scalefactor_bands;
 pub mod side_info;
 
 use crate::bitstream::BitWriter;
