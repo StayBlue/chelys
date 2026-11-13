@@ -1,8 +1,8 @@
 // Copyright (c) 2026 StayBlue
 // SPDX-License-Identifier: MIT
 
-use chelys::mp3::header::{Bitrate, Mode, SamplingFrequency};
-use chelys::mp3::{SAMPLES_PER_FRAME, StreamConfig, encode_silence};
+use chelys::mp3::header::{Bitrate, Mode, SamplingFrequency, Version};
+use chelys::mp3::{StreamConfig, encode_silence};
 use chelys_conformance::ffmpeg::{self, StreamInfo};
 
 #[test]
@@ -18,7 +18,7 @@ fn ffmpeg_decodes_silence_in_every_configuration() {
     ];
     let frames = 50;
     for sampling_frequency in SamplingFrequency::ALL {
-        for bitrate in Bitrate::all() {
+        for bitrate in Bitrate::all(sampling_frequency.version()) {
             for mode in modes {
                 for crc_protected in [false, true] {
                     let config = StreamConfig {
@@ -40,7 +40,7 @@ fn ffmpeg_decodes_silence_in_every_configuration() {
                     assert_eq!(decoded.diagnostics, "", "{config:?}");
                     assert_eq!(
                         decoded.samples.len(),
-                        frames * SAMPLES_PER_FRAME * mode.channels(),
+                        frames * sampling_frequency.version().samples_per_frame() * mode.channels(),
                         "{config:?}"
                     );
                     assert!(decoded.samples.iter().all(|&s| s == 0.0), "{config:?}");
@@ -55,7 +55,7 @@ fn ffmpeg_decodes_silence_in_every_configuration() {
 #[test]
 fn ffmpeg_reports_a_corrupted_crc() {
     let config = StreamConfig {
-        bitrate: Bitrate::from_kbps(128).unwrap(),
+        bitrate: Bitrate::from_kbps(Version::Mpeg1, 128).unwrap(),
         sampling_frequency: SamplingFrequency::Hz44100,
         mode: Mode::Stereo,
         crc_protected: true,

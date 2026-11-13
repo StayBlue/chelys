@@ -111,7 +111,7 @@ pub fn outer_loop(
         reuse.is_none() || intensity.is_none(),
         "intensity stereo positions are not taken over with scfsi"
     );
-    let mut scalefactors = Scalefactors::new(block_type);
+    let mut scalefactors = Scalefactors::new(block_type, sampling_frequency.version());
     if let Some(reuse) = reuse {
         assert_ne!(block_type, BlockType::Short, "short blocks have no scfsi");
         scalefactors.preflag = reuse.first.preflag;

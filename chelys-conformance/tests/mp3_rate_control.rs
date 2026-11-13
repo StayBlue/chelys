@@ -12,7 +12,7 @@ use chelys_conformance::ffmpeg;
 
 fn config(kbps: u32, sampling_frequency: SamplingFrequency, mode: Mode) -> StreamConfig {
     StreamConfig {
-        bitrate: Bitrate::from_kbps(kbps).unwrap(),
+        bitrate: Bitrate::from_kbps(sampling_frequency.version(), kbps).unwrap(),
         sampling_frequency,
         mode,
         crc_protected: false,
@@ -62,6 +62,35 @@ fn quality_rises_with_the_bitrate() {
         "SNR by bitrate: {snrs:?}"
     );
     assert!(snrs[3] > 40.0, "SNR by bitrate: {snrs:?}");
+}
+
+/// At the lower sampling frequencies too, with frames of one granule and
+/// the bitrates and scalefactor bands of ISO/IEC 13818-3. (From about 64
+/// kbit/s up, these tones in one channel reach some 78 dB, the finest the
+/// quantizer goes.)
+#[test]
+fn quality_rises_with_the_bitrate_at_the_lower_sampling_frequencies() {
+    for fs in [
+        SamplingFrequency::Hz16000,
+        SamplingFrequency::Hz22050,
+        SamplingFrequency::Hz24000,
+    ] {
+        let input = tones(f64::from(fs.hz()), 1.0);
+        let snrs: Vec<f64> = [16, 24, 32, 48]
+            .into_iter()
+            .map(|kbps| {
+                let stream = encode_pcm(&config(kbps, fs, Mode::SingleChannel), &[&input]);
+                let decoded = ffmpeg::decode_mp3(&stream);
+                assert_eq!(decoded.diagnostics, "", "{fs:?} at {kbps} kbit/s");
+                snr(&input, &decoded.samples, 1, 0)
+            })
+            .collect();
+        assert!(
+            snrs.windows(2).all(|w| w[1] > w[0]),
+            "{fs:?}: SNR by bitrate: {snrs:?}"
+        );
+        assert!(snrs[3] > 40.0, "{fs:?}: SNR by bitrate: {snrs:?}");
+    }
 }
 
 /// Full-scale white noise is the hardest signal to fit; at the lowest bitrate
@@ -304,14 +333,22 @@ fn intensity_stereo_frames(stream: &[u8]) -> Vec<bool> {
         .collect()
 }
 
+/// The length of a frame from its header: MPEG-1 Layer III (clause 2.4.2.3),
+/// or with `ID` 0 the lower sampling frequencies, whose frames hold half as
+/// many slots (clause 2.4.2.3 of ISO/IEC 13818-3).
 fn frame_len(header: &[u8]) -> usize {
-    const KBPS: [u32; 15] = [
-        0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320,
+    const KBPS: [[u32; 15]; 2] = [
+        [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160],
+        [
+            0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320,
+        ],
     ];
-    const HZ: [u32; 3] = [44_100, 48_000, 32_000];
-    let kbps = KBPS[usize::from(header[2] >> 4)];
-    let hz = HZ[usize::from((header[2] >> 2) & 3)];
-    (144_000 * kbps / hz) as usize + usize::from((header[2] >> 1) & 1)
+    const HZ: [[u32; 3]; 2] = [[22_050, 24_000, 16_000], [44_100, 48_000, 32_000]];
+    let id = usize::from(header[1] >> 3 & 1);
+    let kbps = KBPS[id][usize::from(header[2] >> 4)];
+    let hz = HZ[id][usize::from((header[2] >> 2) & 3)];
+    let slots_per_kbit = if id == 1 { 144_000 } else { 72_000 };
+    (slots_per_kbit * kbps / hz) as usize + usize::from((header[2] >> 1) & 1)
 }
 
 /// With joint stereo, frames whose channels are alike are coded in MS
@@ -377,6 +414,29 @@ fn alike_channels_use_ms_stereo() {
     ] {
         let stream = encode_pcm(&config(64, fs, joint), &channels);
         assert!(ms_stereo_frames(&stream).iter().all(|&on| !on), "{label}");
+    }
+}
+
+/// MS stereo works the same at the lower sampling frequencies.
+#[test]
+fn alike_channels_use_ms_stereo_at_the_lower_sampling_frequencies() {
+    let fs = SamplingFrequency::Hz22050;
+    let joint = Mode::JointStereo {
+        intensity_stereo: false,
+        ms_stereo: true,
+    };
+    let both = tones(22_050.0, 1.0);
+    let stream = encode_pcm(&config(32, fs, joint), &[&both, &both]);
+    let ms = ms_stereo_frames(&stream);
+    assert!(
+        ms.iter().filter(|&&on| on).count() > ms.len() * 9 / 10,
+        "{ms:?}"
+    );
+    let decoded = ffmpeg::decode_mp3(&stream);
+    assert_eq!(decoded.diagnostics, "");
+    for channel in 0..2 {
+        let snr = snr(&both, &decoded.samples, 2, channel);
+        assert!(snr > 20.0, "channel {channel}: {snr:.1} dB");
     }
 }
 

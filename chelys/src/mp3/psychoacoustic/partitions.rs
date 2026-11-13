@@ -95,6 +95,9 @@ pub fn partitions(sampling_frequency: SamplingFrequency) -> &'static [Partition]
         SamplingFrequency::Hz48000 => &PARTITIONS_48000,
         SamplingFrequency::Hz44100 => &PARTITIONS_44100,
         SamplingFrequency::Hz32000 => &PARTITIONS_32000,
+        SamplingFrequency::Hz24000 => &PARTITIONS_24000,
+        SamplingFrequency::Hz22050 => &PARTITIONS_22050,
+        SamplingFrequency::Hz16000 => &PARTITIONS_16000,
     }
 }
 
@@ -103,6 +106,9 @@ pub fn band_weights(sampling_frequency: SamplingFrequency) -> &'static [BandWeig
         SamplingFrequency::Hz48000 => &BANDS_48000,
         SamplingFrequency::Hz44100 => &BANDS_44100,
         SamplingFrequency::Hz32000 => &BANDS_32000,
+        SamplingFrequency::Hz24000 => &BANDS_24000,
+        SamplingFrequency::Hz22050 => &BANDS_22050,
+        SamplingFrequency::Hz16000 => &BANDS_16000,
     }
 }
 
@@ -113,12 +119,17 @@ pub fn band_weights(sampling_frequency: SamplingFrequency) -> &'static [BandWeig
 /// long-block table for the same sampling frequency (C.7.a to C.7.c),
 /// although the short partitions have other Bark values. It does not match
 /// the reciprocal of the spreading function summed over the short
-/// partitions, as the long tables' column does (clause D.2.4 f)).
+/// partitions, as the long tables' column does (clause D.2.4 f)). Tables
+/// D.3.d to D.3.f of ISO/IEC 13818-3 print a column of their own, as they
+/// do for long blocks.
 pub fn short_partitions(sampling_frequency: SamplingFrequency) -> &'static [ShortPartition] {
     match sampling_frequency {
         SamplingFrequency::Hz48000 => &SHORT_PARTITIONS_48000,
         SamplingFrequency::Hz44100 => &SHORT_PARTITIONS_44100,
         SamplingFrequency::Hz32000 => &SHORT_PARTITIONS_32000,
+        SamplingFrequency::Hz24000 => &SHORT_PARTITIONS_24000,
+        SamplingFrequency::Hz22050 => &SHORT_PARTITIONS_22050,
+        SamplingFrequency::Hz16000 => &SHORT_PARTITIONS_16000,
     }
 }
 
@@ -129,6 +140,9 @@ pub fn short_band_weights(
         SamplingFrequency::Hz48000 => &SHORT_BANDS_48000,
         SamplingFrequency::Hz44100 => &SHORT_BANDS_44100,
         SamplingFrequency::Hz32000 => &SHORT_BANDS_32000,
+        SamplingFrequency::Hz24000 => &SHORT_BANDS_24000,
+        SamplingFrequency::Hz22050 => &SHORT_BANDS_22050,
+        SamplingFrequency::Hz16000 => &SHORT_BANDS_16000,
     }
 }
 
@@ -721,13 +735,6 @@ const SHORT_BANDS_32000: [BandWeights; SHORT_BANDS] = band_weights_from([
 
 // Table D.3.a of ISO/IEC 13818-3, 24 kHz long blocks.
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the LSF sampling frequencies are not supported yet"
-    )
-)]
 const PARTITIONS_24000: [Partition; 60] = partitions_from([
     (0, 2, 15.0, 17.8250179, 0.697374165, 0.236874461),
     (1, 2, 15.0, 17.8250179, 0.455024809, 0.71016103),
@@ -793,13 +800,6 @@ const PARTITIONS_24000: [Partition; 60] = partitions_from([
 
 // Table D.3.b of ISO/IEC 13818-3, 22.05 kHz long blocks.
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the LSF sampling frequencies are not supported yet"
-    )
-)]
 const PARTITIONS_22050: [Partition; 60] = partitions_from([
     (0, 2, 15.0, 17.8250179, 0.658683598, 0.217637643),
     (1, 2, 15.0, 17.8250179, 0.432554901, 0.652563453),
@@ -865,13 +865,6 @@ const PARTITIONS_22050: [Partition; 60] = partitions_from([
 
 // Table D.3.c of ISO/IEC 13818-3, 16 kHz long blocks.
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the LSF sampling frequencies are not supported yet"
-    )
-)]
 const PARTITIONS_16000: [Partition; 56] = partitions_from([
     (0, 3, 15.0, 26.7375278, 0.697374165, 0.236874461),
     (1, 3, 15.0, 26.7375278, 0.455024809, 0.71016103),
@@ -933,13 +926,6 @@ const PARTITIONS_16000: [Partition; 56] = partitions_from([
 
 // Table D.3.d of ISO/IEC 13818-3, 24 kHz short blocks.
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the LSF sampling frequencies are not supported yet"
-    )
-)]
 const SHORT_PARTITIONS_24000: [ShortPartition; 45] = short_partitions_from_ratios([
     (0, 1, 8.91250896, 0.971850038, 0.150000006, 0.0),
     (1, 1, 8.91250896, 0.874727964, 0.150000006, 0.946573138),
@@ -990,13 +976,6 @@ const SHORT_PARTITIONS_24000: [ShortPartition; 45] = short_partitions_from_ratio
 
 // Table D.3.e of ISO/IEC 13818-3, 22.05 kHz short blocks.
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the LSF sampling frequencies are not supported yet"
-    )
-)]
 const SHORT_PARTITIONS_22050: [ShortPartition; 45] = short_partitions_from_ratios([
     (0, 1, 8.91250896, 0.954045713, 0.150000006, 0.0),
     (1, 1, 8.91250896, 0.833381653, 0.150000006, 0.869851649),
@@ -1047,13 +1026,6 @@ const SHORT_PARTITIONS_22050: [ShortPartition; 45] = short_partitions_from_ratio
 
 // Table D.3.f of ISO/IEC 13818-3, 16 kHz short blocks.
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the LSF sampling frequencies are not supported yet"
-    )
-)]
 const SHORT_PARTITIONS_16000: [ShortPartition; 46] = short_partitions_from_ratios([
     (0, 1, 8.91250896, 0.834739447, 0.150000006, 0.0),
     (1, 1, 8.91250896, 0.623757005, 0.150000006, 0.631518543),
@@ -1105,13 +1077,6 @@ const SHORT_PARTITIONS_16000: [ShortPartition; 46] = short_partitions_from_ratio
 
 // Table D.4.a of ISO/IEC 13818-3, 24 kHz long blocks.
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the LSF sampling frequencies are not supported yet"
-    )
-)]
 const BANDS_24000: [BandWeights; LONG_BANDS] = band_weights_from([
     (0, 0, 3, 1.0, 0.916666746),
     (1, 3, 6, 0.083333254, 0.583333492),
@@ -1143,13 +1108,6 @@ const BANDS_24000: [BandWeights; LONG_BANDS] = band_weights_from([
 // which adds up to 1 with `w1` of band 14, as the weights of every other
 // partition shared by two bands do.
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the LSF sampling frequencies are not supported yet"
-    )
-)]
 const BANDS_22050: [BandWeights; LONG_BANDS] = band_weights_from([
     (0, 0, 3, 1.0, 0.916666746),
     (1, 3, 6, 0.083333254, 0.583333492),
@@ -1176,13 +1134,6 @@ const BANDS_22050: [BandWeights; LONG_BANDS] = band_weights_from([
 
 // Table D.4.c of ISO/IEC 13818-3, 16 kHz long blocks.
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the LSF sampling frequencies are not supported yet"
-    )
-)]
 const BANDS_16000: [BandWeights; LONG_BANDS] = band_weights_from([
     (0, 0, 2, 1.0, 0.944444478),
     (1, 2, 4, 0.055555504, 0.722222328),
@@ -1209,13 +1160,6 @@ const BANDS_16000: [BandWeights; LONG_BANDS] = band_weights_from([
 
 // Table D.4.d of ISO/IEC 13818-3, 24 kHz short blocks.
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the LSF sampling frequencies are not supported yet"
-    )
-)]
 const SHORT_BANDS_24000: [BandWeights; SHORT_BANDS] = band_weights_from([
     (0, 0, 4, 1.0, 0.166666746),
     (1, 4, 6, 0.833333254, 0.833333492),
@@ -1233,13 +1177,6 @@ const SHORT_BANDS_24000: [BandWeights; SHORT_BANDS] = band_weights_from([
 
 // Table D.4.e of ISO/IEC 13818-3, 22.05 kHz short blocks.
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the LSF sampling frequencies are not supported yet"
-    )
-)]
 const SHORT_BANDS_22050: [BandWeights; SHORT_BANDS] = band_weights_from([
     (0, 0, 4, 1.0, 0.166666746),
     (1, 4, 6, 0.833333254, 0.833333492),
@@ -1257,13 +1194,6 @@ const SHORT_BANDS_22050: [BandWeights; SHORT_BANDS] = band_weights_from([
 
 // Table D.4.f of ISO/IEC 13818-3, 16 kHz short blocks.
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the LSF sampling frequencies are not supported yet"
-    )
-)]
 const SHORT_BANDS_16000: [BandWeights; SHORT_BANDS] = band_weights_from([
     (0, 0, 4, 1.0, 0.166666746),
     (1, 4, 6, 0.833333254, 0.833333492),
@@ -1282,15 +1212,24 @@ const SHORT_BANDS_16000: [BandWeights; SHORT_BANDS] = band_weights_from([
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mp3::header::Version;
+
+    fn mpeg1() -> impl Iterator<Item = SamplingFrequency> {
+        SamplingFrequency::ALL
+            .into_iter()
+            .filter(|fs| fs.version() == Version::Mpeg1)
+    }
     use crate::mp3::psychoacoustic::spreading_function;
 
-    /// `norm` is printed without its derivation, but it matches the
-    /// normalisation `rnorm` of clause D.2.4 f), the reciprocal of the
-    /// spreading function summed over all partitions, to within the rounding
-    /// of the printed Bark values. This checks both columns.
+    /// `norm` is printed without its derivation, but in Tables C.7.a to
+    /// C.7.c it matches the normalisation `rnorm` of clause D.2.4 f), the
+    /// reciprocal of the spreading function summed over all partitions, to
+    /// within the rounding of the printed Bark values. This checks both
+    /// columns. (The column of Tables D.3.a to D.3.c of ISO/IEC 13818-3 lies
+    /// 1 to 3 dB below it, and is used as printed.)
     #[test]
     fn norm_is_the_reciprocal_of_the_spreading_sum() {
-        for fs in SamplingFrequency::ALL {
+        for fs in mpeg1() {
             let partitions = partitions(fs);
             for (b, p) in partitions.iter().enumerate() {
                 let sum: f64 = partitions
@@ -1307,12 +1246,12 @@ mod tests {
         }
     }
 
-    /// The short tables' `norm` column repeats the long one (see
-    /// [`short_partitions`]) to within a rounding step. This checks that
-    /// reading of the column.
+    /// The short tables' `norm` column of ISO/IEC 11172-3 repeats the long
+    /// one (see [`short_partitions`]) to within a rounding step. This checks
+    /// that reading of the column.
     #[test]
     fn short_norm_repeats_the_long_column() {
-        for fs in SamplingFrequency::ALL {
+        for fs in mpeg1() {
             for (short, long) in short_partitions(fs).iter().zip(partitions(fs)) {
                 assert!((short.norm - long.norm).abs() <= 0.0015, "{fs:?}");
             }
@@ -1323,7 +1262,11 @@ mod tests {
     /// per-line levels, to within the rounding of the printed values.
     #[test]
     fn qthr_is_a_per_line_level_times_the_width() {
-        const LEVELS: [f64; 7] = [0.009, 0.018, 0.0286, 0.0904, 0.904, 4.532, 9.043];
+        const LEVELS: [f64; 13] = [
+            // ISO/IEC 11172-3
+            0.009, 0.018, 0.0286, 0.0904, 0.904, 4.532, 9.043, // ISO/IEC 13818-3
+            0.008913, 0.017783, 0.028184, 0.089125, 0.891251, 8.912509,
+        ];
         for fs in SamplingFrequency::ALL {
             let long = partitions(fs).iter().map(|p| (p.width, p.qthr));
             let short = short_partitions(fs).iter().map(|p| (p.width, p.qthr));
@@ -1351,16 +1294,23 @@ mod tests {
                 );
             }
             for p in partitions {
-                assert!([0.0, 3.0, 6.0, 12.0, 18.0, 20.0, 24.5].contains(&p.minval));
+                let minvals = match fs.version() {
+                    Version::Mpeg1 => [0.0, 3.0, 6.0, 12.0, 18.0, 20.0, 24.5].as_slice(),
+                    Version::Mpeg2 => &[0.0, 3.0, 6.0, 9.0, 10.0, 12.0, 13.0, 15.0],
+                };
+                assert!(minvals.contains(&p.minval), "{fs:?}");
             }
         }
     }
 
     /// The short blocks' SNR rises from low to high frequencies through a
-    /// few values.
+    /// few values, the same few in both standards but for -5.528 dB, a ratio
+    /// of 0.28, in ISO/IEC 13818-3 alone.
     #[test]
     fn short_snr_steps_up() {
-        const SNR: [f64; 7] = [-8.240, -7.447, -6.990, -6.020, -5.229, -4.559, -3.980];
+        const SNR: [f64; 8] = [
+            -8.240, -7.447, -6.990, -6.020, -5.528, -5.229, -4.559, -3.980,
+        ];
         for fs in SamplingFrequency::ALL {
             let partitions = short_partitions(fs);
             for (b, pair) in partitions.windows(2).enumerate() {
@@ -1371,7 +1321,7 @@ mod tests {
                 );
             }
             assert!(
-                partitions.iter().all(|p| SNR.contains(&p.snr.db())),
+                (partitions.iter()).all(|p| SNR.iter().any(|db| (db - p.snr.db()).abs() < 0.001)),
                 "{fs:?}"
             );
         }
@@ -1396,7 +1346,9 @@ mod tests {
                         sb + 1
                     );
                 }
-                assert!(bands.last().unwrap().bo < partitions, "{fs:?}");
+                // One past the last partition in most tables of ISO/IEC
+                // 13818-3; see `band_ratio`.
+                assert!(bands.last().unwrap().bo <= partitions, "{fs:?}");
             }
         }
     }

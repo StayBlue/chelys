@@ -13,7 +13,7 @@
 //! scalefactor sent with the wrong width, in the wrong band, or with the
 //! wrong multiplier or preemphasis decodes at least a factor of 2^(1/2) off.
 
-use chelys::mp3::header::{Bitrate, Mode, SamplingFrequency};
+use chelys::mp3::header::{Bitrate, Mode, SamplingFrequency, Version};
 use chelys::mp3::scalefactor_bands::{self, LONG_BANDS};
 use chelys::mp3::scalefactors::{PRETAB, Scalefac, Scalefactors};
 use chelys::mp3::{BlockType, GRANULE_LINES, QuantizedGranule, StreamConfig, encode_granules};
@@ -23,7 +23,8 @@ const GLOBAL_GAIN: u8 = 150;
 
 fn config(sampling_frequency: SamplingFrequency) -> StreamConfig {
     StreamConfig {
-        bitrate: Bitrate::from_kbps(320).unwrap(),
+        // The highest: 320 kbit/s, or 160 at the lower sampling frequencies.
+        bitrate: Bitrate::all(sampling_frequency.version()).last().unwrap(),
         sampling_frequency,
         mode: Mode::SingleChannel,
         crc_protected: false,
@@ -162,13 +163,18 @@ fn scalefactors_divide_their_bands() {
             spectrum(&mut rng, BlockType::Normal, fs),
             spectrum(&mut rng, BlockType::Normal, fs),
         ];
-        let expected = decode(fs, &spectra, &Scalefactors::default(), 0);
+        let expected = decode(
+            fs,
+            &spectra,
+            &Scalefactors::new(BlockType::Normal, fs.version()),
+            0,
+        );
 
         let mut variants = Vec::new();
         // scalefac_scale 0: 8 steps of 2^(1/2) in random bands of 0 to 10,
         // which slen1 can hold.
         for _ in 0..3 {
-            let mut scalefactors = Scalefactors::default();
+            let mut scalefactors = Scalefactors::new(BlockType::Normal, fs.version());
             for scalefac in &mut scalefactors.values_mut()[..11] {
                 *scalefac = 8 * rng.next(2) as u8;
             }
@@ -178,7 +184,7 @@ fn scalefactors_divide_their_bands() {
         for _ in 0..3 {
             let mut scalefactors = Scalefactors {
                 scalefac_scale: true,
-                ..Scalefactors::default()
+                ..Scalefactors::new(BlockType::Normal, fs.version())
             };
             for scalefac in scalefactors.values_mut() {
                 *scalefac = 4 * rng.next(2) as u8;
@@ -190,19 +196,34 @@ fn scalefactors_divide_their_bands() {
         let mut scalefactors = Scalefactors {
             scalefac_scale: true,
             preflag: true,
-            ..Scalefactors::default()
+            ..Scalefactors::new(BlockType::Normal, fs.version())
         };
         for (scalefac, pretab) in scalefactors.values_mut().iter_mut().zip(PRETAB) {
             *scalefac = 4 - pretab;
         }
         variants.push(("preflag", scalefactors, 0));
+        // 4 steps of 2 in random bands of 0 to 17 and none above: at the
+        // lower sampling frequencies, scalefac_compress from 400 sends these
+        // in partitions of 6, 5, 7 and 3 bands, the last in no bits.
+        let mut scalefactors = Scalefactors {
+            scalefac_scale: true,
+            ..Scalefactors::new(BlockType::Normal, fs.version())
+        };
+        for scalefac in &mut scalefactors.values_mut()[..18] {
+            *scalefac = 4 * rng.next(2) as u8;
+        }
+        if fs.version() == Version::Mpeg2 {
+            let compress = scalefactors.compress().unwrap();
+            assert!((400..500).contains(&compress), "{fs:?}: {compress}");
+        }
+        variants.push(("none above band 17", scalefactors, 0));
         // The same scalefactor in every band, undone by global_gain: 1, 2 and
         // 3 steps for the narrower field widths.
         for (scalefac, scalefac_scale) in [(1, true), (2, false), (3, false), (2, true)] {
             let scalefactors = Scalefactors {
                 scalefac: Scalefac::Long([scalefac; LONG_BANDS]),
                 scalefac_scale,
-                ..Scalefactors::default()
+                ..Scalefactors::new(BlockType::Normal, fs.version())
             };
             let gain_steps = if scalefac_scale { 4 } else { 2 } * scalefac;
             variants.push(("uniform", scalefactors, gain_steps));
@@ -230,7 +251,7 @@ fn short_scalefactors_divide_their_band_and_window() {
             spectrum(&mut rng, BlockType::Short, fs),
             spectrum(&mut rng, BlockType::Short, fs),
         ];
-        let short = Scalefactors::new(BlockType::Short);
+        let short = Scalefactors::new(BlockType::Short, fs.version());
         let expected = decode(fs, &spectra, &short, 0);
 
         let mut variants = Vec::new();
@@ -278,10 +299,13 @@ fn short_scalefactors_divide_their_band_and_window() {
 /// With `scfsi` set, the second granule of a frame does not send the
 /// scalefactors of that scfsi band but takes over the first granule's
 /// (clauses 2.4.1.7 and 2.4.2.7). Encoded either way, the same scalefactors
-/// decode alike.
+/// decode alike. The lower sampling frequencies have no scfsi.
 #[test]
 fn scfsi_takes_over_the_first_granules_scalefactors() {
-    for fs in SamplingFrequency::ALL {
+    let mpeg1 = SamplingFrequency::ALL
+        .into_iter()
+        .filter(|fs| fs.version() == Version::Mpeg1);
+    for fs in mpeg1 {
         let mut rng = Rng(0x5CF5_1000);
         let spectra = [
             spectrum(&mut rng, BlockType::Normal, fs),

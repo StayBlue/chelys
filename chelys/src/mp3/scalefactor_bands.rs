@@ -39,6 +39,9 @@ pub fn long_bands(sampling_frequency: SamplingFrequency) -> &'static [Band; LONG
         SamplingFrequency::Hz32000 => &LONG_32000,
         SamplingFrequency::Hz44100 => &LONG_44100,
         SamplingFrequency::Hz48000 => &LONG_48000,
+        SamplingFrequency::Hz16000 => &LONG_16000,
+        SamplingFrequency::Hz22050 => &LONG_22050,
+        SamplingFrequency::Hz24000 => &LONG_24000,
     }
 }
 
@@ -48,6 +51,9 @@ pub fn short_bands(sampling_frequency: SamplingFrequency) -> &'static [Band; SHO
         SamplingFrequency::Hz32000 => &SHORT_32000,
         SamplingFrequency::Hz44100 => &SHORT_44100,
         SamplingFrequency::Hz48000 => &SHORT_48000,
+        SamplingFrequency::Hz16000 => &SHORT_16000,
+        SamplingFrequency::Hz22050 => &SHORT_22050,
+        SamplingFrequency::Hz24000 => &SHORT_24000,
     }
 }
 
@@ -294,13 +300,6 @@ const SHORT_48000: [Band; SHORT_BANDS] = bands([
 // Table B.2 of ISO/IEC 13818-3, 16 kHz.
 
 /// As printed, the same as the table for 22.05 kHz.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the LSF sampling frequencies are not supported yet"
-    )
-)]
 const LONG_16000: [Band; LONG_BANDS] = bands_with_top(
     [
         (0, 6, 0, 5),
@@ -329,13 +328,6 @@ const LONG_16000: [Band; LONG_BANDS] = bands_with_top(
     GRANULE_LINES,
 );
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the LSF sampling frequencies are not supported yet"
-    )
-)]
 const SHORT_16000: [Band; SHORT_BANDS] = bands_with_top(
     [
         (0, 4, 0, 3),
@@ -357,13 +349,6 @@ const SHORT_16000: [Band; SHORT_BANDS] = bands_with_top(
 
 // Table B.2 of ISO/IEC 13818-3, 22.05 kHz.
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the LSF sampling frequencies are not supported yet"
-    )
-)]
 const LONG_22050: [Band; LONG_BANDS] = bands_with_top(
     [
         (0, 6, 0, 5),
@@ -392,13 +377,6 @@ const LONG_22050: [Band; LONG_BANDS] = bands_with_top(
     GRANULE_LINES,
 );
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the LSF sampling frequencies are not supported yet"
-    )
-)]
 const SHORT_22050: [Band; SHORT_BANDS] = bands_with_top(
     [
         (0, 4, 0, 3),
@@ -420,13 +398,6 @@ const SHORT_22050: [Band; SHORT_BANDS] = bands_with_top(
 
 // Table B.2 of ISO/IEC 13818-3, 24 kHz.
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the LSF sampling frequencies are not supported yet"
-    )
-)]
 const LONG_24000: [Band; LONG_BANDS] = bands_with_top(
     [
         (0, 6, 0, 5),
@@ -460,13 +431,6 @@ const LONG_24000: [Band; LONG_BANDS] = bands_with_top(
 /// 12, ..., 192). Its widths and start indices agree with each other and with
 /// 192 lines, so the end indices are read as misprints and transcribed here
 /// one lower, inclusive like those of every other table.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the LSF sampling frequencies are not supported yet"
-    )
-)]
 const SHORT_24000: [Band; SHORT_BANDS] = bands_with_top(
     [
         (0, 4, 0, 3),
@@ -559,11 +523,14 @@ mod tests {
     /// Table B.2 of ISO/IEC 13818-3 begin.
     #[test]
     fn lsf_bands_end_below_the_top_rows() {
-        let ends = |long: &[Band; LONG_BANDS], short: &[Band; SHORT_BANDS]| {
-            (long[LONG_BANDS - 1].end(), short[SHORT_BANDS - 1].end())
+        let ends = |fs| {
+            (
+                long_bands(fs)[LONG_BANDS - 1].end(),
+                short_bands(fs)[SHORT_BANDS - 1].end(),
+            )
         };
-        assert_eq!(ends(&LONG_16000, &SHORT_16000), (522, 174));
-        assert_eq!(ends(&LONG_22050, &SHORT_22050), (522, 174));
-        assert_eq!(ends(&LONG_24000, &SHORT_24000), (540, 180));
+        assert_eq!(ends(SamplingFrequency::Hz16000), (522, 174));
+        assert_eq!(ends(SamplingFrequency::Hz22050), (522, 174));
+        assert_eq!(ends(SamplingFrequency::Hz24000), (540, 180));
     }
 }

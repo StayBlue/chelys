@@ -12,7 +12,8 @@ use chelys_conformance::ffmpeg;
 
 fn config(sampling_frequency: SamplingFrequency, mode: Mode) -> StreamConfig {
     StreamConfig {
-        bitrate: Bitrate::from_kbps(320).unwrap(),
+        // The highest: 320 kbit/s, or 160 at the lower sampling frequencies.
+        bitrate: Bitrate::all(sampling_frequency.version()).last().unwrap(),
         sampling_frequency,
         mode,
         crc_protected: false,
@@ -21,6 +22,11 @@ fn config(sampling_frequency: SamplingFrequency, mode: Mode) -> StreamConfig {
 
 /// Tones in even and odd subbands, mid-band and near subband edges, where the
 /// frequency inversion and the aliasing butterflies matter.
+///
+/// They fade in and out over 20 ms, outside the part [`align`] compares:
+/// a granule where they start or stop abruptly takes several times the
+/// bits of the others, more than a frame of one granule holds at the lower
+/// sampling frequencies with a fixed quantizer and no bit reservoir.
 fn tones(sampling_frequency: SamplingFrequency, seconds: f64, offset: f64) -> Vec<f64> {
     let fs = f64::from(sampling_frequency.hz());
     let band = fs / 64.0;
@@ -32,13 +38,22 @@ fn tones(sampling_frequency: SamplingFrequency, seconds: f64, offset: f64) -> Ve
         12.5 * band,
         21.2 * band,
     ];
-    (0..(seconds * fs) as usize)
+    let len = (seconds * fs) as usize;
+    let fade = (0.02 * fs) as usize;
+    (0..len)
         .map(|t| {
-            frequencies
+            let edge = t.min(len - 1 - t);
+            let gain = if edge < fade {
+                0.5 - 0.5 * (TAU / 2.0 * edge as f64 / fade as f64).cos()
+            } else {
+                1.0
+            };
+            let sum: f64 = frequencies
                 .iter()
                 .enumerate()
                 .map(|(i, f)| 0.08 * (TAU * f * t as f64 / fs + offset * i as f64).sin())
-                .sum()
+                .sum();
+            gain * sum
         })
         .collect()
 }
@@ -102,13 +117,14 @@ fn short_blocks_round_trip_at_every_sampling_frequency() {
         Normal, Normal, Start, Short, Short, Stop, Normal, Start, Short, Stop, Start, Short, Stop,
     ];
     for fs in SamplingFrequency::ALL {
-        // A tone above the last short scalefactor band of Table B.8 at every
-        // sampling frequency, in the lines that have no scalefactor.
+        // A tone above the last short scalefactor band at every sampling
+        // frequency (line 182 of 192, above band 11's end at 180 or below),
+        // in the lines that have no scalefactor.
         let rate = f64::from(fs.hz());
         let input: Vec<f64> = tones(fs, 1.0, 0.0)
             .iter()
             .enumerate()
-            .map(|(t, x)| x + 0.08 * (TAU * 0.85 * rate / 2.0 * t as f64 / rate).sin())
+            .map(|(t, x)| x + 0.08 * (TAU * 0.95 * rate / 2.0 * t as f64 / rate).sin())
             .collect();
         let config = config(fs, Mode::SingleChannel);
         for (label, pattern) in [

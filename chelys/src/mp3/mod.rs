@@ -1,7 +1,8 @@
 // Copyright (c) 2026 StayBlue
 // SPDX-License-Identifier: MIT
 
-//! MPEG-1 Audio Layer III.
+//! MPEG-1 Audio Layer III, and its extension to lower sampling frequencies in
+//! ISO/IEC 13818-3.
 
 mod crc;
 pub mod filterbank;
@@ -19,16 +20,13 @@ use std::collections::VecDeque;
 use std::ops::Range;
 
 use crate::bitstream::BitWriter;
-use header::{Bitrate, Emphasis, Header, Mode, PaddingSchedule, SamplingFrequency};
+use header::{Bitrate, Emphasis, Header, Mode, PaddingSchedule, SamplingFrequency, Version};
 use huffman::{QuadTable, SpectrumCoding};
 use loops::scfsi::{self, GranuleSummary};
 use psychoacoustic::switching::{BlockSwitching, SwitchedMasking};
 use reservoir::Reservoir;
 use scalefactors::Scalefactors;
-use side_info::{GRANULES, GranuleChannel, SideInfo, Window};
-
-/// Two granules of 576 samples per channel (clause 2.4.2.1).
-pub const SAMPLES_PER_FRAME: usize = 1152;
+use side_info::{GranuleChannel, SideInfo, Window};
 
 /// Frequency lines in a granule (clause 2.1.70).
 pub const GRANULE_LINES: usize = 576;
@@ -202,7 +200,7 @@ impl QuantizedGranule {
         Self {
             block_type,
             global_gain,
-            scalefactors: Scalefactors::new(block_type),
+            scalefactors: Scalefactors::new(block_type, sampling_frequency.version()),
             values,
             coding,
         }
@@ -292,7 +290,9 @@ impl StreamConfig {
 /// `crc_check` word and the side information.
 fn main_data_bits(header: &Header) -> usize {
     let crc = if header.crc_protected { 2 } else { 0 };
-    8 * (header.frame_len() - Header::LEN_BYTES - crc - SideInfo::len_bytes(header.mode.channels()))
+    let side_info =
+        SideInfo::len_bytes(header.sampling_frequency.version(), header.mode.channels());
+    8 * (header.frame_len() - Header::LEN_BYTES - crc - side_info)
 }
 
 /// The side information and main data of one frame of granules, one entry
@@ -302,9 +302,14 @@ fn frame_contents(
     frame: &[Vec<QuantizedGranule>],
     main_data_begin: usize,
 ) -> (SideInfo, Vec<u8>) {
+    let version = sampling_frequency.version();
+    assert!(
+        main_data_begin < 1 << version.main_data_begin_bits(),
+        "main_data_begin {main_data_begin} overflows its field"
+    );
     let mut side_info = SideInfo {
-        main_data_begin: u16::try_from(main_data_begin).expect("main_data_begin is 9 bits"),
-        ..SideInfo::default()
+        main_data_begin: main_data_begin as u16,
+        ..SideInfo::new(version)
     };
     let mut main_data = BitWriter::new();
     for (gr, granule) in frame.iter().enumerate() {
@@ -350,7 +355,8 @@ fn frame_contents(
 }
 
 /// Encodes quantised granules, given in order with one entry per channel,
-/// into frames of two granules each.
+/// into frames of two granules each, or one at the lower sampling
+/// frequencies.
 ///
 /// Main data is not shared between frames: `main_data_begin` is always 0.
 ///
@@ -360,9 +366,10 @@ fn frame_contents(
 /// a frame's granules do not fit in it.
 pub fn encode_granules(config: &StreamConfig, granules: &[Vec<QuantizedGranule>]) -> Vec<u8> {
     let channels = config.mode.channels();
+    let per_frame = config.sampling_frequency.version().granules();
     assert!(
-        granules.len().is_multiple_of(GRANULES),
-        "a frame holds {GRANULES} granules"
+        granules.len().is_multiple_of(per_frame),
+        "a frame holds {per_frame} granules"
     );
     assert!(
         granules.iter().all(|g| g.len() == channels),
@@ -370,7 +377,7 @@ pub fn encode_granules(config: &StreamConfig, granules: &[Vec<QuantizedGranule>]
     );
     let mut padding = PaddingSchedule::new(config.bitrate, config.sampling_frequency);
     let mut writer = FrameWriter::default();
-    for frame in granules.chunks_exact(GRANULES) {
+    for frame in granules.chunks_exact(per_frame) {
         let (side_info, main_data) = frame_contents(config.sampling_frequency, frame, 0);
         writer.write(
             &config.header(padding.next_padding()),
@@ -415,9 +422,17 @@ pub fn encode_pcm(config: &StreamConfig, channels: &[&[f64]]) -> Vec<u8> {
 pub struct Encoder(FrameEncoder<ModelCoding>);
 
 impl Encoder {
+    /// # Panics
+    ///
+    /// If the mode allows intensity stereo at one of the lower sampling
+    /// frequencies, which is not supported yet.
     pub fn new(config: StreamConfig) -> Self {
         let fs = config.sampling_frequency;
         let (ms_allowed, intensity_allowed) = config.joint_stereo();
+        assert!(
+            !(intensity_allowed && fs.version() == Version::Mpeg2),
+            "intensity stereo at the lower sampling frequencies is not supported yet"
+        );
         let coding = ModelCoding {
             models: (0..config.mode.channels())
                 .map(|_| BlockSwitching::new(fs))
@@ -426,7 +441,7 @@ impl Encoder {
             intensity_allowed,
             sampling_frequency: fs,
         };
-        let reservoir = Reservoir::new(config.header(true).frame_len());
+        let reservoir = Reservoir::new(config.header(true).frame_len(), fs.version());
         Self(FrameEncoder::new(config, coding, reservoir))
     }
 
@@ -1014,10 +1029,11 @@ impl<C: Coding> FrameEncoder<C> {
             pcm.extend_from_slice(samples);
         }
         self.samples += len;
+        let frame_samples = self.samples_per_frame();
         let mut start = 0;
-        while self.pcm[0].len() - start >= SAMPLES_PER_FRAME + GRANULE_LINES {
+        while self.pcm[0].len() - start >= frame_samples + GRANULE_LINES {
             self.encode_frame(start);
-            start += SAMPLES_PER_FRAME;
+            start += frame_samples;
         }
         for pcm in &mut self.pcm {
             pcm.drain(..start);
@@ -1029,15 +1045,20 @@ impl<C: Coding> FrameEncoder<C> {
     /// flush the filterbank, codes them, and appends the rest of the stream
     /// to `out`.
     fn finish(mut self, out: &mut Vec<u8>) {
-        let frames = self.samples.div_ceil(SAMPLES_PER_FRAME) + 1;
+        let frame_samples = self.samples_per_frame();
+        let frames = self.samples.div_ceil(frame_samples) + 1;
         let remaining = frames - self.frames;
         for pcm in &mut self.pcm {
-            pcm.resize(remaining * SAMPLES_PER_FRAME + GRANULE_LINES, 0.0);
+            pcm.resize(remaining * frame_samples + GRANULE_LINES, 0.0);
         }
         for frame in 0..remaining {
-            self.encode_frame(frame * SAMPLES_PER_FRAME);
+            self.encode_frame(frame * frame_samples);
         }
         self.writer.finish(out);
+    }
+
+    fn samples_per_frame(&self) -> usize {
+        self.config.sampling_frequency.version().samples_per_frame()
     }
 
     /// Codes the frame whose PCM starts at `start` in [`Self::pcm`].
@@ -1065,7 +1086,8 @@ impl<C: Coding> FrameEncoder<C> {
                 );
             }
         }
-        let filtered: Vec<Vec<Filtered<C::Analysis>>> = (0..GRANULES)
+        let granules = fs.version().granules();
+        let filtered: Vec<Vec<Filtered<C::Analysis>>> = (0..granules)
             .map(|gr| {
                 (filterbanks.iter_mut().enumerate())
                     .map(|(channel, filterbank)| {
@@ -1089,7 +1111,7 @@ impl<C: Coding> FrameEncoder<C> {
         // mode_extension does not change the frame's length.
         let padded = self.padding.next_padding();
         let slot_bits = main_data_bits(&self.config.header(padded));
-        let shares = GRANULES * self.pcm.len();
+        let shares = granules * self.pcm.len();
         let mean_bits = slot_bits / shares;
         let block_types: Vec<BlockType> = filtered.iter().flatten().map(|f| f.block_type).collect();
         let coded = self
@@ -1122,7 +1144,8 @@ pub fn encode_silence(config: &StreamConfig, frames: usize) -> Vec<u8> {
         config.sampling_frequency,
     );
     let granule = vec![silent; config.mode.channels()];
-    encode_granules(config, &vec![granule; frames * GRANULES])
+    let granules = frames * config.sampling_frequency.version().granules();
+    encode_granules(config, &vec![granule; granules])
 }
 
 #[cfg(test)]
@@ -1131,7 +1154,7 @@ mod tests {
 
     fn config(crc_protected: bool) -> StreamConfig {
         StreamConfig {
-            bitrate: Bitrate::from_kbps(128).unwrap(),
+            bitrate: Bitrate::from_kbps(Version::Mpeg1, 128).unwrap(),
             sampling_frequency: SamplingFrequency::Hz44100,
             mode: Mode::Stereo,
             crc_protected,
@@ -1157,7 +1180,7 @@ mod tests {
         assert_eq!(protected[..2], [0xFF, 0xFA]);
         assert_eq!(protected[2..4], plain[2..4]);
 
-        let side_info = &plain[4..4 + SideInfo::len_bytes(2)];
+        let side_info = &plain[4..4 + SideInfo::len_bytes(Version::Mpeg1, 2)];
         assert_eq!(protected[6..6 + side_info.len()], *side_info);
         let expected = crc::crc16(plain[2..4].iter().chain(side_info).copied());
         assert_eq!(protected[4..6], expected.to_be_bytes());
@@ -1166,7 +1189,7 @@ mod tests {
     fn small_header() -> Header {
         Header {
             crc_protected: false,
-            bitrate: Bitrate::from_kbps(32).unwrap(),
+            bitrate: Bitrate::from_kbps(Version::Mpeg1, 32).unwrap(),
             sampling_frequency: SamplingFrequency::Hz32000,
             padding: false,
             private: false,
@@ -1186,10 +1209,10 @@ mod tests {
         // 144 slots minus the 4-byte header and 17 bytes of side information.
         let slot = 144 - 4 - 17;
         let mut writer = FrameWriter::default();
-        writer.write(&header, &SideInfo::default(), &[1; 100]);
+        writer.write(&header, &SideInfo::new(Version::Mpeg1), &[1; 100]);
         let side_info = SideInfo {
             main_data_begin: 20,
-            ..SideInfo::default()
+            ..SideInfo::new(Version::Mpeg1)
         };
         writer.write(&header, &side_info, &[2; 30]);
         let first = &writer.out[21..144];
@@ -1212,7 +1235,7 @@ mod tests {
     fn main_data_cannot_begin_before_the_stream() {
         let side_info = SideInfo {
             main_data_begin: 1,
-            ..SideInfo::default()
+            ..SideInfo::new(Version::Mpeg1)
         };
         FrameWriter::default().write(&small_header(), &side_info, &[]);
     }
@@ -1222,7 +1245,7 @@ mod tests {
     fn rejects_main_data_larger_than_the_frame() {
         let header = Header {
             crc_protected: false,
-            bitrate: Bitrate::from_kbps(32).unwrap(),
+            bitrate: Bitrate::from_kbps(Version::Mpeg1, 32).unwrap(),
             sampling_frequency: SamplingFrequency::Hz32000,
             padding: false,
             private: false,
@@ -1233,7 +1256,12 @@ mod tests {
         };
         // 144 slots minus the 4-byte header and 17 bytes of side information.
         let main_data = [0; 144 - 4 - 17 + 1];
-        write_frame(&header, &SideInfo::default(), &main_data, &mut Vec::new());
+        write_frame(
+            &header,
+            &SideInfo::new(Version::Mpeg1),
+            &main_data,
+            &mut Vec::new(),
+        );
     }
 
     /// For every pattern of tries within their allowed distortion, up to the
@@ -1286,7 +1314,7 @@ mod tests {
     #[test]
     fn streaming_does_not_depend_on_how_the_input_is_divided() {
         let config = StreamConfig {
-            bitrate: Bitrate::from_kbps(32).unwrap(),
+            bitrate: Bitrate::from_kbps(Version::Mpeg1, 32).unwrap(),
             sampling_frequency: SamplingFrequency::Hz44100,
             mode: Mode::JointStereo {
                 intensity_stereo: false,
@@ -1297,17 +1325,21 @@ mod tests {
         // Silence fills the reservoir to its limit, past which the rest is
         // stuffing, and the noise after it reaches back into it.
         let mut seed = 1;
-        let samples = 12 * SAMPLES_PER_FRAME + 300;
+        let samples = 12 * Version::Mpeg1.samples_per_frame() + 300;
         let pcm: Vec<[f64; 2]> = (0..samples)
             .map(|n| {
-                let level = if n < 9 * SAMPLES_PER_FRAME { 0.0 } else { 0.5 };
+                let level = if n < 9 * Version::Mpeg1.samples_per_frame() {
+                    0.0
+                } else {
+                    0.5
+                };
                 [level * noise(&mut seed), level * noise(&mut seed)]
             })
             .collect();
         let (left, right): (Vec<f64>, Vec<f64>) = pcm.iter().map(|&[l, r]| (l, r)).unzip();
         let whole = encode_pcm(&config, &[&left, &right]);
         let mut padding = PaddingSchedule::new(config.bitrate, config.sampling_frequency);
-        let frames = samples.div_ceil(SAMPLES_PER_FRAME) + 1;
+        let frames = samples.div_ceil(Version::Mpeg1.samples_per_frame()) + 1;
         let frame_lens = (0..frames).map(|_| config.header(padding.next_padding()).frame_len());
         assert_eq!(whole.len(), frame_lens.sum::<usize>());
 
@@ -1321,8 +1353,8 @@ mod tests {
                 1,
                 100,
                 GRANULE_LINES,
-                SAMPLES_PER_FRAME - 1,
-                SAMPLES_PER_FRAME + GRANULE_LINES + 1,
+                Version::Mpeg1.samples_per_frame() - 1,
+                Version::Mpeg1.samples_per_frame() + GRANULE_LINES + 1,
             ]
             .map(|chunk| {
                 let (left, right) = (&left, &right);

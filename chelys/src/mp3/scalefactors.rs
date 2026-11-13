@@ -3,10 +3,12 @@
 
 //! Layer III scalefactors: their meaning in the requantization formula
 //! (clause 2.4.3.4.7.1), their transmission with `scalefac_compress` (clause
-//! 2.4.2.7), and preemphasis (Table B.6). Mixed blocks are not used.
+//! 2.4.2.7, and clause 2.4.3.2 of ISO/IEC 13818-3 for the lower sampling
+//! frequencies), and preemphasis (Table B.6). Mixed blocks are not used.
 
 use crate::bitstream::BitWriter;
 use crate::mp3::BlockType;
+use crate::mp3::header::Version;
 use crate::mp3::scalefactor_bands::{LONG_BANDS, SHORT_BANDS, SHORT_WINDOWS};
 use crate::mp3::side_info::SCFSI_BANDS;
 
@@ -48,6 +50,59 @@ const SCALEFAC_COMPRESS: [(u32, u32); 16] = [
     (4, 3),
 ];
 
+/// The values of the 9-bit `scalefac_compress` of the lower sampling
+/// frequencies.
+const LSF_SCALEFAC_COMPRESS: u16 = 512;
+
+/// How the scalefactors are sent at the lower sampling frequencies for a
+/// value of `scalefac_compress`: in four partitions of `nr_of_sfb`
+/// scalefactors in the order sent, each scalefactor of a partition in
+/// `slen` bits, and whether `preflag` is set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LsfPartitions {
+    slen: [u32; 4],
+    nr_of_sfb: [usize; 4],
+    preflag: bool,
+}
+
+impl LsfPartitions {
+    /// Decodes `scalefac_compress` as clause 2.4.3.2 of ISO/IEC 13818-3
+    /// prints it for channels not coded in intensity stereo, with the rows
+    /// for block types 0, 1 and 3 or for block type 2 without mixed blocks.
+    fn decode(scalefac_compress: u16, short: bool) -> Self {
+        let sc = u32::from(scalefac_compress);
+        let (slen, preflag, long_sfb, short_sfb) = if sc < 400 {
+            let slen = [(sc >> 4) / 5, (sc >> 4) % 5, (sc % 16) >> 2, sc % 4];
+            (slen, false, [6, 5, 5, 5], [9, 9, 9, 9])
+        } else if sc < 500 {
+            let sc = sc - 400;
+            let slen = [(sc >> 2) / 5, (sc >> 2) % 5, sc % 4, 0];
+            (slen, false, [6, 5, 7, 3], [9, 9, 12, 6])
+        } else {
+            assert!(sc < 512, "scalefac_compress {sc} has more than 9 bits");
+            let sc = sc - 500;
+            ([sc / 3, sc % 3, 0, 0], true, [11, 10, 0, 0], [18, 18, 0, 0])
+        };
+        Self {
+            slen,
+            nr_of_sfb: if short { short_sfb } else { long_sfb },
+            preflag,
+        }
+    }
+
+    /// The `slen` of each of `count` scalefactors in the order sent.
+    fn widths(self, count: usize) -> impl Iterator<Item = u32> {
+        let widths = (self.slen.into_iter().zip(self.nr_of_sfb))
+            .flat_map(|(slen, n)| std::iter::repeat_n(slen, n));
+        assert_eq!(
+            self.nr_of_sfb.iter().sum::<usize>(),
+            count,
+            "the partitions hold every scalefactor"
+        );
+        widths
+    }
+}
+
 /// Table B.6: `pretab`, added to the scalefactors when `preflag` is set.
 pub const PRETAB: [u8; LONG_BANDS] = [
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 3, 3, 3, 2,
@@ -66,30 +121,35 @@ pub enum Scalefac {
 /// with them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Scalefactors {
+    /// The version whose `scalefac_compress` sends them.
+    pub version: Version,
     pub scalefac: Scalefac,
     /// Never set for short blocks (clause 2.4.2.7).
     pub preflag: bool,
     pub scalefac_scale: bool,
     /// The scfsi bands whose scalefactors the second granule of a frame takes
     /// over from the first, and so does not send (clause 2.4.2.7). Always
-    /// clear in the first granule and for short blocks.
+    /// clear in the first granule, for short blocks, and at the lower
+    /// sampling frequencies, which have no scfsi.
     pub scfsi: [bool; SCFSI_BANDS],
 }
 
 impl Default for Scalefactors {
     fn default() -> Self {
-        Self::new(BlockType::Normal)
+        Self::new(BlockType::Normal, Version::Mpeg1)
     }
 }
 
 impl Scalefactors {
-    /// Zero scalefactors for a granule of `block_type`.
-    pub fn new(block_type: BlockType) -> Self {
+    /// Zero scalefactors for a granule of `block_type`, sent as `version`
+    /// sends them.
+    pub fn new(block_type: BlockType, version: Version) -> Self {
         let scalefac = match block_type {
             BlockType::Short => Scalefac::Short([[0; SHORT_WINDOWS]; SHORT_BANDS]),
             _ => Scalefac::Long([0; LONG_BANDS]),
         };
         Self {
+            version,
             scalefac,
             preflag: false,
             scalefac_scale: false,
@@ -152,8 +212,24 @@ impl Scalefactors {
     /// at most 3 bits, and could not hold 15. The clause is one off for mixed
     /// blocks in the same way, giving "0 through 17" where `slen1` covers 17
     /// scalefactors, 0 through 16.
+    ///
+    /// Spec gap: Annex C of ISO/IEC 13818-3 gives no limits for the lower
+    /// sampling frequencies. They are taken, in the same way, as the widest
+    /// fields a `scalefac_compress` with the same `preflag` gives each
+    /// scalefactor (clause 2.4.3.2 of ISO/IEC 13818-3). Without `preflag`
+    /// these are 4 bits for the first two partitions of values below 400,
+    /// which cover the same scalefactors as `slen1` above, and 3 bits for the
+    /// rest, so the limits are the same; with `preflag`, values 500 and up
+    /// give 3 bits to the scalefactors `slen1` covers above and 2 to the
+    /// rest, limits of 7 and 3.
     pub fn limit(&self, index: usize) -> u8 {
-        if index < self.slen1_count() { 15 } else { 7 }
+        let first = index < self.slen1_count();
+        match (self.version, self.preflag, first) {
+            (Version::Mpeg2, true, true) => 7,
+            (Version::Mpeg2, true, false) => 3,
+            (_, _, true) => 15,
+            (_, _, false) => 7,
+        }
     }
 
     /// `scalefac_multiplier` (clause 2.4.2.7).
@@ -178,20 +254,69 @@ impl Scalefactors {
 
     /// The `scalefac_compress` whose field widths hold the scalefactors sent
     /// in the fewest bits, or `None` if one is above its
-    /// [`limit`](Self::limit).
-    pub fn compress(&self) -> Option<u8> {
-        let bits = |values: &[u8]| {
-            let max = values.iter().copied().max().unwrap_or(0);
-            u8::BITS - max.leading_zeros()
-        };
-        let (low, high) = self.sent_values();
-        let (need1, need2) = (bits(&low), bits(&high));
-        (0..16u8)
-            .filter(|&c| {
+    /// [`limit`](Self::limit). At the lower sampling frequencies it also
+    /// sets `preflag` as the scalefactors have it.
+    pub fn compress(&self) -> Option<u16> {
+        let fits = |c: u16| match self.version {
+            Version::Mpeg1 => {
                 let (slen1, slen2) = SCALEFAC_COMPRESS[usize::from(c)];
-                slen1 >= need1 && slen2 >= need2
-            })
+                let (low, high) = self.sent_values();
+                low.iter().all(|&v| fits_in(v, slen1)) && high.iter().all(|&v| fits_in(v, slen2))
+            }
+            Version::Mpeg2 => {
+                let partitions = self.lsf_partitions(c);
+                partitions.preflag == self.preflag
+                    && (self
+                        .values()
+                        .iter()
+                        .zip(partitions.widths(self.values().len())))
+                    .all(|(&v, slen)| fits_in(v, slen))
+            }
+        };
+        let values = match self.version {
+            Version::Mpeg1 => SCALEFAC_COMPRESS.len() as u16,
+            Version::Mpeg2 => LSF_SCALEFAC_COMPRESS,
+        };
+        (0..values)
+            .filter(|&c| fits(c))
             .min_by_key(|&c| self.part2_length(c))
+    }
+
+    /// How `scalefac_compress` sends these scalefactors at the lower sampling
+    /// frequencies.
+    fn lsf_partitions(&self, scalefac_compress: u16) -> LsfPartitions {
+        assert_eq!(self.version, Version::Mpeg2);
+        assert!(
+            !self.scfsi.contains(&true),
+            "the lower sampling frequencies have no scfsi"
+        );
+        let short = matches!(self.scalefac, Scalefac::Short(_));
+        LsfPartitions::decode(scalefac_compress, short)
+    }
+
+    /// The width of each scalefactor of [`values`](Self::values) sent with
+    /// `scalefac_compress`, or `None` for those not sent.
+    fn widths(&self, scalefac_compress: u16) -> Vec<Option<u32>> {
+        match self.version {
+            Version::Mpeg1 => {
+                let (slen1, slen2) = SCALEFAC_COMPRESS[usize::from(scalefac_compress)];
+                (0..self.values().len())
+                    .map(|index| {
+                        let slen = if index < self.slen1_count() {
+                            slen1
+                        } else {
+                            slen2
+                        };
+                        self.sent(index).then_some(slen)
+                    })
+                    .collect()
+            }
+            Version::Mpeg2 => self
+                .lsf_partitions(scalefac_compress)
+                .widths(self.values().len())
+                .map(Some)
+                .collect(),
+        }
     }
 
     /// Writes the scalefactors sent (clause 2.4.1.7) with the field widths of
@@ -200,34 +325,33 @@ impl Scalefactors {
     /// # Panics
     ///
     /// If a scalefactor sent does not fit its field.
-    pub fn write(&self, scalefac_compress: u8, w: &mut BitWriter) {
-        let (slen1, slen2) = SCALEFAC_COMPRESS[usize::from(scalefac_compress)];
-        for (index, &scalefac) in self.values().iter().enumerate() {
-            if !self.sent(index) {
-                continue;
-            }
-            let slen = if index < self.slen1_count() {
-                slen1
-            } else {
-                slen2
-            };
+    pub fn write(&self, scalefac_compress: u16, w: &mut BitWriter) {
+        let widths = self.widths(scalefac_compress);
+        for (index, (&scalefac, slen)) in self.values().iter().zip(widths).enumerate() {
+            let Some(slen) = slen else { continue };
             assert!(
-                u32::from(scalefac) >> slen == 0,
+                fits_in(scalefac, slen),
                 "scalefactor {scalefac} at {index} does not fit in {slen} bits"
             );
             w.write(u32::from(scalefac), slen);
         }
     }
 
-    /// `part2_length`: the scalefactors sent with `slen1` times `slen1` plus
-    /// those sent with `slen2` times `slen2`; without `scfsi`, `11 * slen1 +
-    /// 10 * slen2` for long blocks and `18 * slen1 + 18 * slen2` for short
-    /// ones (clause 2.4.2.7).
-    pub fn part2_length(&self, scalefac_compress: u8) -> usize {
-        let (slen1, slen2) = SCALEFAC_COMPRESS[usize::from(scalefac_compress)];
-        let (low, high) = self.sent_values();
-        low.len() * slen1 as usize + high.len() * slen2 as usize
+    /// `part2_length`: the sum of the widths of the scalefactors sent. Without
+    /// `scfsi` this is `11 * slen1 + 10 * slen2` for long blocks and
+    /// `18 * slen1 + 18 * slen2` for short ones (clause 2.4.2.7), and at the
+    /// lower sampling frequencies the sum of `nr_of_sfb * slen` over the
+    /// partitions (clause 2.4.3.2 of ISO/IEC 13818-3).
+    pub fn part2_length(&self, scalefac_compress: u16) -> usize {
+        (self.widths(scalefac_compress).into_iter().flatten())
+            .map(|slen| slen as usize)
+            .sum()
     }
+}
+
+/// Whether `value` fits in `bits` bits.
+fn fits_in(value: u8, bits: u32) -> bool {
+    u32::from(value) >> bits == 0
 }
 
 #[cfg(test)]
@@ -314,7 +438,7 @@ mod tests {
     /// have no preemphasis.
     #[test]
     fn short_blocks_send_three_scalefactors_per_band() {
-        let mut scalefactors = Scalefactors::new(BlockType::Short);
+        let mut scalefactors = Scalefactors::new(BlockType::Short, Version::Mpeg1);
         assert_eq!(scalefactors.values().len(), 36);
         assert_eq!((scalefactors.limit(17), scalefactors.limit(18)), (15, 7));
         if let Scalefac::Short(scalefac_s) = &mut scalefactors.scalefac {

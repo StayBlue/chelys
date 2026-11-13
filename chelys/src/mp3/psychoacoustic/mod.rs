@@ -18,7 +18,7 @@ pub mod switching;
 use std::f64::consts::PI;
 
 use super::GRANULE_LINES;
-use super::header::SamplingFrequency;
+use super::header::{SamplingFrequency, Version};
 use super::scalefactor_bands::{self, LONG_BANDS, SHORT_BANDS, SHORT_WINDOWS};
 use super::{BlockType, stereo};
 use fft::{Complex, Fft};
@@ -296,16 +296,21 @@ impl PsychoacousticModel {
         let partitions = partitions::partitions(sampling_frequency);
         let short_partitions = partitions::short_partitions(sampling_frequency);
         let short_spreading = spreading_matrix(short_partitions.iter().map(|p| p.bval));
-        // Spec reading: the normalising constant is computed from the short
-        // partitions' Bark values as `rnorm` in clause D.2.4 f), the
-        // reciprocal of the spreading function summed over the partitions,
-        // which the long tables' `norm` column matches. The short tables'
-        // own column is a copy of the long one (see
-        // `partitions::short_partitions`) and differs from this by up to
-        // 1.9 dB.
-        let short_norm = (0..short_partitions.len())
-            .map(|b| 1.0 / short_spreading.iter().map(|from| from[b]).sum::<f64>())
-            .collect();
+        // Spec reading: with the tables of ISO/IEC 11172-3, the normalising
+        // constant is computed from the short partitions' Bark values as
+        // `rnorm` in clause D.2.4 f), the reciprocal of the spreading
+        // function summed over the partitions, which the long tables' `norm`
+        // column matches. The short tables' own column is a copy of the long
+        // one (see `partitions::short_partitions`) and differs from this by
+        // up to 1.9 dB. The tables of ISO/IEC 13818-3 print a column of their
+        // own for short blocks, which is used as printed, as their long
+        // tables' column is.
+        let short_norm = match sampling_frequency.version() {
+            Version::Mpeg1 => (0..short_partitions.len())
+                .map(|b| 1.0 / short_spreading.iter().map(|from| from[b]).sum::<f64>())
+                .collect(),
+            Version::Mpeg2 => short_partitions.iter().map(|p| p.norm).collect(),
+        };
         Self {
             partitions,
             band_weights: partitions::band_weights(sampling_frequency),
@@ -522,12 +527,19 @@ fn spreading_matrix(bval: impl Iterator<Item = f64> + Clone) -> Vec<Vec<f64>> {
 
 /// The ratio `thr / eb` of each scalefactor band, with the partitions
 /// converted to scalefactor bands (figure C.6.c).
+///
+/// Spec gap: in Tables D.4.a, D.4.b and D.4.d to D.4.f of ISO/IEC 13818-3,
+/// `bo` of the last band is one past the last partition of the matching
+/// table of Table D.3. A partition that does not exist adds nothing; the
+/// band collects the partitions after `bu` in full.
 fn band_ratio<const N: usize>(bands: &[BandWeights; N], thr: &[f64], eb: &[f64]) -> [f64; N] {
     bands.map(|band| {
         let collect = |values: &[f64]| {
             band.w1 * values[band.bu]
-                + values[band.bu + 1..band.bo].iter().sum::<f64>()
-                + band.w2 * values[band.bo]
+                + values[band.bu + 1..band.bo.min(values.len())]
+                    .iter()
+                    .sum::<f64>()
+                + values.get(band.bo).map_or(0.0, |v| band.w2 * v)
         };
         collect(thr) / collect(eb)
     })
@@ -701,7 +713,9 @@ mod tests {
 
     /// With a fixed SNR for short blocks, and the normalising constant
     /// undoing the spread, the ratio of every short band of loud noise lies
-    /// near the SNR of the partitions it collects.
+    /// near the SNR of the partitions it collects, offset by however far the
+    /// constant used falls short of undoing the spread (the printed one of
+    /// ISO/IEC 13818-3 does by up to about 2 dB).
     #[test]
     fn short_ratio_of_noise_follows_the_snr_column() {
         for fs in SamplingFrequency::ALL {
@@ -713,9 +727,14 @@ mod tests {
             }
             let short = short.unwrap();
             let partitions = partitions::short_partitions(fs);
+            let offset = |b: usize| {
+                let spread: f64 = model.short_spreading.iter().map(|from| from[b]).sum();
+                10.0 * (model.short_norm[b] * spread).log10()
+            };
             for (w, ratio) in short.ratio.iter().enumerate() {
                 for (sb, band) in partitions::short_band_weights(fs).iter().enumerate() {
-                    let snr = partitions[band.bu..=band.bo].iter().map(|p| p.snr.db());
+                    let last = band.bo.min(partitions.len() - 1);
+                    let snr = (band.bu..=last).map(|b| partitions[b].snr.db() + offset(b));
                     let (low, high) =
                         snr.fold((f64::MAX, f64::MIN), |(l, h), s| (l.min(s), h.max(s)));
                     let db = 10.0 * ratio[sb].log10();

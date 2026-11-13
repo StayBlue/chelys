@@ -18,7 +18,8 @@ type Spectrum = [i32; GRANULE_LINES];
 
 fn config(sampling_frequency: SamplingFrequency) -> StreamConfig {
     StreamConfig {
-        bitrate: Bitrate::from_kbps(320).unwrap(),
+        // The highest: 320 kbit/s, or 160 at the lower sampling frequencies.
+        bitrate: Bitrate::all(sampling_frequency.version()).last().unwrap(),
         sampling_frequency,
         mode: Mode::SingleChannel,
         crc_protected: false,

@@ -1,39 +1,98 @@
 // Copyright (c) 2026 StayBlue
 // SPDX-License-Identifier: MIT
 
-//! The 32-bit frame header (clauses 2.4.1.3 and 2.4.2.3) and the frame length
-//! it implies (clause 2.4.3.1).
+//! The 32-bit frame header (clauses 2.4.1.3 and 2.4.2.3, and clause 2.4.2.3
+//! of ISO/IEC 13818-3 for the lower sampling frequencies) and the frame
+//! length it implies (clause 2.4.3.1).
 
 use crate::bitstream::BitWriter;
+use crate::mp3::GRANULE_LINES;
 
 const SYNCWORD: u32 = 0xFFF;
-const ID_MPEG_AUDIO: u32 = 1;
 const LAYER_III: u32 = 0b01;
 
-/// Indexed by `bitrate_index`; index 0 is free format.
-const LAYER_III_KBPS: [u32; 15] = [
-    0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320,
-];
+/// The `ID` bit: the standard that codes the stream, and with it the
+/// sampling frequencies, bitrates and frame layout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Version {
+    /// ISO/IEC 11172-3, `ID` 1.
+    Mpeg1,
+    /// The extension of ISO/IEC 13818-3 to lower sampling frequencies, `ID`
+    /// 0 (clause 2.4 of ISO/IEC 13818-3).
+    Mpeg2,
+}
 
-/// A Layer III bitrate from the `bitrate_index` table. Free format is not
-/// supported.
+impl Version {
+    fn id(self) -> u32 {
+        match self {
+            Self::Mpeg1 => 1,
+            Self::Mpeg2 => 0,
+        }
+    }
+
+    /// The granules of a frame: two, or one at the lower sampling
+    /// frequencies (clause 2.4.3.2 of ISO/IEC 13818-3).
+    pub fn granules(self) -> usize {
+        match self {
+            Self::Mpeg1 => 2,
+            Self::Mpeg2 => 1,
+        }
+    }
+
+    /// The samples of each channel that a frame codes.
+    pub fn samples_per_frame(self) -> usize {
+        self.granules() * GRANULE_LINES
+    }
+
+    /// The width of `main_data_begin`: 9 bits, or 8 at the lower sampling
+    /// frequencies (clause 2.4.1.7 of ISO/IEC 13818-3).
+    pub fn main_data_begin_bits(self) -> u32 {
+        match self {
+            Self::Mpeg1 => 9,
+            Self::Mpeg2 => 8,
+        }
+    }
+
+    /// The Layer III bitrates in kbit/s, indexed by `bitrate_index`; index 0
+    /// is free format (clause 2.4.2.3, and clause 2.4.2.3 of ISO/IEC
+    /// 13818-3).
+    fn kbps(self) -> &'static [u32; 15] {
+        match self {
+            Self::Mpeg1 => &[
+                0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320,
+            ],
+            Self::Mpeg2 => &[0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160],
+        }
+    }
+}
+
+/// A Layer III bitrate from the `bitrate_index` table of a [`Version`]. Free
+/// format is not supported.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Bitrate {
+    version: Version,
     index: u8,
 }
 
 impl Bitrate {
-    pub fn from_kbps(kbps: u32) -> Option<Self> {
-        let index = LAYER_III_KBPS[1..].iter().position(|&k| k == kbps)? + 1;
-        Some(Self { index: index as u8 })
+    pub fn from_kbps(version: Version, kbps: u32) -> Option<Self> {
+        let index = version.kbps()[1..].iter().position(|&k| k == kbps)? + 1;
+        Some(Self {
+            version,
+            index: index as u8,
+        })
     }
 
-    pub fn all() -> impl Iterator<Item = Self> {
-        (1..LAYER_III_KBPS.len() as u8).map(|index| Self { index })
+    pub fn all(version: Version) -> impl Iterator<Item = Self> {
+        (1..version.kbps().len() as u8).map(move |index| Self { version, index })
+    }
+
+    pub fn version(self) -> Version {
+        self.version
     }
 
     pub fn bits_per_second(self) -> u32 {
-        LAYER_III_KBPS[usize::from(self.index)] * 1000
+        self.version.kbps()[usize::from(self.index)] * 1000
     }
 }
 
@@ -42,24 +101,45 @@ pub enum SamplingFrequency {
     Hz44100,
     Hz48000,
     Hz32000,
+    Hz22050,
+    Hz24000,
+    Hz16000,
 }
 
 impl SamplingFrequency {
-    pub const ALL: [Self; 3] = [Self::Hz44100, Self::Hz48000, Self::Hz32000];
+    pub const ALL: [Self; 6] = [
+        Self::Hz44100,
+        Self::Hz48000,
+        Self::Hz32000,
+        Self::Hz22050,
+        Self::Hz24000,
+        Self::Hz16000,
+    ];
 
     pub fn hz(self) -> u32 {
         match self {
             Self::Hz44100 => 44_100,
             Self::Hz48000 => 48_000,
             Self::Hz32000 => 32_000,
+            Self::Hz22050 => 22_050,
+            Self::Hz24000 => 24_000,
+            Self::Hz16000 => 16_000,
         }
     }
 
+    pub fn version(self) -> Version {
+        match self {
+            Self::Hz44100 | Self::Hz48000 | Self::Hz32000 => Version::Mpeg1,
+            Self::Hz22050 | Self::Hz24000 | Self::Hz16000 => Version::Mpeg2,
+        }
+    }
+
+    /// The `sampling_frequency` field, whose meaning depends on `ID`.
     fn code(self) -> u32 {
         match self {
-            Self::Hz44100 => 0b00,
-            Self::Hz48000 => 0b01,
-            Self::Hz32000 => 0b10,
+            Self::Hz44100 | Self::Hz22050 => 0b00,
+            Self::Hz48000 | Self::Hz24000 => 0b01,
+            Self::Hz32000 | Self::Hz16000 => 0b10,
         }
     }
 }
@@ -141,9 +221,19 @@ pub struct Header {
 impl Header {
     pub const LEN_BYTES: usize = 4;
 
+    /// # Panics
+    ///
+    /// If the bitrate is not one of those of the sampling frequency's
+    /// [`Version`].
     pub fn write(&self, w: &mut BitWriter) {
+        let version = self.sampling_frequency.version();
+        assert_eq!(
+            self.bitrate.version, version,
+            "{:?} is not a bitrate of {:?}",
+            self.bitrate, self.sampling_frequency
+        );
         w.write(SYNCWORD, 12);
-        w.write(ID_MPEG_AUDIO, 1);
+        w.write(version.id(), 1);
         w.write(LAYER_III, 2);
         w.write_bool(!self.crc_protected); // protection_bit
         w.write(u32::from(self.bitrate.index), 4);
@@ -165,17 +255,20 @@ impl Header {
     }
 }
 
-/// `N = 144 * bit_rate / sampling_frequency` (clause 2.4.3.1), returned as the
-/// truncated slot count and the remainder of the division.
+/// `N = 144 * bit_rate / sampling_frequency` (clause 2.4.3.1), with 72 in
+/// place of 144 at the lower sampling frequencies (clause 2.4.3.2 of ISO/IEC
+/// 13818-3), returned as the truncated slot count and the remainder of the
+/// division. Both constants are a frame's samples over the 8 bits of a slot.
 fn slots_per_frame(bitrate: Bitrate, sampling_frequency: SamplingFrequency) -> (usize, u32) {
-    let numerator = 144 * bitrate.bits_per_second();
+    let samples = sampling_frequency.version().samples_per_frame() as u32;
+    let numerator = samples / 8 * bitrate.bits_per_second();
     let fs = sampling_frequency.hz();
     ((numerator / fs) as usize, numerator % fs)
 }
 
 /// Decides `padding_bit` frame by frame so that the mean frame length matches
-/// the bitrate exactly: after `k` frames the total length is `floor(k * 144 *
-/// bit_rate / sampling_frequency)` slots, which meets the "(+0, -1 slot)"
+/// the bitrate exactly: after `k` frames the total length is `floor(k * N)`
+/// slots, `N` as in [`slots_per_frame`], which meets the "(+0, -1 slot)"
 /// bound of clause 2.4.2.3.
 ///
 /// Spec gap: that clause's sample procedure ("can be used") is optional; it
@@ -214,7 +307,7 @@ mod tests {
     fn header(kbps: u32, sampling_frequency: SamplingFrequency, mode: Mode) -> Header {
         Header {
             crc_protected: false,
-            bitrate: Bitrate::from_kbps(kbps).unwrap(),
+            bitrate: Bitrate::from_kbps(sampling_frequency.version(), kbps).unwrap(),
             sampling_frequency,
             padding: false,
             private: false,
@@ -234,10 +327,16 @@ mod tests {
 
     #[test]
     fn bitrate_lookup_rejects_values_outside_the_table() {
-        assert_eq!(Bitrate::from_kbps(128).unwrap().bits_per_second(), 128_000);
-        assert!(Bitrate::from_kbps(0).is_none());
-        assert!(Bitrate::from_kbps(384).is_none());
-        assert_eq!(Bitrate::all().count(), 14);
+        let mpeg1 = |kbps| Bitrate::from_kbps(Version::Mpeg1, kbps);
+        let mpeg2 = |kbps| Bitrate::from_kbps(Version::Mpeg2, kbps);
+        assert_eq!(mpeg1(128).unwrap().bits_per_second(), 128_000);
+        assert_eq!(mpeg2(8).unwrap().bits_per_second(), 8_000);
+        assert!(mpeg1(0).is_none());
+        assert!(mpeg1(384).is_none());
+        assert!(mpeg1(8).is_none());
+        assert!(mpeg2(192).is_none());
+        assert_eq!(Bitrate::all(Version::Mpeg1).count(), 14);
+        assert_eq!(Bitrate::all(Version::Mpeg2).count(), 14);
     }
 
     #[test]
@@ -264,6 +363,26 @@ mod tests {
         assert_eq!(header_bytes(&h), [0xFF, 0xFB, 0b1110_0100, 0b1100_0000]);
     }
 
+    /// `ID` 0, and the `bitrate_index` and `sampling_frequency` codes of
+    /// ISO/IEC 13818-3.
+    #[test]
+    fn encodes_lower_sampling_frequencies() {
+        let h = header(64, SamplingFrequency::Hz22050, Mode::Stereo);
+        assert_eq!(header_bytes(&h), [0xFF, 0xF3, 0b1000_0000, 0b0000_0000]);
+        let h = header(8, SamplingFrequency::Hz24000, Mode::SingleChannel);
+        assert_eq!(header_bytes(&h), [0xFF, 0xF3, 0b0001_0100, 0b1100_0000]);
+        let h = header(160, SamplingFrequency::Hz16000, Mode::SingleChannel);
+        assert_eq!(header_bytes(&h), [0xFF, 0xF3, 0b1110_1000, 0b1100_0000]);
+    }
+
+    #[test]
+    #[should_panic(expected = "is not a bitrate of")]
+    fn rejects_a_bitrate_of_the_other_version() {
+        let mut h = header(128, SamplingFrequency::Hz44100, Mode::Stereo);
+        h.sampling_frequency = SamplingFrequency::Hz22050;
+        header_bytes(&h);
+    }
+
     #[test]
     fn crc_protection_clears_protection_bit() {
         let mut h = header(320, SamplingFrequency::Hz48000, Mode::SingleChannel);
@@ -285,19 +404,34 @@ mod tests {
             header(32, SamplingFrequency::Hz32000, Mode::Stereo).frame_len(),
             144
         );
+        // Half as many slots for frames of one granule.
+        assert_eq!(
+            header(64, SamplingFrequency::Hz24000, Mode::Stereo).frame_len(),
+            192
+        );
+        assert_eq!(
+            header(8, SamplingFrequency::Hz16000, Mode::Stereo).frame_len(),
+            36
+        );
+        assert_eq!(
+            header(64, SamplingFrequency::Hz22050, Mode::Stereo).frame_len(),
+            208
+        );
     }
 
     #[test]
     fn padding_keeps_cumulative_length_exact() {
         for fs in SamplingFrequency::ALL {
-            for bitrate in Bitrate::all() {
+            let slots_per_kbit = fs.version().samples_per_frame() as u64 / 8;
+            for bitrate in Bitrate::all(fs.version()) {
                 let mut schedule = PaddingSchedule::new(bitrate, fs);
                 let mut h = header(bitrate.bits_per_second() / 1000, fs, Mode::Stereo);
                 let mut total = 0u64;
                 for k in 1..=2000u64 {
                     h.padding = schedule.next_padding();
                     total += h.frame_len() as u64;
-                    let exact = k * 144 * u64::from(bitrate.bits_per_second()) / u64::from(fs.hz());
+                    let bits = u64::from(bitrate.bits_per_second());
+                    let exact = k * slots_per_kbit * bits / u64::from(fs.hz());
                     assert_eq!(total, exact, "{bitrate:?} at {fs:?}, frame {k}");
                 }
             }
@@ -305,9 +439,14 @@ mod tests {
     }
 
     #[test]
-    fn padding_is_never_needed_at_48_and_32_khz() {
-        for fs in [SamplingFrequency::Hz48000, SamplingFrequency::Hz32000] {
-            for bitrate in Bitrate::all() {
+    fn padding_is_never_needed_but_at_44_1_and_22_05_khz() {
+        for fs in [
+            SamplingFrequency::Hz48000,
+            SamplingFrequency::Hz32000,
+            SamplingFrequency::Hz24000,
+            SamplingFrequency::Hz16000,
+        ] {
+            for bitrate in Bitrate::all(fs.version()) {
                 let mut schedule = PaddingSchedule::new(bitrate, fs);
                 assert!(
                     (0..100).all(|_| !schedule.next_padding()),

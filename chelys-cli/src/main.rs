@@ -1,8 +1,9 @@
 // Copyright (c) 2026 StayBlue
 // SPDX-License-Identifier: MIT
 
-//! Encodes raw PCM from stdin as MPEG-1 Layer III on stdout. Input formats are
-//! left to other tools, for example:
+//! Encodes raw PCM from stdin as MPEG-1 Layer III, or MPEG-2 Layer III at the
+//! lower sampling frequencies, on stdout. Input formats are left to other
+//! tools, for example:
 //!
 //! ```sh
 //! ffmpeg -i song.flac -f f32le -ar 44100 -ac 2 - | chelys --sample-rate 44100 --channels 2 > song.mp3
@@ -11,7 +12,7 @@
 use std::io::{ErrorKind, Read, Write};
 use std::process::ExitCode;
 
-use chelys::mp3::header::{Bitrate, Mode, SamplingFrequency};
+use chelys::mp3::header::{Bitrate, Mode, SamplingFrequency, Version};
 use chelys::mp3::{Encoder, StreamConfig};
 
 const USAGE: &str = "\
@@ -19,18 +20,20 @@ usage: chelys --sample-rate HZ --channels N [--bitrate KBPS] [--joint-stereo]
               [--intensity-stereo] < input.f32 > output.mp3
 
 Reads interleaved 32-bit little-endian float PCM from stdin and writes MPEG-1
-Layer III to stdout.
+Layer III to stdout, or MPEG-2 Layer III at 16, 22.05 and 24 kHz.
 
-  --sample-rate HZ   32000, 44100 or 48000
+  --sample-rate HZ   32000, 44100 or 48000; or 16000, 22050 or 24000
   --channels N       1 or 2
   --bitrate KBPS     32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256
-                     or 320 (default 128)
+                     or 320; at 16, 22.05 and 24 kHz 8, 16, 24, 32, 40, 48,
+                     56, 64, 80, 96, 112, 128, 144 or 160 (default 128)
   --joint-stereo     code each frame of two channels in MS stereo where the
                      channels are alike (default: left/right stereo)
   --intensity-stereo code the upper bands of each frame of two channels in
                      intensity stereo where the frame is short of bits,
                      keeping only the level of each channel there and not
-                     its fine structure; for low bitrates (default: off)";
+                     its fine structure; for low bitrates; not yet at 16,
+                     22.05 and 24 kHz (default: off)";
 
 struct Options {
     sampling_frequency: SamplingFrequency,
@@ -77,12 +80,19 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
         n @ (1 | 2) => n as usize,
         n => return Err(format!("unsupported channel count: {n}")),
     };
-    let bitrate = Bitrate::from_kbps(bitrate).ok_or(format!("unsupported bitrate: {bitrate}"))?;
+    let bitrate = Bitrate::from_kbps(sampling_frequency.version(), bitrate).ok_or(format!(
+        "unsupported bitrate at {sample_rate} Hz: {bitrate}"
+    ))?;
     if joint_stereo && channels != 2 {
         return Err("--joint-stereo needs two channels".to_owned());
     }
     if intensity_stereo && channels != 2 {
         return Err("--intensity-stereo needs two channels".to_owned());
+    }
+    if intensity_stereo && sampling_frequency.version() == Version::Mpeg2 {
+        return Err(format!(
+            "--intensity-stereo is not supported at {sample_rate} Hz yet"
+        ));
     }
     Ok(Options {
         sampling_frequency,

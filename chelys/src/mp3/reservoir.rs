@@ -5,12 +5,11 @@
 //! unused are saved for later granules, and handed out again where the
 //! psychoacoustic model asks for more than the average.
 
+use crate::mp3::header::Version;
+
 /// The decoder's input buffer, which must hold a frame and the reservoir
 /// before it (clause 2.4.3.4.4).
 const BUFFER_BITS: usize = 7680;
-
-/// `main_data_begin` is a 9-bit field (clause 2.4.1.7).
-const MAX_MAIN_DATA_BEGIN: usize = (1 << 9) - 1;
 
 /// The reservoir's fill, above this share of its maximum, is released.
 const RELEASE_ABOVE: f64 = 0.8;
@@ -35,15 +34,21 @@ pub struct Reservoir {
 }
 
 impl Reservoir {
-    /// A reservoir for frames of at most `largest_frame_bytes`.
+    /// A reservoir for frames of `version` of at most `largest_frame_bytes`,
+    /// bounded by the decoder's buffer and the largest `main_data_begin`.
     ///
     /// Spec reading: clause 2.4.3.4.4 bounds the reservoir by the 7680-bit
     /// buffer less the frame, and asks for the same buffer at every sampling
     /// frequency. The largest frame, with padding, is used so that every
     /// frame fits.
-    pub fn new(largest_frame_bytes: usize) -> Self {
+    ///
+    /// Spec gap: ISO/IEC 13818-3 does not restate the buffer for the lower
+    /// sampling frequencies, and refers to ISO/IEC 11172-3 for
+    /// `main_data_begin`, so the same buffer is assumed there.
+    pub fn new(largest_frame_bytes: usize, version: Version) -> Self {
+        let max_main_data_begin = (1 << version.main_data_begin_bits()) - 1;
         let max_bytes =
-            (BUFFER_BITS.saturating_sub(8 * largest_frame_bytes) / 8).min(MAX_MAIN_DATA_BEGIN);
+            (BUFFER_BITS.saturating_sub(8 * largest_frame_bytes) / 8).min(max_main_data_begin);
         Self { bits: 0, max_bytes }
     }
 
@@ -127,18 +132,21 @@ mod tests {
 
     /// At 320 kbit/s and 48 kHz a frame fills the buffer, so the reservoir
     /// is always empty (clause 2.4.3.4.4); at 64 kbit/s it is limited by
-    /// `main_data_begin`.
+    /// `main_data_begin`, which is narrower at the lower sampling
+    /// frequencies.
     #[test]
     fn maximum_follows_the_buffer_and_the_field() {
-        assert_eq!(Reservoir::new(960).max_bytes(), 0);
-        assert_eq!(Reservoir::new(192).max_bytes(), 511);
-        // 160 kbit/s at 32 kHz: 720-byte frames leave 240 bytes.
-        assert_eq!(Reservoir::new(720).max_bytes(), 240);
+        assert_eq!(Reservoir::new(960, Version::Mpeg1).max_bytes(), 0);
+        assert_eq!(Reservoir::new(192, Version::Mpeg1).max_bytes(), 511);
+        assert_eq!(Reservoir::new(192, Version::Mpeg2).max_bytes(), 255);
+        // 160 kbit/s at 32 or 16 kHz: 720-byte frames leave 240 bytes.
+        assert_eq!(Reservoir::new(720, Version::Mpeg1).max_bytes(), 240);
+        assert_eq!(Reservoir::new(720, Version::Mpeg2).max_bytes(), 240);
     }
 
     #[test]
     fn unused_bits_are_saved_and_lent() {
-        let mut reservoir = Reservoir::new(400);
+        let mut reservoir = Reservoir::new(400, Version::Mpeg1);
         assert_eq!(reservoir.granule_bits(1000, 0.0), 1000);
         reservoir.granule_done(1000, 600);
         reservoir.granule_done(1000, 1000);
@@ -153,7 +161,7 @@ mod tests {
 
     #[test]
     fn a_full_reservoir_releases_its_top_and_stuffs_the_excess() {
-        let mut reservoir = Reservoir::new(800);
+        let mut reservoir = Reservoir::new(800, Version::Mpeg1);
         assert_eq!(reservoir.max_bytes(), 160);
         reservoir.granule_done(3000, 0);
         assert_eq!(reservoir.end_frame(0), 160);
