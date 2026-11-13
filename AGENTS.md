@@ -25,7 +25,8 @@ file.*
 
 ## Clean room
 
-chelys is implemented from ISO/IEC 11172-3 and its official corrigenda only.
+chelys is implemented from ISO/IEC 11172-3, ISO/IEC 13818-3 (its extension to
+lower sampling frequencies only), and their official corrigenda only.
 
 - Do not read, or reproduce from memory, the source code or internals of other
   encoders and decoders (for example LAME, the ISO reference code (dist10),
@@ -38,7 +39,8 @@ chelys is implemented from ISO/IEC 11172-3 and its official corrigenda only.
   documented in the code where it is made.
 
 *User, 2026-11-12, at the start of the project; "strictly the spec" for the
-annexes.*
+annexes.* *User, 2026-11-13: ISO/IEC 13818-3 added for the lower sampling
+frequencies; the wording was proposed by the agent and approved by the user.*
 
 ## Scope: PCM only
 
