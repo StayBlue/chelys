@@ -7,7 +7,7 @@
 use std::f64::consts::TAU;
 
 use chelys::mp3::header::{Bitrate, Mode, SamplingFrequency};
-use chelys::mp3::{StreamConfig, encode_pcm, encode_silence};
+use chelys::mp3::{GRANULE_LINES, StreamConfig, encode_pcm, encode_silence};
 use chelys_conformance::{DECODERS, Decoder, ffmpeg};
 
 fn config(kbps: u32, sampling_frequency: SamplingFrequency, mode: Mode) -> StreamConfig {
@@ -643,6 +643,152 @@ fn intensity_stereo_keeps_the_level_of_each_channel_at_the_lower_sampling_freque
                     );
                 }
             }
+        }
+    }
+}
+
+/// Reads `count` bits from bit `at` of `data`, most significant first.
+fn bits(data: &[u8], at: usize, count: usize) -> u32 {
+    (at..at + count).fold(0, |value, bit| {
+        value << 1 | u32::from(data[bit / 8] >> (7 - bit % 8) & 1)
+    })
+}
+
+/// For each granule of a stereo stream, whether its frame is coded in
+/// intensity stereo and both its channels in short blocks: with
+/// `window_switching_flag` set and `block_type` '10' (clause 2.4.1.7, and
+/// clause 2.4.2.1 of ISO/IEC 13818-3 for the lower sampling frequencies).
+fn short_intensity_granules(stream: &[u8]) -> Vec<bool> {
+    let mut granules = Vec::new();
+    let mut at = 0;
+    while at + 4 <= stream.len() {
+        let header = &stream[at..];
+        assert_eq!(header[0], 0xFF, "no syncword at {at}");
+        let mpeg1 = header[1] >> 3 & 1 == 1;
+        let crc = if header[1] & 1 == 0 { 2 } else { 0 };
+        let side_info = &header[4 + crc..];
+        let intensity = header[3] >> 4 & 1 == 1;
+        // The bits before the first granule's (main_data_begin, the
+        // private bits and, in MPEG-1, scfsi), the bits of each granule of
+        // each channel, and those before its window_switching_flag
+        // (part2_3_length, big_values, global_gain and scalefac_compress).
+        let (start, per_channel, before, count) = if mpeg1 {
+            (9 + 3 + 8, 59, 12 + 9 + 8 + 4, 2)
+        } else {
+            (8 + 2, 63, 12 + 9 + 8 + 9, 1)
+        };
+        for gr in 0..count {
+            let short = (0..2).all(|ch| {
+                let flag = start + (2 * gr + ch) * per_channel + before;
+                bits(side_info, flag, 3) == 0b110
+            });
+            granules.push(intensity && short);
+        }
+        at += frame_len(header);
+    }
+    granules
+}
+
+/// The third difference of `x` at `t`, which passes a sine of frequency `f`
+/// at `(2 sin(pi f / fs))^3` of its amplitude: less than a tenth up to
+/// 1.6 kHz at 22.05 kHz and 3.2 kHz at 44.1 kHz, and more than its whole
+/// amplitude from `fs / 6` up.
+fn high_pass(x: impl Fn(usize) -> f64, t: usize) -> f64 {
+    x(t + 3) - 3.0 * x(t + 2) + 3.0 * x(t + 1) - x(t)
+}
+
+/// Intensity stereo in short blocks. Bursts of noise every 9600 samples,
+/// decaying with a time constant of 30 ms, switch both channels to short
+/// blocks, over tones at 1.2, 2.8, 3.7 and 5 kHz, with the right channel at
+/// half the left throughout.
+///
+/// At 44.1 kHz and 64 kbit/s, with MS stereo on or off, the frames are
+/// short of bits, and those with short blocks are coded in intensity stereo.
+/// Amplitudes 2 to 1 take position 4 in every band and window, which
+/// decodes the right channel at `1 / tan(60)`, 0.577, of the left.
+///
+/// At 22.05 kHz and 48 kbit/s the tones lie in the bands just below the
+/// bounds of short blocks, bands 4, 7, 8 and 9 (Table B.2 of ISO/IEC
+/// 13818-3), so that the right channel need not mark a band in any window,
+/// and some short blocks are coded in intensity stereo. Amplitudes 2 to 1
+/// take position 4, which decodes the right channel at `i0^2`, 0.5, of the
+/// left.
+///
+/// In the short granules coded in intensity stereo, the decoded right
+/// channel, high-passed, is that share of the decoded left in ffmpeg,
+/// mpg123 and LAME, within 2%.
+#[test]
+fn intensity_stereo_keeps_the_level_of_each_channel_in_short_blocks() {
+    let cases = [
+        (
+            SamplingFrequency::Hz44100,
+            64,
+            false,
+            1.0 / 60f64.to_radians().tan(),
+        ),
+        (
+            SamplingFrequency::Hz44100,
+            64,
+            true,
+            1.0 / 60f64.to_radians().tan(),
+        ),
+        (SamplingFrequency::Hz22050, 48, false, 0.5),
+    ];
+    for (fs, kbps, ms_stereo, share) in cases {
+        let hz = f64::from(fs.hz());
+        let mut seed = 1u64;
+        let left: Vec<f64> = (0..(2.0 * hz) as usize)
+            .map(|t| {
+                seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                let noise = (seed >> 11) as f64 / (1u64 << 52) as f64 - 1.0;
+                let burst = 0.6 * (-((t % 9600) as f64) / (0.03 * hz)).exp() * noise;
+                let tones: f64 = [1_200.0, 2_800.0, 3_700.0, 5_000.0]
+                    .iter()
+                    .map(|f| 0.1 * (TAU * f * t as f64 / hz).sin())
+                    .sum();
+                burst + tones
+            })
+            .collect();
+        let right: Vec<f64> = left.iter().map(|x| 0.5 * x).collect();
+        let mode = Mode::JointStereo {
+            intensity_stereo: true,
+            ms_stereo,
+        };
+        let stream = encode_pcm(&config(kbps, fs, mode), &[&left, &right]);
+        let granules = short_intensity_granules(&stream);
+        let coded = granules.iter().filter(|&&on| on).count();
+        assert!(coded >= 4, "{fs:?}, MS {ms_stereo}: {granules:?}");
+        // The input samples of each short granule coded in intensity
+        // stereo, but for the last three.
+        let samples: Vec<usize> = (granules.iter().enumerate())
+            .filter(|&(_, &on)| on)
+            .flat_map(|(granule, _)| granule * GRANULE_LINES..(granule + 1) * GRANULE_LINES)
+            .filter(|&t| t + 3 < left.len())
+            .collect();
+        for Decoder { name, decode } in DECODERS {
+            let decoded = decode(&stream);
+            assert_eq!(decoded.diagnostics, "", "{name}");
+            // The decoded `channel`, high-passed, projected on the left
+            // input, high-passed, with the output `delay` samples behind.
+            let gain = |channel: usize, delay: usize, samples: &[usize]| {
+                let output = |t: usize| {
+                    let at = 2 * (t + delay) + channel;
+                    decoded.samples.get(at).copied().map_or(0.0, f64::from)
+                };
+                let (product, energy) = samples.iter().fold((0.0, 0.0), |(p, e), &t| {
+                    let input = high_pass(|t| left[t], t);
+                    (p + high_pass(output, t) * input, e + input * input)
+                });
+                product / energy
+            };
+            let delay = (0..2 * GRANULE_LINES)
+                .max_by(|&a, &b| gain(0, a, &samples).total_cmp(&gain(0, b, &samples)))
+                .unwrap();
+            let decoded_share = gain(1, delay, &samples) / gain(0, delay, &samples);
+            assert!(
+                (decoded_share / share - 1.0).abs() < 0.02,
+                "{name}, {fs:?}, MS {ms_stereo}: {decoded_share:.4} for {share:.4}"
+            );
         }
     }
 }

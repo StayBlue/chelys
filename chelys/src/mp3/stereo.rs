@@ -8,10 +8,11 @@
 //! lower sampling frequencies in clause 2.4.3.2 of ISO/IEC 13818-3.
 
 use std::f64::consts::{PI, SQRT_2};
+use std::iter::Chain;
 use std::ops::Range;
 
 use super::header::{SamplingFrequency, Version};
-use super::scalefactor_bands::{self, LONG_BANDS};
+use super::scalefactor_bands::{self, SHORT_WINDOWS};
 use super::scalefactors::{Scalefactors, ZeroPart};
 use super::{BlockType, GRANULE_LINES};
 
@@ -162,36 +163,56 @@ const MAX_STEPS: i32 = 7;
 /// reading 7 as illegal in a field of 3 bits too.
 const SKIPPED_STEPS: i32 = -4;
 
+/// The steps by which more and more bands are coded in intensity stereo
+/// (see [`intensity_bounds`]).
+pub const INTENSITY_STEPS: usize = 4;
+
 /// The `bound` of Layers I and II in intensity stereo: the subband from
 /// which they code it (Annex G.1, clause 2.4.2.3), from the fewest subbands
 /// to the most.
-const LAYER_I_II_BOUNDS: [usize; 4] = [16, 12, 8, 4];
+const LAYER_I_II_BOUNDS: [usize; INTENSITY_STEPS] = [16, 12, 8, 4];
 
 /// The frequency lines of a granule in each polyphase subband (clause
-/// 2.4.3.4.10).
+/// 2.4.3.4.10): 18 in a long block, 6 in each window of a short one.
 const SUBBAND_LINES: usize = 18;
 
-/// The long scalefactor bands from which a frame may be coded in intensity
-/// stereo, from the fewest bands to the most.
+/// The scalefactor bands of `block_type`, long or short, from which a
+/// granule may be coded in intensity stereo, from the fewest bands to the
+/// most.
 ///
 /// Spec gap: Annex G.2 c) does not say which bands to code in intensity
 /// stereo. Annex G.1 does for Layers I and II: from subband 16, 12, 8 or 4,
 /// depending on the bits needed. The same four steps are taken here, each
-/// from the first scalefactor band that starts at or above the subband, so
-/// that intensity stereo never reaches below where those layers would let
-/// it. The lowest, from subband 4, starts at 2.3 to 3.0 kHz, above the
-/// "about 2 kHz" where G.1 says the temporal envelope, which intensity
-/// stereo keeps, takes over localisation from the fine structure, which it
-/// loses. At the lower sampling frequencies, whose subbands are half as wide,
-/// it starts at 1.1 to 1.7 kHz, below that, as it does for Layers I and II
-/// there, whose `bound` is that of ISO/IEC 11172-3 (clause 2.4.2.3 of
-/// ISO/IEC 13818-3).
-pub fn intensity_bounds(sampling_frequency: SamplingFrequency) -> [usize; 4] {
-    let bands = scalefactor_bands::long_bands(sampling_frequency);
-    LAYER_I_II_BOUNDS.map(|subband| {
-        bands
+/// from the first scalefactor band that starts at or above the subband, in
+/// each window of a short block, so that intensity stereo never reaches
+/// below where those layers would let it. For long blocks the lowest, from
+/// subband 4, starts at 2.3 to 3.0 kHz, above the "about 2 kHz" where G.1
+/// says the temporal envelope, which intensity stereo keeps, takes over
+/// localisation from the fine structure, which it loses; for short blocks,
+/// whose bands are coarser, at 2.5 to 3.5 kHz. At the lower sampling
+/// frequencies, whose subbands are half as wide, it starts at 1.1 to 1.7 kHz
+/// for long blocks and 1.1 to 1.6 kHz for short ones, below that, as it
+/// does for Layers I and II there, whose `bound` is that of ISO/IEC 11172-3
+/// (clause 2.4.2.3 of ISO/IEC 13818-3).
+pub fn intensity_bounds(
+    block_type: BlockType,
+    sampling_frequency: SamplingFrequency,
+) -> [usize; INTENSITY_STEPS] {
+    let starts: Vec<usize> = match block_type {
+        BlockType::Short => scalefactor_bands::short_bands(sampling_frequency)
             .iter()
-            .position(|band| band.start >= SUBBAND_LINES * subband)
+            .map(|band| band.start)
+            .collect(),
+        _ => scalefactor_bands::long_bands(sampling_frequency)
+            .iter()
+            .map(|band| band.start)
+            .collect(),
+    };
+    let lines = SUBBAND_LINES / scalefactor_bands::windows(block_type);
+    LAYER_I_II_BOUNDS.map(|subband| {
+        starts
+            .iter()
+            .position(|&start| start >= lines * subband)
             .expect("every bound lies below the highest band")
     })
 }
@@ -285,23 +306,31 @@ fn shares(version: Version, position: u8) -> (f64, f64) {
     }
 }
 
-/// The positions of the bands of the right channel that a frame codes in
+/// The positions of the bands of the right channel that a granule codes in
 /// intensity stereo, for the scalefactors of its zero part (clause
 /// 2.4.3.4.9.3).
+///
+/// For short blocks each window has its own position in each band, and the
+/// encoder codes the same bands of all three in intensity stereo: the bound
+/// is the same short scalefactor band in each window.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IntensityPositions {
-    /// The first long scalefactor band coded in intensity stereo.
+    block_type: BlockType,
+    /// The first scalefactor band coded in intensity stereo, long or short
+    /// as `block_type` has them.
     bound: usize,
-    /// `is_pos` of each band from `bound`.
-    positions: [u8; LONG_BANDS],
+    /// `is_pos` of each scalefactor from the bound, in the order of
+    /// [`Scalefactors::values`].
+    positions: Vec<u8>,
     sampling_frequency: SamplingFrequency,
 }
 
 impl IntensityPositions {
-    /// The positions of one granule coded from long scalefactor band
-    /// `bound` up in intensity stereo, each found from the energies of the
-    /// band's `left` and `right` lines (Annex G.2 c), and
-    /// [`lsf_intensity_position`] at the lower sampling frequencies).
+    /// The positions of one granule of `block_type` coded from scalefactor
+    /// band `bound` up in intensity stereo, each found from the energies of
+    /// the band's `left` and `right` lines (Annex G.2 c), and
+    /// [`lsf_intensity_position`] at the lower sampling frequencies), in
+    /// each window of a short block.
     ///
     /// Spec gap: the lines above the highest scalefactor band have no
     /// scalefactor, and so no position, and the standard does not say how a
@@ -309,7 +338,8 @@ impl IntensityPositions {
     /// channel's zero part, which the figure of clause 2.4.3.4.9.3 shows
     /// coded in intensity stereo up to the end of the spectrum, and are
     /// coded like the bands (see [`code`](Self::code)). They are taken to
-    /// share the position of the highest band, which is found from the
+    /// share the position of the highest band, in each window of a short
+    /// block that of the window's highest band, which is found from the
     /// energies of that band's lines and theirs together.
     ///
     /// Settled by decoding with ffmpeg (black box): at 64 kbit/s and
@@ -329,11 +359,11 @@ impl IntensityPositions {
     ///
     /// # Panics
     ///
-    /// If `bound` is not a long scalefactor band. Short blocks are not coded
-    /// in intensity stereo.
+    /// If `bound` is not a scalefactor band of `block_type`.
     pub fn new(
         left: &[f64; GRANULE_LINES],
         right: &[f64; GRANULE_LINES],
+        block_type: BlockType,
         bound: usize,
         sampling_frequency: SamplingFrequency,
     ) -> Self {
@@ -341,20 +371,36 @@ impl IntensityPositions {
             Version::Mpeg1 => intensity_position,
             Version::Mpeg2 => lsf_intensity_position,
         };
-        let mut positions = [0; LONG_BANDS];
-        for (sb, lines) in coded_bands(bound, sampling_frequency) {
-            positions[sb] = position(energy(&left[lines.clone()]), energy(&right[lines]));
+        let scalefactors = scalefactor_bands::coding_bands(block_type, sampling_frequency).len();
+        assert!(
+            bound < scalefactors / scalefactor_bands::windows(block_type),
+            "bound {bound} is not a scalefactor band"
+        );
+        let mut positions = vec![0; scalefactors];
+        for (index, lines) in coded_bands(block_type, bound, sampling_frequency) {
+            let left_energy = energy(lines.clone().map(|i| left[i]));
+            positions[index] = position(left_energy, energy(lines.map(|i| right[i])));
         }
         Self {
+            block_type,
             bound,
             positions,
             sampling_frequency,
         }
     }
 
-    /// The first long scalefactor band coded in intensity stereo.
-    pub fn bound(&self) -> usize {
-        self.bound
+    /// The first scalefactor coded in intensity stereo, in the order of
+    /// [`Scalefactors::values`]: the bound in its first window.
+    pub fn first_scalefactor(&self) -> usize {
+        self.bound * scalefactor_bands::windows(self.block_type)
+    }
+
+    /// The first line coded in intensity stereo, in the order the lines are
+    /// sent: all those from it on are, in every window.
+    pub fn first_line(&self) -> usize {
+        scalefactor_bands::coding_bands(self.block_type, self.sampling_frequency)
+            [self.first_scalefactor()]
+        .start
     }
 
     /// Codes a granule's lines from the bound up in intensity stereo (Annex
@@ -388,14 +434,15 @@ impl IntensityPositions {
     ) {
         let fs = self.sampling_frequency;
         let [coded_left, coded_right] = coded;
-        for (sb, lines) in coded_bands(self.bound, fs) {
+        for (index, lines) in coded_bands(self.block_type, self.bound, fs) {
             let sum: Vec<f64> = lines.clone().map(|i| left[i] + right[i]).collect();
             let scale = match fs.version() {
                 Version::Mpeg1 => 1.0,
                 Version::Mpeg2 => {
-                    let (k_l, k_r) = shares(fs.version(), self.positions[sb]);
-                    let wanted = energy(&left[lines.clone()]) + energy(&right[lines.clone()]);
-                    let decoded = (k_l * k_l + k_r * k_r) * energy(&sum);
+                    let (k_l, k_r) = shares(fs.version(), self.positions[index]);
+                    let wanted = energy(lines.clone().map(|i| left[i]))
+                        + energy(lines.clone().map(|i| right[i]));
+                    let decoded = (k_l * k_l + k_r * k_r) * energy(sum.iter().copied());
                     if decoded > 0.0 {
                         (wanted / decoded).sqrt()
                     } else {
@@ -411,8 +458,9 @@ impl IntensityPositions {
     }
 
     /// The allowed distortion of the sum of the left and right channels
-    /// sent in long scalefactor band `sb`, from or above the bound, given
-    /// the allowed distortion of the left and right channels.
+    /// sent for scalefactor `index` of [`Scalefactors::values`], from or
+    /// above the bound, given the allowed distortion of the left and right
+    /// channels.
     ///
     /// Spec gap: Annex G does not say how to find it. The decoder gives each
     /// channel the lines sent times its `shares`, and so those factors,
@@ -420,10 +468,13 @@ impl IntensityPositions {
     /// that keeps each channel within its allowance. A channel whose share
     /// is zero sets no limit, and nor does one that allows no noise because
     /// it has no energy in the band, as in [`middle_side_distortion`].
-    pub fn sum_distortion(&self, sb: usize, left: f64, right: f64) -> f64 {
-        assert!(sb >= self.bound, "band {sb} is below the bound");
+    pub fn sum_distortion(&self, index: usize, left: f64, right: f64) -> f64 {
+        assert!(
+            index >= self.first_scalefactor(),
+            "scalefactor {index} is below the bound"
+        );
         let (left_share, right_share) =
-            shares(self.sampling_frequency.version(), self.positions[sb]);
+            shares(self.sampling_frequency.version(), self.positions[index]);
         [(left, left_share), (right, right_share)]
             .into_iter()
             .filter(|&(xmin, share)| xmin > 0.0 && share > 0.0)
@@ -446,6 +497,18 @@ impl IntensityPositions {
     /// `big_values * 2 + count1 * 4`. Here the `count1` partition ends with
     /// the pair holding the last nonzero value (clause C.1.5.4.4.4), and
     /// scalefactor bands start on even lines, so the two agree.
+    ///
+    /// Spec reading: for short blocks, clause 2.4.3.2 of ISO/IEC 13818-3 finds
+    /// the bound in each window apart, from the window's own last nonzero
+    /// value, and says this is done "like" ISO/IEC 11172-3 (its 1995 edition
+    /// said "unlike"). Clause 2.4.3.4.9.3 of ISO/IEC 11172-3 says nothing of
+    /// windows, and is read as the 1998 edition of ISO/IEC 13818-3 describes
+    /// it. So each window has its own zero part, and its bands below the
+    /// bound are marked from above its own last nonzero value. A decoder
+    /// that found one zero part for the granule, from the last nonzero value
+    /// in the order the values are sent, would read the same bands as
+    /// coded in intensity stereo, as the bound is the same in every window
+    /// and the bands marked would at most be read as scalefactors of zeros.
     ///
     /// Spec reading: Annex G.2 c) asks for the mark in every band of zeros
     /// outside the intensity coded part. Only the bands of the zero part
@@ -471,24 +534,33 @@ impl IntensityPositions {
     ///
     /// If a value from the bound is not zero.
     pub fn mark(&self, scalefactors: &mut Scalefactors, values: &[i32; GRANULE_LINES]) {
-        let bands = scalefactor_bands::long_bands(self.sampling_frequency);
+        let bands = scalefactor_bands::coding_bands(self.block_type, self.sampling_frequency);
+        let windows = scalefactor_bands::windows(self.block_type);
+        let first = self.first_scalefactor();
         assert!(
-            values[bands[self.bound].start..].iter().all(|&v| v == 0),
+            values[bands[first].start..].iter().all(|&v| v == 0),
             "the right channel is zero from the intensity stereo bound"
         );
-        let zero_from = values.iter().rposition(|&v| v != 0).map_or(0, |last| {
-            bands.iter().position(|b| last < b.end()).unwrap() + 1
-        });
-        for sb in zero_from..LONG_BANDS {
-            // The marked bands send no value of their own.
-            scalefactors.values_mut()[sb] = if sb < self.bound {
-                0
-            } else {
-                self.positions[sb]
-            };
+        // The band above the last nonzero value of each window.
+        let mut start = [0; SHORT_WINDOWS];
+        for (index, band) in bands[..first].iter().enumerate() {
+            if values[band.start..band.end()].iter().any(|&v| v != 0) {
+                start[index % windows] = index / windows + 1;
+            }
+        }
+        for (index, scalefactor) in scalefactors.values_mut().iter_mut().enumerate() {
+            let (sfb, window) = (index / windows, index % windows);
+            if sfb >= start[window] {
+                // The marked bands send no value of their own.
+                *scalefactor = if sfb < self.bound {
+                    0
+                } else {
+                    self.positions[index]
+                };
+            }
         }
         scalefactors.intensity = Some(ZeroPart {
-            start: zero_from,
+            start,
             bound: self.bound,
         });
     }
@@ -498,45 +570,51 @@ impl IntensityPositions {
     /// sending its position: the bits the iteration loops can always fit it
     /// in, by quantising more coarsely, and so the fewest it must be given.
     ///
-    /// In ISO/IEC 11172-3 these are 63, every band in 3 bits; at the lower
-    /// sampling frequencies they depend on the positions, and a granule
-    /// quantised so is not kept, as its marks are not sent there (see
-    /// `quantize_frame`).
+    /// In ISO/IEC 11172-3 these are 63 for long blocks and 108 for short
+    /// ones, every band in 3 bits; at the lower sampling frequencies they
+    /// depend on the positions, and a granule quantised so is not kept, as
+    /// its marks are not sent there (see `quantize_frame`).
     pub fn silent_bits(&self) -> usize {
         let mut scalefactors =
-            Scalefactors::new(BlockType::Normal, self.sampling_frequency.version());
+            Scalefactors::new(self.block_type, self.sampling_frequency.version());
         self.mark(&mut scalefactors, &[0; GRANULE_LINES]);
         let compress = scalefactors.compress().expect("marks that fit a field");
         scalefactors.part2_length(compress)
     }
 }
 
-/// The long scalefactor bands from `bound` up, each with the lines it codes
-/// in intensity stereo: the highest also those above it (see
-/// [`IntensityPositions::new`]).
+/// The scalefactors of a granule of `block_type` from band `bound` up, in
+/// the order of [`Scalefactors::values`], each with the lines it codes in
+/// intensity stereo in the order they are sent: the highest band of each
+/// window also those above it (see [`IntensityPositions::new`]).
 fn coded_bands(
+    block_type: BlockType,
     bound: usize,
     sampling_frequency: SamplingFrequency,
-) -> impl Iterator<Item = (usize, Range<usize>)> {
-    let bands = scalefactor_bands::long_bands(sampling_frequency);
-    bands.iter().enumerate().skip(bound).map(|(sb, band)| {
-        let end = if sb == LONG_BANDS - 1 {
-            GRANULE_LINES
+) -> impl Iterator<Item = (usize, Chain<Range<usize>, Range<usize>>)> {
+    let bands = scalefactor_bands::coding_bands(block_type, sampling_frequency);
+    let windows = scalefactor_bands::windows(block_type);
+    let highest = bands.len() / windows - 1;
+    (bound * windows..bands.len()).map(move |index| {
+        let (sfb, window) = (index / windows, index % windows);
+        let above = if sfb == highest {
+            scalefactor_bands::lines_above_bands(block_type, sampling_frequency, window)
         } else {
-            band.end()
+            0..0
         };
-        (sb, band.start..end)
+        (index, (bands[index].start..bands[index].end()).chain(above))
     })
 }
 
-fn energy(lines: &[f64]) -> f64 {
-    lines.iter().map(|x| x * x).sum()
+fn energy(lines: impl Iterator<Item = f64>) -> f64 {
+    lines.map(|x| x * x).sum()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::bitstream::BitWriter;
+    use crate::mp3::scalefactor_bands::LONG_BANDS;
 
     #[test]
     fn alike_channels_switch_ms_on_and_either_alone_does_not() {
@@ -588,34 +666,24 @@ mod tests {
     }
 
     /// The Layer I and II bounds, subbands 16, 12, 8 and 4, start at lines
-    /// 288, 216, 144 and 72; each step is the first band starting there or
+    /// 288, 216, 144 and 72 of a long block, and 96, 72, 48 and 24 of each
+    /// window of a short one; each step is the first band starting there or
     /// above (Table B.8, and Table B.2 of ISO/IEC 13818-3).
     #[test]
     fn intensity_bounds_follow_the_layer_i_and_ii_subbands() {
-        assert_eq!(
-            intensity_bounds(SamplingFrequency::Hz16000),
-            [18, 16, 14, 10]
-        );
-        assert_eq!(
-            intensity_bounds(SamplingFrequency::Hz22050),
-            [18, 16, 14, 10]
-        );
-        assert_eq!(
-            intensity_bounds(SamplingFrequency::Hz24000),
-            [18, 16, 14, 10]
-        );
-        assert_eq!(
-            intensity_bounds(SamplingFrequency::Hz32000),
-            [18, 17, 15, 12]
-        );
-        assert_eq!(
-            intensity_bounds(SamplingFrequency::Hz44100),
-            [19, 18, 16, 12]
-        );
-        assert_eq!(
-            intensity_bounds(SamplingFrequency::Hz48000),
-            [20, 18, 16, 12]
-        );
+        use SamplingFrequency::*;
+        let cases = [
+            (Hz16000, [18, 16, 14, 10], [10, 9, 7, 5]),
+            (Hz22050, [18, 16, 14, 10], [10, 9, 8, 5]),
+            (Hz24000, [18, 16, 14, 10], [10, 9, 7, 5]),
+            (Hz32000, [18, 17, 15, 12], [10, 9, 8, 6]),
+            (Hz44100, [19, 18, 16, 12], [11, 10, 8, 6]),
+            (Hz48000, [20, 18, 16, 12], [11, 10, 8, 6]),
+        ];
+        for (fs, long, short) in cases {
+            assert_eq!(intensity_bounds(BlockType::Normal, fs), long, "{fs:?}");
+            assert_eq!(intensity_bounds(BlockType::Short, fs), short, "{fs:?}");
+        }
     }
 
     /// `nint(12 / pi * arctan(sqrt(L / R)))`: amplitudes 2 to 1 lie at
@@ -645,8 +713,8 @@ mod tests {
         right[bands[20].start..].fill(0.0);
         let mut left_top = left;
         left_top[bands[20].start..bands[20].end()].fill(0.0);
-        let positions = IntensityPositions::new(&left_top, &right, 12, fs);
-        assert_eq!(positions.bound(), 12);
+        let positions = IntensityPositions::new(&left_top, &right, BlockType::Normal, 12, fs);
+        assert_eq!(positions.first_scalefactor(), 12);
         assert_eq!(positions.positions[20], 6);
         let (mut coded_left, mut coded_right) = middle_side(&left_top, &right);
         let (middle, side) = (coded_left, coded_right);
@@ -668,7 +736,8 @@ mod tests {
         let fs = SamplingFrequency::Hz44100;
         let bands = scalefactor_bands::long_bands(fs);
         let left: [f64; GRANULE_LINES] = std::array::from_fn(|i| 1.0 + (i % 3) as f64);
-        let positions = IntensityPositions::new(&left, &[0.5; GRANULE_LINES], 12, fs);
+        let positions =
+            IntensityPositions::new(&left, &[0.5; GRANULE_LINES], BlockType::Normal, 12, fs);
         let mut values = [0; GRANULE_LINES];
         values[bands[5].start + 1] = -2;
         let mut scalefactors = Scalefactors::default();
@@ -680,7 +749,7 @@ mod tests {
         assert_eq!(
             scalefactors.intensity,
             Some(ZeroPart {
-                start: 6,
+                start: [6, 0, 0],
                 bound: 12
             })
         );
@@ -695,9 +764,118 @@ mod tests {
 
         let mut scalefactors = Scalefactors::default();
         positions.mark(&mut scalefactors, &[0; GRANULE_LINES]);
-        assert_eq!(scalefactors.intensity.unwrap().start, 0);
+        assert_eq!(scalefactors.intensity.unwrap().start, [0; SHORT_WINDOWS]);
         // Marks in 3 bits for all 21 bands.
         assert_eq!(positions.silent_bits(), 3 * LONG_BANDS);
+    }
+
+    /// The right channel of a short block at the level of the left in its
+    /// first window, at half in its second and silent in its third: each
+    /// window has its own positions, 3, 4 and 6. Band 11 of the second
+    /// window is silent in both channels, so its position is found from the
+    /// window's lines above it alone. From the bound up, in every window,
+    /// the left channel sends the sum and the right zero.
+    #[test]
+    fn short_blocks_have_positions_in_each_window() {
+        let fs = SamplingFrequency::Hz44100;
+        let bands = scalefactor_bands::coding_bands(BlockType::Short, fs);
+        let mut left: [f64; GRANULE_LINES] = std::array::from_fn(|i| 1.0 + (i % 3) as f64);
+        let mut right = left;
+        for window in 0..SHORT_WINDOWS {
+            let above = scalefactor_bands::lines_above_bands(BlockType::Short, fs, window);
+            let lines = (window..bands.len()).step_by(SHORT_WINDOWS);
+            let lines = lines.flat_map(|index| bands[index].start..bands[index].end());
+            for i in lines.chain(above) {
+                right[i] *= [1.0, 0.5, 0.0][window];
+            }
+        }
+        let band_11 = bands[3 * 11 + 1];
+        left[band_11.start..band_11.end()].fill(0.0);
+        right[band_11.start..band_11.end()].fill(0.0);
+
+        let positions = IntensityPositions::new(&left, &right, BlockType::Short, 8, fs);
+        assert_eq!(positions.first_scalefactor(), 24);
+        assert_eq!(
+            positions.first_line(),
+            3 * scalefactor_bands::short_bands(fs)[8].start
+        );
+        for index in 24..bands.len() {
+            assert_eq!(positions.positions[index], [3, 4, 6][index % 3], "{index}");
+        }
+        let (mut coded_left, mut coded_right) = (left, right);
+        positions.code(&left, &right, [&mut coded_left, &mut coded_right]);
+        let start = positions.first_line();
+        assert_eq!(coded_left[..start], left[..start]);
+        assert_eq!(coded_right[..start], right[..start]);
+        for i in start..GRANULE_LINES {
+            assert_eq!(coded_left[i], left[i] + right[i]);
+            assert_eq!(coded_right[i], 0.0);
+        }
+    }
+
+    /// Each window of a short block has its own zero part: the bands of a
+    /// window above its last nonzero value are marked with 7 up to the
+    /// bound, and the others keep their scalefactors.
+    #[test]
+    fn short_blocks_mark_the_zero_part_of_each_window() {
+        let fs = SamplingFrequency::Hz44100;
+        let bands = scalefactor_bands::coding_bands(BlockType::Short, fs);
+        let left: [f64; GRANULE_LINES] = std::array::from_fn(|i| 1.0 + (i % 3) as f64);
+        let positions =
+            IntensityPositions::new(&left, &[0.5; GRANULE_LINES], BlockType::Short, 8, fs);
+        // Nonzero in band 5 of the first window and band 2 of the third.
+        let mut values = [0; GRANULE_LINES];
+        values[bands[3 * 5].start] = 1;
+        values[bands[3 * 2 + 2].end() - 1] = -1;
+        let mut scalefactors = Scalefactors::new(BlockType::Short, Version::Mpeg1);
+        // Band 1 in the first and second windows.
+        scalefactors.values_mut()[3] = 9;
+        scalefactors.values_mut()[4] = 9;
+        positions.mark(&mut scalefactors, &values);
+        assert_eq!(
+            scalefactors.intensity,
+            Some(ZeroPart {
+                start: [6, 0, 3],
+                bound: 8
+            })
+        );
+        assert!(scalefactors.marks_any());
+        assert_eq!(scalefactors.values()[3..5], [9, 0]);
+        assert_eq!(scalefactors.values()[24..], positions.positions[24..]);
+        // Bands 0 to 5 in 4 bits, 6 to 11 in 3.
+        let compress = scalefactors.compress().unwrap();
+        let mut w = BitWriter::new();
+        scalefactors.write(compress, &mut w);
+        let bits: String = w.into_bytes().iter().map(|b| format!("{b:08b}")).collect();
+        let sent = |index: usize| {
+            let at = if index < 18 {
+                4 * index
+            } else {
+                72 + 3 * (index - 18)
+            };
+            let width = if index < 18 { 4 } else { 3 };
+            &bits[at..at + width]
+        };
+        let expected = [
+            (3, "1001"),
+            (4, "0111"),
+            (8, "0000"),
+            (11, "0111"),
+            (15, "0000"),
+            (16, "0111"),
+            (18, "111"),
+            (23, "111"),
+        ];
+        for (index, value) in expected {
+            assert_eq!(sent(index), value, "scalefactor {index}");
+        }
+        for index in 24..bands.len() {
+            let position = format!("{:03b}", positions.positions[index]);
+            assert_eq!(sent(index), position, "scalefactor {index}");
+        }
+
+        // Marks in 3 bits for all 36 scalefactors.
+        assert_eq!(positions.silent_bits(), 3 * 36);
     }
 
     /// At the lower sampling frequencies each step of position halves the
@@ -740,7 +918,7 @@ mod tests {
         let tone: [f64; GRANULE_LINES] = std::array::from_fn(|i| ((i * 7) % 5) as f64 - 2.0);
         let half = tone.map(|x| 0.5 * x);
         for (right, position) in [(tone, 0), (half, 4)] {
-            let positions = IntensityPositions::new(&tone, &right, 10, fs);
+            let positions = IntensityPositions::new(&tone, &right, BlockType::Normal, 10, fs);
             assert!(positions.positions[10..].iter().all(|&p| p == position));
             let (mut coded_left, mut coded_right) = (tone, right);
             positions.code(&tone, &right, [&mut coded_left, &mut coded_right]);
@@ -759,12 +937,12 @@ mod tests {
     fn lsf_marks_take_a_field_of_at_least_one_bit() {
         let fs = SamplingFrequency::Hz22050;
         let tone: [f64; GRANULE_LINES] = std::array::from_fn(|i| ((i * 7) % 5) as f64 - 2.0);
-        let alike = IntensityPositions::new(&tone, &tone, 14, fs);
+        let alike = IntensityPositions::new(&tone, &tone, BlockType::Normal, 14, fs);
         // Bands 0 to 13 marked in 1 bit; positions 0 in bands 14 to 20, the
         // third partition of int_scalefac_compress below 180, in no bits.
         assert_eq!(alike.silent_bits(), 14);
         let half = tone.map(|x| 0.5 * x);
-        let panned = IntensityPositions::new(&tone, &half, 14, fs);
+        let panned = IntensityPositions::new(&tone, &half, BlockType::Normal, 14, fs);
         // Position 4 needs a field of 3 bits, below its mark 7.
         assert_eq!(panned.silent_bits(), 7 + 7 + 3 * 7);
     }
@@ -774,13 +952,16 @@ mod tests {
     #[test]
     fn the_sum_is_allowed_what_keeps_both_channels_within_theirs() {
         let positions = IntensityPositions {
+            block_type: BlockType::Normal,
             bound: 10,
-            positions: std::array::from_fn(|sb| match sb {
-                10 => 3,
-                11 => 6,
-                12 => 0,
-                _ => 2,
-            }),
+            positions: (0..LONG_BANDS)
+                .map(|sb| match sb {
+                    10 => 3,
+                    11 => 6,
+                    12 => 0,
+                    _ => 2,
+                })
+                .collect(),
             sampling_frequency: SamplingFrequency::Hz44100,
         };
         assert!((positions.sum_distortion(10, 2.0, 1.0) - 4.0).abs() < 1e-12);
@@ -798,7 +979,7 @@ mod tests {
         // channel half the lines sent, and a quarter of their noise.
         let lsf = IntensityPositions {
             sampling_frequency: SamplingFrequency::Hz22050,
-            positions: [4; LONG_BANDS],
+            positions: vec![4; LONG_BANDS],
             ..positions
         };
         assert!((lsf.sum_distortion(10, 2.0, 1.0) - 2.0).abs() < 1e-12);

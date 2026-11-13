@@ -22,7 +22,7 @@
 //! ffmpeg, mpg123 and LAME.
 
 use chelys::mp3::header::{Bitrate, Mode, SamplingFrequency};
-use chelys::mp3::scalefactor_bands::{self, LONG_BANDS};
+use chelys::mp3::scalefactor_bands::{self, LONG_BANDS, SHORT_WINDOWS};
 use chelys::mp3::scalefactors::ZeroPart;
 use chelys::mp3::stereo::INTENSITY_SCALE;
 use chelys::mp3::{BlockType, GRANULE_LINES, QuantizedGranule, StreamConfig, encode_granules};
@@ -49,7 +49,10 @@ fn right_channel(intensity: Option<(usize, [u8; LONG_BANDS])>) -> QuantizedGranu
     let mut right = QuantizedGranule::new(0, [0; GRANULE_LINES], BlockType::Normal, FS);
     if let Some((bound, positions)) = intensity {
         right.scalefactors.values_mut()[bound..].copy_from_slice(&positions[bound..]);
-        right.scalefactors.intensity = Some(ZeroPart { start: 0, bound });
+        right.scalefactors.intensity = Some(ZeroPart {
+            start: [0; SHORT_WINDOWS],
+            bound,
+        });
     }
     right
 }

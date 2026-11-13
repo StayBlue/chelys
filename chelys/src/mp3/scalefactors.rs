@@ -172,13 +172,13 @@ pub struct Scalefactors {
 }
 
 /// Where the zero part of the right channel of a frame coded in intensity
-/// stereo begins, in the order of [`Scalefactors::values`]: the
-/// scalefactors from `start` up to `bound` are marked as not coded in
-/// intensity stereo, and those from `bound` up are intensity stereo
-/// positions.
+/// stereo begins, in each window: in window `w`, the scalefactor bands from
+/// `start[w]` up to `bound` are marked as not coded in intensity stereo, and
+/// those from `bound` up are intensity stereo positions. Long blocks have
+/// one window, the first, and leave the other starts unused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ZeroPart {
-    pub start: usize,
+    pub start: [usize; SHORT_WINDOWS],
     pub bound: usize,
 }
 
@@ -187,19 +187,14 @@ impl ZeroPart {
     /// positions are marked (see
     /// [`IntensityPositions::mark`](crate::mp3::stereo::IntensityPositions::mark)).
     pub const UNMARKED: Self = Self {
-        start: usize::MAX,
+        start: [usize::MAX; SHORT_WINDOWS],
         bound: usize::MAX,
     };
 
-    /// Whether scalefactor `index` is marked as not coded in intensity
-    /// stereo.
-    fn marks(self, index: usize) -> bool {
-        (self.start..self.bound).contains(&index)
-    }
-
-    /// Whether any scalefactor is marked as not coded in intensity stereo.
-    pub fn marks_any(self) -> bool {
-        self.start < self.bound
+    /// Whether scalefactor band `sfb` of `window` is marked as not coded in
+    /// intensity stereo.
+    fn marks(self, sfb: usize, window: usize) -> bool {
+        (self.start[window]..self.bound).contains(&sfb)
     }
 }
 
@@ -340,6 +335,26 @@ impl Scalefactors {
         matches!(self.scalefac, Scalefac::Short(_))
     }
 
+    /// The scalefactor band and window of scalefactor `index` of
+    /// [`values`](Self::values).
+    fn band_window(&self, index: usize) -> (usize, usize) {
+        if self.short() {
+            (index / SHORT_WINDOWS, index % SHORT_WINDOWS)
+        } else {
+            (index, 0)
+        }
+    }
+
+    /// Whether any scalefactor is marked as not coded in intensity stereo.
+    pub fn marks_any(&self) -> bool {
+        self.intensity.is_some_and(|zero_part| {
+            (0..self.values().len()).any(|index| {
+                let (sfb, window) = self.band_window(index);
+                zero_part.marks(sfb, window)
+            })
+        })
+    }
+
     /// `scalefac_multiplier` (clause 2.4.2.7).
     fn multiplier(&self) -> f64 {
         if self.scalefac_scale { 1.0 } else { 0.5 }
@@ -398,11 +413,12 @@ impl Scalefactors {
             return fits_in(value, slen).then_some(value);
         };
         let mark = not_intensity(self.version, slen);
-        if zero_part.marks(index) {
+        let (sfb, window) = self.band_window(index);
+        if zero_part.marks(sfb, window) {
             return mark;
         }
         let value = self.values()[index];
-        let position = index >= zero_part.bound;
+        let position = sfb >= zero_part.bound;
         (fits_in(value, slen) && !(position && mark == Some(value))).then_some(value)
     }
 
@@ -644,7 +660,7 @@ mod tests {
         scalefactors.values_mut()[..7].copy_from_slice(&[0, 2, 0, 0, 0, 0, 0]);
         // Bands 7 to 13 marked, 14 to 20 positions.
         scalefactors.intensity = Some(ZeroPart {
-            start: 7,
+            start: [7; SHORT_WINDOWS],
             bound: 14,
         });
         // Positions 0: the marks need one bit, the positions none.
@@ -675,7 +691,7 @@ mod tests {
         // MPEG-1 marks with 7 in 3 bits.
         let mpeg1 = Scalefactors {
             intensity: Some(ZeroPart {
-                start: 7,
+                start: [7; SHORT_WINDOWS],
                 bound: 14,
             }),
             ..Scalefactors::default()

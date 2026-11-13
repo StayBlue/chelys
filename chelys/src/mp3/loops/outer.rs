@@ -493,7 +493,7 @@ mod tests {
         let bands = scalefactor_bands::long_bands(FS);
         let mut xr = spectrum();
         xr[bands[12].start..].fill(0.0);
-        let positions = IntensityPositions::new(&spectrum(), &xr, 12, FS);
+        let positions = IntensityPositions::new(&spectrum(), &xr, BlockType::Normal, 12, FS);
         for bits in [80, 150, 300, 1500] {
             let outcome = outer_loop(
                 &xr,

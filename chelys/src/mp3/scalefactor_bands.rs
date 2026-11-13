@@ -8,6 +8,8 @@
 //! index of start, index of end)`, with the end index inclusive. Their
 //! consistency is checked at compile time.
 
+use std::ops::Range;
+
 use super::header::SamplingFrequency;
 use super::{BlockType, GRANULE_LINES};
 
@@ -76,6 +78,35 @@ pub fn coding_bands(block_type: BlockType, sampling_frequency: SamplingFrequency
             })
         })
         .collect()
+}
+
+/// The windows of a granule of `block_type`: three for short blocks, and one
+/// for the others.
+pub fn windows(block_type: BlockType) -> usize {
+    match block_type {
+        BlockType::Short => SHORT_WINDOWS,
+        _ => 1,
+    }
+}
+
+/// The lines of `window` of a granule of `block_type` that lie above its
+/// highest scalefactor band, and so have no scalefactor, in the order they
+/// are sent: the end of the granule for long blocks, and for short blocks
+/// the window's share of the band [`short_coding_order`] sends last.
+pub fn lines_above_bands(
+    block_type: BlockType,
+    sampling_frequency: SamplingFrequency,
+    window: usize,
+) -> Range<usize> {
+    let windows = windows(block_type);
+    assert!(window < windows, "window {window} of {windows}");
+    let last = match block_type {
+        BlockType::Short => short_bands(sampling_frequency)[SHORT_BANDS - 1].end(),
+        _ => long_bands(sampling_frequency)[LONG_BANDS - 1].end(),
+    };
+    let width = GRANULE_LINES / windows - last;
+    let start = windows * last + window * width;
+    start..start + width
 }
 
 /// Reorders the lines of a short block from the subband order of the
@@ -490,6 +521,21 @@ mod tests {
                     assert_eq!(x as usize, expected, "{fs:?} sfb {sfb} window {window}");
                 }
             }
+            let last = short_bands(fs)[SHORT_BANDS - 1].end();
+            for window in 0..SHORT_WINDOWS {
+                let above = lines_above_bands(BlockType::Short, fs, window);
+                assert_eq!(above.len(), SHORT_WINDOW_LINES - last, "{fs:?}");
+                for (offset, &x) in ordered[above].iter().enumerate() {
+                    let line = last + offset;
+                    let expected = 18 * (line / 6) + 6 * window + line % 6;
+                    assert_eq!(x as usize, expected, "{fs:?} window {window}");
+                }
+            }
+            let long_last = long_bands(fs)[LONG_BANDS - 1].end();
+            assert_eq!(
+                lines_above_bands(BlockType::Normal, fs, 0),
+                long_last..GRANULE_LINES
+            );
         }
     }
 

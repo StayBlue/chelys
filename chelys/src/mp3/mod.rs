@@ -25,7 +25,7 @@ use huffman::{QuadTable, SpectrumCoding};
 use loops::scfsi::{self, GranuleSummary};
 use psychoacoustic::switching::{BlockSwitching, SwitchedMasking};
 use reservoir::Reservoir;
-use scalefactors::{Scalefactors, ZeroPart};
+use scalefactors::Scalefactors;
 use side_info::{GranuleChannel, SideInfo, Window};
 
 /// Frequency lines in a granule (clause 2.1.70).
@@ -504,10 +504,10 @@ impl Coding for ModelCoding {
             }
         }
         let ms_stereo = self.ms_allowed && middle_side_frame(&frame);
-        let bounds = if self.intensity_allowed && intensity_frame(&frame) {
-            stereo::intensity_bounds(fs).to_vec()
+        let steps = if self.intensity_allowed && intensity_frame(&frame) {
+            0..stereo::INTENSITY_STEPS
         } else {
-            Vec::new()
+            0..0
         };
         let to_quantize = FrameToQuantize {
             frame: &frame,
@@ -520,9 +520,8 @@ impl Coding for ModelCoding {
         let tries: Vec<_> = if plain.within_allowance {
             Vec::new()
         } else {
-            bounds
-                .into_iter()
-                .filter_map(|bound| IntensityTry::new(&frame, &plain.granules, bound, fs))
+            steps
+                .filter_map(|step| IntensityTry::new(&frame, &plain.granules, step, fs))
                 .collect()
         };
         let kept = search_intensity(&tries, |intensity, if_outside| {
@@ -622,31 +621,20 @@ fn middle_side_frame(frame: &[Vec<Filtered<Analysis>>]) -> bool {
     same_types && stereo::ms_stereo(&spectra)
 }
 
-/// Whether a stereo frame may be coded in intensity stereo.
+/// Whether a stereo frame may be coded in intensity stereo: if each of its
+/// granules has the same block type in both channels. Short blocks find
+/// the bound in each window (see [`stereo::IntensityPositions::mark`]).
 ///
 /// Spec gap: the standard asks for the same block type in both channels
-/// only for MS stereo (clause 2.4.3.4.9), and does not say how intensity
-/// stereo applies to short blocks: clause 2.4.3.4.9.3 finds the bound from
-/// the right channel's zero part, and short blocks are sent by band and
-/// then window (clause 2.4.3.4.8), so that the zero part could begin in any
-/// window of a band. As intensity stereo moves the left channel's lines
-/// into the right channel's synthesis, whose window should then be the
-/// same, frames are coded in it only if each granule has the same long
-/// block type in both channels.
-///
-/// At the lower sampling frequencies clause 2.4.3.2 of ISO/IEC 13818-3 does
-/// settle the bound of short blocks: it is found for each window. Its 1998
-/// edition calls this "like" ISO/IEC 11172-3, 2.4.3.4, where its 1995
-/// edition said "unlike", but clause 2.4.3.4 of ISO/IEC 11172-3 says
-/// nothing of windows, so it leaves the gap above open. Short blocks are
-/// kept out of intensity stereo at the lower sampling frequencies too: the
-/// positions, the bits shared between the channels and the bounds tried
-/// here are all worked out for long scalefactor bands.
+/// only for MS stereo (clause 2.4.3.4.9). As intensity stereo moves the left
+/// channel's lines into the right channel's synthesis, whose window should
+/// then be the same, and short blocks send their lines in another order
+/// (clause 2.4.2.7), frames are coded in it only if their channels have the
+/// same block types.
 fn intensity_frame(frame: &[Vec<Filtered<Analysis>>]) -> bool {
-    frame.iter().all(|granule| {
-        let block_type = granule[0].block_type;
-        block_type != BlockType::Short && granule[1].block_type == block_type
-    })
+    frame
+        .iter()
+        .all(|granule| granule[0].block_type == granule[1].block_type)
 }
 
 /// A try at coding a frame in intensity stereo: the positions of each of
@@ -671,8 +659,10 @@ struct IntensityTry {
 }
 
 impl IntensityTry {
-    /// The try at coding `frame` in intensity stereo from long scalefactor
-    /// band `bound`, given its granules as coded without it, `plain`.
+    /// The try at coding `frame` in intensity stereo from the bounds of
+    /// `step` of [`stereo::intensity_bounds`], long or short as each
+    /// granule's block type has them, given its granules as coded without
+    /// it, `plain`.
     ///
     /// Spec reading: Annex G.1 codes bands in intensity stereo to lower the
     /// bits a frame needs. When the right channel's bits from the bound up
@@ -683,22 +673,27 @@ impl IntensityTry {
     fn new(
         frame: &[Vec<Filtered<Analysis>>],
         plain: &[Vec<QuantizedGranule>],
-        bound: usize,
+        step: usize,
         sampling_frequency: SamplingFrequency,
     ) -> Option<Self> {
         let fs = sampling_frequency;
-        let bands = scalefactor_bands::long_bands(fs);
-        let start = bands[bound].start;
         let positions: Vec<_> = frame
             .iter()
             .map(|granule| {
-                stereo::IntensityPositions::new(&granule[0].xr, &granule[1].xr, bound, fs)
+                let block_type = granule[0].block_type;
+                let bound = stereo::intensity_bounds(block_type, fs)[step];
+                let (left, right) = (&granule[0].xr, &granule[1].xr);
+                stereo::IntensityPositions::new(left, right, block_type, bound, fs)
             })
             .collect();
         let right_bits: Vec<usize> = (plain.iter().zip(&positions))
             .map(|(granule, positions)| {
                 let right = &granule[1];
-                let below = right.coding.bit_count_below(&right.values, bands, start);
+                let bands = scalefactor_bands::coding_bands(right.block_type, fs);
+                // The lines from the bound up follow those below it in every
+                // window.
+                let start = positions.first_line();
+                let below = right.coding.bit_count_below(&right.values, &bands, start);
                 // Its scalefactors as they would be sent with those values:
                 // all of them, as it will not use scfsi, and marked.
                 let mut values = right.values;
@@ -744,7 +739,8 @@ impl IntensityTry {
 /// ISO/IEC 13818-3), but decoders do not agree on it, and no mark is read as
 /// one by all of them. So the encoder sends no marks there: a frame whose
 /// right channel would need one, with no nonzero value in the band just
-/// below the bound, is coded from a lower bound or without intensity stereo.
+/// below the bound, in any window of a short block, is coded from a lower
+/// bound or without intensity stereo.
 ///
 /// Settled by decoding with ffmpeg, mpg123 and LAME (black box): of the
 /// marks of fields of 1 to 5 bits, 1, 3, 7, 15 and 31, ffmpeg reads only 31
@@ -807,8 +803,9 @@ fn quantize_frame(
             if let Some(positions) = positions {
                 positions.code(&granule[0].xr, &granule[1].xr, [left, right]);
                 let (left_alone, right_alone) = (&granule[0].analysis.1, &granule[1].analysis.1);
-                for (sb, xmin) in left_xmin.iter_mut().enumerate().skip(positions.bound()) {
-                    *xmin = positions.sum_distortion(sb, left_alone[sb], right_alone[sb]);
+                let coded = positions.first_scalefactor();
+                for (index, xmin) in left_xmin.iter_mut().enumerate().skip(coded) {
+                    *xmin = positions.sum_distortion(index, left_alone[index], right_alone[index]);
                 }
             }
         }
@@ -848,8 +845,7 @@ fn quantize_frame(
             if gr == 0 {
                 first[channel] = Some((summary, outcome.granule.scalefactors.clone()));
             }
-            let zero_part = outcome.granule.scalefactors.intensity;
-            if fs.version() == Version::Mpeg2 && zero_part.is_some_and(ZeroPart::marks_any) {
+            if fs.version() == Version::Mpeg2 && outcome.granule.scalefactors.marks_any() {
                 return None;
             }
             reservoir.granule_done(mean_bits, outcome.granule.bit_len(fs));
@@ -1314,7 +1310,7 @@ mod tests {
     /// none after the one it keeps.
     #[test]
     fn intensity_search_keeps_the_first_try_that_fits_or_else_the_last() {
-        for count in 0..=stereo::intensity_bounds(SamplingFrequency::Hz44100).len() {
+        for count in 0..=stereo::INTENSITY_STEPS {
             for pattern in 0..1u32 << count {
                 let fits = |index: usize| pattern & 1 << index != 0;
                 let tries: Vec<usize> = (0..count).collect();
