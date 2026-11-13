@@ -5,11 +5,11 @@
 //! ffmpeg -i song.flac -f f32le -ar 44100 -ac 2 - | chelys --sample-rate 44100 --channels 2 > song.mp3
 //! ```
 
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::process::ExitCode;
 
 use chelys::mp3::header::{Bitrate, Mode, SamplingFrequency};
-use chelys::mp3::{StreamConfig, encode_pcm};
+use chelys::mp3::{Encoder, StreamConfig};
 
 const USAGE: &str = "\
 usage: chelys --sample-rate HZ --channels N [--bitrate KBPS] [--joint-stereo]
@@ -103,22 +103,6 @@ fn main() -> ExitCode {
         }
     };
 
-    let mut input = Vec::new();
-    if let Err(e) = std::io::stdin().lock().read_to_end(&mut input) {
-        eprintln!("chelys: reading stdin: {e}");
-        return ExitCode::FAILURE;
-    }
-    let frame_bytes = 4 * options.channels;
-    if input.len() % frame_bytes != 0 {
-        eprintln!("chelys: input is not a whole number of {frame_bytes}-byte sample frames");
-        return ExitCode::FAILURE;
-    }
-    let mut channels = vec![Vec::with_capacity(input.len() / frame_bytes); options.channels];
-    for (i, bytes) in input.chunks_exact(4).enumerate() {
-        let sample = f32::from_le_bytes(bytes.try_into().unwrap());
-        channels[i % options.channels].push(f64::from(sample));
-    }
-
     let config = StreamConfig {
         bitrate: options.bitrate,
         sampling_frequency: options.sampling_frequency,
@@ -136,11 +120,62 @@ fn main() -> ExitCode {
         },
         crc_protected: false,
     };
-    let slices: Vec<&[f64]> = channels.iter().map(Vec::as_slice).collect();
-    let stream = encode_pcm(&config, &slices);
-    if let Err(e) = std::io::stdout().lock().write_all(&stream) {
-        eprintln!("chelys: writing stdout: {e}");
-        return ExitCode::FAILURE;
+    match encode(config, options.channels) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(message) => {
+            eprintln!("chelys: {message}");
+            ExitCode::FAILURE
+        }
     }
-    ExitCode::SUCCESS
+}
+
+/// Encodes stdin to stdout as it arrives.
+fn encode(config: StreamConfig, channels: usize) -> Result<(), String> {
+    let frame_bytes = 4 * channels;
+    let mut stdin = std::io::stdin().lock();
+    let mut stdout = std::io::stdout().lock();
+    let mut encoder = Encoder::new(config);
+    let mut input = vec![0; 64 * 1024];
+    // Bytes read but not yet decoded: the start of an incomplete sample frame.
+    let mut held = 0;
+    let mut pcm = vec![Vec::new(); channels];
+    let mut stream = Vec::new();
+    loop {
+        let read = match stdin.read(&mut input[held..]) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) => return Err(format!("reading stdin: {e}")),
+        };
+        let filled = held + read;
+        let whole = filled - filled % frame_bytes;
+        for samples in &mut pcm {
+            samples.clear();
+        }
+        for (i, bytes) in input[..whole].chunks_exact(4).enumerate() {
+            let sample = f32::from_le_bytes(bytes.try_into().unwrap());
+            pcm[i % channels].push(f64::from(sample));
+        }
+        input.copy_within(whole..filled, 0);
+        held = filled - whole;
+        let slices: Vec<&[f64]> = pcm.iter().map(Vec::as_slice).collect();
+        encoder.encode(&slices, &mut stream);
+        write(&mut stdout, &mut stream)?;
+    }
+    if held != 0 {
+        return Err(format!(
+            "input is not a whole number of {frame_bytes}-byte sample frames"
+        ));
+    }
+    encoder.finish(&mut stream);
+    write(&mut stdout, &mut stream)
+}
+
+/// Writes `stream` to `stdout` and empties it.
+fn write(stdout: &mut impl Write, stream: &mut Vec<u8>) -> Result<(), String> {
+    stdout
+        .write_all(stream)
+        .map_err(|e| format!("writing stdout: {e}"))?;
+    stream.clear();
+    Ok(())
 }

@@ -131,6 +131,28 @@ impl FrameWriter {
             self.out[at] = byte;
         }
     }
+
+    /// Keeps only the last `main_data_begin` unused bytes, those the next
+    /// frame's main data begins in; those before them stay zero.
+    fn keep_unused(&mut self, main_data_begin: usize) {
+        let keep = main_data_begin.min(self.unused.len());
+        self.unused.drain(..self.unused.len() - keep);
+    }
+
+    /// Moves to `out` the bytes before the first that later main data may
+    /// still fill.
+    fn take_final(&mut self, out: &mut Vec<u8>) {
+        let end = self.unused.front().copied().unwrap_or(self.out.len());
+        out.extend(self.out.drain(..end));
+        for at in &mut self.unused {
+            *at -= end;
+        }
+    }
+
+    /// Moves the rest of the stream to `out`, with no frame to follow.
+    fn finish(self, out: &mut Vec<u8>) {
+        out.extend(self.out);
+    }
 }
 
 /// One granule of one channel, quantised and ready for coding.
@@ -356,8 +378,22 @@ pub fn encode_granules(config: &StreamConfig, granules: &[Vec<QuantizedGranule>]
     writer.out
 }
 
-/// Encodes PCM, one slice of samples (nominally -1.0 to 1.0) per channel, at
-/// the configured bitrate.
+/// Encodes PCM, one slice of samples (nominally -1.0 to 1.0) per channel, in
+/// one go, with an [`Encoder`].
+///
+/// # Panics
+///
+/// If the channel count does not match the configured mode, or the channels
+/// have different numbers of samples.
+pub fn encode_pcm(config: &StreamConfig, channels: &[&[f64]]) -> Vec<u8> {
+    let mut encoder = Encoder::new(*config);
+    let mut out = Vec::new();
+    encoder.encode(channels, &mut out);
+    encoder.finish(&mut out);
+    out
+}
+
+/// Encodes PCM at the configured bitrate as it arrives.
 ///
 /// Psychoacoustic model 2 chooses each granule's block type, switching to
 /// short blocks for attacks, and sets the distortion each scalefactor band
@@ -365,75 +401,131 @@ pub fn encode_granules(config: &StreamConfig, granules: &[Vec<QuantizedGranule>]
 /// channel gets an equal share of its frame's main data, the `mean_bits` of
 /// clause C.1.5.3.4, plus what the bit reservoir lends it, and the iteration
 /// loops shape the quantisation noise to the allowed distortion within those
-/// bits. The input is padded with silence to whole frames, plus one more
-/// frame to flush the filterbank.
+/// bits.
 ///
 /// In joint stereo, frames whose channels are alike are coded in MS stereo
 /// if the mode allows it, and frames short of bits are coded in intensity
 /// stereo if the mode allows that (Annex G.2).
 ///
-/// # Panics
-///
-/// If the channel count does not match the configured mode.
-pub fn encode_pcm(config: &StreamConfig, channels: &[&[f64]]) -> Vec<u8> {
-    let fs = config.sampling_frequency;
-    let (ms_allowed, intensity_allowed) = config.joint_stereo();
-    let mut models: Vec<_> = channels.iter().map(|_| BlockSwitching::new(fs)).collect();
-    let reservoir = Reservoir::new(config.header(true).frame_len());
-    encode_filtered(
-        config,
-        channels,
-        reservoir,
-        |channel, pcm| {
-            let masking = models[channel].granule(pcm)?;
-            Some((masking.block_type(), (masking, Vec::new())))
-        },
-        |mut frame, mean_bits, reservoir| {
-            for granule in frame.iter_mut() {
-                for filtered in granule.iter_mut() {
-                    let (masking, xmin) = &mut filtered.analysis;
-                    *xmin = masking.allowed_distortion(&filtered.xr, fs);
-                }
+/// The stream does not depend on how the input is divided between calls to
+/// [`encode`](Self::encode).
+pub struct Encoder(FrameEncoder<ModelCoding>);
+
+impl Encoder {
+    pub fn new(config: StreamConfig) -> Self {
+        let fs = config.sampling_frequency;
+        let (ms_allowed, intensity_allowed) = config.joint_stereo();
+        let coding = ModelCoding {
+            models: (0..config.mode.channels())
+                .map(|_| BlockSwitching::new(fs))
+                .collect(),
+            ms_allowed,
+            intensity_allowed,
+            sampling_frequency: fs,
+        };
+        let reservoir = Reservoir::new(config.header(true).frame_len());
+        Self(FrameEncoder::new(config, coding, reservoir))
+    }
+
+    /// Encodes `channels`, one slice of samples (nominally -1.0 to 1.0) per
+    /// channel, and appends to `out` the bytes of the stream that are final.
+    ///
+    /// A frame is coded once the granule after it has arrived, as its block
+    /// type depends on whether that granule has an attack, and its bytes are
+    /// final once no later frame's main data can begin in them: the bytes
+    /// the bit reservoir holds, at most 511 of main data, and the frames
+    /// after them stay behind until later calls.
+    ///
+    /// # Panics
+    ///
+    /// If the channel count does not match the configured mode, or the
+    /// channels have different numbers of samples.
+    pub fn encode(&mut self, channels: &[&[f64]], out: &mut Vec<u8>) {
+        self.0.encode(channels, out);
+    }
+
+    /// Ends the stream: pads the input with silence to whole frames, plus
+    /// one more frame to flush the filterbank, and appends the rest of the
+    /// stream to `out`.
+    pub fn finish(self, out: &mut Vec<u8>) {
+        self.0.finish(out);
+    }
+}
+
+/// The encoding process of Annex C: psychoacoustic model 2 with block
+/// switching, the iteration loops and the bit reservoir, with joint stereo as
+/// Annex G describes.
+struct ModelCoding {
+    /// One for each channel.
+    models: Vec<BlockSwitching>,
+    ms_allowed: bool,
+    intensity_allowed: bool,
+    sampling_frequency: SamplingFrequency,
+}
+
+impl Coding for ModelCoding {
+    type Analysis = Analysis;
+
+    fn look_ahead(
+        &mut self,
+        channel: usize,
+        pcm: &[f64; GRANULE_LINES],
+    ) -> Option<(BlockType, Analysis)> {
+        let masking = self.models[channel].granule(pcm)?;
+        Some((masking.block_type(), (masking, Vec::new())))
+    }
+
+    fn quantize(
+        &mut self,
+        mut frame: Vec<Vec<Filtered<Analysis>>>,
+        mean_bits: usize,
+        reservoir: &mut Reservoir,
+    ) -> CodedFrame {
+        let fs = self.sampling_frequency;
+        for granule in frame.iter_mut() {
+            for filtered in granule.iter_mut() {
+                let (masking, xmin) = &mut filtered.analysis;
+                *xmin = masking.allowed_distortion(&filtered.xr, fs);
             }
-            let ms_stereo = ms_allowed && middle_side_frame(&frame);
-            let bounds = if intensity_allowed && intensity_frame(&frame) {
-                stereo::intensity_bounds(fs).to_vec()
-            } else {
-                Vec::new()
-            };
-            let to_quantize = FrameToQuantize {
-                frame: &frame,
-                ms_stereo,
-                mean_bits,
-                sampling_frequency: fs,
-            };
-            let plain = quantize_frame(&to_quantize, None, reservoir, IfOutsideAllowance::Finish)
-                .expect("a finished frame");
-            let tries: Vec<_> = if plain.within_allowance {
-                Vec::new()
-            } else {
-                bounds
-                    .into_iter()
-                    .filter_map(|bound| IntensityTry::new(&frame, &plain.granules, bound, fs))
-                    .collect()
-            };
-            let kept = search_intensity(&tries, |intensity, if_outside| {
-                quantize_frame(&to_quantize, Some(intensity), reservoir, if_outside)
-            });
-            let intensity_stereo = kept.is_some();
-            let FrameTry {
-                granules,
-                reservoir: kept_reservoir,
-                ..
-            } = kept.unwrap_or(plain);
-            *reservoir = kept_reservoir;
-            CodedFrame {
-                granules,
-                ms_stereo,
-                intensity_stereo,
-            }
-        },
-    )
+        }
+        let ms_stereo = self.ms_allowed && middle_side_frame(&frame);
+        let bounds = if self.intensity_allowed && intensity_frame(&frame) {
+            stereo::intensity_bounds(fs).to_vec()
+        } else {
+            Vec::new()
+        };
+        let to_quantize = FrameToQuantize {
+            frame: &frame,
+            ms_stereo,
+            mean_bits,
+            sampling_frequency: fs,
+        };
+        let plain = quantize_frame(&to_quantize, None, reservoir, IfOutsideAllowance::Finish)
+            .expect("a finished frame");
+        let tries: Vec<_> = if plain.within_allowance {
+            Vec::new()
+        } else {
+            bounds
+                .into_iter()
+                .filter_map(|bound| IntensityTry::new(&frame, &plain.granules, bound, fs))
+                .collect()
+        };
+        let kept = search_intensity(&tries, |intensity, if_outside| {
+            quantize_frame(&to_quantize, Some(intensity), reservoir, if_outside)
+        });
+        let intensity_stereo = kept.is_some();
+        let FrameTry {
+            granules,
+            reservoir: kept_reservoir,
+            ..
+        } = kept.unwrap_or(plain);
+        *reservoir = kept_reservoir;
+        CodedFrame {
+            granules,
+            ms_stereo,
+            intensity_stereo,
+        }
+    }
 }
 
 /// Annex G.1: if the frame needs more bits than it has, more and more bands
@@ -744,61 +836,86 @@ pub fn encode_with_block_types(
     config: &StreamConfig,
     global_gain: u8,
     channels: &[&[f64]],
-    mut block_type: impl FnMut(usize, usize) -> BlockType,
+    block_type: impl FnMut(usize, usize) -> BlockType,
 ) -> Vec<u8> {
     let (ms_stereo, intensity_stereo) = config.joint_stereo();
     assert!(!intensity_stereo, "intensity stereo needs encode_pcm");
-    let fs = config.sampling_frequency;
-    let mut next = vec![0usize; channels.len()];
-    encode_filtered(
-        config,
-        channels,
-        Reservoir::disabled(),
-        |channel, _| {
-            // Called once ahead of the first granule, whose type it gives
-            // on the second call.
-            let granule = next[channel].checked_sub(1);
-            next[channel] += 1;
-            granule.map(|g| {
-                let block_type = block_type(channel, g);
-                (block_type, block_type)
-            })
-        },
-        |mut frame, mean_bits, reservoir| {
-            let mut granules = Vec::with_capacity(frame.len());
-            for granule in frame.iter_mut() {
-                if ms_stereo {
-                    let [left, right] = &mut granule[..] else {
-                        unreachable!("MS stereo has two channels")
-                    };
-                    assert_eq!(
-                        left.block_type, right.block_type,
-                        "MS stereo needs one block type"
-                    );
-                    (left.xr, right.xr) = stereo::middle_side(&left.xr, &right.xr);
-                }
-                let quantized: Vec<_> = granule
-                    .iter()
-                    .map(|filtered| {
-                        let values =
-                            loops::quantize(&filtered.xr, global_gain).unwrap_or_else(|| {
-                                panic!("a granule is too loud for global_gain {global_gain}")
-                            });
-                        let granule =
-                            QuantizedGranule::new(global_gain, values, filtered.block_type, fs);
-                        reservoir.granule_done(mean_bits, granule.bit_len(fs));
-                        granule
-                    })
-                    .collect();
-                granules.push(quantized);
+    let coding = FixedGainCoding {
+        global_gain,
+        block_type,
+        next: vec![0; config.mode.channels()],
+        ms_stereo,
+        sampling_frequency: config.sampling_frequency,
+    };
+    let mut encoder = FrameEncoder::new(*config, coding, Reservoir::disabled());
+    let mut out = Vec::new();
+    encoder.encode(channels, &mut out);
+    encoder.finish(&mut out);
+    out
+}
+
+/// Quantisation of every granule with the same `global_gain`, with the block
+/// type of each given by `block_type(channel, granule)`, for
+/// [`encode_with_block_types`].
+struct FixedGainCoding<F> {
+    global_gain: u8,
+    block_type: F,
+    /// The index of the granule each channel's look-ahead is given next.
+    next: Vec<usize>,
+    ms_stereo: bool,
+    sampling_frequency: SamplingFrequency,
+}
+
+impl<F: FnMut(usize, usize) -> BlockType> Coding for FixedGainCoding<F> {
+    type Analysis = ();
+
+    fn look_ahead(&mut self, channel: usize, _: &[f64; GRANULE_LINES]) -> Option<(BlockType, ())> {
+        // Called once ahead of the first granule, whose type it gives on the
+        // second call.
+        let granule = self.next[channel].checked_sub(1);
+        self.next[channel] += 1;
+        granule.map(|g| ((self.block_type)(channel, g), ()))
+    }
+
+    fn quantize(
+        &mut self,
+        mut frame: Vec<Vec<Filtered<()>>>,
+        mean_bits: usize,
+        reservoir: &mut Reservoir,
+    ) -> CodedFrame {
+        let (global_gain, fs) = (self.global_gain, self.sampling_frequency);
+        let mut granules = Vec::with_capacity(frame.len());
+        for granule in frame.iter_mut() {
+            if self.ms_stereo {
+                let [left, right] = &mut granule[..] else {
+                    unreachable!("MS stereo has two channels")
+                };
+                assert_eq!(
+                    left.block_type, right.block_type,
+                    "MS stereo needs one block type"
+                );
+                (left.xr, right.xr) = stereo::middle_side(&left.xr, &right.xr);
             }
-            CodedFrame {
-                granules,
-                ms_stereo,
-                intensity_stereo: false,
-            }
-        },
-    )
+            let quantized: Vec<_> = granule
+                .iter()
+                .map(|filtered| {
+                    let values = loops::quantize(&filtered.xr, global_gain).unwrap_or_else(|| {
+                        panic!("a granule is too loud for global_gain {global_gain}")
+                    });
+                    let granule =
+                        QuantizedGranule::new(global_gain, values, filtered.block_type, fs);
+                    reservoir.granule_done(mean_bits, granule.bit_len(fs));
+                    granule
+                })
+                .collect();
+            granules.push(quantized);
+        }
+        CodedFrame {
+            granules,
+            ms_stereo: self.ms_stereo,
+            intensity_stereo: false,
+        }
+    }
 }
 
 /// One granule of one channel, analysed and filtered, before quantisation.
@@ -817,57 +934,142 @@ struct CodedFrame {
     intensity_stereo: bool,
 }
 
-/// Runs each channel through its filterbank granule by granule, quantises
-/// each frame with `quantize`, and writes the frames.
-///
-/// `look_ahead` is given each channel's PCM one granule ahead of the
-/// filterbank, starting with the first granule before any is filtered, and
-/// returns the block type and analysis of the granule before the one it is
-/// given: `None` only for the first. `quantize` is given each frame's
-/// granules, indexed `[gr][ch]`, once all are filtered, the share of the
-/// frame's main data of each granule of each channel, and the bit
-/// reservoir. It quantises the granules, accounting in the reservoir for
-/// the bits each uses.
-fn encode_filtered<A>(
-    config: &StreamConfig,
-    channels: &[&[f64]],
-    mut reservoir: Reservoir,
-    mut look_ahead: impl FnMut(usize, &[f64; GRANULE_LINES]) -> Option<(BlockType, A)>,
-    mut quantize: impl FnMut(Vec<Vec<Filtered<A>>>, usize, &mut Reservoir) -> CodedFrame,
-) -> Vec<u8> {
-    assert_eq!(
-        channels.len(),
-        config.mode.channels(),
-        "one slice per channel"
-    );
-    let samples = channels.iter().map(|c| c.len()).max().unwrap_or(0);
-    let frames = samples.div_ceil(SAMPLES_PER_FRAME) + 1;
-    let granule_pcm = |channel: usize, granule: usize| -> [f64; GRANULE_LINES] {
-        let offset = granule * GRANULE_LINES;
-        std::array::from_fn(|t| channels[channel].get(offset + t).copied().unwrap_or(0.0))
-    };
-    let mut filterbanks: Vec<_> = channels
-        .iter()
-        .map(|_| filterbank::Filterbank::new())
-        .collect();
-    for channel in 0..channels.len() {
-        assert!(look_ahead(channel, &granule_pcm(channel, 0)).is_none());
-    }
-    let fs = config.sampling_frequency;
-    let mut padding = PaddingSchedule::new(config.bitrate, fs);
-    let mut writer = FrameWriter::default();
-    let mut main_data_begin = 0;
+/// How [`FrameEncoder`] analyses and quantises granules.
+trait Coding {
+    /// What the analysis of a granule gives besides its block type.
+    type Analysis;
 
-    for frame in 0..frames {
-        let filtered: Vec<Vec<Filtered<A>>> = (0..GRANULES)
+    /// Given each channel's PCM one granule ahead of the filterbank,
+    /// starting with the first granule before any is filtered, returns the
+    /// block type and analysis of the granule before the one it is given:
+    /// `None` only for the first.
+    fn look_ahead(
+        &mut self,
+        channel: usize,
+        pcm: &[f64; GRANULE_LINES],
+    ) -> Option<(BlockType, Self::Analysis)>;
+
+    /// Quantises a frame's granules, indexed `[gr][ch]`, given the share of
+    /// the frame's main data of each granule of each channel, accounting in
+    /// the reservoir for the bits each uses.
+    fn quantize(
+        &mut self,
+        frame: Vec<Vec<Filtered<Self::Analysis>>>,
+        mean_bits: usize,
+        reservoir: &mut Reservoir,
+    ) -> CodedFrame;
+}
+
+/// Runs each channel through its filterbank granule by granule as its PCM
+/// arrives, quantises each frame as `coding` does, and writes the frames.
+struct FrameEncoder<C> {
+    config: StreamConfig,
+    coding: C,
+    reservoir: Reservoir,
+    /// One for each channel.
+    filterbanks: Vec<filterbank::Filterbank>,
+    padding: PaddingSchedule,
+    writer: FrameWriter,
+    main_data_begin: usize,
+    /// Each channel's PCM from the first granule not yet filtered.
+    pcm: Vec<Vec<f64>>,
+    /// The samples each channel has been given.
+    samples: usize,
+    /// The frames written.
+    frames: usize,
+}
+
+impl<C: Coding> FrameEncoder<C> {
+    fn new(config: StreamConfig, coding: C, reservoir: Reservoir) -> Self {
+        let channels = config.mode.channels();
+        Self {
+            config,
+            coding,
+            reservoir,
+            filterbanks: (0..channels)
+                .map(|_| filterbank::Filterbank::new())
+                .collect(),
+            padding: PaddingSchedule::new(config.bitrate, config.sampling_frequency),
+            writer: FrameWriter::default(),
+            main_data_begin: 0,
+            pcm: vec![Vec::new(); channels],
+            samples: 0,
+            frames: 0,
+        }
+    }
+
+    /// Codes the frames whose PCM, and the granule after it, have arrived,
+    /// and appends the bytes that are final to `out`.
+    fn encode(&mut self, channels: &[&[f64]], out: &mut Vec<u8>) {
+        assert_eq!(channels.len(), self.pcm.len(), "one slice per channel");
+        let len = channels[0].len();
+        assert!(
+            channels.iter().all(|c| c.len() == len),
+            "every channel has the same number of samples"
+        );
+        for (pcm, samples) in self.pcm.iter_mut().zip(channels) {
+            pcm.extend_from_slice(samples);
+        }
+        self.samples += len;
+        let mut start = 0;
+        while self.pcm[0].len() - start >= SAMPLES_PER_FRAME + GRANULE_LINES {
+            self.encode_frame(start);
+            start += SAMPLES_PER_FRAME;
+        }
+        for pcm in &mut self.pcm {
+            pcm.drain(..start);
+        }
+        self.writer.take_final(out);
+    }
+
+    /// Pads the input with silence to whole frames, plus one more frame to
+    /// flush the filterbank, codes them, and appends the rest of the stream
+    /// to `out`.
+    fn finish(mut self, out: &mut Vec<u8>) {
+        let frames = self.samples.div_ceil(SAMPLES_PER_FRAME) + 1;
+        let remaining = frames - self.frames;
+        for pcm in &mut self.pcm {
+            pcm.resize(remaining * SAMPLES_PER_FRAME + GRANULE_LINES, 0.0);
+        }
+        for frame in 0..remaining {
+            self.encode_frame(frame * SAMPLES_PER_FRAME);
+        }
+        self.writer.finish(out);
+    }
+
+    /// Codes the frame whose PCM starts at `start` in [`Self::pcm`].
+    fn encode_frame(&mut self, start: usize) {
+        let Self {
+            config,
+            coding,
+            filterbanks,
+            pcm,
+            ..
+        } = self;
+        let fs = config.sampling_frequency;
+        let granule_pcm = |channel: usize, granule: usize| -> &[f64; GRANULE_LINES] {
+            let from = start + granule * GRANULE_LINES;
+            pcm[channel][from..from + GRANULE_LINES]
+                .try_into()
+                .expect("a granule of PCM")
+        };
+        if self.frames == 0 {
+            for channel in 0..pcm.len() {
+                assert!(
+                    coding
+                        .look_ahead(channel, granule_pcm(channel, 0))
+                        .is_none()
+                );
+            }
+        }
+        let filtered: Vec<Vec<Filtered<C::Analysis>>> = (0..GRANULES)
             .map(|gr| {
-                let index = frame * GRANULES + gr;
                 (filterbanks.iter_mut().enumerate())
                     .map(|(channel, filterbank)| {
-                        let (block_type, analysis) =
-                            look_ahead(channel, &granule_pcm(channel, index + 1))
-                                .expect("the granule before has been analysed");
-                        let xr = filterbank.granule(&granule_pcm(channel, index), block_type);
+                        let (block_type, analysis) = coding
+                            .look_ahead(channel, granule_pcm(channel, gr + 1))
+                            .expect("the granule before has been analysed");
+                        let xr = filterbank.granule(granule_pcm(channel, gr), block_type);
                         let xr = match block_type {
                             BlockType::Short => scalefactor_bands::short_coding_order(&xr, fs),
                             _ => xr,
@@ -882,24 +1084,29 @@ fn encode_filtered<A>(
             })
             .collect();
         // mode_extension does not change the frame's length.
-        let padded = padding.next_padding();
-        let slot_bits = main_data_bits(&config.header(padded));
-        let shares = GRANULES * channels.len();
+        let padded = self.padding.next_padding();
+        let slot_bits = main_data_bits(&self.config.header(padded));
+        let shares = GRANULES * self.pcm.len();
         let mean_bits = slot_bits / shares;
         let block_types: Vec<BlockType> = filtered.iter().flatten().map(|f| f.block_type).collect();
-        let coded = quantize(filtered, mean_bits, &mut reservoir);
+        let coded = self
+            .coding
+            .quantize(filtered, mean_bits, &mut self.reservoir);
         assert!(
             (coded.granules.iter().flatten())
                 .map(|q| q.block_type)
                 .eq(block_types),
             "the granules keep their block types"
         );
-        let header = config.frame_header(padded, coded.ms_stereo, coded.intensity_stereo);
-        let (side_info, main_data) = frame_contents(fs, &coded.granules, main_data_begin);
-        writer.write(&header, &side_info, &main_data);
-        main_data_begin = reservoir.end_frame(slot_bits - shares * mean_bits);
+        let header = self
+            .config
+            .frame_header(padded, coded.ms_stereo, coded.intensity_stereo);
+        let (side_info, main_data) = frame_contents(fs, &coded.granules, self.main_data_begin);
+        self.writer.write(&header, &side_info, &main_data);
+        self.main_data_begin = self.reservoir.end_frame(slot_bits - shares * mean_bits);
+        self.writer.keep_unused(self.main_data_begin);
+        self.frames += 1;
     }
-    writer.out
 }
 
 /// Encodes `frames` frames of digital silence. Every granule codes to
@@ -1059,6 +1266,87 @@ mod tests {
                     .collect();
                 assert_eq!(calls, expected_calls, "{count} tries, fits {pattern:b}");
             }
+        }
+    }
+
+    /// A deterministic sequence of samples from -1.0 to 1.0 (an LCG).
+    fn noise(seed: &mut u64) -> f64 {
+        *seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+        (*seed >> 11) as f64 / (1u64 << 52) as f64 - 1.0
+    }
+
+    /// However the input is divided between calls, the encoder writes the
+    /// same stream, of whole frames for the input padded with silence plus
+    /// one more, and holds back no more than the next frame's main data can
+    /// begin in: its `main_data_begin` bytes, and the header and side
+    /// information of each frame after the first of them.
+    #[test]
+    fn streaming_does_not_depend_on_how_the_input_is_divided() {
+        let config = StreamConfig {
+            bitrate: Bitrate::from_kbps(32).unwrap(),
+            sampling_frequency: SamplingFrequency::Hz44100,
+            mode: Mode::JointStereo {
+                intensity_stereo: false,
+                ms_stereo: true,
+            },
+            crc_protected: false,
+        };
+        // Silence fills the reservoir to its limit, past which the rest is
+        // stuffing, and the noise after it reaches back into it.
+        let mut seed = 1;
+        let samples = 12 * SAMPLES_PER_FRAME + 300;
+        let pcm: Vec<[f64; 2]> = (0..samples)
+            .map(|n| {
+                let level = if n < 9 * SAMPLES_PER_FRAME { 0.0 } else { 0.5 };
+                [level * noise(&mut seed), level * noise(&mut seed)]
+            })
+            .collect();
+        let (left, right): (Vec<f64>, Vec<f64>) = pcm.iter().map(|&[l, r]| (l, r)).unzip();
+        let whole = encode_pcm(&config, &[&left, &right]);
+        let mut padding = PaddingSchedule::new(config.bitrate, config.sampling_frequency);
+        let frames = samples.div_ceil(SAMPLES_PER_FRAME) + 1;
+        let frame_lens = (0..frames).map(|_| config.header(padding.next_padding()).frame_len());
+        assert_eq!(whole.len(), frame_lens.sum::<usize>());
+
+        // Frames without padding have the smallest slots, and so span the
+        // most frames for the same bytes.
+        let header = config.header(false);
+        let slot = main_data_bits(&header) / 8;
+        let overhead = header.frame_len() - slot;
+        let streams = std::thread::scope(|scope| {
+            [
+                1,
+                100,
+                GRANULE_LINES,
+                SAMPLES_PER_FRAME - 1,
+                SAMPLES_PER_FRAME + GRANULE_LINES + 1,
+            ]
+            .map(|chunk| {
+                let (left, right) = (&left, &right);
+                scope.spawn(move || {
+                    let mut encoder = Encoder::new(config);
+                    let mut out = Vec::new();
+                    let mut furthest = 0;
+                    for (left, right) in left.chunks(chunk).zip(right.chunks(chunk)) {
+                        encoder.encode(&[left, right], &mut out);
+                        let begin = encoder.0.main_data_begin;
+                        furthest = furthest.max(begin);
+                        let held = encoder.0.writer.out.len();
+                        let most = begin + begin.div_ceil(slot) * overhead;
+                        assert!(held <= most, "{held} bytes held in chunks of {chunk}");
+                    }
+                    encoder.finish(&mut out);
+                    (chunk, out, furthest)
+                })
+            })
+            .map(|stream| stream.join().expect("the encoding passes"))
+        });
+        for (chunk, stream, furthest) in streams {
+            assert!(stream == whole, "chunks of {chunk}");
+            assert!(
+                furthest > slot,
+                "main data reaches back {furthest} bytes, within the frame before"
+            );
         }
     }
 }
