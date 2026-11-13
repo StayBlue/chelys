@@ -10,6 +10,7 @@ pub mod reservoir;
 pub mod scalefactor_bands;
 pub mod scalefactors;
 pub mod side_info;
+pub mod stereo;
 
 use std::collections::VecDeque;
 use std::ops::Range;
@@ -18,7 +19,7 @@ use crate::bitstream::BitWriter;
 use header::{Bitrate, Emphasis, Header, Mode, PaddingSchedule, SamplingFrequency};
 use huffman::{QuadTable, SpectrumCoding};
 use loops::scfsi::{self, GranuleSummary};
-use psychoacoustic::switching::BlockSwitching;
+use psychoacoustic::switching::{BlockSwitching, SwitchedMasking};
 use reservoir::Reservoir;
 use scalefactors::Scalefactors;
 use side_info::{GRANULES, GranuleChannel, SideInfo, Window};
@@ -216,13 +217,48 @@ const MAX_PART2_3_LENGTH: usize = (1 << 12) - 1;
 
 impl StreamConfig {
     fn header(&self, padding: bool) -> Header {
+        self.frame_header(padding, false)
+    }
+
+    /// Whether the configured mode allows MS stereo: joint stereo with
+    /// `ms_stereo` set.
+    ///
+    /// # Panics
+    ///
+    /// If it asks for intensity stereo, which is not implemented.
+    fn ms_stereo_allowed(&self) -> bool {
+        match self.mode {
+            Mode::JointStereo {
+                intensity_stereo,
+                ms_stereo,
+            } => {
+                assert!(!intensity_stereo, "intensity stereo is not implemented");
+                ms_stereo
+            }
+            _ => false,
+        }
+    }
+
+    /// The header of a frame, with `mode_extension` switching MS stereo on
+    /// for this frame alone if `ms_stereo` is set.
+    fn frame_header(&self, padding: bool, ms_stereo: bool) -> Header {
+        let mode = match self.mode {
+            Mode::JointStereo { .. } => Mode::JointStereo {
+                intensity_stereo: false,
+                ms_stereo,
+            },
+            mode => {
+                assert!(!ms_stereo, "MS stereo needs the joint stereo mode");
+                mode
+            }
+        };
         Header {
             crc_protected: self.crc_protected,
             bitrate: self.bitrate,
             sampling_frequency: self.sampling_frequency,
             padding,
             private: false,
-            mode: self.mode,
+            mode,
             copyright: false,
             original: false,
             emphasis: Emphasis::None,
@@ -340,6 +376,7 @@ pub fn encode_granules(config: &StreamConfig, granules: &[Vec<QuantizedGranule>]
 /// If the channel count does not match the configured mode.
 pub fn encode_pcm(config: &StreamConfig, channels: &[&[f64]]) -> Vec<u8> {
     let fs = config.sampling_frequency;
+    let ms_allowed = config.ms_stereo_allowed();
     let mut models: Vec<_> = channels.iter().map(|_| BlockSwitching::new(fs)).collect();
     // Each channel's first granule of the frame, for scfsi in the second.
     let mut first: Vec<Option<(GranuleSummary, Scalefactors)>> = vec![None; channels.len()];
@@ -350,11 +387,19 @@ pub fn encode_pcm(config: &StreamConfig, channels: &[&[f64]]) -> Vec<u8> {
         reservoir,
         |channel, pcm| {
             let masking = models[channel].granule(pcm)?;
-            Some((masking.block_type(), masking))
+            Some((masking.block_type(), (masking, Vec::new())))
         },
-        |channel, gr, masking, xr, mean_bits, reservoir| {
+        |frame| {
+            for granule in frame.iter_mut() {
+                for filtered in granule.iter_mut() {
+                    let (masking, xmin) = &mut filtered.analysis;
+                    *xmin = masking.allowed_distortion(&filtered.xr, fs);
+                }
+            }
+            ms_allowed && middle_side_frame(frame, fs)
+        },
+        |channel, gr, (masking, xmin), xr, mean_bits, reservoir| {
             let block_type = masking.block_type();
-            let xmin = masking.allowed_distortion(xr, fs);
             let available_bits = reservoir
                 .granule_bits(mean_bits, masking.perceptual_entropy())
                 .min(MAX_PART2_3_LENGTH);
@@ -371,6 +416,52 @@ pub fn encode_pcm(config: &StreamConfig, channels: &[&[f64]]) -> Vec<u8> {
             granule
         },
     )
+}
+
+/// A granule's psychoacoustic analysis and the allowed distortion of each
+/// of its scalefactors, in the order they are sent.
+type Analysis = (SwitchedMasking, Vec<f64>);
+
+/// Decides whether to code a stereo frame in MS stereo (Annex G.2), and if
+/// so turns its left and right lines into middle and side lines, with the
+/// allowed distortion of each.
+///
+/// The normative decoding needs both channels of a granule to have the same
+/// block type in MS stereo (clause 2.4.3.4.9). Spec gap: Annex G does not
+/// say what to do when they do not; such frames are coded in left/right
+/// stereo. The perceptual entropy each channel's bits are reckoned from
+/// stays that of the left and right channels.
+fn middle_side_frame(
+    frame: &mut [Vec<Filtered<Analysis>>],
+    sampling_frequency: SamplingFrequency,
+) -> bool {
+    let same_types = frame
+        .iter()
+        .all(|granule| granule[0].block_type == granule[1].block_type);
+    let spectra: Vec<_> = frame
+        .iter()
+        .map(|granule| {
+            (
+                granule[0].analysis.0.spectrum(),
+                granule[1].analysis.0.spectrum(),
+            )
+        })
+        .collect();
+    if !same_types || !stereo::ms_stereo(&spectra) {
+        return false;
+    }
+    for granule in frame.iter_mut() {
+        let [left, right] = &mut granule[..] else {
+            unreachable!("MS stereo has two channels")
+        };
+        let (middle, mut side) = stereo::middle_side(&left.xr, &right.xr);
+        stereo::limit_side(&mut side, left.block_type, sampling_frequency);
+        let xmin = stereo::middle_side_distortion(&left.analysis.1, &right.analysis.1);
+        (left.xr, right.xr) = (middle, side);
+        left.analysis.1.clone_from(&xmin);
+        right.analysis.1 = xmin;
+    }
+    true
 }
 
 /// Encodes PCM like [`encode_pcm`], but with long blocks only, quantising
@@ -391,7 +482,9 @@ pub fn encode_pcm_with_global_gain(
 
 /// Encodes PCM like [`encode_pcm_with_global_gain`], with the block type of
 /// each granule given by `block_type(channel, granule)`. The block types must
-/// follow each other as figure C.7 allows.
+/// follow each other as figure C.7 allows. If the mode allows MS stereo,
+/// every frame is coded in it, with no limitation of the side channel, and
+/// both channels must have the same block types.
 ///
 /// # Panics
 ///
@@ -417,6 +510,22 @@ pub fn encode_with_block_types(
                 (block_type, block_type)
             })
         },
+        |frame| {
+            if !config.ms_stereo_allowed() {
+                return false;
+            }
+            for granule in frame.iter_mut() {
+                let [left, right] = &mut granule[..] else {
+                    unreachable!("MS stereo has two channels")
+                };
+                assert_eq!(
+                    left.block_type, right.block_type,
+                    "MS stereo needs one block type"
+                );
+                (left.xr, right.xr) = stereo::middle_side(&left.xr, &right.xr);
+            }
+            true
+        },
         |_, _, block_type, xr, _, _| {
             let values = loops::quantize(xr, global_gain)
                 .unwrap_or_else(|| panic!("a granule is too loud for global_gain {global_gain}"));
@@ -425,21 +534,32 @@ pub fn encode_with_block_types(
     )
 }
 
+/// One granule of one channel, analysed and filtered, before quantisation.
+struct Filtered<A> {
+    block_type: BlockType,
+    analysis: A,
+    /// The lines in the order they are sent.
+    xr: [f64; GRANULE_LINES],
+}
+
 /// Runs each channel through its filterbank granule by granule, quantises
 /// each granule with `quantize`, and writes the frames.
 ///
 /// `look_ahead` is given each channel's PCM one granule ahead of the
 /// filterbank, starting with the first granule before any is filtered, and
 /// returns the block type and analysis of the granule before the one it is
-/// given: `None` only for the first. `quantize` is given the channel, the
-/// granule's index in its frame, that analysis, the granule's lines in the
-/// order they are sent, its share of the frame's main data and the bit
-/// reservoir, which accounts for the bits it then uses.
+/// given: `None` only for the first. `joint` is given each frame's granules,
+/// indexed `[gr][ch]`, once all are filtered, may change them, and returns
+/// whether the frame is coded in MS stereo. `quantize` is then given the
+/// channel, the granule's index in its frame, its analysis, its lines, its
+/// share of the frame's main data and the bit reservoir, which accounts for
+/// the bits it then uses.
 fn encode_filtered<A>(
     config: &StreamConfig,
     channels: &[&[f64]],
     mut reservoir: Reservoir,
     mut look_ahead: impl FnMut(usize, &[f64; GRANULE_LINES]) -> Option<(BlockType, A)>,
+    mut joint: impl FnMut(&mut [Vec<Filtered<A>>]) -> bool,
     mut quantize: impl FnMut(
         usize,
         usize,
@@ -473,28 +593,48 @@ fn encode_filtered<A>(
     let mut main_data_begin = 0;
 
     for frame in 0..frames {
-        let header = config.header(padding.next_padding());
+        let mut filtered: Vec<Vec<Filtered<A>>> = (0..GRANULES)
+            .map(|gr| {
+                let index = frame * GRANULES + gr;
+                (filterbanks.iter_mut().enumerate())
+                    .map(|(channel, filterbank)| {
+                        let (block_type, analysis) =
+                            look_ahead(channel, &granule_pcm(channel, index + 1))
+                                .expect("the granule before has been analysed");
+                        let xr = filterbank.granule(&granule_pcm(channel, index), block_type);
+                        let xr = match block_type {
+                            BlockType::Short => scalefactor_bands::short_coding_order(&xr, fs),
+                            _ => xr,
+                        };
+                        Filtered {
+                            block_type,
+                            analysis,
+                            xr,
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        let ms_stereo = joint(&mut filtered);
+        let header = config.frame_header(padding.next_padding(), ms_stereo);
         let slot_bits = main_data_bits(&header);
         let shares = GRANULES * channels.len();
         let mean_bits = slot_bits / shares;
         let mut granules = Vec::with_capacity(GRANULES);
-        for gr in 0..GRANULES {
-            let index = frame * GRANULES + gr;
-            let mut granule = Vec::with_capacity(channels.len());
-            for (channel, filterbank) in filterbanks.iter_mut().enumerate() {
-                let (block_type, analysis) = look_ahead(channel, &granule_pcm(channel, index + 1))
-                    .expect("the granule before has been analysed");
-                let xr = filterbank.granule(&granule_pcm(channel, index), block_type);
-                let xr = match block_type {
-                    BlockType::Short => scalefactor_bands::short_coding_order(&xr, fs),
-                    _ => xr,
-                };
+        for (gr, granule) in filtered.into_iter().enumerate() {
+            let mut quantized_granule = Vec::with_capacity(channels.len());
+            for (channel, filtered) in granule.into_iter().enumerate() {
+                let Filtered {
+                    block_type,
+                    analysis,
+                    xr,
+                } = filtered;
                 let quantized = quantize(channel, gr, analysis, &xr, mean_bits, &reservoir);
                 assert_eq!(quantized.block_type, block_type);
                 reservoir.granule_done(mean_bits, quantized.bit_len(fs));
-                granule.push(quantized);
+                quantized_granule.push(quantized);
             }
-            granules.push(granule);
+            granules.push(quantized_granule);
         }
         let (side_info, main_data) = frame_contents(fs, &granules, main_data_begin);
         writer.write(&header, &side_info, &main_data);

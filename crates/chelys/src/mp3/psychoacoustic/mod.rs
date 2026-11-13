@@ -14,10 +14,10 @@ pub mod switching;
 
 use std::f64::consts::PI;
 
-use super::BlockType;
 use super::GRANULE_LINES;
 use super::header::SamplingFrequency;
 use super::scalefactor_bands::{self, LONG_BANDS, SHORT_BANDS, SHORT_WINDOWS};
+use super::{BlockType, stereo};
 use fft::{Complex, Fft};
 use partitions::{BandWeights, Partition, ShortPartition};
 
@@ -117,6 +117,9 @@ pub struct Masking {
     pub ratio: [f64; LONG_BANDS],
     /// The perceptual entropy `pe` (clause C.1.5.3.2.1).
     pub perceptual_entropy: f64,
+    /// The energy `r(w)^2` of each line of the long FFT below line 512, for
+    /// the MS stereo decision (Annex G.2 a)).
+    pub spectrum: Vec<f64>,
 }
 
 impl Masking {
@@ -158,6 +161,9 @@ pub struct ShortMasking {
     /// The perceptual entropy `pe`, which figure C.6.a computes from the
     /// long-block threshold whatever the block type.
     pub perceptual_entropy: f64,
+    /// As [`Masking::spectrum`]: the long FFT is computed whatever the block
+    /// type.
+    pub spectrum: Vec<f64>,
 }
 
 impl ShortMasking {
@@ -433,13 +439,16 @@ impl PsychoacousticModel {
             .sum::<f64>();
 
         // Figure C.6.c: the partitions converted to scalefactor bands.
+        let spectrum: Vec<f64> = r[..stereo::CRITERION_LINES].iter().map(|r| r * r).collect();
         let long = Masking {
             ratio: band_ratio(self.band_weights, &thr, &eb),
             perceptual_entropy,
+            spectrum: spectrum.clone(),
         };
         let short = ShortMasking {
             ratio: r_short.map(|r| self.short_ratio(&r)),
             perceptual_entropy,
+            spectrum,
         };
         (long, short)
     }
@@ -744,6 +753,7 @@ mod tests {
         let masking = Masking {
             ratio: [0.01; LONG_BANDS],
             perceptual_entropy: 0.0,
+            spectrum: Vec::new(),
         };
         let mut xr = [0.0; GRANULE_LINES];
         let band = scalefactor_bands::long_bands(FS)[5];

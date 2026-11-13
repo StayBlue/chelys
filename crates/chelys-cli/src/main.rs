@@ -12,7 +12,8 @@ use chelys::mp3::header::{Bitrate, Mode, SamplingFrequency};
 use chelys::mp3::{StreamConfig, encode_pcm};
 
 const USAGE: &str = "\
-usage: chelys --sample-rate HZ --channels N [--bitrate KBPS] < input.f32 > output.mp3
+usage: chelys --sample-rate HZ --channels N [--bitrate KBPS] [--joint-stereo]
+              < input.f32 > output.mp3
 
 Reads interleaved 32-bit little-endian float PCM from stdin and writes MPEG-1
 Layer III to stdout.
@@ -20,16 +21,20 @@ Layer III to stdout.
   --sample-rate HZ   32000, 44100 or 48000
   --channels N       1 or 2
   --bitrate KBPS     32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256
-                     or 320 (default 128)";
+                     or 320 (default 128)
+  --joint-stereo     code each frame of two channels in MS stereo where the
+                     channels are alike (default: left/right stereo)";
 
 struct Options {
     sampling_frequency: SamplingFrequency,
     channels: usize,
     bitrate: Bitrate,
+    joint_stereo: bool,
 }
 
 fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
     let (mut sample_rate, mut channels, mut bitrate) = (None, None, 128);
+    let mut joint_stereo = false;
     let mut args = args.into_iter();
     while let Some(flag) = args.next() {
         let mut value = |name: &str| -> Result<u32, String> {
@@ -42,6 +47,7 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
             "--sample-rate" => sample_rate = Some(value("--sample-rate")?),
             "--channels" => channels = Some(value("--channels")?),
             "--bitrate" => bitrate = value("--bitrate")?,
+            "--joint-stereo" => joint_stereo = true,
             // An empty message asks for the usage text alone.
             "-h" | "--help" => return Err(String::new()),
             other => return Err(format!("unknown argument: {other}")),
@@ -57,10 +63,14 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
         n => return Err(format!("unsupported channel count: {n}")),
     };
     let bitrate = Bitrate::from_kbps(bitrate).ok_or(format!("unsupported bitrate: {bitrate}"))?;
+    if joint_stereo && channels != 2 {
+        return Err("--joint-stereo needs two channels".to_owned());
+    }
     Ok(Options {
         sampling_frequency,
         channels,
         bitrate,
+        joint_stereo,
     })
 }
 
@@ -96,10 +106,13 @@ fn main() -> ExitCode {
     let config = StreamConfig {
         bitrate: options.bitrate,
         sampling_frequency: options.sampling_frequency,
-        mode: if options.channels == 1 {
-            Mode::SingleChannel
-        } else {
-            Mode::Stereo
+        mode: match (options.channels, options.joint_stereo) {
+            (1, _) => Mode::SingleChannel,
+            (_, false) => Mode::Stereo,
+            (_, true) => Mode::JointStereo {
+                intensity_stereo: false,
+                ms_stereo: true,
+            },
         },
         crc_protected: false,
     };

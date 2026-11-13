@@ -269,3 +269,88 @@ fn steady_tones_share_scalefactors_between_granules() {
     let snr = snr(&input, &decoded.samples, 1, 0);
     assert!(snr > 25.0, "{snr:.1} dB");
 }
+
+/// Whether each frame of a stream is coded in MS stereo: bit 1 of its
+/// `mode_extension` (clause 2.4.2.3).
+fn ms_stereo_frames(stream: &[u8]) -> Vec<bool> {
+    let mut frames = Vec::new();
+    let mut at = 0;
+    while at + 4 <= stream.len() {
+        let header = &stream[at..];
+        assert_eq!(header[0], 0xFF, "no syncword at {at}");
+        frames.push(header[3] >> 5 & 1 == 1);
+        at += frame_len(header);
+    }
+    frames
+}
+
+fn frame_len(header: &[u8]) -> usize {
+    const KBPS: [u32; 15] = [
+        0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320,
+    ];
+    const HZ: [u32; 3] = [44_100, 48_000, 32_000];
+    let kbps = KBPS[usize::from(header[2] >> 4)];
+    let hz = HZ[usize::from((header[2] >> 2) & 3)];
+    (144_000 * kbps / hz) as usize + usize::from((header[2] >> 1) & 1)
+}
+
+/// With joint stereo, frames whose channels are alike are coded in MS
+/// stereo (Annex G.2). The same signal in both channels then needs bits for
+/// the middle channel only, and decodes better than in left/right stereo at
+/// a low bitrate. A signal in one channel only stays in left/right stereo.
+///
+/// A panned signal is coded in MS stereo too, and keeps the level
+/// difference between its channels.
+#[test]
+fn alike_channels_use_ms_stereo() {
+    let fs = SamplingFrequency::Hz44100;
+    let joint = Mode::JointStereo {
+        intensity_stereo: false,
+        ms_stereo: true,
+    };
+    let both = tones(44_100.0, 1.0);
+    let panned: Vec<f64> = both.iter().map(|x| 0.5 * x).collect();
+    let silent = vec![0.0; both.len()];
+
+    let stream = encode_pcm(&config(64, fs, joint), &[&both, &both]);
+    let ms = ms_stereo_frames(&stream);
+    assert!(
+        ms.iter().filter(|&&on| on).count() > ms.len() * 9 / 10,
+        "{ms:?}"
+    );
+    let decoded = ffmpeg::decode_mp3(&stream);
+    assert_eq!(decoded.diagnostics, "");
+    let joint_snr = [0, 1].map(|channel| snr(&both, &decoded.samples, 2, channel));
+    let stream = encode_pcm(&config(64, fs, Mode::Stereo), &[&both, &both]);
+    let decoded = ffmpeg::decode_mp3(&stream);
+    let stereo_snr = [0, 1].map(|channel| snr(&both, &decoded.samples, 2, channel));
+    for channel in 0..2 {
+        assert!(
+            joint_snr[channel] > stereo_snr[channel] + 3.0,
+            "channel {channel}: {:.1} dB in MS against {:.1} dB in left/right",
+            joint_snr[channel],
+            stereo_snr[channel]
+        );
+    }
+
+    let stream = encode_pcm(&config(64, fs, joint), &[&both, &panned]);
+    let ms = ms_stereo_frames(&stream);
+    assert!(
+        ms.iter().filter(|&&on| on).count() > ms.len() * 9 / 10,
+        "{ms:?}"
+    );
+    let decoded = ffmpeg::decode_mp3(&stream);
+    assert_eq!(decoded.diagnostics, "");
+    for (channel, input) in [&both, &panned].into_iter().enumerate() {
+        let snr = snr(input, &decoded.samples, 2, channel);
+        assert!(snr > 25.0, "panned, channel {channel}: {snr:.1} dB");
+    }
+
+    for (label, channels) in [
+        ("left only", [&both[..], &silent[..]]),
+        ("right only", [&silent[..], &both[..]]),
+    ] {
+        let stream = encode_pcm(&config(64, fs, joint), &channels);
+        assert!(ms_stereo_frames(&stream).iter().all(|&on| !on), "{label}");
+    }
+}

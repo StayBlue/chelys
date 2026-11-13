@@ -39,6 +39,14 @@ impl SwitchedMasking {
         }
     }
 
+    /// The line energies of the long FFT, [`Masking::spectrum`].
+    pub fn spectrum(&self) -> &[f64] {
+        match self {
+            Self::Normal(masking) | Self::Start(masking) | Self::Stop(masking) => &masking.spectrum,
+            Self::Short(masking) => &masking.spectrum,
+        }
+    }
+
     /// The allowed distortion of each scalefactor of the granule, in the
     /// order they are sent, from its lines `xr` in the order they are sent.
     pub fn allowed_distortion(

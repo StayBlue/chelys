@@ -140,6 +140,39 @@ fn stereo_channels_round_trip_separately() {
     }
 }
 
+/// In MS stereo the middle and side channels are sent in place of the left
+/// and right, and the decoder's matrix (clause 2.4.3.4.9.2) restores them:
+/// with long blocks, and with short ones in both channels.
+#[test]
+fn ms_stereo_round_trips() {
+    let fs = SamplingFrequency::Hz32000;
+    let left = tones(fs, 1.0, 0.0);
+    let right: Vec<f64> = tones(fs, 1.0, 1.7).iter().map(|x| -0.7 * x).collect();
+    let mode = Mode::JointStereo {
+        intensity_stereo: false,
+        ms_stereo: true,
+    };
+    let config = config(fs, mode);
+    for (label, short) in [("long blocks", false), ("short blocks", true)] {
+        let stream = encode_with_block_types(&config, 160, &[&left, &right], |_, _| {
+            if short {
+                BlockType::Short
+            } else {
+                BlockType::Normal
+            }
+        });
+        let decoded = ffmpeg::decode_mp3(&stream);
+        assert_eq!(decoded.diagnostics, "");
+        for (channel, input) in [&left, &right].into_iter().enumerate() {
+            let (lag, snr) = align(input, &decoded.samples, 2, channel);
+            assert!(
+                snr > 40.0,
+                "{label}, channel {channel}: {snr:.1} dB at lag {lag}"
+            );
+        }
+    }
+}
+
 /// Each step of `global_gain` scales the quantizer step by 2^(1/4), so the
 /// noise grows steadily as the gain rises.
 #[test]
