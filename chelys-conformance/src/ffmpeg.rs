@@ -3,16 +3,10 @@
 
 //! The `ffmpeg` and `ffprobe` programs.
 
-use std::process::{Command, Output};
+use std::process::Command;
 
-use crate::TempFile;
-
-pub struct Decoded {
-    /// Interleaved 32-bit float PCM, as the decoder produced it.
-    pub samples: Vec<f32>,
-    /// Anything the decoder logged at error level.
-    pub diagnostics: String,
-}
+pub use crate::Decoded;
+use crate::{TempFile, run};
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct StreamInfo {
@@ -59,17 +53,4 @@ pub fn probe_mp3(stream: &[u8]) -> StreamInfo {
         sample_rate: field("sample_rate").parse().unwrap(),
         channels: field("channels").parse().unwrap(),
     }
-}
-
-fn run(command: &mut Command) -> Output {
-    let program = command.get_program().to_string_lossy().into_owned();
-    let output = command
-        .output()
-        .unwrap_or_else(|e| panic!("could not run {program} (is it on PATH?): {e}"));
-    assert!(
-        output.status.success(),
-        "{program} failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    output
 }
