@@ -1,0 +1,112 @@
+//! PCM through the analysis filterbank, decoded by ffmpeg and compared with
+//! the input.
+
+use std::f64::consts::TAU;
+
+use chelys::mp3::header::{Bitrate, Mode, SamplingFrequency};
+use chelys::mp3::{StreamConfig, encode_pcm};
+use chelys_conformance::ffmpeg;
+
+fn config(sampling_frequency: SamplingFrequency, mode: Mode) -> StreamConfig {
+    StreamConfig {
+        bitrate: Bitrate::from_kbps(320).unwrap(),
+        sampling_frequency,
+        mode,
+        crc_protected: false,
+    }
+}
+
+/// Tones in even and odd subbands, mid-band and near subband edges, where the
+/// frequency inversion and the aliasing butterflies matter.
+fn tones(sampling_frequency: SamplingFrequency, seconds: f64, offset: f64) -> Vec<f64> {
+    let fs = f64::from(sampling_frequency.hz());
+    let band = fs / 64.0;
+    let frequencies = [
+        0.5 * band,
+        1.5 * band,
+        3.97 * band,
+        7.03 * band,
+        12.5 * band,
+        21.2 * band,
+    ];
+    (0..(seconds * fs) as usize)
+        .map(|t| {
+            frequencies
+                .iter()
+                .enumerate()
+                .map(|(i, f)| 0.08 * (TAU * f * t as f64 / fs + offset * i as f64).sin())
+                .sum()
+        })
+        .collect()
+}
+
+/// The lag of `output` behind `input` that best lines them up, and the
+/// signal-to-noise ratio in dB at that lag over the steady middle part.
+/// `output` is interleaved over `channels`, of which `input` is `channel`.
+fn align(input: &[f64], output: &[f32], channels: usize, channel: usize) -> (usize, f64) {
+    let span = 1152 * 2..input.len() - 1152 * 2;
+    let snr = |lag: usize| {
+        let (signal, noise) = span.clone().fold((0.0, 0.0), |(s, n), t| {
+            let x = input[t];
+            let y = f64::from(output[(t + lag) * channels + channel]);
+            (s + x * x, n + (x - y) * (x - y))
+        });
+        10.0 * (signal / noise).log10()
+    };
+    (0..3000)
+        .map(|lag| (lag, snr(lag)))
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+        .unwrap()
+}
+
+/// With a fine quantizer the decoded output matches the input closely, which
+/// needs the filterbank, the encoder's frequency inversion and aliasing
+/// butterflies, and the scaling to the decoder's `xr` all to be right.
+/// (Leaving out the inversion drops this to about 1 dB, the butterflies to
+/// about 10 dB.)
+#[test]
+fn pcm_round_trips_at_every_sampling_frequency() {
+    for fs in SamplingFrequency::ALL {
+        let input = tones(fs, 1.0, 0.0);
+        let stream = encode_pcm(&config(fs, Mode::SingleChannel), 150, &[&input]);
+        let decoded = ffmpeg::decode_mp3(&stream);
+        assert_eq!(decoded.diagnostics, "");
+        let (lag, snr) = align(&input, &decoded.samples, 1, 0);
+        assert!(snr > 50.0, "{fs:?}: {snr:.1} dB at lag {lag}");
+    }
+}
+
+/// A slightly coarser quantizer than the mono test, so that two channels fit
+/// in a frame without rate control or a bit reservoir.
+#[test]
+fn stereo_channels_round_trip_separately() {
+    let fs = SamplingFrequency::Hz32000;
+    let left = tones(fs, 1.0, 0.0);
+    let right: Vec<f64> = tones(fs, 1.0, 1.7).iter().map(|x| -0.7 * x).collect();
+    let stream = encode_pcm(&config(fs, Mode::Stereo), 160, &[&left, &right]);
+    let decoded = ffmpeg::decode_mp3(&stream);
+    assert_eq!(decoded.diagnostics, "");
+    for (channel, input) in [&left, &right].into_iter().enumerate() {
+        let (lag, snr) = align(input, &decoded.samples, 2, channel);
+        assert!(snr > 40.0, "channel {channel}: {snr:.1} dB at lag {lag}");
+    }
+}
+
+/// Each step of `global_gain` scales the quantizer step by 2^(1/4), so the
+/// noise grows steadily as the gain rises.
+#[test]
+fn noise_follows_the_quantizer_step() {
+    let fs = SamplingFrequency::Hz44100;
+    let input = tones(fs, 1.0, 0.0);
+    let snrs: Vec<f64> = [150, 160, 170, 180]
+        .into_iter()
+        .map(|gain| {
+            let stream = encode_pcm(&config(fs, Mode::SingleChannel), gain, &[&input]);
+            align(&input, &ffmpeg::decode_mp3(&stream).samples, 1, 0).1
+        })
+        .collect();
+    for pair in snrs.windows(2) {
+        let drop = pair[0] - pair[1];
+        assert!((7.0..14.0).contains(&drop), "SNR by gain: {snrs:?}");
+    }
+}

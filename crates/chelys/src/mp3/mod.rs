@@ -1,8 +1,10 @@
 //! MPEG-1 Audio Layer III.
 
 mod crc;
+pub mod filterbank;
 pub mod header;
 pub mod huffman;
+pub mod quantizer;
 pub mod scalefactor_bands;
 pub mod side_info;
 
@@ -155,6 +157,48 @@ pub fn encode_granules(config: &StreamConfig, granules: &[Vec<QuantizedGranule>]
     }
 
     out
+}
+
+/// Encodes PCM, one slice of samples (nominally -1.0 to 1.0) per channel,
+/// quantising every granule with the same `global_gain`. The input is padded
+/// with silence to whole frames, plus one more frame to flush the filterbank.
+///
+/// # Panics
+///
+/// If the channel count does not match the configured mode, or a granule
+/// cannot be quantised with `global_gain` or does not fit in its frame.
+pub fn encode_pcm(config: &StreamConfig, global_gain: u8, channels: &[&[f64]]) -> Vec<u8> {
+    assert_eq!(
+        channels.len(),
+        config.mode.channels(),
+        "one slice per channel"
+    );
+    let samples = channels.iter().map(|c| c.len()).max().unwrap_or(0);
+    let granules = samples.div_ceil(SAMPLES_PER_FRAME) * GRANULES + GRANULES;
+    let mut filterbanks: Vec<_> = channels
+        .iter()
+        .map(|_| filterbank::Filterbank::new())
+        .collect();
+
+    let quantized: Vec<Vec<QuantizedGranule>> = (0..granules)
+        .map(|g| {
+            channels
+                .iter()
+                .zip(&mut filterbanks)
+                .map(|(pcm, filterbank)| {
+                    let pcm = std::array::from_fn(|t| {
+                        pcm.get(g * GRANULE_LINES + t).copied().unwrap_or(0.0)
+                    });
+                    let xr = filterbank.granule(&pcm);
+                    let values = quantizer::quantize(&xr, global_gain).unwrap_or_else(|| {
+                        panic!("granule {g} is too loud for global_gain {global_gain}")
+                    });
+                    QuantizedGranule::new(global_gain, values, config.sampling_frequency)
+                })
+                .collect()
+        })
+        .collect();
+    encode_granules(config, &quantized)
 }
 
 /// Encodes `frames` frames of digital silence. Every granule codes to
