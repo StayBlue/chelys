@@ -379,8 +379,6 @@ pub fn encode_pcm(config: &StreamConfig, channels: &[&[f64]]) -> Vec<u8> {
     let fs = config.sampling_frequency;
     let (ms_allowed, intensity_allowed) = config.joint_stereo();
     let mut models: Vec<_> = channels.iter().map(|_| BlockSwitching::new(fs)).collect();
-    // Each channel's first granule of the frame, for scfsi in the second.
-    let mut first: Vec<Option<(GranuleSummary, Scalefactors)>> = vec![None; channels.len()];
     let reservoir = Reservoir::new(config.header(true).frame_len());
     encode_filtered(
         config,
@@ -403,48 +401,32 @@ pub fn encode_pcm(config: &StreamConfig, channels: &[&[f64]]) -> Vec<u8> {
             } else {
                 Vec::new()
             };
-            // Annex G.1: if the frame needs more bits than it has, more and
-            // more bands are coded in intensity stereo, down to the lowest
-            // bound, and the last tried is kept even if the frame still needs
-            // more. Bounds that would not lower the bits are not tried.
-            let mut plain_reservoir = reservoir.clone();
-            let mut plain_first = first.clone();
-            let (plain, mut within_allowance) = quantize_frame(
-                &frame,
+            let to_quantize = FrameToQuantize {
+                frame: &frame,
                 ms_stereo,
-                None,
                 mean_bits,
-                &mut plain_reservoir,
-                &mut plain_first,
-                fs,
-            );
-            let mut tried = None;
-            for bound in bounds {
-                if within_allowance {
-                    break;
-                }
-                let Some(intensity) = IntensityTry::new(&frame, &plain, bound, fs) else {
-                    continue;
-                };
-                let mut tried_reservoir = reservoir.clone();
-                let mut tried_first = first.clone();
-                let granules;
-                (granules, within_allowance) = quantize_frame(
-                    &frame,
-                    ms_stereo,
-                    Some(&intensity),
-                    mean_bits,
-                    &mut tried_reservoir,
-                    &mut tried_first,
-                    fs,
-                );
-                tried = Some((granules, tried_reservoir, tried_first));
-            }
-            let intensity_stereo = tried.is_some();
-            let (granules, kept_reservoir, kept_first) =
-                tried.unwrap_or((plain, plain_reservoir, plain_first));
+                sampling_frequency: fs,
+            };
+            let plain = quantize_frame(&to_quantize, None, reservoir, IfOutsideAllowance::Finish)
+                .expect("a finished frame");
+            let tries: Vec<_> = if plain.within_allowance {
+                Vec::new()
+            } else {
+                bounds
+                    .into_iter()
+                    .filter_map(|bound| IntensityTry::new(&frame, &plain.granules, bound, fs))
+                    .collect()
+            };
+            let kept = search_intensity(&tries, |intensity, if_outside| {
+                quantize_frame(&to_quantize, Some(intensity), reservoir, if_outside)
+            });
+            let intensity_stereo = kept.is_some();
+            let FrameTry {
+                granules,
+                reservoir: kept_reservoir,
+                ..
+            } = kept.unwrap_or(plain);
             *reservoir = kept_reservoir;
-            first = kept_first;
             CodedFrame {
                 granules,
                 ms_stereo,
@@ -454,14 +436,61 @@ pub fn encode_pcm(config: &StreamConfig, channels: &[&[f64]]) -> Vec<u8> {
     )
 }
 
+/// Annex G.1: if the frame needs more bits than it has, more and more bands
+/// are coded in intensity stereo, down to the lowest bound, and the last
+/// tried is kept even if the frame still needs more. Bounds that would not
+/// lower the bits are not tried (see [`IntensityTry::new`]).
+///
+/// Given the tries worth making, from the fewest bands to the most, and a
+/// function that quantises the frame for a try, returns the try kept: `None`
+/// if there are no tries. A try before the last is kept only if the whole
+/// frame is within its allowed distortion, so it is given up at the first
+/// granule that is not; the frame then comes out as if it had been finished
+/// and passed over.
+fn search_intensity<Try, Frame>(
+    tries: &[Try],
+    mut quantize: impl FnMut(&Try, IfOutsideAllowance) -> Option<Frame>,
+) -> Option<Frame> {
+    let (last, earlier) = tries.split_last()?;
+    earlier
+        .iter()
+        .find_map(|intensity| quantize(intensity, IfOutsideAllowance::GiveUp))
+        .or_else(|| quantize(last, IfOutsideAllowance::Finish))
+}
+
+/// A frame to quantise, the same for each try at coding it: its granules,
+/// indexed `[gr][ch]`, whether it is in MS stereo, and the share of its main
+/// data of each granule of each channel.
+struct FrameToQuantize<'a> {
+    frame: &'a [Vec<Filtered<Analysis>>],
+    ms_stereo: bool,
+    mean_bits: usize,
+    sampling_frequency: SamplingFrequency,
+}
+
+/// What [`quantize_frame`] does when a granule comes out outside its allowed
+/// distortion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IfOutsideAllowance {
+    /// Quantise the rest of the frame.
+    Finish,
+    /// Stop, and return no frame.
+    GiveUp,
+}
+
+/// A frame quantised one way, and the bit reservoir after it, which is taken
+/// over only if the frame is kept.
+struct FrameTry {
+    /// The frame's granules, with one entry per channel each.
+    granules: Vec<Vec<QuantizedGranule>>,
+    /// Whether every granule was within its allowed distortion.
+    within_allowance: bool,
+    reservoir: Reservoir,
+}
+
 /// A granule's psychoacoustic analysis and the allowed distortion of each
 /// of its scalefactors, in the order they are sent.
 type Analysis = (SwitchedMasking, Vec<f64>);
-
-/// The earlier scalefactors of each channel that the second granule of a
-/// frame may take over with scfsi: its first granule's summary and
-/// scalefactors.
-type FirstGranules = [Option<(GranuleSummary, Scalefactors)>];
 
 /// Whether to code a stereo frame in MS stereo (Annex G.2 a)).
 ///
@@ -576,8 +605,9 @@ impl IntensityTry {
 }
 
 /// Quantises a frame's granules, in MS stereo if `ms_stereo` is set and in
-/// intensity stereo as `intensity` gives, and accounts for their bits in the
-/// reservoir. Returns them, and whether each was within its allowed
+/// intensity stereo as `intensity` gives, accounting for their bits in a
+/// copy of the reservoir, so that a try leaves the encoder's state as it
+/// was. `None` if `if_outside` gives up on a granule outside its allowed
 /// distortion.
 ///
 /// The perceptual entropy each channel's bits are reckoned from stays that
@@ -594,15 +624,20 @@ impl IntensityTry {
 /// granule (Annex G.2 c)). In intensity stereo the right channel does not
 /// use scfsi.
 fn quantize_frame(
-    frame: &[Vec<Filtered<Analysis>>],
-    ms_stereo: bool,
+    to_quantize: &FrameToQuantize,
     intensity: Option<&IntensityTry>,
-    mean_bits: usize,
-    reservoir: &mut Reservoir,
-    first: &mut FirstGranules,
-    sampling_frequency: SamplingFrequency,
-) -> (Vec<Vec<QuantizedGranule>>, bool) {
-    let fs = sampling_frequency;
+    reservoir: &Reservoir,
+    if_outside: IfOutsideAllowance,
+) -> Option<FrameTry> {
+    let &FrameToQuantize {
+        frame,
+        ms_stereo,
+        mean_bits,
+        sampling_frequency: fs,
+    } = to_quantize;
+    let mut reservoir = reservoir.clone();
+    // Each channel's first granule, for scfsi in the second.
+    let mut first: Vec<Option<(GranuleSummary, Scalefactors)>> = vec![None; frame[0].len()];
     let mut within_allowance = true;
     let mut granules = Vec::with_capacity(frame.len());
     for (gr, granule) in frame.iter().enumerate() {
@@ -660,14 +695,23 @@ fn quantize_frame(
             };
             let outcome =
                 loops::quantize_granule(xr, xmin, block_type, available_bits, fs, reuse, intensity);
-            first[channel] = (gr == 0).then(|| (summary, outcome.granule.scalefactors.clone()));
+            if gr == 0 {
+                first[channel] = Some((summary, outcome.granule.scalefactors.clone()));
+            }
             reservoir.granule_done(mean_bits, outcome.granule.bit_len(fs));
+            if !outcome.within_allowance && if_outside == IfOutsideAllowance::GiveUp {
+                return None;
+            }
             within_allowance &= outcome.within_allowance;
             quantized.push(outcome.granule);
         }
         granules.push(quantized);
     }
-    (granules, within_allowance)
+    Some(FrameTry {
+        granules,
+        within_allowance,
+        reservoir,
+    })
 }
 
 /// Encodes PCM like [`encode_pcm`], but with long blocks only, quantising
@@ -980,5 +1024,41 @@ mod tests {
         // 144 slots minus the 4-byte header and 17 bytes of side information.
         let main_data = [0; 144 - 4 - 17 + 1];
         write_frame(&header, &SideInfo::default(), &main_data, &mut Vec::new());
+    }
+
+    /// For every pattern of tries within their allowed distortion, up to the
+    /// most a frame can have, the search keeps the first try within it or
+    /// else the last, gives up only on tries before the last, and quantises
+    /// none after the one it keeps.
+    #[test]
+    fn intensity_search_keeps_the_first_try_that_fits_or_else_the_last() {
+        for count in 0..=stereo::intensity_bounds(SamplingFrequency::Hz44100).len() {
+            for pattern in 0..1u32 << count {
+                let fits = |index: usize| pattern & 1 << index != 0;
+                let tries: Vec<usize> = (0..count).collect();
+                let mut calls = Vec::new();
+                let kept = search_intensity(&tries, |&index, if_outside| {
+                    calls.push((index, if_outside));
+                    (fits(index) || if_outside == IfOutsideAllowance::Finish).then_some(index)
+                });
+
+                let expected = (0..count).find(|&index| fits(index) || index + 1 == count);
+                assert_eq!(kept, expected, "{count} tries, fits {pattern:b}");
+                let expected_calls: Vec<_> = expected
+                    .into_iter()
+                    .flat_map(|kept| 0..=kept)
+                    .map(|index| {
+                        let last = index + 1 == count;
+                        let if_outside = if last {
+                            IfOutsideAllowance::Finish
+                        } else {
+                            IfOutsideAllowance::GiveUp
+                        };
+                        (index, if_outside)
+                    })
+                    .collect();
+                assert_eq!(calls, expected_calls, "{count} tries, fits {pattern:b}");
+            }
+        }
     }
 }
