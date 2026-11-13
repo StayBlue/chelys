@@ -4,6 +4,7 @@ mod crc;
 pub mod filterbank;
 pub mod header;
 pub mod huffman;
+pub mod psychoacoustic;
 pub mod quantizer;
 pub mod scalefactor_bands;
 pub mod side_info;
