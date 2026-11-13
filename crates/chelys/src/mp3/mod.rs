@@ -2,6 +2,7 @@
 
 mod crc;
 pub mod header;
+pub mod huffman;
 pub mod side_info;
 
 use crate::bitstream::BitWriter;
