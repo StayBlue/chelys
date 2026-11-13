@@ -71,6 +71,14 @@ pub fn middle_side(
 /// would always be mono, and from band 11 (about 2 kHz) a channel 6 dB
 /// quieter than the other would be decoded, like the other, at their
 /// average: level differences between the channels would be lost.
+///
+/// Settled by decoding with ffmpeg (black box): at 44.1 kHz, tones with the
+/// right channel at half the left decode at 13.5 and 7.7 dB SNR with
+/// sparsing, at both 64 and 128 kbit/s, and at 35.2 and 29.6 dB (64 kbit/s)
+/// and 59.8 and 54.4 dB (128 kbit/s) without it, against 34 dB (64 kbit/s)
+/// and 58 dB (128 kbit/s) in left/right stereo. The same tones in both
+/// channels gain the same either way. The conformance test
+/// `alike_channels_use_ms_stereo` fails with sparsing.
 pub fn limit_side(
     side: &mut [f64; GRANULE_LINES],
     block_type: BlockType,

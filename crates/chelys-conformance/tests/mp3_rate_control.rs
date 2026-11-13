@@ -300,7 +300,12 @@ fn frame_len(header: &[u8]) -> usize {
 /// a low bitrate. A signal in one channel only stays in left/right stereo.
 ///
 /// A panned signal is coded in MS stereo too, and keeps the level
-/// difference between its channels.
+/// difference between its channels. (With the side channel sparsed as
+/// Annex G.2 b) describes, the channels of tones at full and half level
+/// decode at about 13 and 8 dB.)
+///
+/// This is the evidence for leaving the sparsing out, which the side
+/// channel's limitation marks as settled by decoding with ffmpeg.
 #[test]
 fn alike_channels_use_ms_stereo() {
     let fs = SamplingFrequency::Hz44100;
