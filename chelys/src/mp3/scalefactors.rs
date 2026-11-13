@@ -4,13 +4,16 @@
 //! Layer III scalefactors: their meaning in the requantization formula
 //! (clause 2.4.3.4.7.1), their transmission with `scalefac_compress` (clause
 //! 2.4.2.7, and clause 2.4.3.2 of ISO/IEC 13818-3 for the lower sampling
-//! frequencies), and preemphasis (Table B.6). Mixed blocks are not used.
+//! frequencies), with the intensity stereo positions the right channel sends
+//! in their place (clause 2.4.3.4.9.3), and preemphasis (Table B.6). Mixed
+//! blocks are not used.
 
 use crate::bitstream::BitWriter;
 use crate::mp3::BlockType;
 use crate::mp3::header::Version;
 use crate::mp3::scalefactor_bands::{LONG_BANDS, SHORT_BANDS, SHORT_WINDOWS};
 use crate::mp3::side_info::SCFSI_BANDS;
+use crate::mp3::stereo::INTENSITY_SCALE;
 
 /// The long scalefactor bands of each scfsi band: `SCFSI_STARTS[band]` up to
 /// `SCFSI_STARTS[band + 1]` (clause 2.4.2.7).
@@ -90,6 +93,34 @@ impl LsfPartitions {
         }
     }
 
+    /// Decodes `scalefac_compress` as clause 2.4.3.2 of ISO/IEC 13818-3
+    /// prints it for the right channel of a frame coded in intensity stereo,
+    /// `intensity_scale` in its lowest bit and `int_scalefac_compress` in the
+    /// rest, with the same rows as [`decode`](Self::decode).
+    fn decode_intensity(scalefac_compress: u16, short: bool) -> Self {
+        let isc = u32::from(scalefac_compress >> 1);
+        let (slen, long_sfb, short_sfb) = if isc < 180 {
+            let slen = [isc / 36, (isc % 36) / 6, (isc % 36) % 6, 0];
+            (slen, [7, 7, 7, 0], [12, 12, 12, 0])
+        } else if isc < 244 {
+            let isc = isc - 180;
+            let slen = [(isc % 64) >> 4, (isc % 16) >> 2, isc % 4, 0];
+            (slen, [6, 6, 6, 3], [12, 9, 9, 6])
+        } else {
+            assert!(
+                isc <= 255,
+                "scalefac_compress {scalefac_compress} has more than 9 bits"
+            );
+            let isc = isc - 244;
+            ([isc / 3, isc % 3, 0, 0], [8, 8, 5, 0], [15, 12, 9, 0])
+        };
+        Self {
+            slen,
+            nr_of_sfb: if short { short_sfb } else { long_sfb },
+            preflag: false,
+        }
+    }
+
     /// The `slen` of each of `count` scalefactors in the order sent.
     fn widths(self, count: usize) -> impl Iterator<Item = u32> {
         let widths = (self.slen.into_iter().zip(self.nr_of_sfb))
@@ -132,6 +163,66 @@ pub struct Scalefactors {
     /// clear in the first granule, for short blocks, and at the lower
     /// sampling frequencies, which have no scfsi.
     pub scfsi: [bool; SCFSI_BANDS],
+    /// Set for the right channel of a frame coded in intensity stereo, whose
+    /// zero part sends intensity stereo positions in place of scalefactors
+    /// (clause 2.4.3.4.9.3). At the lower sampling frequencies it also sends
+    /// all its scalefactors with the other branch of `scalefac_compress`
+    /// (clause 2.4.3.2 of ISO/IEC 13818-3).
+    pub intensity: Option<ZeroPart>,
+}
+
+/// Where the zero part of the right channel of a frame coded in intensity
+/// stereo begins, in the order of [`Scalefactors::values`]: the
+/// scalefactors from `start` up to `bound` are marked as not coded in
+/// intensity stereo, and those from `bound` up are intensity stereo
+/// positions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ZeroPart {
+    pub start: usize,
+    pub bound: usize,
+}
+
+impl ZeroPart {
+    /// No zero part yet: the scalefactors of the right channel before its
+    /// positions are marked (see
+    /// [`IntensityPositions::mark`](crate::mp3::stereo::IntensityPositions::mark)).
+    pub const UNMARKED: Self = Self {
+        start: usize::MAX,
+        bound: usize::MAX,
+    };
+
+    /// Whether scalefactor `index` is marked as not coded in intensity
+    /// stereo.
+    fn marks(self, index: usize) -> bool {
+        (self.start..self.bound).contains(&index)
+    }
+
+    /// Whether any scalefactor is marked as not coded in intensity stereo.
+    pub fn marks_any(self) -> bool {
+        self.start < self.bound
+    }
+}
+
+/// The value that marks a scalefactor band of the right channel's zero part
+/// as not coded in intensity stereo, the "illegal" position, when sent in
+/// `slen` bits, or `None` if the field cannot send it: 7, sent in 3 bits
+/// (clause 2.4.3.4.9.3, Annex G.2 c)), or at the lower sampling frequencies
+/// the largest value of the field (clause 2.4.3.2 of ISO/IEC 13818-3).
+///
+/// Spec reading: clause 2.4.3.2 of ISO/IEC 13818-3 gives the scalefactors of
+/// a band sent in no bits the intensity stereo position zero, so a field of
+/// no bits has no illegal position.
+///
+/// The encoder never sends these marks at the lower sampling frequencies: it
+/// codes such a frame without intensity stereo (see `quantize_frame`). They
+/// are still given here, as the standard has them, so that the bits the right
+/// channel's scalefactors take, and the values its positions must avoid,
+/// follow it.
+fn not_intensity(version: Version, slen: u32) -> Option<u8> {
+    match version {
+        Version::Mpeg1 => (slen >= 3).then_some(7),
+        Version::Mpeg2 => (slen >= 1).then(|| ((1u32 << slen) - 1) as u8),
+    }
 }
 
 impl Default for Scalefactors {
@@ -154,6 +245,7 @@ impl Scalefactors {
             preflag: false,
             scalefac_scale: false,
             scfsi: [false; SCFSI_BANDS],
+            intensity: None,
         }
     }
 
@@ -164,15 +256,6 @@ impl Scalefactors {
             Scalefac::Long(_) => !self.scfsi[scfsi_band(index)],
             Scalefac::Short(_) => true,
         }
-    }
-
-    /// The scalefactors sent with `slen1` and with `slen2`.
-    fn sent_values(&self) -> (Vec<u8>, Vec<u8>) {
-        let sent = (self.values().iter().enumerate()).filter(|&(index, _)| self.sent(index));
-        let (low, high): (Vec<_>, Vec<_>) =
-            sent.partition(|&(index, _)| index < self.slen1_count());
-        let values = |pairs: Vec<(usize, &u8)>| pairs.into_iter().map(|(_, &v)| v).collect();
-        (values(low), values(high))
     }
 
     /// The scalefactors in the order they are sent: `scalefac_l[sfb]` at
@@ -221,8 +304,16 @@ impl Scalefactors {
     /// which cover the same scalefactors as `slen1` above, and 3 bits for the
     /// rest, so the limits are the same; with `preflag`, values 500 and up
     /// give 3 bits to the scalefactors `slen1` covers above and 2 to the
-    /// rest, limits of 7 and 3.
+    /// rest, limits of 7 and 3. The right channel of a frame coded in
+    /// intensity stereo, which has no `preflag`, gets the widest fields of
+    /// its own branch: 4 bits for the first partition of
+    /// `int_scalefac_compress` below 180, and 5 for the rest, limits of 15
+    /// and 31.
     pub fn limit(&self, index: usize) -> u8 {
+        if self.version == Version::Mpeg2 && self.intensity.is_some() {
+            let first = LsfPartitions::decode_intensity(0, self.short()).nr_of_sfb[0];
+            return if index < first { 15 } else { 31 };
+        }
         let first = index < self.slen1_count();
         match (self.version, self.preflag, first) {
             (Version::Mpeg2, true, true) => 7,
@@ -230,6 +321,18 @@ impl Scalefactors {
             (_, _, true) => 15,
             (_, _, false) => 7,
         }
+    }
+
+    /// Whether `preflag` can be sent: not for short blocks (clause 2.4.2.7),
+    /// nor for the right channel of a frame coded in intensity stereo at the
+    /// lower sampling frequencies, whose branch of `scalefac_compress` always
+    /// clears it (clause 2.4.3.2 of ISO/IEC 13818-3).
+    pub fn can_preemphasise(&self) -> bool {
+        !self.short() && (self.version != Version::Mpeg2 || self.intensity.is_none())
+    }
+
+    fn short(&self) -> bool {
+        matches!(self.scalefac, Scalefac::Short(_))
     }
 
     /// `scalefac_multiplier` (clause 2.4.2.7).
@@ -255,31 +358,47 @@ impl Scalefactors {
     /// The `scalefac_compress` whose field widths hold the scalefactors sent
     /// in the fewest bits, or `None` if one is above its
     /// [`limit`](Self::limit). At the lower sampling frequencies it also
-    /// sets `preflag` as the scalefactors have it.
+    /// sets `preflag` as the scalefactors have it, and in the right channel
+    /// of a frame coded in intensity stereo [`INTENSITY_SCALE`].
     pub fn compress(&self) -> Option<u16> {
-        let fits = |c: u16| match self.version {
-            Version::Mpeg1 => {
-                let (slen1, slen2) = SCALEFAC_COMPRESS[usize::from(c)];
-                let (low, high) = self.sent_values();
-                low.iter().all(|&v| fits_in(v, slen1)) && high.iter().all(|&v| fits_in(v, slen2))
-            }
-            Version::Mpeg2 => {
-                let partitions = self.lsf_partitions(c);
-                partitions.preflag == self.preflag
-                    && (self
-                        .values()
-                        .iter()
-                        .zip(partitions.widths(self.values().len())))
-                    .all(|(&v, slen)| fits_in(v, slen))
-            }
+        let (count, step, offset) = match (self.version, self.intensity) {
+            (Version::Mpeg1, _) => (SCALEFAC_COMPRESS.len() as u16, 1, 0),
+            (Version::Mpeg2, None) => (LSF_SCALEFAC_COMPRESS, 1, 0),
+            (Version::Mpeg2, Some(_)) => (LSF_SCALEFAC_COMPRESS / 2, 2, INTENSITY_SCALE),
         };
-        let values = match self.version {
-            Version::Mpeg1 => SCALEFAC_COMPRESS.len() as u16,
-            Version::Mpeg2 => LSF_SCALEFAC_COMPRESS,
+        let fits = |c: u16| {
+            let preflag_sent = match self.version {
+                Version::Mpeg1 => true,
+                Version::Mpeg2 => self.lsf_partitions(c).preflag == self.preflag,
+            };
+            preflag_sent
+                && (self.widths(c).into_iter().enumerate()).all(|(index, slen)| {
+                    slen.is_none_or(|slen| self.sent_value(index, slen).is_some())
+                })
         };
-        (0..values)
+        (0..count)
+            .map(|c| c * step + offset)
             .filter(|&c| fits(c))
             .min_by_key(|&c| self.part2_length(c))
+    }
+
+    /// The value sent for scalefactor `index` of [`values`](Self::values) in
+    /// a field of `slen` bits, or `None` if the field cannot send it: the
+    /// scalefactor, or in the right channel of a frame coded in intensity
+    /// stereo the mark of a band not coded in it. An intensity stereo
+    /// position must not be sent as the mark.
+    fn sent_value(&self, index: usize, slen: u32) -> Option<u8> {
+        let Some(zero_part) = self.intensity else {
+            let value = self.values()[index];
+            return fits_in(value, slen).then_some(value);
+        };
+        let mark = not_intensity(self.version, slen);
+        if zero_part.marks(index) {
+            return mark;
+        }
+        let value = self.values()[index];
+        let position = index >= zero_part.bound;
+        (fits_in(value, slen) && !(position && mark == Some(value))).then_some(value)
     }
 
     /// How `scalefac_compress` sends these scalefactors at the lower sampling
@@ -290,8 +409,10 @@ impl Scalefactors {
             !self.scfsi.contains(&true),
             "the lower sampling frequencies have no scfsi"
         );
-        let short = matches!(self.scalefac, Scalefac::Short(_));
-        LsfPartitions::decode(scalefac_compress, short)
+        match self.intensity {
+            Some(_) => LsfPartitions::decode_intensity(scalefac_compress, self.short()),
+            None => LsfPartitions::decode(scalefac_compress, self.short()),
+        }
     }
 
     /// The width of each scalefactor of [`values`](Self::values) sent with
@@ -327,13 +448,12 @@ impl Scalefactors {
     /// If a scalefactor sent does not fit its field.
     pub fn write(&self, scalefac_compress: u16, w: &mut BitWriter) {
         let widths = self.widths(scalefac_compress);
-        for (index, (&scalefac, slen)) in self.values().iter().zip(widths).enumerate() {
+        for (index, slen) in widths.into_iter().enumerate() {
             let Some(slen) = slen else { continue };
-            assert!(
-                fits_in(scalefac, slen),
-                "scalefactor {scalefac} at {index} does not fit in {slen} bits"
-            );
-            w.write(u32::from(scalefac), slen);
+            let value = self
+                .sent_value(index, slen)
+                .unwrap_or_else(|| panic!("scalefactor {index} cannot be sent in {slen} bits"));
+            w.write(u32::from(value), slen);
         }
     }
 
@@ -456,5 +576,106 @@ mod tests {
 
         scalefactors.preflag = true;
         assert_eq!(scalefactors.amplification(18), 2f64.powf(1.5));
+    }
+
+    /// The right channel's branch of `scalefac_compress` (clause 2.4.3.2 of
+    /// ISO/IEC 13818-3), at the first value of each of its three ranges and
+    /// at the last.
+    #[test]
+    fn intensity_branch_decodes_int_scalefac_compress() {
+        let cases = [
+            (0, [0, 0, 0, 0], [7, 7, 7, 0], [12, 12, 12, 0]),
+            (2 * 179 + 1, [4, 5, 5, 0], [7, 7, 7, 0], [12, 12, 12, 0]),
+            (2 * 180, [0, 0, 0, 0], [6, 6, 6, 3], [12, 9, 9, 6]),
+            (2 * 243, [3, 3, 3, 0], [6, 6, 6, 3], [12, 9, 9, 6]),
+            (2 * 244, [0, 0, 0, 0], [8, 8, 5, 0], [15, 12, 9, 0]),
+            (2 * 255 + 1, [3, 2, 0, 0], [8, 8, 5, 0], [15, 12, 9, 0]),
+        ];
+        for (sc, slen, long, short) in cases {
+            for (is_short, nr_of_sfb) in [(false, long), (true, short)] {
+                let partitions = LsfPartitions::decode_intensity(sc, is_short);
+                assert_eq!(partitions.slen, slen, "{sc}");
+                assert_eq!(partitions.nr_of_sfb, nr_of_sfb, "{sc}");
+                assert!(!partitions.preflag);
+            }
+        }
+    }
+
+    /// At the lower sampling frequencies the right channel of a frame in
+    /// intensity stereo sends `intensity_scale` 1, has no preemphasis, and
+    /// limits of 15 and 31.
+    #[test]
+    fn intensity_branch_sends_its_scale_and_no_preflag() {
+        let mut scalefactors = Scalefactors::new(BlockType::Normal, Version::Mpeg2);
+        assert!(scalefactors.can_preemphasise());
+        scalefactors.intensity = Some(ZeroPart::UNMARKED);
+        assert!(!scalefactors.can_preemphasise());
+        assert_eq!((scalefactors.limit(6), scalefactors.limit(7)), (15, 31));
+        assert_eq!(scalefactors.compress(), Some(1));
+        scalefactors.values_mut()[0] = 15;
+        scalefactors.values_mut()[20] = 31;
+        let compress = scalefactors.compress().unwrap();
+        assert_eq!(compress % 2, 1);
+        assert_eq!(
+            LsfPartitions::decode_intensity(compress, false).slen,
+            [4, 0, 5, 0]
+        );
+        scalefactors.preflag = true;
+        assert_eq!(scalefactors.compress(), None);
+
+        let short = Scalefactors {
+            intensity: Some(ZeroPart::UNMARKED),
+            ..Scalefactors::new(BlockType::Short, Version::Mpeg2)
+        };
+        assert_eq!((short.limit(11), short.limit(12)), (15, 31));
+    }
+
+    /// At the lower sampling frequencies a mark is sent as the largest value
+    /// of its field, a position never is, and a position sent in no bits is
+    /// zero.
+    #[test]
+    fn lsf_marks_are_the_largest_value_of_their_field() {
+        let mut scalefactors = Scalefactors::new(BlockType::Normal, Version::Mpeg2);
+        scalefactors.values_mut()[..7].copy_from_slice(&[0, 2, 0, 0, 0, 0, 0]);
+        // Bands 7 to 13 marked, 14 to 20 positions.
+        scalefactors.intensity = Some(ZeroPart {
+            start: 7,
+            bound: 14,
+        });
+        // Positions 0: the marks need one bit, the positions none.
+        let compress = scalefactors.compress().unwrap();
+        assert_eq!(
+            LsfPartitions::decode_intensity(compress, false).slen,
+            [2, 1, 0, 0]
+        );
+        assert_eq!(scalefactors.part2_length(compress), 7 * 2 + 7);
+        let mut w = BitWriter::new();
+        scalefactors.write(compress, &mut w);
+        let bits: String = w.into_bytes().iter().map(|b| format!("{b:08b}")).collect();
+        assert_eq!(&bits[..21], "00100000000000".to_owned() + "1111111");
+
+        // Position 3 would be the mark of 2 bits, and so takes 3.
+        scalefactors.values_mut()[20] = 3;
+        let compress = scalefactors.compress().unwrap();
+        let slen = LsfPartitions::decode_intensity(compress, false).slen;
+        assert_eq!(slen[2], 3);
+        let mut w = BitWriter::new();
+        scalefactors.write(compress, &mut w);
+        assert_eq!(w.bit_len(), scalefactors.part2_length(compress));
+        let bits: String = w.into_bytes().iter().map(|b| format!("{b:08b}")).collect();
+        let marks = 7 * slen[0] as usize..7 * (slen[0] + slen[1]) as usize;
+        let mark = "1".repeat(slen[1] as usize);
+        assert_eq!(bits[marks], mark.repeat(7));
+
+        // MPEG-1 marks with 7 in 3 bits.
+        let mpeg1 = Scalefactors {
+            intensity: Some(ZeroPart {
+                start: 7,
+                bound: 14,
+            }),
+            ..Scalefactors::default()
+        };
+        let compress = mpeg1.compress().unwrap();
+        assert_eq!(SCALEFAC_COMPRESS[usize::from(compress)], (3, 3));
     }
 }

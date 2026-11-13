@@ -7,7 +7,7 @@
 use super::inner::{inner_loop, step_size};
 use crate::mp3::header::SamplingFrequency;
 use crate::mp3::scalefactor_bands::{self, Band, LONG_BANDS};
-use crate::mp3::scalefactors::{PRETAB, Scalefactors};
+use crate::mp3::scalefactors::{PRETAB, Scalefactors, ZeroPart};
 use crate::mp3::side_info::SCFSI_BANDS;
 use crate::mp3::stereo::IntensityPositions;
 use crate::mp3::{BlockType, GRANULE_LINES, QuantizedGranule};
@@ -58,7 +58,9 @@ const PREEMPHASIS_BANDS: std::ops::Range<usize> = LONG_BANDS - 4..LONG_BANDS;
 /// Spec gap: clause C.1.5.4.3.4 leaves the choice of preemphasis to the
 /// implementation and suggests the rule used here: `preflag` is set if, after
 /// the first inner loop, all of the upper four bands exceed their `xmin`.
-/// Short blocks never use it (clause 2.4.2.7).
+/// Short blocks never use it (clause 2.4.2.7), nor does the right channel of
+/// a frame coded in intensity stereo at the lower sampling frequencies
+/// (clause 2.4.3.2 of ISO/IEC 13818-3).
 ///
 /// With `reuse` in at least one scfsi band, the second granule of a frame
 /// takes over the first granule's `preflag` and `scalefac_scale`
@@ -93,8 +95,8 @@ const PREEMPHASIS_BANDS: std::ops::Range<usize> = LONG_BANDS - 4..LONG_BANDS;
 ///
 /// If `xr` cannot be quantised even without scalefactors, which takes lines
 /// far beyond the decoder's output range, or the marks of `intensity` take
-/// more than `available_bits`, which takes fewer than
-/// [`MAX_POSITION_BITS`](crate::mp3::stereo::MAX_POSITION_BITS).
+/// more than `available_bits`, which takes fewer than its
+/// [`silent_bits`](IntensityPositions::silent_bits).
 pub fn outer_loop(
     xr: &[f64; GRANULE_LINES],
     xmin: &[f64],
@@ -112,6 +114,7 @@ pub fn outer_loop(
         "intensity stereo positions are not taken over with scfsi"
     );
     let mut scalefactors = Scalefactors::new(block_type, sampling_frequency.version());
+    scalefactors.intensity = intensity.map(|_| ZeroPart::UNMARKED);
     if let Some(reuse) = reuse {
         assert_ne!(block_type, BlockType::Short, "short blocks have no scfsi");
         scalefactors.preflag = reuse.first.preflag;
@@ -171,7 +174,7 @@ pub fn outer_loop(
         // C.1.5.4.3.4: preemphasis, which raises the allowed distortion of the
         // preemphasised bands along with their lines.
         if first
-            && block_type != BlockType::Short
+            && scalefactors.can_preemphasise()
             && reuse.is_none()
             && PREEMPHASIS_BANDS
                 .clone()
@@ -234,11 +237,7 @@ fn fit(
         let Some(intensity) = intensity else {
             return Some(granule);
         };
-        intensity.mark(
-            &mut granule.scalefactors,
-            &granule.values,
-            sampling_frequency,
-        );
+        intensity.mark(&mut granule.scalefactors, &granule.values);
         let bits = granule.bit_len(sampling_frequency);
         if bits <= available_bits {
             return Some(granule);
@@ -509,7 +508,7 @@ mod tests {
             assert!(total_bits(granule) <= bits, "{bits}");
             assert!(!outcome.within_allowance, "{bits}");
             let mut marked = granule.scalefactors.clone();
-            positions.mark(&mut marked, &granule.values, FS);
+            positions.mark(&mut marked, &granule.values);
             assert_eq!(marked, granule.scalefactors, "{bits}");
             assert_ne!(granule.scalefactors.values()[20], 0, "{bits}");
         }

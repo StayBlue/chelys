@@ -28,7 +28,8 @@ use super::{BlockType, GRANULE_LINES, QuantizedGranule};
 /// # Panics
 ///
 /// If the scalefactors that `intensity` marks do not fit in
-/// `available_bits`, which takes fewer than [`MAX_POSITION_BITS`](super::stereo::MAX_POSITION_BITS).
+/// `available_bits`, which takes fewer than its
+/// [`silent_bits`](IntensityPositions::silent_bits).
 pub fn quantize_granule(
     xr: &[f64; GRANULE_LINES],
     xmin: &[f64],
@@ -42,11 +43,7 @@ pub fn quantize_granule(
         let mut granule =
             QuantizedGranule::new(0, [0; GRANULE_LINES], block_type, sampling_frequency);
         if let Some(intensity) = intensity {
-            intensity.mark(
-                &mut granule.scalefactors,
-                &granule.values,
-                sampling_frequency,
-            );
+            intensity.mark(&mut granule.scalefactors, &granule.values);
             assert!(
                 granule.bit_len(sampling_frequency) <= available_bits,
                 "the intensity stereo positions do not fit in {available_bits} bits"

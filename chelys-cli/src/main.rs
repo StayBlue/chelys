@@ -12,7 +12,7 @@
 use std::io::{ErrorKind, Read, Write};
 use std::process::ExitCode;
 
-use chelys::mp3::header::{Bitrate, Mode, SamplingFrequency, Version};
+use chelys::mp3::header::{Bitrate, Mode, SamplingFrequency};
 use chelys::mp3::{Encoder, StreamConfig};
 
 const USAGE: &str = "\
@@ -32,8 +32,7 @@ Layer III to stdout, or MPEG-2 Layer III at 16, 22.05 and 24 kHz.
   --intensity-stereo code the upper bands of each frame of two channels in
                      intensity stereo where the frame is short of bits,
                      keeping only the level of each channel there and not
-                     its fine structure; for low bitrates; not yet at 16,
-                     22.05 and 24 kHz (default: off)";
+                     its fine structure; for low bitrates (default: off)";
 
 struct Options {
     sampling_frequency: SamplingFrequency,
@@ -88,11 +87,6 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
     }
     if intensity_stereo && channels != 2 {
         return Err("--intensity-stereo needs two channels".to_owned());
-    }
-    if intensity_stereo && sampling_frequency.version() == Version::Mpeg2 {
-        return Err(format!(
-            "--intensity-stereo is not supported at {sample_rate} Hz yet"
-        ));
     }
     Ok(Options {
         sampling_frequency,

@@ -4,13 +4,15 @@
 //! Joint stereo for Layer III (Annex G.2): MS stereo, with when to switch it
 //! on, the MS matrix and the limitation of the side channel's bandwidth, and
 //! intensity stereo, with the bands it codes and their positions. The
-//! decoder's inverse is clause 2.4.3.4.9.
+//! decoder's inverse is clause 2.4.3.4.9, with the intensity stereo of the
+//! lower sampling frequencies in clause 2.4.3.2 of ISO/IEC 13818-3.
 
 use std::f64::consts::{PI, SQRT_2};
+use std::ops::Range;
 
-use super::header::SamplingFrequency;
+use super::header::{SamplingFrequency, Version};
 use super::scalefactor_bands::{self, LONG_BANDS};
-use super::scalefactors::Scalefactors;
+use super::scalefactors::{Scalefactors, ZeroPart};
 use super::{BlockType, GRANULE_LINES};
 
 /// The FFT lines the switching criterion sums over, `i = 0` to `511`
@@ -115,10 +117,38 @@ pub fn middle_side_distortion(left: &[f64], right: &[f64]) -> Vec<f64> {
         .collect()
 }
 
-/// The intensity stereo position that marks a band of the right channel as
-/// not coded in intensity stereo, the "illegal" `is_pos` (clause
-/// 2.4.3.4.9.3, Annex G.2 c)).
-pub const NOT_INTENSITY: u8 = 7;
+/// `intensity_scale`, sent in the right channel's `scalefac_compress` at the
+/// lower sampling frequencies, which sets the step between intensity stereo
+/// positions: `i0 = 1/sqrt(2)` for 1, `1/sqrt(sqrt(2))` for 0 (clause
+/// 2.4.3.2 of ISO/IEC 13818-3).
+///
+/// Spec gap: neither standard says how to choose it. It is always 1: each
+/// step of position then halves the energy of the quieter channel, 3 dB,
+/// which keeps every level within 1.5 dB of its ratio, closer than the
+/// positions of ISO/IEC 11172-3 at their closest (0 and 4.8 dB at positions
+/// 3 and 4), and in the 3 bits those positions take reaches 9 dB either way,
+/// where steps of 1.5 dB would reach 4.5 dB.
+pub const INTENSITY_SCALE: u16 = 1;
+
+/// `i0` for [`INTENSITY_SCALE`].
+const I0: f64 = std::f64::consts::FRAC_1_SQRT_2;
+
+/// The most steps of `i0` that a position at the lower sampling frequencies
+/// gives the quieter channel: positions 13 and 14, 21 dB with
+/// [`INTENSITY_SCALE`] 1.
+///
+/// Spec reading: clause 2.4.3.2 of ISO/IEC 13818-3 allows positions up to
+/// 30, in a field of 5 bits, but not every decoder reads them so. Positions
+/// are kept below 16.
+const MAX_STEPS: i32 = 7;
+
+/// The steps of `i0` that a position at the lower sampling frequencies never
+/// gives: position 7, the left channel four steps quieter than the right.
+///
+/// Spec reading: position 7 is a position in a field of 4 or 5 bits (clause
+/// 2.4.3.2 of ISO/IEC 13818-3), but not every decoder reads it so. A band
+/// whose nearest position is 7 takes the nearer of 5 and 9.
+const SKIPPED_STEPS: i32 = -4;
 
 /// The `bound` of Layers I and II in intensity stereo: the subband from
 /// which they code it (Annex G.1, clause 2.4.2.3), from the fewest subbands
@@ -140,7 +170,10 @@ const SUBBAND_LINES: usize = 18;
 /// it. The lowest, from subband 4, starts at 2.3 to 3.0 kHz, above the
 /// "about 2 kHz" where G.1 says the temporal envelope, which intensity
 /// stereo keeps, takes over localisation from the fine structure, which it
-/// loses.
+/// loses. At the lower sampling frequencies, whose subbands are half as wide,
+/// it starts at 1.1 to 1.7 kHz, below that, as it does for Layers I and II
+/// there, whose `bound` is that of ISO/IEC 11172-3 (clause 2.4.2.3 of
+/// ISO/IEC 13818-3).
 pub fn intensity_bounds(sampling_frequency: SamplingFrequency) -> [usize; 4] {
     let bands = scalefactor_bands::long_bands(sampling_frequency);
     LAYER_I_II_BOUNDS.map(|subband| {
@@ -170,6 +203,76 @@ pub fn intensity_position(left_energy: f64, right_energy: f64) -> u8 {
     (12.0 / PI * angle).round() as u8
 }
 
+/// The intensity stereo position of a scalefactor band at the lower
+/// sampling frequencies, from the energies of its left and right lines.
+///
+/// Spec reading: Annex C.1.3 of ISO/IEC 13818-3 has the encoder take every
+/// basic step of ISO/IEC 11172-3, but the position of Annex G.2 c) is the
+/// one by which that standard's decoder splits the sum, and clause 2.4.3.2
+/// of ISO/IEC 13818-3 decodes positions otherwise: it multiplies the lines
+/// sent by `k_l` and `k_r`, both 1 at position 0, and at odd positions
+/// `k_l = i0^((is_pos + 1) / 2)`, at even ones `k_r = i0^(is_pos / 2)`, the
+/// other 1. The position taken is the one whose `k_l / k_r` lies nearest the
+/// ratio `sqrt(L_energy / R_energy)` that Annex G.2 c) takes the arctangent
+/// of, nearest in steps of `i0`, of which there are up to `MAX_STEPS`,
+/// other than `SKIPPED_STEPS`.
+///
+/// Spec gap: a band with no energy in either channel has no position. It
+/// takes position 0, the same level in both; its lines are zero in both
+/// channels anyway.
+pub fn lsf_intensity_position(left_energy: f64, right_energy: f64) -> u8 {
+    if left_energy == 0.0 && right_energy == 0.0 {
+        return 0;
+    }
+    // Steps of i0 in amplitude; a silent channel makes them infinite.
+    let exact = (left_energy / right_energy).sqrt().ln() / -I0.ln();
+    let steps = exact
+        .round()
+        .clamp(f64::from(-MAX_STEPS), f64::from(MAX_STEPS)) as i32;
+    let steps = match steps {
+        SKIPPED_STEPS if exact >= f64::from(SKIPPED_STEPS) => SKIPPED_STEPS + 1,
+        SKIPPED_STEPS => SKIPPED_STEPS - 1,
+        steps => steps,
+    };
+    match steps {
+        0 => 0,
+        n if n > 0 => (2 * n) as u8,
+        n => (-2 * n - 1) as u8,
+    }
+}
+
+/// The factors by which the decoder multiplies the lines sent in the left
+/// channel for a band at intensity stereo `position`, to give the left and
+/// the right channel: `is_ratio / (1 + is_ratio)` and `1 / (1 + is_ratio)`
+/// with `is_ratio = tan(is_pos * pi / 12)` (clause 2.4.3.4.9.3), or at the
+/// lower sampling frequencies `k_l` and `k_r` (clause 2.4.3.2 of ISO/IEC
+/// 13818-3).
+///
+/// Spec reading: step 5 of clause 2.4.3.4.9.3 computes `R_i` from `L_i`
+/// after step 4 has set `L_i` to the left channel's share. It is read as the
+/// lines sent, as before step 4: so the two shares add up to them, which
+/// Annex G.2 c) sends as `L_i + R_i`. Clause 2.4.3.2 of ISO/IEC 13818-3
+/// swaps the two steps so that this is so.
+fn shares(version: Version, position: u8) -> (f64, f64) {
+    match version {
+        Version::Mpeg1 => {
+            // sin / (sin + cos) and cos / (sin + cos), exact at the ends,
+            // where tan is 0 or infinite.
+            let (sin, cos) = match position {
+                0 => (0.0, 1.0),
+                6 => (1.0, 0.0),
+                _ => (f64::from(position) * PI / 12.0).sin_cos(),
+            };
+            (sin / (sin + cos), cos / (sin + cos))
+        }
+        Version::Mpeg2 => match position {
+            0 => (1.0, 1.0),
+            p if p % 2 == 1 => (I0.powi(i32::from(p.div_ceil(2))), 1.0),
+            p => (1.0, I0.powi(i32::from(p / 2))),
+        },
+    }
+}
+
 /// The positions of the bands of the right channel that a frame codes in
 /// intensity stereo, for the scalefactors of its zero part (clause
 /// 2.4.3.4.9.3).
@@ -179,12 +282,14 @@ pub struct IntensityPositions {
     bound: usize,
     /// `is_pos` of each band from `bound`.
     positions: [u8; LONG_BANDS],
+    sampling_frequency: SamplingFrequency,
 }
 
 impl IntensityPositions {
     /// The positions of one granule coded from long scalefactor band
     /// `bound` up in intensity stereo, each found from the energies of the
-    /// band's `left` and `right` lines (Annex G.2 c)).
+    /// band's `left` and `right` lines (Annex G.2 c), and
+    /// [`lsf_intensity_position`] at the lower sampling frequencies).
     ///
     /// Spec gap: the lines above the highest scalefactor band have no
     /// scalefactor, and so no position, and the standard does not say how a
@@ -213,19 +318,19 @@ impl IntensityPositions {
         bound: usize,
         sampling_frequency: SamplingFrequency,
     ) -> Self {
-        let bands = scalefactor_bands::long_bands(sampling_frequency);
-        let energy = |lines: &[f64]| lines.iter().map(|x| x * x).sum::<f64>();
+        let position = match sampling_frequency.version() {
+            Version::Mpeg1 => intensity_position,
+            Version::Mpeg2 => lsf_intensity_position,
+        };
         let mut positions = [0; LONG_BANDS];
-        for (sb, band) in bands.iter().enumerate().skip(bound) {
-            let end = if sb == LONG_BANDS - 1 {
-                GRANULE_LINES
-            } else {
-                band.end()
-            };
-            let lines = band.start..end;
-            positions[sb] = intensity_position(energy(&left[lines.clone()]), energy(&right[lines]));
+        for (sb, lines) in coded_bands(bound, sampling_frequency) {
+            positions[sb] = position(energy(&left[lines.clone()]), energy(&right[lines]));
         }
-        Self { bound, positions }
+        Self {
+            bound,
+            positions,
+            sampling_frequency,
+        }
     }
 
     /// The first long scalefactor band coded in intensity stereo.
@@ -239,18 +344,44 @@ impl IntensityPositions {
     /// lines sent in the left and right channels, which below the bound are
     /// the left and right lines or, in MS stereo, the middle and side lines.
     /// The decoder splits the sum by the positions (clause 2.4.3.4.9.3).
+    ///
+    /// Spec reading: the decoder of ISO/IEC 11172-3 splits the sum into
+    /// shares that add up to it, but at the lower sampling frequencies it
+    /// multiplies the lines sent by `k_l` and `k_r`, the larger of which is 1
+    /// (clause 2.4.3.2 of ISO/IEC 13818-3), so that the sum itself would
+    /// decode too loud: twice the level of each channel where the two are
+    /// alike. There the sum is scaled in each band so that the two channels
+    /// decode with the energy of its left and right lines together. For a
+    /// signal panned between the channels, as intensity stereo takes it to
+    /// be, at the level difference its position gives, that sends the
+    /// louder channel's lines.
     pub fn code(
         &self,
         left: &[f64; GRANULE_LINES],
         right: &[f64; GRANULE_LINES],
         coded: [&mut [f64; GRANULE_LINES]; 2],
-        sampling_frequency: SamplingFrequency,
     ) {
-        let start = scalefactor_bands::long_bands(sampling_frequency)[self.bound].start;
+        let fs = self.sampling_frequency;
         let [coded_left, coded_right] = coded;
-        for i in start..GRANULE_LINES {
-            coded_left[i] = left[i] + right[i];
-            coded_right[i] = 0.0;
+        for (sb, lines) in coded_bands(self.bound, fs) {
+            let sum: Vec<f64> = lines.clone().map(|i| left[i] + right[i]).collect();
+            let scale = match fs.version() {
+                Version::Mpeg1 => 1.0,
+                Version::Mpeg2 => {
+                    let (k_l, k_r) = shares(fs.version(), self.positions[sb]);
+                    let wanted = energy(&left[lines.clone()]) + energy(&right[lines.clone()]);
+                    let decoded = (k_l * k_l + k_r * k_r) * energy(&sum);
+                    if decoded > 0.0 {
+                        (wanted / decoded).sqrt()
+                    } else {
+                        0.0
+                    }
+                }
+            };
+            for (i, x) in lines.zip(sum) {
+                coded_left[i] = scale * x;
+                coded_right[i] = 0.0;
+            }
         }
     }
 
@@ -258,42 +389,32 @@ impl IntensityPositions {
     /// sent in long scalefactor band `sb`, from or above the bound, given
     /// the allowed distortion of the left and right channels.
     ///
-    /// Spec gap: Annex G does not say how to find it. With
-    /// `is_ratio = tan(is_pos * pi / 12)`, the decoder gives the left
-    /// channel the sum times `is_ratio / (1 + is_ratio)` and the right the
-    /// sum times `1 / (1 + is_ratio)` (clause 2.4.3.4.9.3), and so those
-    /// shares, squared, of its noise energy.
-    ///
-    /// Spec reading: step 5 of clause 2.4.3.4.9.3 computes `R_i` from
-    /// `L_i` after step 4 has set `L_i` to the left channel's share. It is
-    /// read as the sum, as before step 4: so the two shares add up to the
-    /// sum, which Annex G.2 c) sends as `L_i + R_i`. The sum is allowed the most
-    /// noise that keeps each channel within its allowance. A channel whose
-    /// share is zero sets no limit, and nor does one that allows no noise
-    /// because it has no energy in the band, as in [`middle_side_distortion`].
+    /// Spec gap: Annex G does not say how to find it. The decoder gives each
+    /// channel the lines sent times its `shares`, and so those factors,
+    /// squared, of their noise energy. The sum is allowed the most noise
+    /// that keeps each channel within its allowance. A channel whose share
+    /// is zero sets no limit, and nor does one that allows no noise because
+    /// it has no energy in the band, as in [`middle_side_distortion`].
     pub fn sum_distortion(&self, sb: usize, left: f64, right: f64) -> f64 {
         assert!(sb >= self.bound, "band {sb} is below the bound");
-        let angle = f64::from(self.positions[sb]) * PI / 12.0;
-        // is_ratio / (1 + is_ratio) and 1 / (1 + is_ratio), exact at the
-        // ends, where tan is 0 or infinite.
-        let (sin, cos) = match self.positions[sb] {
-            0 => (0.0, 1.0),
-            6 => (1.0, 0.0),
-            _ => angle.sin_cos(),
-        };
-        [(left, sin), (right, cos)]
+        let (left_share, right_share) =
+            shares(self.sampling_frequency.version(), self.positions[sb]);
+        [(left, left_share), (right, right_share)]
             .into_iter()
             .filter(|&(xmin, share)| xmin > 0.0 && share > 0.0)
-            .map(|(xmin, share)| xmin * ((sin + cos) / share).powi(2))
+            .map(|(xmin, share)| xmin / (share * share))
             .reduce(f64::min)
             .unwrap_or(0.0)
     }
 
     /// Sets the scalefactors of the right channel's zero part, given its
-    /// quantised `values`: the position of each band from the bound, and
-    /// [`NOT_INTENSITY`] in each band below it that lies above the last
-    /// nonzero value, as Annex G.2 c) asks so that the decoder does not
-    /// decode those bands in intensity stereo.
+    /// quantised `values`: the position of each band from the bound, and a
+    /// mark in each band below it that lies above the last nonzero value, as
+    /// Annex G.2 c) asks so that the decoder does not decode those bands in
+    /// intensity stereo. The mark is the "illegal" position, sent as
+    /// [`Scalefactors::write`] gives it. At the lower sampling frequencies a
+    /// granule with marks is not kept (see `quantize_frame`), but they still
+    /// count towards the bits of its scalefactors while it is quantised.
     ///
     /// Spec reading: clause 2.4.3.4.9.1 has the zero part begin above the
     /// band of the last nonzero value, and also at line
@@ -324,13 +445,8 @@ impl IntensityPositions {
     /// # Panics
     ///
     /// If a value from the bound is not zero.
-    pub fn mark(
-        &self,
-        scalefactors: &mut Scalefactors,
-        values: &[i32; GRANULE_LINES],
-        sampling_frequency: SamplingFrequency,
-    ) {
-        let bands = scalefactor_bands::long_bands(sampling_frequency);
+    pub fn mark(&self, scalefactors: &mut Scalefactors, values: &[i32; GRANULE_LINES]) {
+        let bands = scalefactor_bands::long_bands(self.sampling_frequency);
         assert!(
             values[bands[self.bound].start..].iter().all(|&v| v == 0),
             "the right channel is zero from the intensity stereo bound"
@@ -339,23 +455,63 @@ impl IntensityPositions {
             bands.iter().position(|b| last < b.end()).unwrap() + 1
         });
         for sb in zero_from..LONG_BANDS {
+            // The marked bands send no value of their own.
             scalefactors.values_mut()[sb] = if sb < self.bound {
-                NOT_INTENSITY
+                0
             } else {
                 self.positions[sb]
             };
         }
+        scalefactors.intensity = Some(ZeroPart {
+            start: zero_from,
+            bound: self.bound,
+        });
+    }
+
+    /// The bits the right channel takes with all its lines quantised to
+    /// zero, every band below the bound marked and every band from it
+    /// sending its position: the bits the iteration loops can always fit it
+    /// in, by quantising more coarsely, and so the fewest it must be given.
+    ///
+    /// In ISO/IEC 11172-3 these are 63, every band in 3 bits; at the lower
+    /// sampling frequencies they depend on the positions, and a granule
+    /// quantised so is not kept, as its marks are not sent there (see
+    /// `quantize_frame`).
+    pub fn silent_bits(&self) -> usize {
+        let mut scalefactors =
+            Scalefactors::new(BlockType::Normal, self.sampling_frequency.version());
+        self.mark(&mut scalefactors, &[0; GRANULE_LINES]);
+        let compress = scalefactors.compress().expect("marks that fit a field");
+        scalefactors.part2_length(compress)
     }
 }
 
-/// The most bits the scalefactors of the right channel take in intensity
-/// stereo when all its lines quantise to zero: every long scalefactor in 3
-/// bits, as positions up to [`NOT_INTENSITY`] need.
-pub const MAX_POSITION_BITS: usize = 3 * LONG_BANDS;
+/// The long scalefactor bands from `bound` up, each with the lines it codes
+/// in intensity stereo: the highest also those above it (see
+/// [`IntensityPositions::new`]).
+fn coded_bands(
+    bound: usize,
+    sampling_frequency: SamplingFrequency,
+) -> impl Iterator<Item = (usize, Range<usize>)> {
+    let bands = scalefactor_bands::long_bands(sampling_frequency);
+    bands.iter().enumerate().skip(bound).map(|(sb, band)| {
+        let end = if sb == LONG_BANDS - 1 {
+            GRANULE_LINES
+        } else {
+            band.end()
+        };
+        (sb, band.start..end)
+    })
+}
+
+fn energy(lines: &[f64]) -> f64 {
+    lines.iter().map(|x| x * x).sum()
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bitstream::BitWriter;
 
     #[test]
     fn alike_channels_switch_ms_on_and_either_alone_does_not() {
@@ -408,9 +564,21 @@ mod tests {
 
     /// The Layer I and II bounds, subbands 16, 12, 8 and 4, start at lines
     /// 288, 216, 144 and 72; each step is the first band starting there or
-    /// above (Table B.8).
+    /// above (Table B.8, and Table B.2 of ISO/IEC 13818-3).
     #[test]
     fn intensity_bounds_follow_the_layer_i_and_ii_subbands() {
+        assert_eq!(
+            intensity_bounds(SamplingFrequency::Hz16000),
+            [18, 16, 14, 10]
+        );
+        assert_eq!(
+            intensity_bounds(SamplingFrequency::Hz22050),
+            [18, 16, 14, 10]
+        );
+        assert_eq!(
+            intensity_bounds(SamplingFrequency::Hz24000),
+            [18, 16, 14, 10]
+        );
         assert_eq!(
             intensity_bounds(SamplingFrequency::Hz32000),
             [18, 17, 15, 12]
@@ -457,7 +625,7 @@ mod tests {
         assert_eq!(positions.positions[20], 6);
         let (mut coded_left, mut coded_right) = middle_side(&left_top, &right);
         let (middle, side) = (coded_left, coded_right);
-        positions.code(&left_top, &right, [&mut coded_left, &mut coded_right], fs);
+        positions.code(&left_top, &right, [&mut coded_left, &mut coded_right]);
         let start = bands[12].start;
         assert_eq!(coded_left[..start], middle[..start]);
         assert_eq!(coded_right[..start], side[..start]);
@@ -480,22 +648,100 @@ mod tests {
         values[bands[5].start + 1] = -2;
         let mut scalefactors = Scalefactors::default();
         scalefactors.values_mut()[2] = 9;
-        positions.mark(&mut scalefactors, &values, fs);
+        positions.mark(&mut scalefactors, &values);
         let marked = scalefactors.values();
         assert_eq!(marked[..6], [0, 0, 9, 0, 0, 0]);
-        assert!(marked[6..12].iter().all(|&s| s == NOT_INTENSITY));
         assert_eq!(marked[12..], positions.positions[12..]);
+        assert_eq!(
+            scalefactors.intensity,
+            Some(ZeroPart {
+                start: 6,
+                bound: 12
+            })
+        );
+        // Bands 0 to 10 in 4 bits, 11 to 20 in 3: 9, then the marks.
+        let compress = scalefactors.compress().unwrap();
+        let mut w = BitWriter::new();
+        scalefactors.write(compress, &mut w);
+        let bits: String = w.into_bytes().iter().map(|b| format!("{b:08b}")).collect();
+        assert_eq!(&bits[..4 * 6], "000000001001000000000000");
+        assert_eq!(&bits[4 * 6..4 * 11], "01110111011101110111");
+        assert_eq!(&bits[4 * 11..4 * 11 + 3], "111");
 
         let mut scalefactors = Scalefactors::default();
-        positions.mark(&mut scalefactors, &[0; GRANULE_LINES], fs);
-        assert!(
-            scalefactors.values()[..12]
-                .iter()
-                .all(|&s| s == NOT_INTENSITY)
-        );
+        positions.mark(&mut scalefactors, &[0; GRANULE_LINES]);
+        assert_eq!(scalefactors.intensity.unwrap().start, 0);
         // Marks in 3 bits for all 21 bands.
-        let compress = scalefactors.compress().unwrap();
-        assert_eq!(scalefactors.part2_length(compress), MAX_POSITION_BITS);
+        assert_eq!(positions.silent_bits(), 3 * LONG_BANDS);
+    }
+
+    /// At the lower sampling frequencies each step of position halves the
+    /// energy of the quieter channel: the louder channel at twice the
+    /// amplitude of the other is 2 steps, positions 4 (left) and 3 (right).
+    #[test]
+    fn lsf_positions_step_by_i0() {
+        assert_eq!(lsf_intensity_position(1.0, 1.0), 0);
+        assert_eq!(lsf_intensity_position(4.0, 1.0), 4);
+        assert_eq!(lsf_intensity_position(1.0, 4.0), 3);
+        assert_eq!(lsf_intensity_position(2.0, 1.0), 2);
+        assert_eq!(lsf_intensity_position(1.0, 2.0), 1);
+        // Nearest in steps: 2^1.4 is 1 step, 2^1.6 is 2.
+        assert_eq!(lsf_intensity_position(1.4f64.exp2(), 1.0), 2);
+        assert_eq!(lsf_intensity_position(1.6f64.exp2(), 1.0), 4);
+        assert_eq!(lsf_intensity_position(1.0, 0.0), 14);
+        assert_eq!(lsf_intensity_position(0.0, 1.0), 13);
+        assert_eq!(lsf_intensity_position(40f64.exp2(), 1.0), 14);
+        // Never position 7, the left channel 4 steps quieter: 3 or 5.
+        assert_eq!(lsf_intensity_position(1.0, 3.6f64.exp2()), 5);
+        assert_eq!(lsf_intensity_position(1.0, 3.9f64.exp2()), 5);
+        assert_eq!(lsf_intensity_position(1.0, 4.1f64.exp2()), 9);
+        assert_eq!(lsf_intensity_position(1.0, 4.4f64.exp2()), 9);
+        assert_eq!(lsf_intensity_position(4f64.exp2(), 1.0), 8);
+        assert_eq!(lsf_intensity_position(0.0, 0.0), 0);
+        for (position, expected) in [(0, (1.0, 1.0)), (3, (0.5, 1.0)), (4, (1.0, 0.5))] {
+            let (k_l, k_r) = shares(Version::Mpeg2, position);
+            assert!((k_l - expected.0).abs() < 1e-12, "{position}");
+            assert!((k_r - expected.1).abs() < 1e-12, "{position}");
+        }
+    }
+
+    /// At the lower sampling frequencies the sum is scaled so that the
+    /// channels decode with their energy: alike channels send either, and a
+    /// tone with the right channel at half the left sends the left.
+    #[test]
+    fn lsf_intensity_sends_the_louder_channel() {
+        let fs = SamplingFrequency::Hz22050;
+        let start = scalefactor_bands::long_bands(fs)[10].start;
+        let tone: [f64; GRANULE_LINES] = std::array::from_fn(|i| ((i * 7) % 5) as f64 - 2.0);
+        let half = tone.map(|x| 0.5 * x);
+        for (right, position) in [(tone, 0), (half, 4)] {
+            let positions = IntensityPositions::new(&tone, &right, 10, fs);
+            assert!(positions.positions[10..].iter().all(|&p| p == position));
+            let (mut coded_left, mut coded_right) = (tone, right);
+            positions.code(&tone, &right, [&mut coded_left, &mut coded_right]);
+            for i in start..GRANULE_LINES {
+                assert!((coded_left[i] - tone[i]).abs() < 1e-12, "{position}, {i}");
+                assert_eq!(coded_right[i], 0.0);
+            }
+            assert_eq!(coded_left[..start], tone[..start]);
+        }
+    }
+
+    /// At the lower sampling frequencies a mark is the largest value of its
+    /// field, so a right channel all zero needs a bit for each band below
+    /// the bound, and its positions a field that sends them below the mark.
+    #[test]
+    fn lsf_marks_take_a_field_of_at_least_one_bit() {
+        let fs = SamplingFrequency::Hz22050;
+        let tone: [f64; GRANULE_LINES] = std::array::from_fn(|i| ((i * 7) % 5) as f64 - 2.0);
+        let alike = IntensityPositions::new(&tone, &tone, 14, fs);
+        // Bands 0 to 13 marked in 1 bit; positions 0 in bands 14 to 20, the
+        // third partition of int_scalefac_compress below 180, in no bits.
+        assert_eq!(alike.silent_bits(), 14);
+        let half = tone.map(|x| 0.5 * x);
+        let panned = IntensityPositions::new(&tone, &half, 14, fs);
+        // Position 4 needs a field of 3 bits, below its mark 7.
+        assert_eq!(panned.silent_bits(), 7 + 7 + 3 * 7);
     }
 
     /// In the middle position each channel gets half the sum, and a quarter
@@ -510,6 +756,7 @@ mod tests {
                 12 => 0,
                 _ => 2,
             }),
+            sampling_frequency: SamplingFrequency::Hz44100,
         };
         assert!((positions.sum_distortion(10, 2.0, 1.0) - 4.0).abs() < 1e-12);
         assert_eq!(positions.sum_distortion(11, 2.0, 1.0), 2.0);
@@ -522,6 +769,15 @@ mod tests {
         let (sin, cos) = (PI / 6.0).sin_cos();
         let expected = 1.0 * ((sin + cos) / cos).powi(2);
         assert!((positions.sum_distortion(13, 1.0, 1.0) - expected).abs() < 1e-12);
+        // At the lower sampling frequencies position 4 gives the right
+        // channel half the lines sent, and a quarter of their noise.
+        let lsf = IntensityPositions {
+            sampling_frequency: SamplingFrequency::Hz22050,
+            positions: [4; LONG_BANDS],
+            ..positions
+        };
+        assert!((lsf.sum_distortion(10, 2.0, 1.0) - 2.0).abs() < 1e-12);
+        assert!((lsf.sum_distortion(10, 2.0, 0.25) - 1.0).abs() < 1e-12);
     }
 
     #[test]

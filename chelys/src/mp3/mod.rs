@@ -25,7 +25,7 @@ use huffman::{QuadTable, SpectrumCoding};
 use loops::scfsi::{self, GranuleSummary};
 use psychoacoustic::switching::{BlockSwitching, SwitchedMasking};
 use reservoir::Reservoir;
-use scalefactors::Scalefactors;
+use scalefactors::{Scalefactors, ZeroPart};
 use side_info::{GranuleChannel, SideInfo, Window};
 
 /// Frequency lines in a granule (clause 2.1.70).
@@ -358,7 +358,11 @@ fn frame_contents(
 /// into frames of two granules each, or one at the lower sampling
 /// frequencies.
 ///
-/// Main data is not shared between frames: `main_data_begin` is always 0.
+/// Main data is not shared between frames: `main_data_begin` is always 0. In
+/// joint stereo every frame has MS stereo and intensity stereo on as the
+/// configured mode sets them; in intensity stereo the right channel's
+/// scalefactors must give its zero part
+/// ([`Scalefactors::intensity`](scalefactors::Scalefactors::intensity)).
 ///
 /// # Panics
 ///
@@ -375,12 +379,13 @@ pub fn encode_granules(config: &StreamConfig, granules: &[Vec<QuantizedGranule>]
         granules.iter().all(|g| g.len() == channels),
         "each granule needs one entry per channel"
     );
+    let (ms_stereo, intensity_stereo) = config.joint_stereo();
     let mut padding = PaddingSchedule::new(config.bitrate, config.sampling_frequency);
     let mut writer = FrameWriter::default();
     for frame in granules.chunks_exact(per_frame) {
         let (side_info, main_data) = frame_contents(config.sampling_frequency, frame, 0);
         writer.write(
-            &config.header(padding.next_padding()),
+            &config.frame_header(padding.next_padding(), ms_stereo, intensity_stereo),
             &side_info,
             &main_data,
         );
@@ -422,17 +427,9 @@ pub fn encode_pcm(config: &StreamConfig, channels: &[&[f64]]) -> Vec<u8> {
 pub struct Encoder(FrameEncoder<ModelCoding>);
 
 impl Encoder {
-    /// # Panics
-    ///
-    /// If the mode allows intensity stereo at one of the lower sampling
-    /// frequencies, which is not supported yet.
     pub fn new(config: StreamConfig) -> Self {
         let fs = config.sampling_frequency;
         let (ms_allowed, intensity_allowed) = config.joint_stereo();
-        assert!(
-            !(intensity_allowed && fs.version() == Version::Mpeg2),
-            "intensity stereo at the lower sampling frequencies is not supported yet"
-        );
         let coding = ModelCoding {
             models: (0..config.mode.channels())
                 .map(|_| BlockSwitching::new(fs))
@@ -553,7 +550,8 @@ impl Coding for ModelCoding {
 ///
 /// Given the tries worth making, from the fewest bands to the most, and a
 /// function that quantises the frame for a try, returns the try kept: `None`
-/// if there are no tries. A try before the last is kept only if the whole
+/// if there are no tries, or if the function gives up on the last, as
+/// [`quantize_frame`] can whatever the distortion. A try before the last is kept only if the whole
 /// frame is within its allowed distortion, so it is given up at the first
 /// granule that is not; the frame then comes out as if it had been finished
 /// and passed over.
@@ -635,6 +633,15 @@ fn middle_side_frame(frame: &[Vec<Filtered<Analysis>>]) -> bool {
 /// into the right channel's synthesis, whose window should then be the
 /// same, frames are coded in it only if each granule has the same long
 /// block type in both channels.
+///
+/// At the lower sampling frequencies clause 2.4.3.2 of ISO/IEC 13818-3 does
+/// settle the bound of short blocks: it is found for each window. Its 1998
+/// edition calls this "like" ISO/IEC 11172-3, 2.4.3.4, where its 1995
+/// edition said "unlike", but clause 2.4.3.4 of ISO/IEC 11172-3 says
+/// nothing of windows, so it leaves the gap above open. Short blocks are
+/// kept out of intensity stereo at the lower sampling frequencies too: the
+/// positions, the bits shared between the channels and the bounds tried
+/// here are all worked out for long scalefactor bands.
 fn intensity_frame(frame: &[Vec<Filtered<Analysis>>]) -> bool {
     frame.iter().all(|granule| {
         let block_type = granule[0].block_type;
@@ -696,14 +703,20 @@ impl IntensityTry {
                 // all of them, as it will not use scfsi, and marked.
                 let mut values = right.values;
                 values[start..].fill(0);
+                // At the lower sampling frequencies the right channel's
+                // branch of scalefac_compress has no preflag, and sends the
+                // scalefactors within their limits without it.
                 let mut scalefactors = right.scalefactors.clone();
                 scalefactors.scfsi = [false; side_info::SCFSI_BANDS];
-                positions.mark(&mut scalefactors, &values, fs);
+                if fs.version() == Version::Mpeg2 {
+                    scalefactors.preflag = false;
+                }
+                positions.mark(&mut scalefactors, &values);
                 let compress = scalefactors
                     .compress()
                     .expect("scalefactors within their limits");
                 // Enough for the marks if fewer bits leave more bands zero.
-                (scalefactors.part2_length(compress) + below).max(stereo::MAX_POSITION_BITS)
+                (scalefactors.part2_length(compress) + below).max(positions.silent_bits())
             })
             .collect();
         let plain_bits: usize = plain.iter().map(|granule| granule[1].bit_len(fs)).sum();
@@ -718,7 +731,20 @@ impl IntensityTry {
 /// intensity stereo as `intensity` gives, accounting for their bits in a
 /// copy of the reservoir, so that a try leaves the encoder's state as it
 /// was. `None` if `if_outside` gives up on a granule outside its allowed
-/// distortion.
+/// distortion, or if the reservoir gives the right channel of a granule
+/// in intensity stereo fewer bits than its marks take with all its lines
+/// zero (see [`stereo::IntensityPositions::silent_bits`]), which can happen
+/// at the lowest bitrates of the lower sampling frequencies. `None` too at
+/// the lower sampling frequencies if the right channel of a granule in
+/// intensity stereo would mark a band.
+///
+/// Spec reading: at the lower sampling frequencies the illegal intensity
+/// position that marks a band of the right channel's zero part as not coded
+/// in intensity stereo is the largest value of its field (clause 2.4.3.2 of
+/// ISO/IEC 13818-3), but decoders do not agree on it, and no mark is read as
+/// one by all of them. So the encoder sends no marks there: a frame whose
+/// right channel would need one, with no nonzero value in the band just
+/// below the bound, is coded from a lower bound or without intensity stereo.
 ///
 /// The perceptual entropy each channel's bits are reckoned from stays that
 /// of the left and right channels; in intensity stereo the two then share
@@ -768,7 +794,7 @@ fn quantize_frame(
                 *right_xmin = joint;
             }
             if let Some(positions) = positions {
-                positions.code(&granule[0].xr, &granule[1].xr, [left, right], fs);
+                positions.code(&granule[0].xr, &granule[1].xr, [left, right]);
                 let (left_alone, right_alone) = (&granule[0].analysis.1, &granule[1].analysis.1);
                 for (sb, xmin) in left_xmin.iter_mut().enumerate().skip(positions.bound()) {
                     *xmin = positions.sum_distortion(sb, left_alone[sb], right_alone[sb]);
@@ -793,6 +819,9 @@ fn quantize_frame(
             }
             let available_bits = available_bits.min(MAX_PART2_3_LENGTH);
             let intensity = positions.filter(|_| channel == 1);
+            if intensity.is_some_and(|positions| available_bits < positions.silent_bits()) {
+                return None;
+            }
             let summary = GranuleSummary::new(xr, xmin, block_type, fs);
             let reuse = match (gr, &first[channel]) {
                 (1, Some((first_summary, first_scalefactors))) if intensity.is_none() => {
@@ -807,6 +836,10 @@ fn quantize_frame(
                 loops::quantize_granule(xr, xmin, block_type, available_bits, fs, reuse, intensity);
             if gr == 0 {
                 first[channel] = Some((summary, outcome.granule.scalefactors.clone()));
+            }
+            let zero_part = outcome.granule.scalefactors.intensity;
+            if fs.version() == Version::Mpeg2 && zero_part.is_some_and(ZeroPart::marks_any) {
+                return None;
             }
             reservoir.granule_done(mean_bits, outcome.granule.bit_len(fs));
             if !outcome.within_allowance && if_outside == IfOutsideAllowance::GiveUp {
