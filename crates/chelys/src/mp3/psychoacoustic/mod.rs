@@ -1,27 +1,32 @@
 //! Psychoacoustic model 2 (clause D.2) as adapted for Layer III in clause
-//! C.1.5.3.2.1, figures C.6.a to C.6.c. Long blocks only: the model computes
-//! the threshold for long blocks and leaves out the switch to short blocks.
+//! C.1.5.3.2.1, figures C.6.a to C.6.d.
 //!
 //! For each granule the model gives the ratio of allowed noise to signal
 //! energy in every scalefactor band, from which the allowed distortion
 //! `xmin` of the outer iteration loop follows, and the perceptual entropy.
+//! [`PsychoacousticModel::granule`] gives the threshold for long blocks;
+//! [`switching::BlockSwitching`] also chooses the block type and gives the
+//! threshold for short blocks where it switches to them.
 
 mod fft;
 pub mod partitions;
+pub mod switching;
 
 use std::f64::consts::PI;
 
 use super::GRANULE_LINES;
 use super::header::SamplingFrequency;
-use super::scalefactor_bands::{self, LONG_BANDS};
+use super::scalefactor_bands::{self, LONG_BANDS, SHORT_BANDS};
 use fft::{Complex, Fft};
-use partitions::{BandWeights, Partition};
+use partitions::{BandWeights, Partition, ShortPartition};
 
 const LONG_FFT: usize = 1024;
 /// The FFT of the model run with a shift length of 192 samples (clause
 /// C.1.5.3.2.1, "General considerations").
 const SHORT_FFT: usize = 256;
 const SHORT_SHIFT: usize = 192;
+/// The short blocks, and short windows, of a granule.
+pub const SHORT_WINDOWS: usize = 3;
 
 /// The unpredictability `cw` comes from the long FFT below this line, from
 /// the short FFT below [`SHORT_CW_LINES`], and is 0.4 above (clause
@@ -142,6 +147,20 @@ impl Masking {
     }
 }
 
+/// The model's output for one granule of one channel coded with short
+/// blocks.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ShortMasking {
+    /// The ratio of the allowed noise to the signal energy in each short
+    /// scalefactor band of each short window, indexed `[window][sb]`
+    /// (figure C.6.d). Infinite where the band has no energy, as in
+    /// [`Masking::ratio`].
+    pub ratio: [[f64; SHORT_BANDS]; SHORT_WINDOWS],
+    /// The perceptual entropy `pe`, which figure C.6.a computes from the
+    /// long-block threshold whatever the block type.
+    pub perceptual_entropy: f64,
+}
+
 /// The magnitude `r` and phase `f` of one FFT line (clause D.2.4 b)).
 #[derive(Clone, Copy, Debug, Default)]
 struct Polar {
@@ -224,6 +243,12 @@ pub struct PsychoacousticModel {
     band_weights: &'static [BandWeights; LONG_BANDS],
     /// `sprdngf(bval(bb), bval(b))`, indexed `[bb][b]`.
     spreading: Vec<Vec<f64>>,
+    short_partitions: &'static [ShortPartition],
+    short_band_weights: &'static [BandWeights; SHORT_BANDS],
+    /// As `spreading`, between the short partitions.
+    short_spreading: Vec<Vec<f64>>,
+    /// The normalising constant of each short partition.
+    short_norm: Vec<f64>,
     history: [f64; HISTORY],
     long: Analysis,
     short: Analysis,
@@ -235,19 +260,26 @@ pub struct PsychoacousticModel {
 impl PsychoacousticModel {
     pub fn new(sampling_frequency: SamplingFrequency) -> Self {
         let partitions = partitions::partitions(sampling_frequency);
-        let spreading = partitions
-            .iter()
-            .map(|from| {
-                partitions
-                    .iter()
-                    .map(|into| spreading_function(from.bval, into.bval))
-                    .collect()
-            })
+        let short_partitions = partitions::short_partitions(sampling_frequency);
+        let short_spreading = spreading_matrix(short_partitions.iter().map(|p| p.bval));
+        // Spec reading: the normalising constant is computed from the short
+        // partitions' Bark values as `rnorm` in clause D.2.4 f), the
+        // reciprocal of the spreading function summed over the partitions,
+        // which the long tables' `norm` column matches. The short tables'
+        // own column is a copy of the long one (see
+        // `partitions::short_partitions`) and differs from this by up to
+        // 1.9 dB.
+        let short_norm = (0..short_partitions.len())
+            .map(|b| 1.0 / short_spreading.iter().map(|from| from[b]).sum::<f64>())
             .collect();
         Self {
             partitions,
             band_weights: partitions::band_weights(sampling_frequency),
-            spreading,
+            spreading: spreading_matrix(partitions.iter().map(|p| p.bval)),
+            short_partitions,
+            short_band_weights: partitions::short_band_weights(sampling_frequency),
+            short_spreading,
+            short_norm,
             history: [0.0; HISTORY],
             long: Analysis::new(LONG_FFT),
             short: Analysis::new(SHORT_FFT),
@@ -257,12 +289,19 @@ impl PsychoacousticModel {
     }
 
     /// Analyses the next granule of PCM, nominally in -1.0 to 1.0, centred on
-    /// the block the filterbank returns for the same granule.
+    /// the block the filterbank returns for the same granule, for long
+    /// blocks.
     pub fn granule(&mut self, pcm: &[f64; GRANULE_LINES]) -> Masking {
+        self.analyse(pcm).0
+    }
+
+    /// Analyses the next granule like [`Self::granule`], giving the
+    /// threshold for both long and short blocks.
+    fn analyse(&mut self, pcm: &[f64; GRANULE_LINES]) -> (Masking, ShortMasking) {
         self.history.copy_within(GRANULE_LINES.., 0);
         self.history[HISTORY - GRANULE_LINES..].copy_from_slice(pcm);
 
-        let cw_short = self.unpredictability();
+        let (r_short, cw_short) = self.short_blocks();
         let long_start = BLOCK_CENTRE - LONG_FFT / 2;
         let (r, cw_long) = self
             .long
@@ -369,36 +408,92 @@ impl PsychoacousticModel {
             .sum::<f64>();
 
         // Figure C.6.c: the partitions converted to scalefactor bands.
-        let ratio = self.band_weights.map(|band| {
-            let collect = |values: &[f64]| {
-                band.w1 * values[band.bu]
-                    + values[band.bu + 1..band.bo].iter().sum::<f64>()
-                    + band.w2 * values[band.bo]
-            };
-            collect(&thr) / collect(&eb)
-        });
-        Masking {
-            ratio,
+        let long = Masking {
+            ratio: band_ratio(self.band_weights, &thr, &eb),
             perceptual_entropy,
-        }
+        };
+        let short = ShortMasking {
+            ratio: r_short.map(|r| self.short_ratio(&r)),
+            perceptual_entropy,
+        };
+        (long, short)
     }
 
-    /// The unpredictability of the short FFT's lines in the second of the
-    /// granule's three short blocks (clause C.1.5.3.2.1). The short blocks
-    /// are 192 samples apart and centred on the long block, and each is
-    /// predicted from the two short blocks before it.
-    fn unpredictability(&mut self) -> Vec<f64> {
+    /// Figure C.6.d: the ratio of each short scalefactor band in one short
+    /// block, from the magnitudes `r` of its FFT.
+    ///
+    /// Spec reading: the figure says to compare the threshold with the last
+    /// one as well as the threshold in quiet, but its formula,
+    /// `thr(b) = maximum(qthr(b), nbb(b))`, has no last threshold, and none
+    /// of the pre-echo constants. The formula is taken as printed. So is
+    /// the exponent `SNR(b)/10`: the short tables' SNR is negative, so,
+    /// unlike the long blocks' (figure C.6.b), it puts the threshold below
+    /// the spread energy. With a fixed SNR, the unpredictability that the
+    /// figure convolves alongside the energy has no use, and is left out.
+    fn short_ratio(&self, r: &[f64]) -> [f64; SHORT_BANDS] {
+        let eb: Vec<f64> = self
+            .short_partitions
+            .iter()
+            .map(|p| r[p.start..p.start + p.width].iter().map(|r| r * r).sum())
+            .collect();
+        let thr: Vec<f64> = self
+            .short_partitions
+            .iter()
+            .enumerate()
+            .map(|(b, p)| {
+                let ecb: f64 = (self.short_spreading.iter().zip(&eb))
+                    .map(|(spreading, eb)| eb * spreading[b])
+                    .sum();
+                let nbb = ecb * self.short_norm[b] * 10f64.powf(p.snr / 10.0);
+                p.qthr.max(nbb)
+            })
+            .collect();
+        band_ratio(self.short_band_weights, &thr, &eb)
+    }
+
+    /// The magnitudes of the granule's three short blocks, and the
+    /// unpredictability of the lines of the second (clause C.1.5.3.2.1). The
+    /// short blocks are 192 samples apart and centred on the long block, as
+    /// the three short windows are in the filterbank's block (clause
+    /// C.1.5.3.3), and each is predicted from the two short blocks before
+    /// it.
+    fn short_blocks(&mut self) -> ([Vec<f64>; SHORT_WINDOWS], Vec<f64>) {
         let mut middle = Vec::new();
-        for block in 0..3 {
+        let r = std::array::from_fn(|block| {
             let centre = BLOCK_CENTRE + block * SHORT_SHIFT - SHORT_SHIFT;
             let samples = &self.history[centre - SHORT_FFT / 2..][..SHORT_FFT];
-            let (_, c) = self.short.next_block(samples);
+            let (r, c) = self.short.next_block(samples);
             if block == 1 {
                 middle = c;
             }
-        }
-        middle
+            r
+        });
+        (r, middle)
     }
+}
+
+/// `sprdngf(bval(bb), bval(b))` between all partitions, indexed `[bb][b]`.
+fn spreading_matrix(bval: impl Iterator<Item = f64> + Clone) -> Vec<Vec<f64>> {
+    bval.clone()
+        .map(|from| {
+            bval.clone()
+                .map(|into| spreading_function(from, into))
+                .collect()
+        })
+        .collect()
+}
+
+/// The ratio `thr / eb` of each scalefactor band, with the partitions
+/// converted to scalefactor bands (figure C.6.c).
+fn band_ratio<const N: usize>(bands: &[BandWeights; N], thr: &[f64], eb: &[f64]) -> [f64; N] {
+    bands.map(|band| {
+        let collect = |values: &[f64]| {
+            band.w1 * values[band.bu]
+                + values[band.bu + 1..band.bo].iter().sum::<f64>()
+                + band.w2 * values[band.bo]
+        };
+        collect(thr) / collect(eb)
+    })
 }
 
 #[cfg(test)]
@@ -565,6 +660,57 @@ mod tests {
             .max_by(|&a, &b| energy(a).total_cmp(&energy(b)))
             .unwrap();
         assert!(loudest.abs_diff(centre) <= 16, "{loudest} vs {centre}");
+    }
+
+    /// With a fixed SNR for short blocks, and the normalising constant
+    /// undoing the spread, the ratio of every short band of loud noise lies
+    /// near the SNR of the partitions it collects.
+    #[test]
+    fn short_ratio_of_noise_follows_the_snr_column() {
+        for fs in SamplingFrequency::ALL {
+            let mut model = PsychoacousticModel::new(fs);
+            let mut seed = 1;
+            let mut short = None;
+            for _ in 0..6 {
+                short = Some(model.analyse(&noise(&mut seed, 0.5)).1);
+            }
+            let short = short.unwrap();
+            let partitions = partitions::short_partitions(fs);
+            for (w, ratio) in short.ratio.iter().enumerate() {
+                for (sb, band) in partitions::short_band_weights(fs).iter().enumerate() {
+                    let snr = partitions[band.bu..=band.bo].iter().map(|p| p.snr);
+                    let (low, high) =
+                        snr.fold((f64::MAX, f64::MIN), |(l, h), s| (l.min(s), h.max(s)));
+                    let db = 10.0 * ratio[sb].log10();
+                    assert!(
+                        (low - 1.5..=high + 1.5).contains(&db),
+                        "{fs:?} window {w} band {sb}: {db} dB, SNR {low} to {high}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The three short windows follow each other in time: a click that only
+    /// the last short block sees leaves the first two silent.
+    #[test]
+    fn short_windows_follow_time() {
+        let mut model = PsychoacousticModel::new(FS);
+        // In the history of the second granule, the click lands 192 samples
+        // after the block centre, the centre of the last short block, and
+        // more than 128 samples after the end of the second.
+        let click = BLOCK_CENTRE + SHORT_SHIFT - (HISTORY - 2 * GRANULE_LINES);
+        let mut pcm = [0.0; GRANULE_LINES];
+        pcm[click] = 0.5;
+        model.analyse(&pcm);
+        let (_, short) = model.analyse(&[0.0; GRANULE_LINES]);
+        assert!(short.ratio[0].iter().all(|r| r.is_infinite()));
+        assert!(short.ratio[1].iter().all(|r| r.is_infinite()));
+        assert!(
+            short.ratio[2].iter().all(|r| r.is_finite()),
+            "{:?}",
+            short.ratio[2]
+        );
     }
 
     /// `xmin` is the band's mean energy per line scaled by its ratio.
