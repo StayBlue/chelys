@@ -1,9 +1,9 @@
 //! Quantisation of frequency lines (clause C.1.5.4.4.1) and the inner
 //! iteration loop that sets the step size (clause C.1.5.4.4, figure C.9.c).
 
-use super::header::SamplingFrequency;
-use super::huffman::MAX_MAGNITUDE;
-use super::{GRANULE_LINES, QuantizedGranule, scalefactor_bands};
+use crate::mp3::header::SamplingFrequency;
+use crate::mp3::huffman::MAX_MAGNITUDE;
+use crate::mp3::{GRANULE_LINES, QuantizedGranule, scalefactor_bands};
 
 /// Clause C.1.5.4.1 sets `global_gain = qquant + system_constant` and leaves
 /// the constant to the implementation. The decoder requantises with
@@ -13,26 +13,52 @@ use super::{GRANULE_LINES, QuantizedGranule, scalefactor_bands};
 /// requantizer.
 const GLOBAL_GAIN_OFFSET: i32 = 210;
 
+/// The quantizer step size of `global_gain`, `2^((global_gain - 210) / 4)`.
+pub fn step_size(global_gain: u8) -> f64 {
+    (f64::from(i32::from(global_gain) - GLOBAL_GAIN_OFFSET) / 4.0).exp2()
+}
+
 /// Quantises `xr` with step size `global_gain`:
 /// `ix(i) = nint((|xr(i)| / 2^((global_gain - 210) / 4))^0.75 - 0.0946)`,
 /// carrying the sign of `xr(i)`. Returns `None` if a magnitude would exceed
 /// the largest the Huffman tables can code (clause C.1.5.4.4.2).
 pub fn quantize(xr: &[f64; GRANULE_LINES], global_gain: u8) -> Option<[i32; GRANULE_LINES]> {
-    let step = 2f64.powf(f64::from(i32::from(global_gain) - GLOBAL_GAIN_OFFSET) / 4.0);
-    let mut ix = [0; GRANULE_LINES];
-    for (ix, &xr) in ix.iter_mut().zip(xr) {
-        let magnitude = ((xr.abs() / step).powf(0.75) - 0.0946).round().max(0.0);
-        if magnitude > f64::from(MAX_MAGNITUDE) {
-            return None;
+    Lines::new(xr).quantize(global_gain)
+}
+
+/// A granule's lines with their magnitudes raised to the power 0.75 once, so
+/// that each step size tried costs one multiplication per line:
+/// `(|xr| / step)^0.75 = |xr|^0.75 * step^-0.75`.
+struct Lines<'a> {
+    xr: &'a [f64; GRANULE_LINES],
+    powered: [f64; GRANULE_LINES],
+}
+
+impl<'a> Lines<'a> {
+    fn new(xr: &'a [f64; GRANULE_LINES]) -> Self {
+        Self {
+            xr,
+            powered: xr.map(|x| x.abs().powf(0.75)),
         }
-        *ix = magnitude.copysign(xr) as i32;
     }
-    Some(ix)
+
+    fn quantize(&self, global_gain: u8) -> Option<[i32; GRANULE_LINES]> {
+        let scale = step_size(global_gain).powf(-0.75);
+        let mut ix = [0; GRANULE_LINES];
+        for ((ix, &powered), &xr) in ix.iter_mut().zip(&self.powered).zip(self.xr) {
+            let magnitude = (powered * scale - 0.0946).round().max(0.0);
+            if magnitude > f64::from(MAX_MAGNITUDE) {
+                return None;
+            }
+            *ix = magnitude.copysign(xr) as i32;
+        }
+        Some(ix)
+    }
 }
 
 /// The inner iteration loop (clause C.1.5.4.4, figure C.9.c): quantises
 /// `xr` with the smallest step size whose Huffman coding fits in
-/// `available_bits`.
+/// `available_bits`, or returns `None` if not even the largest step does.
 ///
 /// The loop raises the step size one `global_gain` at a time until the
 /// quantised values are within the range of the tables (clause C.1.5.4.4.2;
@@ -40,31 +66,79 @@ pub fn quantize(xr: &[f64; GRANULE_LINES], global_gain: u8) -> Option<[i32; GRAN
 /// text) and their bits fit. Clause C.1.5.4.2.1 leaves the starting step,
 /// `quantanf`, to the implementation, asking only that the first iteration
 /// need more bits than are available and suggesting it be chosen to save
-/// iterations; here it is found by bisection, one step below the first fit.
+/// iterations. Here the search starts from `start_gain` if given, as the
+/// outer loop does with the step of its last iteration, and otherwise from a
+/// bisection of the whole range. Either way it ends on a step that fits with
+/// the next finer step not fitting, as the loop of figure C.9.c would started
+/// from that finer step.
 ///
 /// A granule whose lines are all zero skips the loop (figure C.9.a).
 pub fn inner_loop(
     xr: &[f64; GRANULE_LINES],
     available_bits: usize,
     sampling_frequency: SamplingFrequency,
-) -> QuantizedGranule {
+    start_gain: Option<u8>,
+) -> Option<QuantizedGranule> {
     if xr.iter().all(|&x| x == 0.0) {
-        return QuantizedGranule::new(0, [0; GRANULE_LINES], sampling_frequency);
+        return Some(QuantizedGranule::new(
+            0,
+            [0; GRANULE_LINES],
+            sampling_frequency,
+        ));
     }
     let bands = scalefactor_bands::long_bands(sampling_frequency);
+    let lines = Lines::new(xr);
     let attempt = |global_gain: u8| {
-        let values = quantize(xr, global_gain)?;
+        let values = lines.quantize(global_gain)?;
         let granule = QuantizedGranule::new(global_gain, values, sampling_frequency);
         let fits = granule.coding.bit_count(&granule.values, bands) <= available_bits;
         fits.then_some(granule)
     };
 
-    // The smallest gain that fits, assuming larger steps never need more bits.
-    // At the largest gain every line quantises to zero, which always fits.
-    let (mut over, mut fits) = (0u8, u8::MAX);
-    if attempt(over).is_some() {
-        fits = over;
+    let start = start_gain.unwrap_or_else(|| bisect(&attempt));
+    if let Some(mut granule) = attempt(start) {
+        // Finer steps while they fit.
+        while let Some(finer) = granule.global_gain.checked_sub(1).and_then(&attempt) {
+            granule = finer;
+        }
+        return Some(granule);
     }
+    // Coarser steps until one fits: doubling the distance, then bisecting.
+    let (mut over, mut distance) = (start, 1u8);
+    let fits = loop {
+        let next = over.saturating_add(distance);
+        if attempt(next).is_some() {
+            break next;
+        }
+        if next == u8::MAX {
+            return None;
+        }
+        over = next;
+        distance = distance.saturating_mul(2);
+    };
+    let fits = bisect_between(&attempt, over, fits);
+    attempt(fits)
+}
+
+/// A step size near the finest that fits, by bisection over the whole range
+/// assuming that larger steps never need more bits.
+fn bisect(attempt: &impl Fn(u8) -> Option<QuantizedGranule>) -> u8 {
+    if attempt(0).is_some() {
+        return 0;
+    }
+    if attempt(u8::MAX).is_none() {
+        return u8::MAX;
+    }
+    bisect_between(attempt, 0, u8::MAX)
+}
+
+/// Narrows `over`, which does not fit, and `fits`, which does, to adjacent
+/// steps and returns the one that fits.
+fn bisect_between(
+    attempt: &impl Fn(u8) -> Option<QuantizedGranule>,
+    mut over: u8,
+    mut fits: u8,
+) -> u8 {
     while fits - over > 1 {
         let middle = over + (fits - over) / 2;
         if attempt(middle).is_some() {
@@ -73,14 +147,7 @@ pub fn inner_loop(
             over = middle;
         }
     }
-
-    let mut global_gain = fits.saturating_sub(1);
-    loop {
-        if let Some(granule) = attempt(global_gain) {
-            return granule;
-        }
-        global_gain += 1;
-    }
+    fits
 }
 
 #[cfg(test)]
@@ -138,7 +205,7 @@ mod tests {
         let bands = scalefactor_bands::long_bands(fs);
         let xr = tone_granule();
         for available in [100, 400, 1500, 4000] {
-            let granule = inner_loop(&xr, available, fs);
+            let granule = inner_loop(&xr, available, fs, None).unwrap();
             let bits = granule.coding.bit_count(&granule.values, bands);
             assert!(bits <= available, "{bits} bits for {available}");
             // One step finer either leaves the tables' range or needs too many bits.
@@ -150,9 +217,29 @@ mod tests {
         }
     }
 
+    /// Wherever the search starts, it ends on the same step.
+    #[test]
+    fn inner_loop_ends_on_the_same_step_from_any_start() {
+        let fs = SamplingFrequency::Hz44100;
+        let xr = tone_granule();
+        let expected = inner_loop(&xr, 800, fs, None).unwrap().global_gain;
+        for start in [0, 100, expected - 1, expected, expected + 1, 200, 255] {
+            let granule = inner_loop(&xr, 800, fs, Some(start)).unwrap();
+            assert_eq!(granule.global_gain, expected, "from {start}");
+        }
+    }
+
+    #[test]
+    fn inner_loop_gives_up_when_nothing_fits() {
+        // Lines so loud that even the largest step leaves 1s in every pair.
+        let xr = [1e6; GRANULE_LINES];
+        assert!(inner_loop(&xr, 10, SamplingFrequency::Hz44100, None).is_none());
+    }
+
     #[test]
     fn inner_loop_skips_silence() {
-        let granule = inner_loop(&[0.0; GRANULE_LINES], 0, SamplingFrequency::Hz32000);
+        let granule =
+            inner_loop(&[0.0; GRANULE_LINES], 0, SamplingFrequency::Hz32000, None).unwrap();
         assert!(granule.values.iter().all(|&v| v == 0));
         assert_eq!(granule.coding.big_values, 0);
     }
@@ -160,7 +247,7 @@ mod tests {
     #[test]
     fn inner_loop_fits_even_with_no_bits() {
         let fs = SamplingFrequency::Hz48000;
-        let granule = inner_loop(&tone_granule(), 0, fs);
+        let granule = inner_loop(&tone_granule(), 0, fs, None).unwrap();
         let bands = scalefactor_bands::long_bands(fs);
         assert_eq!(granule.coding.bit_count(&granule.values, bands), 0);
     }

@@ -4,14 +4,17 @@ mod crc;
 pub mod filterbank;
 pub mod header;
 pub mod huffman;
+pub mod loops;
 pub mod psychoacoustic;
-pub mod quantizer;
 pub mod scalefactor_bands;
+pub mod scalefactors;
 pub mod side_info;
 
 use crate::bitstream::BitWriter;
 use header::{Bitrate, Emphasis, Header, Mode, PaddingSchedule, SamplingFrequency};
 use huffman::{QuadTable, SpectrumCoding};
+use psychoacoustic::PsychoacousticModel;
+use scalefactors::Scalefactors;
 use side_info::{GRANULES, GranuleChannel, SideInfo, Window};
 
 /// Two granules of 576 samples per channel (clause 2.4.2.1).
@@ -62,20 +65,21 @@ pub fn write_frame(header: &Header, side_info: &SideInfo, main_data: &[u8], out:
     out.resize(end, 0);
 }
 
-/// One granule of one channel, quantised and ready for Huffman coding. Long
-/// blocks only, without scalefactors.
+/// One granule of one channel, quantised and ready for coding. Long blocks
+/// only.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct QuantizedGranule {
     /// The quantizer step size; see the requantization formula in clause
     /// 2.4.3.4.7.1.
     pub global_gain: u8,
+    pub scalefactors: Scalefactors,
     pub values: [i32; GRANULE_LINES],
     pub coding: SpectrumCoding,
 }
 
 impl QuantizedGranule {
     /// Partitions `values` and chooses Huffman tables for them (clause
-    /// C.1.5.4.4).
+    /// C.1.5.4.4). The scalefactors are all zero.
     pub fn new(
         global_gain: u8,
         values: [i32; GRANULE_LINES],
@@ -85,6 +89,7 @@ impl QuantizedGranule {
             SpectrumCoding::choose(&values, scalefactor_bands::long_bands(sampling_frequency));
         Self {
             global_gain,
+            scalefactors: Scalefactors::default(),
             values,
             coding,
         }
@@ -126,6 +131,11 @@ fn write_granule_frame(header: &Header, frame: &[Vec<QuantizedGranule>], out: &m
     for (gr, granule) in frame.iter().enumerate() {
         for (ch, channel) in granule.iter().enumerate() {
             let start = main_data.bit_len();
+            let scalefactors = &channel.scalefactors;
+            let scalefac_compress = scalefactors
+                .compress()
+                .expect("scalefactors within their limits");
+            scalefactors.write(scalefac_compress, &mut main_data);
             channel.coding.write(&channel.values, bands, &mut main_data);
             let part2_3_length = main_data.bit_len() - start;
             assert!(
@@ -137,14 +147,14 @@ fn write_granule_frame(header: &Header, frame: &[Vec<QuantizedGranule>], out: &m
                 part2_3_length: part2_3_length as u16,
                 big_values: coding.big_values as u16,
                 global_gain: channel.global_gain,
-                scalefac_compress: 0,
+                scalefac_compress,
                 window: Window::Normal {
                     table_select: coding.table_select,
                     region0_count: coding.region0_count,
                     region1_count: coding.region1_count,
                 },
-                preflag: false,
-                scalefac_scale: false,
+                preflag: scalefactors.preflag,
+                scalefac_scale: scalefactors.scalefac_scale,
                 count1table_select: coding.count1_table == QuadTable::B,
             };
         }
@@ -183,17 +193,24 @@ pub fn encode_granules(config: &StreamConfig, granules: &[Vec<QuantizedGranule>]
 /// the configured bitrate.
 ///
 /// Each granule of each channel gets an equal share of its frame's main data,
-/// the `mean_bits` of clause C.1.5.3.4 (there is no bit reservoir yet), and
-/// the inner iteration loop picks the finest quantizer step that fits it. The
-/// input is padded with silence to whole frames, plus one more frame to flush
-/// the filterbank.
+/// the `mean_bits` of clause C.1.5.3.4 (there is no bit reservoir yet).
+/// Psychoacoustic model 2 sets the distortion each scalefactor band allows,
+/// and the iteration loops shape the quantisation noise to it within those
+/// bits. The input is padded with silence to whole frames, plus one more
+/// frame to flush the filterbank.
 ///
 /// # Panics
 ///
 /// If the channel count does not match the configured mode.
 pub fn encode_pcm(config: &StreamConfig, channels: &[&[f64]]) -> Vec<u8> {
-    encode_filtered(config, channels, |xr, available_bits| {
-        quantizer::inner_loop(xr, available_bits, config.sampling_frequency)
+    let fs = config.sampling_frequency;
+    let mut models: Vec<_> = channels
+        .iter()
+        .map(|_| PsychoacousticModel::new(fs))
+        .collect();
+    encode_filtered(config, channels, |channel, pcm, xr, available_bits| {
+        let xmin = models[channel].granule(pcm).allowed_distortion(xr, fs);
+        loops::quantize_granule(xr, &xmin, available_bits, fs)
     })
 }
 
@@ -209,20 +226,25 @@ pub fn encode_pcm_with_global_gain(
     global_gain: u8,
     channels: &[&[f64]],
 ) -> Vec<u8> {
-    encode_filtered(config, channels, |xr, _| {
-        let values = quantizer::quantize(xr, global_gain)
+    encode_filtered(config, channels, |_, _, xr, _| {
+        let values = loops::quantize(xr, global_gain)
             .unwrap_or_else(|| panic!("a granule is too loud for global_gain {global_gain}"));
         QuantizedGranule::new(global_gain, values, config.sampling_frequency)
     })
 }
 
 /// Runs each channel through its filterbank granule by granule, quantises
-/// each granule with `quantize`, given the bits available to it, and writes
-/// the frames.
+/// each granule with `quantize`, given the channel, the granule's PCM, its
+/// lines and the bits available to it, and writes the frames.
 fn encode_filtered(
     config: &StreamConfig,
     channels: &[&[f64]],
-    mut quantize: impl FnMut(&[f64; GRANULE_LINES], usize) -> QuantizedGranule,
+    mut quantize: impl FnMut(
+        usize,
+        &[f64; GRANULE_LINES],
+        &[f64; GRANULE_LINES],
+        usize,
+    ) -> QuantizedGranule,
 ) -> Vec<u8> {
     assert_eq!(
         channels.len(),
@@ -246,9 +268,10 @@ fn encode_filtered(
         for gr in 0..GRANULES {
             let offset = (frame * GRANULES + gr) * GRANULE_LINES;
             let mut granule = Vec::with_capacity(channels.len());
-            for (pcm, filterbank) in channels.iter().zip(&mut filterbanks) {
+            for (channel, (pcm, filterbank)) in channels.iter().zip(&mut filterbanks).enumerate() {
                 let pcm = std::array::from_fn(|t| pcm.get(offset + t).copied().unwrap_or(0.0));
-                granule.push(quantize(&filterbank.granule(&pcm), available_bits));
+                let xr = filterbank.granule(&pcm);
+                granule.push(quantize(channel, &pcm, &xr, available_bits));
             }
             granules.push(granule);
         }
