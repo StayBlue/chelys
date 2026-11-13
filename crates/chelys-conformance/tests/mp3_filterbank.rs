@@ -4,7 +4,7 @@
 use std::f64::consts::TAU;
 
 use chelys::mp3::header::{Bitrate, Mode, SamplingFrequency};
-use chelys::mp3::{StreamConfig, encode_pcm};
+use chelys::mp3::{StreamConfig, encode_pcm_with_global_gain};
 use chelys_conformance::ffmpeg;
 
 fn config(sampling_frequency: SamplingFrequency, mode: Mode) -> StreamConfig {
@@ -68,7 +68,7 @@ fn align(input: &[f64], output: &[f32], channels: usize, channel: usize) -> (usi
 fn pcm_round_trips_at_every_sampling_frequency() {
     for fs in SamplingFrequency::ALL {
         let input = tones(fs, 1.0, 0.0);
-        let stream = encode_pcm(&config(fs, Mode::SingleChannel), 150, &[&input]);
+        let stream = encode_pcm_with_global_gain(&config(fs, Mode::SingleChannel), 150, &[&input]);
         let decoded = ffmpeg::decode_mp3(&stream);
         assert_eq!(decoded.diagnostics, "");
         let (lag, snr) = align(&input, &decoded.samples, 1, 0);
@@ -83,7 +83,7 @@ fn stereo_channels_round_trip_separately() {
     let fs = SamplingFrequency::Hz32000;
     let left = tones(fs, 1.0, 0.0);
     let right: Vec<f64> = tones(fs, 1.0, 1.7).iter().map(|x| -0.7 * x).collect();
-    let stream = encode_pcm(&config(fs, Mode::Stereo), 160, &[&left, &right]);
+    let stream = encode_pcm_with_global_gain(&config(fs, Mode::Stereo), 160, &[&left, &right]);
     let decoded = ffmpeg::decode_mp3(&stream);
     assert_eq!(decoded.diagnostics, "");
     for (channel, input) in [&left, &right].into_iter().enumerate() {
@@ -101,7 +101,8 @@ fn noise_follows_the_quantizer_step() {
     let snrs: Vec<f64> = [150, 160, 170, 180]
         .into_iter()
         .map(|gain| {
-            let stream = encode_pcm(&config(fs, Mode::SingleChannel), gain, &[&input]);
+            let stream =
+                encode_pcm_with_global_gain(&config(fs, Mode::SingleChannel), gain, &[&input]);
             align(&input, &ffmpeg::decode_mp3(&stream).samples, 1, 0).1
         })
         .collect();

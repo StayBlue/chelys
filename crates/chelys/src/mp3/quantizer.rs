@@ -1,7 +1,9 @@
-//! Quantisation of frequency lines (clause C.1.5.4.4.1).
+//! Quantisation of frequency lines (clause C.1.5.4.4.1) and the inner
+//! iteration loop that sets the step size (clause C.1.5.4.4, figure C.9.c).
 
-use super::GRANULE_LINES;
+use super::header::SamplingFrequency;
 use super::huffman::MAX_MAGNITUDE;
+use super::{GRANULE_LINES, QuantizedGranule, scalefactor_bands};
 
 /// Clause C.1.5.4.1 sets `global_gain = qquant + system_constant` and leaves
 /// the constant to the implementation. The decoder requantises with
@@ -26,6 +28,59 @@ pub fn quantize(xr: &[f64; GRANULE_LINES], global_gain: u8) -> Option<[i32; GRAN
         *ix = magnitude.copysign(xr) as i32;
     }
     Some(ix)
+}
+
+/// The inner iteration loop (clause C.1.5.4.4, figure C.9.c): quantises
+/// `xr` with the smallest step size whose Huffman coding fits in
+/// `available_bits`.
+///
+/// The loop raises the step size one `global_gain` at a time until the
+/// quantised values are within the range of the tables (clause C.1.5.4.4.2;
+/// the decision in figure C.9.c has its "y" and "n" swapped relative to that
+/// text) and their bits fit. Clause C.1.5.4.2.1 leaves the starting step,
+/// `quantanf`, to the implementation, asking only that the first iteration
+/// need more bits than are available and suggesting it be chosen to save
+/// iterations; here it is found by bisection, one step below the first fit.
+///
+/// A granule whose lines are all zero skips the loop (figure C.9.a).
+pub fn inner_loop(
+    xr: &[f64; GRANULE_LINES],
+    available_bits: usize,
+    sampling_frequency: SamplingFrequency,
+) -> QuantizedGranule {
+    if xr.iter().all(|&x| x == 0.0) {
+        return QuantizedGranule::new(0, [0; GRANULE_LINES], sampling_frequency);
+    }
+    let bands = scalefactor_bands::long_bands(sampling_frequency);
+    let attempt = |global_gain: u8| {
+        let values = quantize(xr, global_gain)?;
+        let granule = QuantizedGranule::new(global_gain, values, sampling_frequency);
+        let fits = granule.coding.bit_count(&granule.values, bands) <= available_bits;
+        fits.then_some(granule)
+    };
+
+    // The smallest gain that fits, assuming larger steps never need more bits.
+    // At the largest gain every line quantises to zero, which always fits.
+    let (mut over, mut fits) = (0u8, u8::MAX);
+    if attempt(over).is_some() {
+        fits = over;
+    }
+    while fits - over > 1 {
+        let middle = over + (fits - over) / 2;
+        if attempt(middle).is_some() {
+            fits = middle;
+        } else {
+            over = middle;
+        }
+    }
+
+    let mut global_gain = fits.saturating_sub(1);
+    loop {
+        if let Some(granule) = attempt(global_gain) {
+            return granule;
+        }
+        global_gain += 1;
+    }
 }
 
 #[cfg(test)]
@@ -68,5 +123,45 @@ mod tests {
         xr[0] = 10_000f64.powf(4.0 / 3.0);
         assert!(quantize(&xr, 210).is_none());
         assert!(quantize(&xr, 230).is_some());
+    }
+
+    fn tone_granule() -> [f64; GRANULE_LINES] {
+        std::array::from_fn(|i| {
+            let decay = (-(i as f64) / 60.0).exp();
+            0.3 * decay * if i % 3 == 0 { 1.0 } else { -0.6 }
+        })
+    }
+
+    #[test]
+    fn inner_loop_uses_the_finest_step_that_fits() {
+        let fs = SamplingFrequency::Hz44100;
+        let bands = scalefactor_bands::long_bands(fs);
+        let xr = tone_granule();
+        for available in [100, 400, 1500, 4000] {
+            let granule = inner_loop(&xr, available, fs);
+            let bits = granule.coding.bit_count(&granule.values, bands);
+            assert!(bits <= available, "{bits} bits for {available}");
+            // One step finer either leaves the tables' range or needs too many bits.
+            let finer = quantize(&xr, granule.global_gain - 1).map(|values| {
+                let finer = QuantizedGranule::new(granule.global_gain - 1, values, fs);
+                finer.coding.bit_count(&finer.values, bands)
+            });
+            assert!(finer.is_none_or(|bits| bits > available), "{available}");
+        }
+    }
+
+    #[test]
+    fn inner_loop_skips_silence() {
+        let granule = inner_loop(&[0.0; GRANULE_LINES], 0, SamplingFrequency::Hz32000);
+        assert!(granule.values.iter().all(|&v| v == 0));
+        assert_eq!(granule.coding.big_values, 0);
+    }
+
+    #[test]
+    fn inner_loop_fits_even_with_no_bits() {
+        let fs = SamplingFrequency::Hz48000;
+        let granule = inner_loop(&tone_granule(), 0, fs);
+        let bands = scalefactor_bands::long_bands(fs);
+        assert_eq!(granule.coding.bit_count(&granule.values, bands), 0);
     }
 }

@@ -93,6 +93,21 @@ impl SpectrumCoding {
         ]
     }
 
+    /// The bits [`write`](Self::write) produces for `values`, counted as in
+    /// clauses C.1.5.4.4.5 and C.1.5.4.4.8.
+    pub fn bit_count(&self, values: &[i32; GRANULE_LINES], bands: &[Band; LONG_BANDS]) -> usize {
+        let mut bits = 0;
+        let mut start = 0;
+        for (region, end) in self.region_ends(bands).into_iter().enumerate() {
+            let table_select = self.table_select[region];
+            let table = pair_table(table_select)
+                .unwrap_or_else(|| panic!("table {table_select} is not used"));
+            bits += pair_bits(table, &values[start..end]);
+            start = end;
+        }
+        bits + quad_bits(self.count1_table, &values[start..start + 4 * self.count1])
+    }
+
     /// Writes the `Huffmancodebits()` of `values` (clause 2.4.1.7).
     ///
     /// # Panics
@@ -376,19 +391,9 @@ mod tests {
             };
         }
         let coding = SpectrumCoding::choose(&values, bands());
-        let mut expected = 0;
-        let mut start = 0;
-        for (region, end) in coding.region_ends(bands()).into_iter().enumerate() {
-            expected += pair_bits(
-                pair_table(coding.table_select[region]).unwrap(),
-                &values[start..end],
-            );
-            start = end;
-        }
-        expected += quad_bits(
-            coding.count1_table,
-            &values[start..start + 4 * coding.count1],
+        assert_eq!(
+            written(&values, &coding).len(),
+            coding.bit_count(&values, bands())
         );
-        assert_eq!(written(&values, &coding).len(), expected);
     }
 }
