@@ -2,23 +2,14 @@
 //! delay of the model's output by one granule that lets it be made (figure
 //! C.6.a).
 
-use super::super::GRANULE_LINES;
 use super::super::header::SamplingFrequency;
+use super::super::{BlockType, GRANULE_LINES};
 use super::{Masking, PsychoacousticModel, ShortMasking};
 
 /// A granule has an attack, and is coded with short blocks, when its
 /// perceptual entropy exceeds this (clause C.1.5.3.2, `switch_pe` in figure
 /// C.6.a).
 const SWITCH_PE: f64 = 1800.0;
-
-/// The block types of figure C.7.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BlockType {
-    Normal,
-    Start,
-    Short,
-    Stop,
-}
 
 /// The model's output for one granule of one channel, with its block type.
 #[derive(Clone, Debug, PartialEq)]

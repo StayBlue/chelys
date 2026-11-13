@@ -1,12 +1,14 @@
 //! The analysis half of the Layer III hybrid filterbank: the polyphase
-//! subband filter (clause C.1.3, figure C.4) followed by the MDCT and the
-//! encoder's aliasing butterflies (clause C.1.5.3.3). Long blocks only.
+//! subband filter (clause C.1.3, figure C.4) followed by the MDCT, with the
+//! window and transform of the normal, start, short or stop block type, and
+//! the encoder's aliasing butterflies (clause C.1.5.3.3). Mixed blocks are
+//! not used.
 
 mod analysis_window;
 
 use std::f64::consts::PI;
 
-use crate::mp3::GRANULE_LINES;
+use crate::mp3::{BlockType, GRANULE_LINES};
 use analysis_window::ANALYSIS_WINDOW;
 
 const SUBBANDS: usize = 32;
@@ -14,6 +16,13 @@ const SUBBANDS: usize = 32;
 const SUBBAND_SAMPLES: usize = GRANULE_LINES / SUBBANDS;
 /// Samples in a long MDCT block: the subband samples of two granules.
 const LONG_BLOCK: usize = 2 * SUBBAND_SAMPLES;
+/// Samples in each of the three short MDCT blocks of a short block, and the
+/// lines each gives.
+const SHORT_BLOCK: usize = 12;
+const SHORT_LINES: usize = SHORT_BLOCK / 2;
+/// Where the short blocks start in the block of 36 subband samples (clause
+/// C.1.5.3.3: `y(k)_i = x'_(i + 6 + 6k)`).
+const SHORT_BLOCK_STARTS: [usize; 3] = [6, 12, 18];
 
 /// The decoder's long-block IMDCT (clause 2.4.3.4.10.2) with windowing and
 /// overlap-add returns the encoder's MDCT input (clause C.1.5.3.3) scaled by
@@ -31,6 +40,12 @@ const LONG_BLOCK: usize = 2 * SUBBAND_SAMPLES;
 /// to 6 dB, as halving the output should.
 const LONG_BLOCK_GAIN: f64 = LONG_BLOCK as f64 / 4.0;
 
+/// The same scaling for short blocks: the decoder's short IMDCT (clause
+/// 2.4.3.4.10.2) returns each windowed short block scaled by `n / 4 = 3`.
+/// Start and stop blocks are long blocks, scaled by 9, so each side of
+/// their overlap with a short block comes back at unity.
+const SHORT_BLOCK_GAIN: f64 = SHORT_BLOCK as f64 / 4.0;
+
 /// Table B.9: the coefficients `c_i` of the aliasing butterflies.
 const ALIAS_COEFFICIENTS: [f64; 8] = [
     -0.6, -0.535, -0.33, -0.185, -0.095, -0.041, -0.0142, -0.0037,
@@ -43,8 +58,12 @@ pub struct Filterbank {
     /// `M_ik` of clause C.1.3, indexed `[i][k]`.
     matrix: Box<[[f64; 64]; SUBBANDS]>,
     /// The MDCT kernel of clause C.1.5.3.3 for `n = 36`, indexed `[i][k]`,
-    /// with the normal window `sin(pi / 36 * (k + 1/2))` folded in.
-    mdct: Box<[[f64; LONG_BLOCK]; SUBBAND_SAMPLES]>,
+    /// with the window of the normal, start and stop block types folded in,
+    /// in that order.
+    long_mdct: Box<[[[f64; LONG_BLOCK]; SUBBAND_SAMPLES]; 3]>,
+    /// The MDCT kernel for `n = 12`, indexed `[i][k]`, with the short window
+    /// folded in.
+    short_mdct: [[f64; SHORT_BLOCK]; SHORT_LINES],
     /// The previous granule's subband samples, indexed `[subband][time]`.
     previous: [[f64; SUBBAND_SAMPLES]; SUBBANDS],
     /// `cs_i` and `ca_i` of Table B.9.
@@ -65,17 +84,11 @@ impl Filterbank {
                 *m = ((2 * i + 1) as f64 * (k as f64 - 16.0) * PI / 64.0).cos();
             }
         }
-        let n = LONG_BLOCK as f64;
-        let mut mdct = Box::new([[0.0; LONG_BLOCK]; SUBBAND_SAMPLES]);
-        for (i, row) in mdct.iter_mut().enumerate() {
-            for (k, m) in row.iter_mut().enumerate() {
-                let window = (PI / 36.0 * (k as f64 + 0.5)).sin();
-                let kernel =
-                    (PI / (2.0 * n) * (2.0 * k as f64 + 1.0 + n / 2.0) * (2.0 * i as f64 + 1.0))
-                        .cos();
-                *m = window * kernel;
-            }
-        }
+        let long_mdct = Box::new(
+            [BlockType::Normal, BlockType::Start, BlockType::Stop]
+                .map(|block_type| mdct_kernel(|k| long_window(block_type, k))),
+        );
+        let short_mdct = mdct_kernel(short_window);
         let butterflies = ALIAS_COEFFICIENTS.map(|c| {
             let norm = (1.0 + c * c).sqrt();
             (1.0 / norm, c / norm)
@@ -83,17 +96,28 @@ impl Filterbank {
         Self {
             history: [0.0; 512],
             matrix,
-            mdct,
+            long_mdct,
+            short_mdct,
             previous: [[0.0; SUBBAND_SAMPLES]; SUBBANDS],
             butterflies,
         }
     }
 
     /// Filters the next 576 PCM samples, nominally in -1.0 to 1.0, into the
-    /// granule's frequency lines `xr`, line `18 * subband + k` holding MDCT
-    /// output `k` of `subband`. The lines describe the block formed with the
-    /// previous granule, so they lag the input by one granule.
-    pub fn granule(&mut self, pcm: &[f64; GRANULE_LINES]) -> [f64; GRANULE_LINES] {
+    /// granule's frequency lines `xr`, transformed as `block_type` asks. The
+    /// lines describe the block formed with the previous granule, so they lag
+    /// the input by one granule.
+    ///
+    /// Line `18 * subband + k` holds MDCT output `k` of `subband`. For short
+    /// blocks, line `18 * subband + 6 * window + k` holds output `k` of short
+    /// window `window`: the subband order the decoder reorders short blocks
+    /// into before its IMDCT (clause 2.4.3.4.8), not the order of the
+    /// bitstream.
+    pub fn granule(
+        &mut self,
+        pcm: &[f64; GRANULE_LINES],
+        block_type: BlockType,
+    ) -> [f64; GRANULE_LINES] {
         let mut current = [[0.0; SUBBAND_SAMPLES]; SUBBANDS];
         for (time, samples) in pcm.chunks_exact(SUBBANDS).enumerate() {
             let subbands = self.subband_samples(samples.try_into().unwrap());
@@ -114,21 +138,46 @@ impl Filterbank {
         }
 
         let mut xr = [0.0; GRANULE_LINES];
-        for subband in 0..SUBBANDS {
-            let block = self.previous[subband].iter().chain(&current[subband]);
-            let lines = &mut xr[SUBBAND_SAMPLES * subband..][..SUBBAND_SAMPLES];
-            for (line, kernel) in lines.iter_mut().zip(self.mdct.iter()) {
-                *line = kernel
-                    .iter()
-                    .zip(block.clone())
-                    .map(|(m, x)| m * x)
-                    .sum::<f64>()
-                    / LONG_BLOCK_GAIN;
-            }
+        for (subband, lines) in xr.chunks_exact_mut(SUBBAND_SAMPLES).enumerate() {
+            let mut block = [0.0; LONG_BLOCK];
+            block[..SUBBAND_SAMPLES].copy_from_slice(&self.previous[subband]);
+            block[SUBBAND_SAMPLES..].copy_from_slice(&current[subband]);
+            lines.copy_from_slice(&self.mdct(&block, block_type));
         }
         self.previous = current;
-        self.reduce_aliasing(&mut xr);
+        // The encoder's butterflies are those of the decoder (clause
+        // C.1.5.3.3), which leaves them out for short blocks (clause
+        // 2.4.3.4.10.1).
+        if block_type != BlockType::Short {
+            self.reduce_aliasing(&mut xr);
+        }
         xr
+    }
+
+    /// The windowed MDCT of one subband's block of 36 samples, with the
+    /// lines of the three short windows one after the other for a short
+    /// block.
+    fn mdct(&self, block: &[f64; LONG_BLOCK], block_type: BlockType) -> [f64; SUBBAND_SAMPLES] {
+        let transform = |kernel: &[f64], samples: &[f64], gain: f64| {
+            kernel.iter().zip(samples).map(|(m, x)| m * x).sum::<f64>() / gain
+        };
+        let long = match block_type {
+            BlockType::Normal => &self.long_mdct[0],
+            BlockType::Start => &self.long_mdct[1],
+            BlockType::Stop => &self.long_mdct[2],
+            BlockType::Short => {
+                let mut lines = [0.0; SUBBAND_SAMPLES];
+                for (window, start) in SHORT_BLOCK_STARTS.into_iter().enumerate() {
+                    let samples = &block[start..start + SHORT_BLOCK];
+                    for (k, kernel) in self.short_mdct.iter().enumerate() {
+                        lines[SHORT_LINES * window + k] =
+                            transform(kernel, samples, SHORT_BLOCK_GAIN);
+                    }
+                }
+                return lines;
+            }
+        };
+        long.map(|kernel| transform(&kernel, block, LONG_BLOCK_GAIN))
     }
 
     /// One pass of figure C.4: shifts in 32 samples, oldest first, and returns
@@ -165,6 +214,41 @@ impl Filterbank {
     }
 }
 
+/// The window of a long block of `block_type` at sample `k` of 36 (clause
+/// C.1.5.3.3).
+fn long_window(block_type: BlockType, k: usize) -> f64 {
+    let normal = (PI / 36.0 * (k as f64 + 0.5)).sin();
+    match (block_type, k) {
+        (BlockType::Normal, _) => normal,
+        (BlockType::Start, 0..18) | (BlockType::Stop, 18..) => normal,
+        (BlockType::Start, 18..24) | (BlockType::Stop, 12..18) => 1.0,
+        (BlockType::Start, 24..30) => short_window(k - 18),
+        (BlockType::Stop, 6..12) => short_window(k - 6),
+        (BlockType::Start | BlockType::Stop, _) => 0.0,
+        (BlockType::Short, _) => unreachable!("short blocks have three short windows"),
+    }
+}
+
+/// The window of a short block at sample `k` of 12 (clause C.1.5.3.3).
+fn short_window(k: usize) -> f64 {
+    (PI / 12.0 * (k as f64 + 0.5)).sin()
+}
+
+/// The MDCT of clause C.1.5.3.3 for `n` windowed samples, as a matrix
+/// indexed `[i][k]` with `window(k)` folded in.
+fn mdct_kernel<const N: usize, const LINES: usize>(
+    window: impl Fn(usize) -> f64,
+) -> [[f64; N]; LINES] {
+    let n = N as f64;
+    std::array::from_fn(|i| {
+        std::array::from_fn(|k| {
+            let kernel =
+                (PI / (2.0 * n) * (2.0 * k as f64 + 1.0 + n / 2.0) * (2.0 * i as f64 + 1.0)).cos();
+            window(k) * kernel
+        })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,25 +275,52 @@ mod tests {
         }
     }
 
-    /// The decoder's long-block IMDCT, windowing and overlap-add (clauses
-    /// 2.4.3.4.10.2 to 2.4.3.4.10.4) for one subband, written out from the
-    /// formulas to check the encoder's MDCT against.
+    /// The decoder's IMDCT, windowing and overlap-add (clauses 2.4.3.4.10.2
+    /// to 2.4.3.4.10.4) for one subband, written out from the formulas to
+    /// check the encoder's MDCT against.
     fn decoder_imdct(
         lines: &[f64; SUBBAND_SAMPLES],
+        block_type: BlockType,
         overlap: &mut [f64; SUBBAND_SAMPLES],
     ) -> [f64; SUBBAND_SAMPLES] {
-        let n = LONG_BLOCK as f64;
-        let mut z = [0.0; LONG_BLOCK];
-        for (i, z) in z.iter_mut().enumerate() {
-            let x: f64 = lines
-                .iter()
+        let imdct = |x: &[f64], n: usize, i: usize| -> f64 {
+            let n = n as f64;
+            x.iter()
                 .enumerate()
                 .map(|(k, &x)| {
                     x * (PI / (2.0 * n) * (2.0 * i as f64 + 1.0 + n / 2.0) * (2.0 * k as f64 + 1.0))
                         .cos()
                 })
-                .sum();
-            *z = x * (PI / 36.0 * (i as f64 + 0.5)).sin();
+                .sum()
+        };
+        let sine = |n: f64, i: f64| (PI / n * (i + 0.5)).sin();
+        let mut z = [0.0; LONG_BLOCK];
+        if block_type == BlockType::Short {
+            // Each short block j is windowed and placed at 6 + 6 j.
+            //
+            // Spec reading: clause 2.4.3.4.10.3 windows the short blocks
+            // y(j) for j = 0 to 2, but its concatenation names them y(1) to
+            // y(3). They are read as the same three blocks in order: the
+            // offsets of the concatenation, i - 6, i - 12 and i - 18, are
+            // those of the encoder's short blocks 0 to 2 (clause C.1.5.3.3).
+            for j in 0..3 {
+                for i in 0..12 {
+                    let y = imdct(&lines[6 * j..6 * j + 6], 12, i) * sine(12.0, i as f64);
+                    z[6 + 6 * j + i] += y;
+                }
+            }
+        } else {
+            for (i, z) in z.iter_mut().enumerate() {
+                let x = imdct(lines, 36, i);
+                let fi = i as f64;
+                *z = x * match (block_type, i) {
+                    (BlockType::Start, 18..=23) | (BlockType::Stop, 12..=17) => 1.0,
+                    (BlockType::Start, 24..=29) => sine(12.0, fi - 18.0),
+                    (BlockType::Start, 30..=35) | (BlockType::Stop, 0..=5) => 0.0,
+                    (BlockType::Stop, 6..=11) => sine(12.0, fi - 6.0),
+                    _ => sine(36.0, fi),
+                };
+            }
         }
         let mut out = [0.0; SUBBAND_SAMPLES];
         for i in 0..SUBBAND_SAMPLES {
@@ -219,34 +330,90 @@ mod tests {
         out
     }
 
+    /// The encoder's MDCT for every block type inverts through the decoder's
+    /// IMDCT in every sequence of block types that figure C.7 allows.
     #[test]
     fn mdct_inverts_through_the_decoder_imdct() {
+        use BlockType::*;
+        let types = [
+            Normal, Normal, Start, Short, Short, Stop, Normal, Start, Short, Stop, Start, Short,
+            Stop, Normal,
+        ];
         let filterbank = Filterbank::new();
-        let signal: Vec<f64> = (0..SUBBAND_SAMPLES * 6)
+        let signal: Vec<f64> = (0..SUBBAND_SAMPLES * types.len())
             .map(|t| ((t * 7919) % 101) as f64 / 50.0 - 1.0)
             .collect();
         let mut overlap = [0.0; SUBBAND_SAMPLES];
         let mut previous = [0.0; SUBBAND_SAMPLES];
-        for (g, current) in signal.chunks_exact(SUBBAND_SAMPLES).enumerate() {
-            let block = previous.iter().chain(current);
-            let mut lines = [0.0; SUBBAND_SAMPLES];
-            for (line, kernel) in lines.iter_mut().zip(filterbank.mdct.iter()) {
-                *line = kernel
-                    .iter()
-                    .zip(block.clone())
-                    .map(|(m, x)| m * x)
-                    .sum::<f64>()
-                    / LONG_BLOCK_GAIN;
-            }
-            let out = decoder_imdct(&lines, &mut overlap);
+        for (g, (current, &block_type)) in
+            signal.chunks_exact(SUBBAND_SAMPLES).zip(&types).enumerate()
+        {
+            let mut block = [0.0; LONG_BLOCK];
+            block[..SUBBAND_SAMPLES].copy_from_slice(&previous);
+            block[SUBBAND_SAMPLES..].copy_from_slice(current);
+            let lines = filterbank.mdct(&block, block_type);
+            let out = decoder_imdct(&lines, block_type, &mut overlap);
             // Output g restores input g - 1, the first half of block g.
             if g > 0 {
                 let expected = &signal[SUBBAND_SAMPLES * (g - 1)..][..SUBBAND_SAMPLES];
                 for (o, e) in out.iter().zip(expected) {
-                    assert!((o - e).abs() < 1e-12, "granule {g}: {o} != {e}");
+                    assert!(
+                        (o - e).abs() < 1e-12,
+                        "granule {g} ({block_type:?}): {o} != {e}"
+                    );
                 }
             }
             previous.copy_from_slice(current);
+        }
+    }
+
+    /// The three short windows follow each other in time, and their lines
+    /// lie one window after the other: a click at subband sample 27 of the
+    /// block lies only in the last short window (samples 18 to 29).
+    #[test]
+    fn short_windows_lie_in_time_order() {
+        let filterbank = Filterbank::new();
+        let mut block = [0.0; LONG_BLOCK];
+        block[27] = 1.0;
+        let lines = filterbank.mdct(&block, BlockType::Short);
+        assert!(
+            lines[..2 * SHORT_LINES].iter().all(|&x| x == 0.0),
+            "{lines:?}"
+        );
+        assert!(
+            lines[2 * SHORT_LINES..].iter().any(|&x| x != 0.0),
+            "{lines:?}"
+        );
+    }
+
+    /// A granule's lines are the MDCT of each subband's block, with the
+    /// aliasing butterflies applied to every block type but short.
+    #[test]
+    fn short_blocks_skip_the_butterflies() {
+        let pcm = |g: usize| -> [f64; GRANULE_LINES] {
+            std::array::from_fn(|t| (((g * GRANULE_LINES + t) * 7919) % 101) as f64 / 101.0 - 0.5)
+        };
+        for block_type in [
+            BlockType::Normal,
+            BlockType::Start,
+            BlockType::Short,
+            BlockType::Stop,
+        ] {
+            let mut filterbank = Filterbank::new();
+            filterbank.granule(&pcm(0), BlockType::Normal);
+            let previous = filterbank.previous;
+            let xr = filterbank.granule(&pcm(1), block_type);
+            let mut expected = [0.0; GRANULE_LINES];
+            for (subband, lines) in expected.chunks_exact_mut(SUBBAND_SAMPLES).enumerate() {
+                let mut block = [0.0; LONG_BLOCK];
+                block[..SUBBAND_SAMPLES].copy_from_slice(&previous[subband]);
+                block[SUBBAND_SAMPLES..].copy_from_slice(&filterbank.previous[subband]);
+                lines.copy_from_slice(&filterbank.mdct(&block, block_type));
+            }
+            if block_type != BlockType::Short {
+                filterbank.reduce_aliasing(&mut expected);
+            }
+            assert_eq!(xr, expected, "{block_type:?}");
         }
     }
 
@@ -283,7 +450,7 @@ mod tests {
                 let pcm = std::array::from_fn(|t| {
                     (2.0 * PI * frequency * (GRANULE_LINES * g + t) as f64).sin() * 0.5
                 });
-                let xr = filterbank.granule(&pcm);
+                let xr = filterbank.granule(&pcm, BlockType::Normal);
                 if g >= 3 {
                     for (sb, lines) in xr.chunks_exact(SUBBAND_SAMPLES).enumerate() {
                         energy[sb] += lines.iter().map(|x| x * x).sum::<f64>();

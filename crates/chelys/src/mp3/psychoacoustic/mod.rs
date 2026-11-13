@@ -649,7 +649,7 @@ mod tests {
                         0.0
                     }
                 });
-                xr = filterbank.granule(&pcm);
+                xr = filterbank.granule(&pcm, crate::mp3::BlockType::Normal);
             }
             xr.iter().map(|x| x * x).sum::<f64>()
         };

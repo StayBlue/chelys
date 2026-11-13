@@ -28,6 +28,16 @@ pub const SAMPLES_PER_FRAME: usize = 1152;
 /// Frequency lines in a granule (clause 2.1.70).
 pub const GRANULE_LINES: usize = 576;
 
+/// The window and transform of a granule's block (clause C.1.5.3.3, figure
+/// C.7): `block_type` 0 to 3 of clause 2.4.2.7.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlockType {
+    Normal,
+    Start,
+    Short,
+    Stop,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StreamConfig {
     pub bitrate: Bitrate,
@@ -371,7 +381,7 @@ fn encode_filtered(
             let mut granule = Vec::with_capacity(channels.len());
             for (channel, (pcm, filterbank)) in channels.iter().zip(&mut filterbanks).enumerate() {
                 let pcm = std::array::from_fn(|t| pcm.get(offset + t).copied().unwrap_or(0.0));
-                let xr = filterbank.granule(&pcm);
+                let xr = filterbank.granule(&pcm, BlockType::Normal);
                 let quantized = quantize(channel, &pcm, &xr, mean_bits, &reservoir);
                 reservoir.granule_done(mean_bits, quantized.bit_len(fs));
                 granule.push(quantized);
