@@ -192,6 +192,14 @@ impl IntensityPositions {
     /// share the position of the highest band, which is found from the
     /// energies of that band's lines and theirs together.
     ///
+    /// Settled by decoding with ffmpeg (black box): at 64 kbit/s and
+    /// 44.1 kHz, an 18 kHz tone with the right channel at half the left
+    /// decodes at 0.0948 and 0.0547 for the 0.0951 and 0.0549 its position
+    /// gives. With the highest band's position found from that band's lines
+    /// alone, the left channel decodes at 0.0800: ffmpeg splits the lines
+    /// above the highest band by its position. The conformance test
+    /// `intensity_stereo_keeps_the_level_of_each_channel` fails then.
+    ///
     /// # Panics
     ///
     /// If `bound` is not a long scalefactor band. Short blocks are not coded
@@ -302,6 +310,13 @@ impl IntensityPositions {
     /// band is taken to be decoded as though outside it, in MS stereo, as
     /// its middle channel would otherwise be decoded as the left channel
     /// alone.
+    ///
+    /// Settled by decoding with ffmpeg (black box): in MS and intensity
+    /// stereo, with the side channel zero below the bound and so every band
+    /// there marked, a 440 Hz tone the same in both channels at 0.2 decodes
+    /// at 0.1997 in each, where decoding the marked bands in left/right
+    /// stereo would give 0.283 in the left and nothing in the right. The
+    /// conformance test is `intensity_stereo_keeps_the_level_of_each_channel`.
     ///
     /// # Panics
     ///

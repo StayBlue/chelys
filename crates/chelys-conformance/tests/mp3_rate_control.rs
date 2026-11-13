@@ -407,6 +407,11 @@ fn amplitude(samples: &[f32], channel: usize, frequency: f64) -> f64 {
 /// the low tone is coded in the middle channel alone.
 ///
 /// Without intensity stereo allowed, no frame is coded in it.
+///
+/// This is the evidence for decoding the marked bands of the side channel
+/// in MS stereo, and for the position of the lines above the highest band,
+/// which the intensity stereo positions mark as settled by decoding with
+/// ffmpeg.
 #[test]
 fn intensity_stereo_keeps_the_level_of_each_channel() {
     let fs = SamplingFrequency::Hz44100;
