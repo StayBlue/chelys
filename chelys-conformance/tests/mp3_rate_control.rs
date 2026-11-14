@@ -94,7 +94,9 @@ fn quality_rises_with_the_bitrate_at_the_lower_sampling_frequencies() {
 }
 
 /// Full-scale white noise is the hardest signal to fit; at the lowest bitrate
-/// every granule must still squeeze into its share of the frame.
+/// every granule must still squeeze into its share of the frame. That is 32
+/// kbit/s in ISO/IEC 11172-3 and 8 kbit/s in ISO/IEC 13818-3, where a stereo
+/// frame at 24 kHz with an error check leaves 1 byte for the main data.
 #[test]
 fn loud_noise_fits_at_the_lowest_bitrate() {
     let mut state = 0x1234_5678u32;
@@ -107,10 +109,27 @@ fn loud_noise_fits_at_the_lowest_bitrate() {
     let left: Vec<f64> = (0..48_000).map(|_| noise()).collect();
     let right: Vec<f64> = (0..48_000).map(|_| noise()).collect();
     for fs in SamplingFrequency::ALL {
-        let stream = encode_pcm(&config(32, fs, Mode::Stereo), &[&left, &right]);
-        let decoded = ffmpeg::decode_mp3(&stream);
-        assert_eq!(decoded.diagnostics, "", "{fs:?}");
-        assert!(decoded.samples.iter().any(|&s| s != 0.0));
+        for crc_protected in [false, true] {
+            let config = StreamConfig {
+                bitrate: Bitrate::all(fs.version()).next().unwrap(),
+                sampling_frequency: fs,
+                mode: Mode::Stereo,
+                crc_protected,
+            };
+            let stream = encode_pcm(&config, &[&left, &right]);
+            let decoded = ffmpeg::decode_mp3(&stream);
+            let case = format!("{fs:?}, error check {crc_protected}");
+            assert_eq!(decoded.diagnostics, "", "{case}");
+            for channel in 0..2 {
+                assert!(
+                    decoded.samples[channel..]
+                        .iter()
+                        .step_by(2)
+                        .any(|&s| s != 0.0),
+                    "{case}: channel {channel} decodes to silence"
+                );
+            }
+        }
     }
 }
 
