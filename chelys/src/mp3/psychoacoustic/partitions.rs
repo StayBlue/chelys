@@ -11,14 +11,13 @@
 //! use it. Their numbering and layout are checked at compile time.
 //!
 //! Spec gap: neither standard nor US patent 6,185,539 B1 has tables for
-//! MPEG-2.5. Each of its sampling frequencies uses the tables of the
-//! frequency of ISO/IEC 13818-3 with the same `sampling_frequency` code,
-//! twice as high: 22.05 kHz for 11.025 kHz, 24 kHz for 12 kHz and 16 kHz
-//! for 8 kHz. Their partitions cover the same share of the spectrum, but
-//! their Bark values, thresholds in quiet and `minval` are those of
-//! frequencies twice as high as the lines'. As the patent changes the bands
-//! of 8 kHz, its conversion to scalefactor bands is computed (see
-//! [`weights_by_frequency`]).
+//! MPEG-2.5. Its sampling frequencies use the tables of 16 kHz, the lowest
+//! of ISO/IEC 13818-3, whose scalefactor bands 11.025 and 12 kHz share (see
+//! [`scalefactor_bands::long_bands`]). Their partitions cover the same share
+//! of the spectrum, but their Bark values, thresholds in quiet and `minval`
+//! are those of frequencies 1.33 to 2 times as high as the lines'. As the
+//! patent changes the bands of 8 kHz, its conversion to scalefactor bands is
+//! computed (see [`weights_by_frequency`]).
 
 use std::sync::LazyLock;
 
@@ -109,9 +108,10 @@ pub fn partitions(sampling_frequency: SamplingFrequency) -> &'static [Partition]
         SamplingFrequency::Hz32000 => &PARTITIONS_32000,
         SamplingFrequency::Hz24000 => &PARTITIONS_24000,
         SamplingFrequency::Hz22050 => &PARTITIONS_22050,
-        SamplingFrequency::Hz16000 | SamplingFrequency::Hz8000 => &PARTITIONS_16000,
-        SamplingFrequency::Hz11025 => &PARTITIONS_22050,
-        SamplingFrequency::Hz12000 => &PARTITIONS_24000,
+        SamplingFrequency::Hz16000
+        | SamplingFrequency::Hz11025
+        | SamplingFrequency::Hz12000
+        | SamplingFrequency::Hz8000 => &PARTITIONS_16000,
     }
 }
 
@@ -122,9 +122,9 @@ pub fn band_weights(sampling_frequency: SamplingFrequency) -> &'static [BandWeig
         SamplingFrequency::Hz32000 => &BANDS_32000,
         SamplingFrequency::Hz24000 => &BANDS_24000,
         SamplingFrequency::Hz22050 => &BANDS_22050,
-        SamplingFrequency::Hz16000 => &BANDS_16000,
-        SamplingFrequency::Hz11025 => &BANDS_22050,
-        SamplingFrequency::Hz12000 => &BANDS_24000,
+        SamplingFrequency::Hz16000 | SamplingFrequency::Hz11025 | SamplingFrequency::Hz12000 => {
+            &BANDS_16000
+        }
         SamplingFrequency::Hz8000 => &BANDS_8000,
     }
 }
@@ -146,9 +146,10 @@ pub fn short_partitions(sampling_frequency: SamplingFrequency) -> &'static [Shor
         SamplingFrequency::Hz32000 => &SHORT_PARTITIONS_32000,
         SamplingFrequency::Hz24000 => &SHORT_PARTITIONS_24000,
         SamplingFrequency::Hz22050 => &SHORT_PARTITIONS_22050,
-        SamplingFrequency::Hz16000 | SamplingFrequency::Hz8000 => &SHORT_PARTITIONS_16000,
-        SamplingFrequency::Hz11025 => &SHORT_PARTITIONS_22050,
-        SamplingFrequency::Hz12000 => &SHORT_PARTITIONS_24000,
+        SamplingFrequency::Hz16000
+        | SamplingFrequency::Hz11025
+        | SamplingFrequency::Hz12000
+        | SamplingFrequency::Hz8000 => &SHORT_PARTITIONS_16000,
     }
 }
 
@@ -161,9 +162,9 @@ pub fn short_band_weights(
         SamplingFrequency::Hz32000 => &SHORT_BANDS_32000,
         SamplingFrequency::Hz24000 => &SHORT_BANDS_24000,
         SamplingFrequency::Hz22050 => &SHORT_BANDS_22050,
-        SamplingFrequency::Hz16000 => &SHORT_BANDS_16000,
-        SamplingFrequency::Hz11025 => &SHORT_BANDS_22050,
-        SamplingFrequency::Hz12000 => &SHORT_BANDS_24000,
+        SamplingFrequency::Hz16000 | SamplingFrequency::Hz11025 | SamplingFrequency::Hz12000 => {
+            &SHORT_BANDS_16000
+        }
         SamplingFrequency::Hz8000 => &SHORT_BANDS_8000,
     }
 }

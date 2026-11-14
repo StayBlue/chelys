@@ -39,21 +39,20 @@ const SHORT_WINDOW_LINES: usize = GRANULE_LINES / SHORT_WINDOWS;
 /// The bands for long windows (block types 0, 1 and 3).
 ///
 /// Spec gap: US 6,185,539 B1 gives tables for MPEG-2.5 at 8 kHz alone. At
-/// 11.025 and 12 kHz, as the patent leaves the bitstream "in all other
-/// respects" as ISO/IEC 13818-3 has it (column 3), the bands are those of
-/// the frequency of ISO/IEC 13818-3 that has the same `sampling_frequency`
-/// code (see `SamplingFrequency::code`), 22.05 and 24 kHz. The same holds
-/// for [`short_bands`].
+/// 11.025 and 12 kHz the bands are those of 16 kHz, the lowest frequency of
+/// ISO/IEC 13818-3, rather than those of 22.05 and 24 kHz, which share their
+/// `sampling_frequency` codes (see `SamplingFrequency::code`). The same
+/// holds for [`short_bands`].
 pub fn long_bands(sampling_frequency: SamplingFrequency) -> &'static [Band; LONG_BANDS] {
     match sampling_frequency {
         SamplingFrequency::Hz32000 => &LONG_32000,
         SamplingFrequency::Hz44100 => &LONG_44100,
         SamplingFrequency::Hz48000 => &LONG_48000,
-        SamplingFrequency::Hz16000 => &LONG_16000,
+        SamplingFrequency::Hz16000 | SamplingFrequency::Hz11025 | SamplingFrequency::Hz12000 => {
+            &LONG_16000
+        }
         SamplingFrequency::Hz22050 => &LONG_22050,
         SamplingFrequency::Hz24000 => &LONG_24000,
-        SamplingFrequency::Hz11025 => &LONG_22050,
-        SamplingFrequency::Hz12000 => &LONG_24000,
         SamplingFrequency::Hz8000 => &LONG_8000,
     }
 }
@@ -64,11 +63,11 @@ pub fn short_bands(sampling_frequency: SamplingFrequency) -> &'static [Band; SHO
         SamplingFrequency::Hz32000 => &SHORT_32000,
         SamplingFrequency::Hz44100 => &SHORT_44100,
         SamplingFrequency::Hz48000 => &SHORT_48000,
-        SamplingFrequency::Hz16000 => &SHORT_16000,
+        SamplingFrequency::Hz16000 | SamplingFrequency::Hz11025 | SamplingFrequency::Hz12000 => {
+            &SHORT_16000
+        }
         SamplingFrequency::Hz22050 => &SHORT_22050,
         SamplingFrequency::Hz24000 => &SHORT_24000,
-        SamplingFrequency::Hz11025 => &SHORT_22050,
-        SamplingFrequency::Hz12000 => &SHORT_24000,
         SamplingFrequency::Hz8000 => &SHORT_8000,
     }
 }
@@ -657,7 +656,7 @@ mod tests {
         assert_eq!(ends(SamplingFrequency::Hz22050), (522, 174));
         assert_eq!(ends(SamplingFrequency::Hz24000), (540, 180));
         assert_eq!(ends(SamplingFrequency::Hz11025), (522, 174));
-        assert_eq!(ends(SamplingFrequency::Hz12000), (540, 180));
+        assert_eq!(ends(SamplingFrequency::Hz12000), (522, 174));
         assert_eq!(ends(SamplingFrequency::Hz8000), (574, 166));
     }
 
