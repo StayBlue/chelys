@@ -613,6 +613,15 @@ fn intensity_stereo_keeps_the_level_of_each_channel() {
 /// a hundred dB down. So the frames are coded in intensity stereo, most of
 /// them from band 18, and every tone keeps its level.
 ///
+/// The same at 16 kHz and 40 kbit/s and at 24 kHz and 48 kbit/s, with the
+/// tones in the same scalefactor bands (Table B.2 of ISO/IEC 13818-3), and
+/// away from the edges of the polyphase subbands, but for the last case:
+/// there the filterbank leaves nothing in the band below the highest bound,
+/// which would need marking, and nearly every frame is coded in MS stereo
+/// alone. (At 16 kHz and 32 kbit/s the right channel's low tone, below
+/// every bound, loses up to a fifth of its level to the bitrate; in
+/// left/right stereo the tones above lose up to a third.)
+///
 /// Each stream is decoded with ffmpeg, mpg123 and LAME. This is the evidence
 /// for the position of the lines above the highest band and the scaling of
 /// the sum at the lower sampling frequencies, and, with
@@ -621,78 +630,98 @@ fn intensity_stereo_keeps_the_level_of_each_channel() {
 /// settled by decoding with ffmpeg, mpg123 and LAME.
 #[test]
 fn intensity_stereo_keeps_the_level_of_each_channel_at_the_lower_sampling_frequencies() {
-    let fs = SamplingFrequency::Hz22050;
-    let hz = 22_050.0;
-    let tones = |levels: &[(f64, f64, f64)], channel: usize| -> Vec<f64> {
-        (0..2 * 22_050)
-            .map(|t| {
-                (levels.iter())
-                    .map(|&(f, l, r)| [l, r][channel] * (TAU * f * t as f64 / hz).sin())
-                    .sum()
-            })
-            .collect()
-    };
-    // The low tone, and a tone in the band below each bound: bands 9, 13,
-    // 15 and 17, below bands 10, 14, 16 and 18.
-    let below = |right: f64| {
-        [
-            (440.0, 0.2, 0.2),
-            (1_400.0, 0.1, right),
-            (2_900.0, 0.1, right),
-            (4_200.0, 0.1, right),
-            (6_000.0, 0.1, right),
-        ]
-    };
-    let panned_top = [
-        below(0.05).as_slice(),
-        &[(8_000.0, 0.2, 0.1), (10_500.0, 0.1, 0.05)],
-    ]
-    .concat();
-    let alike_top = [
-        below(0.05).as_slice(),
-        &[
-            (7_000.0, 0.05, 0.05),
-            (8_000.0, 0.05, 0.05),
-            (10_500.0, 0.05, 0.05),
-        ],
-    ]
-    .concat();
-    let alike_below = [
-        below(0.1).as_slice(),
-        &[(8_000.0, 0.2, 0.1), (10_500.0, 0.1, 0.05)],
-    ]
-    .concat();
+    // The tones in bands 9, 13, 15 and 17, below the bounds, bands 10, 14,
+    // 16 and 18; in bands 18 and 19; and above band 20, the highest.
     let cases = [
-        (&panned_top, false),
-        (&panned_top, true),
-        (&alike_top, false),
-        (&alike_top, true),
-        (&alike_below, true),
+        (
+            SamplingFrequency::Hz22050,
+            48,
+            [1_400.0, 2_900.0, 4_200.0, 6_000.0],
+            [7_000.0, 8_000.0, 10_500.0],
+        ),
+        (
+            SamplingFrequency::Hz16000,
+            40,
+            [1_050.0, 2_150.0, 3_050.0, 4_300.0],
+            [5_100.0, 6_100.0, 7_600.0],
+        ),
+        (
+            SamplingFrequency::Hz24000,
+            48,
+            [1_550.0, 3_100.0, 4_400.0, 6_300.0],
+            [7_600.0, 9_100.0, 11_450.0],
+        ),
     ];
-    for (levels, ms_stereo) in cases {
-        let (left, right) = (tones(levels, 0), tones(levels, 1));
-        let mode = Mode::JointStereo {
-            intensity_stereo: true,
-            ms_stereo,
+    for (fs, kbps, below_bounds, [band_18, band_19, above]) in cases {
+        let hz = f64::from(fs.hz());
+        let tones = |levels: &[(f64, f64, f64)], channel: usize| -> Vec<f64> {
+            (0..2 * fs.hz() as usize)
+                .map(|t| {
+                    (levels.iter())
+                        .map(|&(f, l, r)| [l, r][channel] * (TAU * f * t as f64 / hz).sin())
+                        .sum()
+                })
+                .collect()
         };
-        let stream = encode_pcm(&config(48, fs, mode), &[&left, &right]);
-        let intensity = intensity_stereo_frames(&stream);
-        let count = intensity.iter().filter(|&&on| on).count();
-        assert!(
-            count > intensity.len() * 9 / 10,
-            "MS {ms_stereo}: {intensity:?}"
-        );
-        for Decoder { name, decode } in DECODERS {
-            let decoded = decode(&stream);
-            assert_eq!(decoded.diagnostics, "", "{name}, MS {ms_stereo}");
-            for &(frequency, left_level, right_level) in levels {
-                for (channel, level) in [(0, left_level), (1, right_level)] {
-                    let decoded = amplitude(&decoded.samples, hz, channel, frequency);
-                    assert!(
-                        (decoded / level - 1.0).abs() < 0.1,
-                        "{name}, MS {ms_stereo}, {frequency} Hz, channel {channel}: \
-                         {decoded:.4} for {level:.4}"
-                    );
+        let below = |right: f64| {
+            [(440.0, 0.2, 0.2)]
+                .into_iter()
+                .chain(below_bounds.map(|f| (f, 0.1, right)))
+                .collect::<Vec<_>>()
+        };
+        let panned_top = [
+            below(0.05).as_slice(),
+            &[(band_19, 0.2, 0.1), (above, 0.1, 0.05)],
+        ]
+        .concat();
+        let alike_top = [
+            below(0.05).as_slice(),
+            &[
+                (band_18, 0.05, 0.05),
+                (band_19, 0.05, 0.05),
+                (above, 0.05, 0.05),
+            ],
+        ]
+        .concat();
+        let alike_below = [
+            below(0.1).as_slice(),
+            &[(band_19, 0.2, 0.1), (above, 0.1, 0.05)],
+        ]
+        .concat();
+        let mut cases = vec![
+            (&panned_top, false),
+            (&panned_top, true),
+            (&alike_top, false),
+            (&alike_top, true),
+        ];
+        if fs == SamplingFrequency::Hz22050 {
+            cases.push((&alike_below, true));
+        }
+        for (levels, ms_stereo) in cases {
+            let (left, right) = (tones(levels, 0), tones(levels, 1));
+            let mode = Mode::JointStereo {
+                intensity_stereo: true,
+                ms_stereo,
+            };
+            let stream = encode_pcm(&config(kbps, fs, mode), &[&left, &right]);
+            let intensity = intensity_stereo_frames(&stream);
+            let count = intensity.iter().filter(|&&on| on).count();
+            assert!(
+                count > intensity.len() * 9 / 10,
+                "{fs:?}, MS {ms_stereo}: {intensity:?}"
+            );
+            for Decoder { name, decode } in DECODERS {
+                let decoded = decode(&stream);
+                assert_eq!(decoded.diagnostics, "", "{name}, {fs:?}, MS {ms_stereo}");
+                for &(frequency, left_level, right_level) in levels {
+                    for (channel, level) in [(0, left_level), (1, right_level)] {
+                        let decoded = amplitude(&decoded.samples, hz, channel, frequency);
+                        assert!(
+                            (decoded / level - 1.0).abs() < 0.1,
+                            "{name}, {fs:?}, MS {ms_stereo}, {frequency} Hz, channel {channel}: \
+                             {decoded:.4} for {level:.4}"
+                        );
+                    }
                 }
             }
         }

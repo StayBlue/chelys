@@ -45,8 +45,11 @@ enum Reading {
 
 /// The right channel, all zero; in intensity stereo from `bound` if given,
 /// with `positions` from it and every band below it marked.
-fn right_channel(intensity: Option<(usize, [u8; LONG_BANDS])>) -> QuantizedGranule {
-    let mut right = QuantizedGranule::new(0, [0; GRANULE_LINES], BlockType::Normal, FS);
+fn right_channel(
+    fs: SamplingFrequency,
+    intensity: Option<(usize, [u8; LONG_BANDS])>,
+) -> QuantizedGranule {
+    let mut right = QuantizedGranule::new(0, [0; GRANULE_LINES], BlockType::Normal, fs);
     if let Some((bound, positions)) = intensity {
         right.scalefactors.values_mut()[bound..].copy_from_slice(&positions[bound..]);
         right.scalefactors.intensity = Some(ZeroPart {
@@ -59,15 +62,20 @@ fn right_channel(intensity: Option<(usize, [u8; LONG_BANDS])>) -> QuantizedGranu
 
 /// A stream of the left channel's single line in long scalefactor band
 /// `band`, in `mode`, with the right channel of [`right_channel`].
-fn stream(band: usize, mode: Mode, intensity: Option<(usize, [u8; LONG_BANDS])>) -> Vec<u8> {
-    let line = scalefactor_bands::long_bands(FS)[band].start + 1;
+fn stream(
+    fs: SamplingFrequency,
+    band: usize,
+    mode: Mode,
+    intensity: Option<(usize, [u8; LONG_BANDS])>,
+) -> Vec<u8> {
+    let line = scalefactor_bands::long_bands(fs)[band].start + 1;
     let mut values = [0; GRANULE_LINES];
     values[line] = 1;
-    let left = QuantizedGranule::new(200, values, BlockType::Normal, FS);
-    let right = right_channel(intensity);
+    let left = QuantizedGranule::new(200, values, BlockType::Normal, fs);
+    let right = right_channel(fs, intensity);
     let config = StreamConfig {
-        bitrate: Bitrate::from_kbps(FS.version(), 160).unwrap(),
-        sampling_frequency: FS,
+        bitrate: Bitrate::from_kbps(fs.version(), 160).unwrap(),
+        sampling_frequency: fs,
         mode,
         crc_protected: false,
     };
@@ -95,14 +103,21 @@ fn levels(decoded: &Decoded) -> [f64; 2] {
 }
 
 /// How each decoder reads the value `sent` in the right channel's
-/// scalefactor of `band`, in intensity stereo from `bound` with `positions`.
-fn readings(band: usize, bound: usize, positions: [u8; LONG_BANDS], sent: u8) -> Vec<Reading> {
-    let plain = stream(band, Mode::Stereo, None);
+/// scalefactor of `band`, in intensity stereo from `bound` with `positions`,
+/// at `fs`.
+fn readings(
+    fs: SamplingFrequency,
+    band: usize,
+    bound: usize,
+    positions: [u8; LONG_BANDS],
+    sent: u8,
+) -> Vec<Reading> {
+    let plain = stream(fs, band, Mode::Stereo, None);
     let joint = Mode::JointStereo {
         intensity_stereo: true,
         ms_stereo: false,
     };
-    let intensity = stream(band, joint, Some((bound, positions)));
+    let intensity = stream(fs, band, joint, Some((bound, positions)));
     let position = Reading::Position(sent);
     let (k_l, k_r) = match sent {
         0 => (1.0, 1.0),
@@ -122,7 +137,7 @@ fn readings(band: usize, bound: usize, positions: [u8; LONG_BANDS], sent: u8) ->
             } else if near((1.0, 0.0)) {
                 Reading::Illegal
             } else {
-                panic!("{name}, band {band}, value {sent}: {left:.4} and {right:.4}")
+                panic!("{name}, {fs:?}, band {band}, value {sent}: {left:.4} and {right:.4}")
             }
         })
         .collect()
@@ -159,7 +174,7 @@ fn marks_are_read_as_illegal_in_different_fields() {
             illegal_in(mark == 7),
         ];
         assert_eq!(
-            readings(band, bound, positions, mark),
+            readings(FS, band, bound, positions, mark),
             expected,
             "mark {mark}"
         );
@@ -181,7 +196,7 @@ fn positions_7_and_16_are_read_as_illegal() {
     for (position, width) in sent {
         let mut positions = [0; LONG_BANDS];
         positions[bound..].fill(position);
-        let compress = right_channel(Some((bound, positions)))
+        let compress = right_channel(FS, Some((bound, positions)))
             .scalefactors
             .compress()
             .unwrap();
@@ -199,9 +214,70 @@ fn positions_7_and_16_are_read_as_illegal() {
             read(position == 7),
         ];
         assert_eq!(
-            readings(band, bound, positions, position),
+            readings(FS, band, bound, positions, position),
             expected,
             "position {position}"
         );
+    }
+}
+
+/// Every partition of all three ranges of `int_scalefac_compress` (clause
+/// 2.4.3.2 of ISO/IEC 13818-3), with every band in intensity stereo, from
+/// bound 0, at each of the lower sampling frequencies. In each case the
+/// positions of each partition are those of one range, and that range
+/// sends them in the fewest bits:
+///
+/// - below 180, partitions of 7, 7 and 7 bands at positions 4, 2 and 5,
+///   `slen` 3, 2 and 3: the other ranges send no bits in bands 18 to 20;
+/// - 180 to 243, partitions of 6, 6, 6 and 3 bands at positions 4, 2, 5 and
+///   0, `slen` 3, 2, 3 and 0: 48 bits, against 63 below 180, and the range
+///   from 244 cannot send 5 in its 2-bit second partition;
+/// - 244 to 255, partitions of 8, 8 and 5 bands at positions 4, 2 and 0,
+///   `slen` 3, 2 and 0: 40 bits, against 48 from 180 and 56 below 180.
+///
+/// A band in each partition decodes at its position in ffmpeg, mpg123 and
+/// LAME.
+#[test]
+fn every_range_of_int_scalefac_compress_sends_positions() {
+    // The positions of each partition, its bands, and the
+    // scalefac_compress expected: 2 * int_scalefac_compress + 1.
+    let ranges: [(&[(std::ops::Range<usize>, u8)], u16); 3] = [
+        (
+            &[(0..7, 4), (7..14, 2), (14..21, 5)],
+            scalefac_compress([3, 2, 3]),
+        ),
+        (
+            &[(0..6, 4), (6..12, 2), (12..18, 5), (18..21, 0)],
+            2 * (180 + 16 * 3 + 4 * 2 + 3) + INTENSITY_SCALE,
+        ),
+        (
+            &[(0..8, 4), (8..16, 2), (16..21, 0)],
+            2 * (244 + 3 * 3 + 2) + INTENSITY_SCALE,
+        ),
+    ];
+    for fs in [
+        SamplingFrequency::Hz16000,
+        SamplingFrequency::Hz22050,
+        SamplingFrequency::Hz24000,
+    ] {
+        for &(partitions, expected) in &ranges {
+            let mut positions = [0; LONG_BANDS];
+            for (bands, position) in partitions {
+                positions[bands.clone()].fill(*position);
+            }
+            let compress = right_channel(fs, Some((0, positions)))
+                .scalefactors
+                .compress()
+                .unwrap();
+            assert_eq!(compress, expected, "{fs:?}, {partitions:?}");
+            for (bands, position) in partitions {
+                let band = bands.start + 1;
+                assert_eq!(
+                    readings(fs, band, 0, positions, *position),
+                    vec![Reading::Position(*position); DECODERS.len()],
+                    "{fs:?}, band {band}"
+                );
+            }
+        }
     }
 }

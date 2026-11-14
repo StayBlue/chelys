@@ -273,3 +273,72 @@ fn lines_above_the_short_bands_take_the_position_of_the_highest_band() {
         }
     }
 }
+
+/// Every partition of all three ranges of `int_scalefac_compress` in short
+/// blocks (clause 2.4.3.2 of ISO/IEC 13818-3), with every band of every
+/// window in intensity stereo, at each of the lower sampling frequencies.
+/// The partitions count the scalefactors in the order sent, three to a band.
+/// In each case the positions of each partition are those of one range, and
+/// that range sends them in the fewest bits:
+///
+/// - below 180, partitions of 12, 12 and 12 at positions 4, 2 and 5 (bands
+///   0 to 3, 4 to 7 and 8 to 11), `slen` 3, 2 and 3: the other ranges send
+///   no bits in bands 10 and 11;
+/// - 180 to 243, partitions of 12, 9, 9 and 6 at positions 4, 2, 5 and 0
+///   (bands 0 to 3, 4 to 6, 7 to 9 and 10 and 11), `slen` 3, 2, 3 and 0: 81
+///   bits, against 108 below 180, and the range from 244 cannot send 5 in
+///   its 2-bit second partition;
+/// - 244 to 255, partitions of 15, 12 and 9 at positions 4, 2 and 0 (bands
+///   0 to 4, 5 to 8 and 9 to 11), `slen` 3, 2 and 0: 69 bits, against 81
+///   from 180 and 96 below 180.
+///
+/// A band in each partition, in its second window, decodes at its position
+/// in ffmpeg, mpg123 and LAME.
+#[test]
+fn every_range_of_int_scalefac_compress_sends_positions_in_short_blocks() {
+    // The positions of the bands of each partition, and the
+    // scalefac_compress expected: 2 * int_scalefac_compress + 1, with
+    // intensity_scale 1.
+    let ranges: [(&[(std::ops::Range<usize>, u8)], u16); 3] = [
+        (
+            &[(0..4, 4), (4..8, 2), (8..12, 5)],
+            2 * (36 * 3 + 6 * 2 + 3) + 1,
+        ),
+        (
+            &[(0..4, 4), (4..7, 2), (7..10, 5), (10..12, 0)],
+            2 * (180 + 16 * 3 + 4 * 2 + 3) + 1,
+        ),
+        (
+            &[(0..5, 4), (5..9, 2), (9..12, 0)],
+            2 * (244 + 3 * 3 + 2) + 1,
+        ),
+    ];
+    let zero_part = ZeroPart {
+        start: [0; SHORT_WINDOWS],
+        bound: 0,
+    };
+    for fs in [
+        SamplingFrequency::Hz16000,
+        SamplingFrequency::Hz22050,
+        SamplingFrequency::Hz24000,
+    ] {
+        for &(partitions, expected) in &ranges {
+            let mut scalefactors = [0; SCALEFACTORS];
+            for (bands, position) in partitions {
+                scalefactors[SHORT_WINDOWS * bands.start..SHORT_WINDOWS * bands.end]
+                    .fill(*position);
+            }
+            let right = right_channel(fs, None, scalefactors, zero_part);
+            let compress = right.scalefactors.compress().unwrap();
+            assert_eq!(compress, expected, "{fs:?}, {partitions:?}");
+            for (bands, position) in partitions {
+                let sfb = bands.start + 1;
+                assert_eq!(
+                    readings(fs, line(fs, sfb, 1, 1), &right),
+                    vec![Reading::Position(*position); DECODERS.len()],
+                    "{fs:?}, band {sfb}"
+                );
+            }
+        }
+    }
+}
