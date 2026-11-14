@@ -25,6 +25,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 pub struct Decoder {
     pub name: &'static str,
     pub decode: fn(&[u8]) -> Decoded,
+    /// The sampling frequency in Hz that the decoder reads from a stream.
+    pub sample_rate: fn(&[u8]) -> u32,
 }
 
 /// Every decoder that MP3 streams are checked against.
@@ -32,14 +34,17 @@ pub const DECODERS: [Decoder; 3] = [
     Decoder {
         name: "ffmpeg",
         decode: ffmpeg::decode_mp3,
+        sample_rate: |stream| ffmpeg::probe_mp3(stream).sample_rate,
     },
     Decoder {
         name: "mpg123",
         decode: mpg123::decode_mp3,
+        sample_rate: mpg123::sample_rate,
     },
     Decoder {
         name: "LAME",
         decode: lame::decode_mp3,
+        sample_rate: lame::sample_rate,
     },
 ];
 
@@ -77,6 +82,23 @@ impl Drop for TempFile {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
     }
+}
+
+/// The sampling frequency in the `fmt ` chunk of a WAV file.
+fn wav_sample_rate(wav: &[u8]) -> u32 {
+    assert!(
+        wav.starts_with(b"RIFF") && wav.get(8..12) == Some(b"WAVE"),
+        "not a WAV file"
+    );
+    let mut chunk = 12;
+    while let Some(header) = wav.get(chunk..chunk + 8) {
+        let len = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
+        if &header[..4] == b"fmt " {
+            return u32::from_le_bytes(wav[chunk + 12..chunk + 16].try_into().unwrap());
+        }
+        chunk += 8 + len + len % 2;
+    }
+    panic!("no fmt chunk in the WAV file");
 }
 
 /// Runs `command` to completion, and panics if it cannot be run or fails.

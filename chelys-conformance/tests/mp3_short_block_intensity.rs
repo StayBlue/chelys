@@ -145,7 +145,7 @@ fn readings(fs: SamplingFrequency, left_line: usize, right: &QuantizedGranule) -
     let intensity = stream(fs, left_line, Some(right));
     DECODERS
         .iter()
-        .map(|Decoder { name, decode }| {
+        .map(|Decoder { name, decode, .. }| {
             let [reference, _] = levels(&decode(&plain));
             let decoded = decode(&intensity);
             assert_eq!(decoded.diagnostics, "", "{name}");

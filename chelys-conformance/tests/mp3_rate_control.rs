@@ -248,7 +248,7 @@ fn main_data_spans_frames_after_quiet_passages() {
             deepest > main_data,
             "{sampling_frequency:?}: main_data_begin never exceeds a slot: {begins:?}"
         );
-        for Decoder { name, decode } in DECODERS {
+        for Decoder { name, decode, .. } in DECODERS {
             let decoded = decode(&stream);
             assert_eq!(decoded.diagnostics, "", "{name}, {sampling_frequency:?}");
             // Main data found in the wrong place would ruin the quiet
@@ -710,7 +710,7 @@ fn intensity_stereo_keeps_the_level_of_each_channel_at_the_lower_sampling_freque
                 count > intensity.len() * 9 / 10,
                 "{fs:?}, MS {ms_stereo}: {intensity:?}"
             );
-            for Decoder { name, decode } in DECODERS {
+            for Decoder { name, decode, .. } in DECODERS {
                 let decoded = decode(&stream);
                 assert_eq!(decoded.diagnostics, "", "{name}, {fs:?}, MS {ms_stereo}");
                 for &(frequency, left_level, right_level) in levels {
@@ -862,7 +862,7 @@ fn intensity_stereo_keeps_the_level_of_each_channel_in_short_blocks() {
             .flat_map(|(granule, _)| granule * GRANULE_LINES..(granule + 1) * GRANULE_LINES)
             .filter(|&t| t + 3 < left.len())
             .collect();
-        for Decoder { name, decode } in DECODERS {
+        for Decoder { name, decode, .. } in DECODERS {
             let decoded = decode(&stream);
             assert_eq!(decoded.diagnostics, "", "{name}");
             // The decoded `channel`, high-passed, projected on the left
