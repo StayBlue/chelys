@@ -11,13 +11,29 @@
 //! use it. Their numbering and layout are checked at compile time.
 //!
 //! Spec gap: neither standard nor US patent 6,185,539 B1 has tables for
-//! MPEG-2.5. Its sampling frequencies use the tables of 16 kHz, the lowest
-//! of ISO/IEC 13818-3, whose scalefactor bands 11.025 and 12 kHz share (see
-//! [`scalefactor_bands::long_bands`]). Their partitions cover the same share
-//! of the spectrum, but their Bark values, thresholds in quiet and `minval`
-//! are those of frequencies 1.33 to 2 times as high as the lines'. As the
-//! patent changes the bands of 8 kHz, its conversion to scalefactor bands is
-//! computed (see [`weights_by_frequency`]).
+//! MPEG-2.5. Each of its sampling frequencies is half one of ISO/IEC
+//! 13818-3: 8 kHz of 16, 11.025 of 22.05 and 12 of 24. Its tables are those
+//! of the frequency twice as high, over the frequencies the lower rate has,
+//! the same frequencies in Hz keeping the same values:
+//!
+//! - The partitions below FFT line 256, half the higher rate's Nyquist line,
+//!   are kept, each twice as wide in lines, since line `w` lies at the
+//!   frequency of line `w / 2` at the higher rate. The last is cut at line
+//!   256 and keeps its printed `bval`, which then lies a little above its
+//!   median.
+//! - `bval` and `minval`, functions of frequency, are kept as printed.
+//! - `qthr`, in the tables a per-line threshold in quiet times the width
+//!   (see the test `qthr_is_a_per_line_level_times_the_width`), keeps its
+//!   per-line level over the new width.
+//! - `norm` and the short blocks' SNR are kept as printed. `rnorm` (clause
+//!   D.2.4 f)) would follow from the changed set of partitions, but the
+//!   printed column lies 1 to 3 dB below it at the higher rate, and the
+//!   printed one keeps the threshold of noise closer to the higher rate's
+//!   for the same frequencies (see the test
+//!   `mpeg25_threshold_follows_the_rate_twice_as_high`).
+//! - The conversion to scalefactor bands is computed (see
+//!   [`weights_by_frequency`]), as the bands are not those of the higher
+//!   rate (see [`scalefactor_bands::long_bands`]).
 
 use std::sync::LazyLock;
 
@@ -108,10 +124,8 @@ pub fn partitions(sampling_frequency: SamplingFrequency) -> &'static [Partition]
         SamplingFrequency::Hz32000 => &PARTITIONS_32000,
         SamplingFrequency::Hz24000 => &PARTITIONS_24000,
         SamplingFrequency::Hz22050 => &PARTITIONS_22050,
-        SamplingFrequency::Hz16000
-        | SamplingFrequency::Hz11025
-        | SamplingFrequency::Hz12000
-        | SamplingFrequency::Hz8000 => &PARTITIONS_16000,
+        SamplingFrequency::Hz16000 => &PARTITIONS_16000,
+        _ => &mpeg25(sampling_frequency).partitions,
     }
 }
 
@@ -122,10 +136,8 @@ pub fn band_weights(sampling_frequency: SamplingFrequency) -> &'static [BandWeig
         SamplingFrequency::Hz32000 => &BANDS_32000,
         SamplingFrequency::Hz24000 => &BANDS_24000,
         SamplingFrequency::Hz22050 => &BANDS_22050,
-        SamplingFrequency::Hz16000 | SamplingFrequency::Hz11025 | SamplingFrequency::Hz12000 => {
-            &BANDS_16000
-        }
-        SamplingFrequency::Hz8000 => &BANDS_8000,
+        SamplingFrequency::Hz16000 => &BANDS_16000,
+        _ => &mpeg25(sampling_frequency).band_weights,
     }
 }
 
@@ -146,10 +158,8 @@ pub fn short_partitions(sampling_frequency: SamplingFrequency) -> &'static [Shor
         SamplingFrequency::Hz32000 => &SHORT_PARTITIONS_32000,
         SamplingFrequency::Hz24000 => &SHORT_PARTITIONS_24000,
         SamplingFrequency::Hz22050 => &SHORT_PARTITIONS_22050,
-        SamplingFrequency::Hz16000
-        | SamplingFrequency::Hz11025
-        | SamplingFrequency::Hz12000
-        | SamplingFrequency::Hz8000 => &SHORT_PARTITIONS_16000,
+        SamplingFrequency::Hz16000 => &SHORT_PARTITIONS_16000,
+        _ => &mpeg25(sampling_frequency).short_partitions,
     }
 }
 
@@ -162,31 +172,109 @@ pub fn short_band_weights(
         SamplingFrequency::Hz32000 => &SHORT_BANDS_32000,
         SamplingFrequency::Hz24000 => &SHORT_BANDS_24000,
         SamplingFrequency::Hz22050 => &SHORT_BANDS_22050,
-        SamplingFrequency::Hz16000 | SamplingFrequency::Hz11025 | SamplingFrequency::Hz12000 => {
-            &SHORT_BANDS_16000
-        }
-        SamplingFrequency::Hz8000 => &SHORT_BANDS_8000,
+        SamplingFrequency::Hz16000 => &SHORT_BANDS_16000,
+        _ => &mpeg25(sampling_frequency).short_band_weights,
     }
 }
 
-/// The conversion of the long partitions of 16 kHz to the long bands of
-/// MPEG-2.5's 8 kHz.
-static BANDS_8000: LazyLock<[BandWeights; LONG_BANDS]> = LazyLock::new(|| {
-    weights_by_frequency(
-        scalefactor_bands::long_bands(SamplingFrequency::Hz8000),
-        PARTITIONS_16000.iter().map(|p| (p.start, p.width)),
-        8.0 / 9.0,
+/// The tables of an MPEG-2.5 sampling frequency, derived from those of the
+/// frequency of ISO/IEC 13818-3 twice as high (see [`halve`]).
+struct Mpeg25Tables {
+    partitions: Vec<Partition>,
+    band_weights: [BandWeights; LONG_BANDS],
+    short_partitions: Vec<ShortPartition>,
+    short_band_weights: [BandWeights; SHORT_BANDS],
+}
+
+static MPEG25_8000: LazyLock<Mpeg25Tables> = LazyLock::new(|| {
+    Mpeg25Tables::halving(
+        SamplingFrequency::Hz8000,
+        &PARTITIONS_16000,
+        &SHORT_PARTITIONS_16000,
+    )
+});
+static MPEG25_11025: LazyLock<Mpeg25Tables> = LazyLock::new(|| {
+    Mpeg25Tables::halving(
+        SamplingFrequency::Hz11025,
+        &PARTITIONS_22050,
+        &SHORT_PARTITIONS_22050,
+    )
+});
+static MPEG25_12000: LazyLock<Mpeg25Tables> = LazyLock::new(|| {
+    Mpeg25Tables::halving(
+        SamplingFrequency::Hz12000,
+        &PARTITIONS_24000,
+        &SHORT_PARTITIONS_24000,
     )
 });
 
-/// As [`BANDS_8000`], for short blocks.
-static SHORT_BANDS_8000: LazyLock<[BandWeights; SHORT_BANDS]> = LazyLock::new(|| {
-    weights_by_frequency(
-        scalefactor_bands::short_bands(SamplingFrequency::Hz8000),
-        SHORT_PARTITIONS_16000.iter().map(|p| (p.start, p.width)),
-        2.0 / 3.0,
-    )
-});
+fn mpeg25(sampling_frequency: SamplingFrequency) -> &'static Mpeg25Tables {
+    match sampling_frequency {
+        SamplingFrequency::Hz8000 => &MPEG25_8000,
+        SamplingFrequency::Hz11025 => &MPEG25_11025,
+        SamplingFrequency::Hz12000 => &MPEG25_12000,
+        _ => panic!("{sampling_frequency:?} is not a sampling frequency of MPEG-2.5"),
+    }
+}
+
+impl Mpeg25Tables {
+    /// The tables of MPEG-2.5's `sampling_frequency` from the partitions of
+    /// the frequency twice as high, `long` and `short`.
+    fn halving(
+        sampling_frequency: SamplingFrequency,
+        long: &[Partition],
+        short: &[ShortPartition],
+    ) -> Self {
+        let halved = halve(long.iter().map(|p| (p.start, p.width)), 512);
+        let partitions: Vec<Partition> = (long.iter().zip(halved))
+            .map(|(p, (start, width))| Partition {
+                start,
+                width,
+                qthr: p.qthr / p.width as f64 * width as f64,
+                ..*p
+            })
+            .collect();
+        let halved = halve(short.iter().map(|p| (p.start, p.width)), 128);
+        let short_partitions: Vec<ShortPartition> = (short.iter().zip(halved))
+            .map(|(p, (start, width))| ShortPartition {
+                start,
+                width,
+                qthr: p.qthr / p.width as f64 * width as f64,
+                ..*p
+            })
+            .collect();
+        let band_weights = weights_by_frequency(
+            scalefactor_bands::long_bands(sampling_frequency),
+            partitions.iter().map(|p| (p.start, p.width)),
+            8.0 / 9.0,
+        );
+        let short_band_weights = weights_by_frequency(
+            scalefactor_bands::short_bands(sampling_frequency),
+            short_partitions.iter().map(|p| (p.start, p.width)),
+            2.0 / 3.0,
+        );
+        Self {
+            partitions,
+            band_weights,
+            short_partitions,
+            short_band_weights,
+        }
+    }
+}
+
+/// The partitions `(start, width)` of an FFT whose lines run up to
+/// `nyquist`, stretched over the same FFT at half the sampling frequency:
+/// those below `nyquist / 2`, the frequencies the lower rate still has,
+/// each twice as wide, the last cut at `nyquist / 2`. Line `w` at the lower
+/// rate lies at the frequency of line `w / 2` at the higher.
+fn halve(
+    partitions: impl Iterator<Item = (usize, usize)>,
+    nyquist: usize,
+) -> impl Iterator<Item = (usize, usize)> {
+    partitions
+        .take_while(move |&(start, _)| start < nyquist / 2)
+        .map(move |(start, width)| (2 * start, 2 * ((start + width).min(nyquist / 2) - start)))
+}
 
 /// Converts partitions `(start, width)` of FFT lines to `bands` of
 /// frequency lines, `fft_per_line` FFT lines to a frequency line: 512 to 576

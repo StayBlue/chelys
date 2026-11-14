@@ -123,6 +123,10 @@ pub struct Masking {
     /// The energy `r(w)^2` of each line of the long FFT below line 512, for
     /// the MS stereo decision (Annex G.2 a)).
     pub spectrum: Vec<f64>,
+    /// The threshold `thr(b)` of each threshold calculation partition of
+    /// [`partitions::partitions`] (figure C.6.b), on the scale of
+    /// [`spectrum`](Self::spectrum).
+    pub threshold: Vec<f64>,
 }
 
 impl Masking {
@@ -452,6 +456,7 @@ impl PsychoacousticModel {
             ratio: band_ratio(self.band_weights, &thr, &eb),
             perceptual_entropy,
             spectrum: spectrum.clone(),
+            threshold: thr,
         };
         let short = ShortMasking {
             ratio: r_short.map(|r| self.short_ratio(&r)),
@@ -769,6 +774,101 @@ mod tests {
         );
     }
 
+    /// One granule of steady noise below 3.2 kHz, the same at every sampling
+    /// frequency: 2000 sinusoids of random phase about 1.5 Hz apart, too
+    /// close for the FFT to resolve at any of the frequencies compared, so
+    /// that the model finds it as unpredictable at each.
+    fn noise_below_3_2_khz(fs: SamplingFrequency, granule: usize) -> [f64; GRANULE_LINES] {
+        let mut seed = 11u64;
+        let components: Vec<(f64, f64)> = (0..2000)
+            .map(|i| {
+                seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                let phase = (seed >> 11) as f64 / (1u64 << 53) as f64 * 2.0 * PI;
+                (100.0 + 3100.0 * (i as f64 + 0.5) / 2000.0, phase)
+            })
+            .collect();
+        std::array::from_fn(|t| {
+            let time = (granule * GRANULE_LINES + t) as f64 / f64::from(fs.hz());
+            (components.iter())
+                .map(|(f, phase)| 0.005 * (2.0 * PI * f * time + phase).sin())
+                .sum()
+        })
+    }
+
+    /// How far, in dB, the threshold relative to the signal at `half` lies
+    /// from that at `double`, over each whole Bark below 3.2 kHz of
+    /// `double`'s partitions and the same frequencies at `half`: the mean and
+    /// the largest distance. Each partition's threshold is spread evenly over
+    /// its lines, as clause D.2.4 k) spreads it. A Bark at a time, rather than
+    /// a partition, so that the leakage of the window, which spreads a tone
+    /// over twice as many partitions at the higher rate, evens out.
+    fn threshold_distance(
+        signal: fn(SamplingFrequency, usize) -> [f64; GRANULE_LINES],
+        half: SamplingFrequency,
+        double: SamplingFrequency,
+    ) -> (f64, f64) {
+        let lines = |fs: SamplingFrequency| {
+            let mut model = PsychoacousticModel::new(fs);
+            let masking = (0..8)
+                .map(|g| model.granule(&signal(fs, g)))
+                .last()
+                .unwrap();
+            let mut threshold = vec![0.0; LONG_FFT / 2];
+            for (p, thr) in partitions::partitions(fs).iter().zip(&masking.threshold) {
+                for line in &mut threshold[p.start..p.start + p.width] {
+                    *line = thr / p.width as f64;
+                }
+            }
+            (threshold, masking.spectrum)
+        };
+        let (half_thr, half_energy) = lines(half);
+        let (double_thr, double_energy) = lines(double);
+        let cutoff = (3200.0 / f64::from(double.hz()) * LONG_FFT as f64) as usize;
+        let partitions = partitions::partitions(double);
+        let distances: Vec<f64> = (1..25)
+            .filter_map(|bark| {
+                let in_bark: Vec<&Partition> = (partitions.iter())
+                    .filter(|p| p.bval.floor() as usize == bark && p.start + p.width <= cutoff)
+                    .collect();
+                let (first, last) = (in_bark.first()?, in_bark.last()?);
+                let end = last.start + last.width;
+                let ratio = |thr: &[f64], energy: &[f64], range: std::ops::Range<usize>| {
+                    thr[range.clone()].iter().sum::<f64>() / energy[range].iter().sum::<f64>()
+                };
+                let double = ratio(&double_thr, &double_energy, first.start..end);
+                let half = ratio(&half_thr, &half_energy, 2 * first.start..2 * end);
+                Some((10.0 * (half / double).log10()).abs())
+            })
+            .collect();
+        let mean = distances.iter().sum::<f64>() / distances.len() as f64;
+        (mean, distances.iter().copied().fold(0.0, f64::max))
+    }
+
+    /// The model hears the same noise at the same frequencies alike at an
+    /// MPEG-2.5 sampling frequency and at the frequency twice as high, whose
+    /// tables its own are derived from (see [`partitions`]): within 2.1 dB
+    /// on average over each Bark from 100 Hz to 3.2 kHz. The tables of
+    /// 16 kHz, which MPEG-2.5 used before, put every frequency 1.33 to 2
+    /// times too high and come to 2.1 to 2.4 dB; `rnorm` in place of the
+    /// printed `norm` to 2.1 to 3.4 dB, and the printed `norm` to 1.1, 1.6
+    /// and 2.0 dB at 8, 11.025 and 12 kHz.
+    ///
+    /// Tones do not show the tables' effect as well: the model's FFT, fixed
+    /// in samples, resolves them twice as finely in frequency at the lower
+    /// rate and spans twice the time, which changes both their spread over
+    /// the partitions and how predictable they are.
+    #[test]
+    fn mpeg25_threshold_follows_the_rate_twice_as_high() {
+        use SamplingFrequency::*;
+        for (half, double) in [(Hz8000, Hz16000), (Hz11025, Hz22050), (Hz12000, Hz24000)] {
+            let (mean, max) = threshold_distance(noise_below_3_2_khz, half, double);
+            assert!(
+                mean < 2.1,
+                "{half:?}: {mean:.2} dB on average, up to {max:.2} dB"
+            );
+        }
+    }
+
     /// `xmin` is the band's mean energy per line scaled by its ratio.
     #[test]
     fn allowed_distortion_scales_the_mean_energy_per_line() {
@@ -776,6 +876,7 @@ mod tests {
             ratio: [0.01; LONG_BANDS],
             perceptual_entropy: 0.0,
             spectrum: Vec::new(),
+            threshold: Vec::new(),
         };
         let mut xr = [0.0; GRANULE_LINES];
         let band = scalefactor_bands::long_bands(FS)[5];
