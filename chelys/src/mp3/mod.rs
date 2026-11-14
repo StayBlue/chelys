@@ -212,6 +212,12 @@ impl QuantizedGranule {
     /// Spec gap: Annex C does not say how to choose `subblock_gain`, which
     /// sets a coarser step for one short window. It is always 0: the outer
     /// loop's scalefactors shape the noise of each window instead.
+    ///
+    /// Spec gap: neither standard says when to set `mixed_block_flag`, which
+    /// codes the lower subbands of a short-block granule with long windows.
+    /// Annex C names it only as an input to the loops, and Annex D chooses
+    /// only the block type. It is always 0: a short-block granule is short
+    /// in every subband.
     fn window(&self) -> Window {
         let coding = &self.coding;
         let block_type = match self.block_type {
@@ -448,7 +454,8 @@ impl Encoder {
     /// A frame is coded once the granule after it has arrived, as its block
     /// type depends on whether that granule has an attack, and its bytes are
     /// final once no later frame's main data can begin in them: the bytes
-    /// the bit reservoir holds, at most 511 of main data, and the frames
+    /// the bit reservoir holds, at most 511 of main data (255 at the lower
+    /// sampling frequencies), and the frames
     /// after them stay behind until later calls.
     ///
     /// # Panics
