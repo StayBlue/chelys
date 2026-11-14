@@ -302,17 +302,42 @@ fn main_data_bits(header: &Header) -> usize {
 }
 
 /// The side information and main data of one frame of granules, one entry
-/// per channel each.
+/// per channel each, under `header`.
+///
+/// # Panics
+///
+/// If the right channel's scalefactors give a zero part
+/// ([`Scalefactors::intensity`](scalefactors::Scalefactors::intensity)) and
+/// `header` does not have intensity stereo on, or the other way round: the
+/// decoder would read its zero part, and at the lower sampling frequencies
+/// its `scalefac_compress`, otherwise than they were coded.
 fn frame_contents(
-    sampling_frequency: SamplingFrequency,
+    header: &Header,
     frame: &[Vec<QuantizedGranule>],
     main_data_begin: usize,
 ) -> (SideInfo, Vec<u8>) {
+    let sampling_frequency = header.sampling_frequency;
     let version = sampling_frequency.version();
     assert!(
         main_data_begin < 1 << version.main_data_begin_bits(),
         "main_data_begin {main_data_begin} overflows its field"
     );
+    let intensity_stereo = matches!(
+        header.mode,
+        Mode::JointStereo {
+            intensity_stereo: true,
+            ..
+        }
+    );
+    for granule in frame {
+        for (ch, channel) in granule.iter().enumerate() {
+            assert_eq!(
+                channel.scalefactors.intensity.is_some(),
+                intensity_stereo && ch == 1,
+                "only the right channel of a frame in intensity stereo has a zero part"
+            );
+        }
+    }
     let mut side_info = SideInfo {
         main_data_begin: main_data_begin as u16,
         ..SideInfo::new(version)
@@ -389,12 +414,9 @@ pub fn encode_granules(config: &StreamConfig, granules: &[Vec<QuantizedGranule>]
     let mut padding = PaddingSchedule::new(config.bitrate, config.sampling_frequency);
     let mut writer = FrameWriter::default();
     for frame in granules.chunks_exact(per_frame) {
-        let (side_info, main_data) = frame_contents(config.sampling_frequency, frame, 0);
-        writer.write(
-            &config.frame_header(padding.next_padding(), ms_stereo, intensity_stereo),
-            &side_info,
-            &main_data,
-        );
+        let header = config.frame_header(padding.next_padding(), ms_stereo, intensity_stereo);
+        let (side_info, main_data) = frame_contents(&header, frame, 0);
+        writer.write(&header, &side_info, &main_data);
     }
     writer.out
 }
@@ -1185,7 +1207,7 @@ impl<C: Coding> FrameEncoder<C> {
         let header = self
             .config
             .frame_header(padded, coded.ms_stereo, coded.intensity_stereo);
-        let (side_info, main_data) = frame_contents(fs, &coded.granules, self.main_data_begin);
+        let (side_info, main_data) = frame_contents(&header, &coded.granules, self.main_data_begin);
         self.writer.write(&header, &side_info, &main_data);
         self.main_data_begin = self.reservoir.end_frame(slot_bits - shares * mean_bits);
         self.writer.keep_unused(self.main_data_begin);
