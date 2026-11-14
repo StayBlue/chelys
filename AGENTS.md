@@ -42,6 +42,18 @@ lower sampling frequencies only), and their official corrigenda only.
 annexes.* *User, 2026-11-13: ISO/IEC 13818-3 added for the lower sampling
 frequencies; the wording was proposed by the agent and approved by the user.*
 
+## MPEG-2.5
+
+The sampling frequencies 8, 11.025 and 12 kHz ("MPEG-2.5") are not part of
+ISO/IEC 11172-3 or 13818-3. They are implemented from US patent 6,185,539 B1
+only, as an extension of ISO/IEC 13818-3, under the same clean-room rules as
+the standards; the patent is the one source added to those named under "Clean
+room". Where it leaves something open, black-box decoding with ffmpeg, mpg123
+and LAME may settle it, documented as for the standards.
+
+*User, 2026-11-13, when the patent was given: the wording was proposed by the
+agent and approved by the user.*
+
 ## Scope: PCM only
 
 The `chelys` library accepts PCM samples and nothing else. Reading WAV or any
