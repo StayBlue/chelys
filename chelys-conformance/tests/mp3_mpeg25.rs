@@ -25,6 +25,10 @@ fn config(sampling_frequency: SamplingFrequency, mode: Mode, kbps: u32) -> Strea
 
 /// Each decoder reads the sampling frequency of every MPEG-2.5 stream from
 /// its sync word and `sampling_frequency` code.
+///
+/// This is the evidence for the gap in US 6,185,539 B1 that the header marks
+/// as settled by decoding with ffmpeg, mpg123 and LAME: the
+/// `sampling_frequency` codes of MPEG-2.5.
 #[test]
 fn decoders_read_the_mpeg25_sampling_frequencies() {
     for fs in SamplingFrequency::MPEG25 {
@@ -148,6 +152,10 @@ fn decoded_widths(
 
 /// Each decoder puts the lines of every MPEG-2.5 stream in the scalefactor
 /// bands that the encoder sends them in, for long and short blocks.
+///
+/// This is the evidence for the gap in US 6,185,539 B1 that the scalefactor
+/// bands mark as settled by decoding with ffmpeg, mpg123 and LAME: the bands
+/// of 11.025 and 12 kHz.
 #[test]
 fn decoders_use_the_mpeg25_scalefactor_bands() {
     for fs in SamplingFrequency::MPEG25 {

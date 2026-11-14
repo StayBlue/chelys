@@ -43,6 +43,11 @@ const SHORT_WINDOW_LINES: usize = GRANULE_LINES / SHORT_WINDOWS;
 /// ISO/IEC 13818-3, rather than those of 22.05 and 24 kHz, which share their
 /// `sampling_frequency` codes (see `SamplingFrequency::code`). The same
 /// holds for [`short_bands`].
+///
+/// Settled by decoding with ffmpeg, mpg123 and LAME (black box): probed
+/// line by line, all three put the lines of 11.025 and 12 kHz in the bands
+/// of 16 kHz, long and short, and not in those of 22.05 and 24 kHz. The
+/// conformance test is `decoders_use_the_mpeg25_scalefactor_bands`.
 pub fn long_bands(sampling_frequency: SamplingFrequency) -> &'static [Band; LONG_BANDS] {
     match sampling_frequency {
         SamplingFrequency::Hz32000 => &LONG_32000,

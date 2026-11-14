@@ -183,6 +183,11 @@ impl SamplingFrequency {
     /// and compares its table of scalefactor bands for 8 kHz with the one
     /// for 16 kHz (column 4), so each frequency takes the code of the one of
     /// ISO/IEC 13818-3 that is twice as high.
+    ///
+    /// Settled by decoding with ffmpeg, mpg123 and LAME (black box): all
+    /// three read these codes, after the sync word "FFE" and with `ID` 0, as
+    /// 11.025, 12 and 8 kHz. The conformance test is
+    /// `decoders_read_the_mpeg25_sampling_frequencies`.
     fn code(self) -> u32 {
         match self {
             Self::Hz44100 | Self::Hz22050 | Self::Hz11025 => 0b00,
