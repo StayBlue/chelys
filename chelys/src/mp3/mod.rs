@@ -759,9 +759,10 @@ impl IntensityTry {
 /// as illegal and the others as positions; a marked band is then decoded in
 /// intensity stereo. The conformance test is
 /// `marks_are_read_as_illegal_in_different_fields`. In MS stereo, with the
-/// side channel zero below every bound, no frame is coded in intensity
-/// stereo, and all three decode every tone at its level; the conformance
-/// test is
+/// side channel all but zero below every bound, frames are coded in
+/// intensity stereo mostly from the highest bound, below which the side
+/// channel codes what is left of the tones above it, and all three decode
+/// every tone at its level; the conformance test is
 /// `intensity_stereo_keeps_the_level_of_each_channel_at_the_lower_sampling_frequencies`.
 ///
 /// The perceptual entropy each channel's bits are reckoned from stays that
