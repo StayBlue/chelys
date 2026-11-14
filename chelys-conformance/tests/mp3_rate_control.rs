@@ -164,34 +164,35 @@ fn silence_codes_to_nothing() {
     assert!(decoded.samples.iter().all(|&s| s == 0.0));
 }
 
-/// The side information of each frame of a stream with unpadded and padded
-/// frames of MPEG-1 Layer III, found from the headers (clauses 2.4.2.3 and
-/// 2.4.2.7).
-fn side_infos(stream: &[u8]) -> Vec<&[u8]> {
-    const KBPS: [u32; 15] = [
-        0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320,
-    ];
-    const HZ: [u32; 3] = [44_100, 48_000, 32_000];
+/// The side information of each frame of a stream, found from the headers
+/// (clauses 2.4.2.3 and 2.4.2.7), with whether the frame is MPEG-1.
+fn side_infos(stream: &[u8]) -> Vec<(bool, &[u8])> {
     let mut side_infos = Vec::new();
     let mut at = 0;
     while at + 6 <= stream.len() {
         let header = &stream[at..];
         assert_eq!(header[0], 0xFF, "no syncword at {at}");
-        let kbps = KBPS[usize::from(header[2] >> 4)];
-        let hz = HZ[usize::from((header[2] >> 2) & 3)];
-        let padding = usize::from((header[2] >> 1) & 1);
+        let mpeg1 = header[1] >> 3 & 1 == 1;
         let crc = if header[1] & 1 == 0 { 2 } else { 0 };
-        side_infos.push(&header[4 + crc..]);
-        at += (144_000 * kbps / hz) as usize + padding;
+        side_infos.push((mpeg1, &header[4 + crc..]));
+        at += frame_len(header);
     }
     side_infos
 }
 
-/// The `main_data_begin` of each frame.
+/// The `main_data_begin` of each frame: 9 bits in MPEG-1, 8 at the lower
+/// sampling frequencies (clause 2.4.1.7, and clause 2.4.1.7 of ISO/IEC
+/// 13818-3).
 fn main_data_begins(stream: &[u8]) -> Vec<usize> {
     side_infos(stream)
         .iter()
-        .map(|side_info| (usize::from(side_info[0]) << 1) | usize::from(side_info[1] >> 7))
+        .map(|&(mpeg1, side_info)| {
+            if mpeg1 {
+                (usize::from(side_info[0]) << 1) | usize::from(side_info[1] >> 7)
+            } else {
+                usize::from(side_info[0])
+            }
+        })
         .collect()
 }
 
@@ -200,55 +201,86 @@ fn main_data_begins(stream: &[u8]) -> Vec<usize> {
 fn single_channel_scfsi(stream: &[u8]) -> Vec<u8> {
     side_infos(stream)
         .iter()
-        .map(|side_info| ((side_info[1] & 0b11) << 2) | (side_info[2] >> 6))
+        .map(|&(mpeg1, side_info)| {
+            assert!(mpeg1, "scfsi is sent in MPEG-1 only");
+            ((side_info[1] & 0b11) << 2) | (side_info[2] >> 6)
+        })
         .collect()
 }
 
 /// Quiet passages leave bits for the loud passages after them: main data
 /// then starts more than a whole slot before its frame, and the decoder must
-/// still find it.
+/// still find it. At 44.1 kHz and 64 kbit/s, where a frame has 208 bytes,
+/// 187 of them main data, and at 22.05 kHz and 32 kbit/s, where it has 104
+/// or 105 bytes, 95 or 96 of them main data, and `main_data_begin` has 8
+/// bits (clause 2.4.1.7 of ISO/IEC 13818-3).
 #[test]
 fn main_data_spans_frames_after_quiet_passages() {
-    let fs = 44_100.0;
-    let mut state = 0x9E37_79B9u32;
-    let mut noise = || {
-        state ^= state << 13;
-        state ^= state >> 17;
-        state ^= state << 5;
-        f64::from(state) / f64::from(u32::MAX) * 2.0 - 1.0
-    };
-    // Half a second of a quiet tone, then half a second of loud noise, twice.
-    let input: Vec<f64> = (0..2 * 44_100)
-        .map(|t| {
-            if (t / 22_050) % 2 == 0 {
-                0.01 * (TAU * 440.0 * t as f64 / fs).sin()
-            } else {
-                0.5 * noise()
+    for (sampling_frequency, kbps, main_data) in [
+        (SamplingFrequency::Hz44100, 64, 187),
+        (SamplingFrequency::Hz22050, 32, 96),
+    ] {
+        let fs = f64::from(sampling_frequency.hz());
+        let half = sampling_frequency.hz() as usize / 2;
+        let mut state = 0x9E37_79B9u32;
+        let mut noise = || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            f64::from(state) / f64::from(u32::MAX) * 2.0 - 1.0
+        };
+        // Half a second of a quiet tone, then half a second of loud noise,
+        // twice.
+        let input: Vec<f64> = (0..4 * half)
+            .map(|t| {
+                if (t / half) % 2 == 0 {
+                    0.01 * (TAU * 440.0 * t as f64 / fs).sin()
+                } else {
+                    0.5 * noise()
+                }
+            })
+            .collect();
+        let config = config(kbps, sampling_frequency, Mode::SingleChannel);
+        let stream = encode_pcm(&config, &[&input]);
+        let begins = main_data_begins(&stream);
+        let deepest = begins.iter().copied().max().unwrap();
+        assert!(
+            deepest > main_data,
+            "{sampling_frequency:?}: main_data_begin never exceeds a slot: {begins:?}"
+        );
+        for Decoder { name, decode } in DECODERS {
+            let decoded = decode(&stream);
+            assert_eq!(decoded.diagnostics, "", "{name}, {sampling_frequency:?}");
+            // Main data found in the wrong place would ruin the quiet
+            // passages, which otherwise decode almost exactly. Each passage
+            // is measured away from its edges, where the loud noise's
+            // quantisation noise spreads. The output is 1057 samples behind
+            // the input, less what the decoder trims from its start, as LAME
+            // does; the delay is the one at which the first passage decodes
+            // best, which no delay makes good if its main data is misplaced.
+            let passages = [
+                (0, 2304..half - 2304),
+                (2, 2 * half + 2304..3 * half - 2304),
+            ];
+            let snr = |range: &std::ops::Range<usize>, delay: usize| {
+                let (signal, noise) = range.clone().fold((0.0, 0.0), |(s, n), t| {
+                    let x = input[t];
+                    let y = f64::from(decoded.samples[t + delay]);
+                    (s + x * x, n + (x - y) * (x - y))
+                });
+                10.0 * (signal / noise).log10()
+            };
+            let delay = (0..=1057)
+                .max_by(|&a, &b| snr(&passages[0].1, a).total_cmp(&snr(&passages[0].1, b)))
+                .unwrap();
+            for (passage, range) in passages {
+                let snr = snr(&range, delay);
+                assert!(
+                    snr > 40.0,
+                    "{name}, {sampling_frequency:?}, quiet passage {passage}: {snr:.1} dB"
+                );
             }
-        })
-        .collect();
-    let config = config(64, SamplingFrequency::Hz44100, Mode::SingleChannel);
-    let stream = encode_pcm(&config, &[&input]);
-    // A 64 kbit/s frame at 44.1 kHz has 208 bytes, 187 of them main data.
-    let begins = main_data_begins(&stream);
-    let deepest = begins.iter().copied().max().unwrap();
-    assert!(
-        deepest > 187,
-        "main_data_begin never exceeds a slot: {begins:?}"
-    );
-    let decoded = ffmpeg::decode_mp3(&stream);
-    assert_eq!(decoded.diagnostics, "");
-    // Main data found in the wrong place would ruin the quiet passages,
-    // which otherwise decode almost exactly. Each passage is measured away
-    // from its edges, where the loud noise's quantisation noise spreads.
-    for (passage, range) in [(0, 2304..19_746), (2, 46_404..63_846)] {
-        let (signal, noise) = range.fold((0.0, 0.0), |(s, n), t| {
-            let x = input[t];
-            let y = f64::from(decoded.samples[t + 1057]);
-            (s + x * x, n + (x - y) * (x - y))
-        });
-        let snr = 10.0 * (signal / noise).log10();
-        assert!(snr > 40.0, "quiet passage {passage}: {snr:.1} dB");
+        }
     }
 }
 
@@ -258,44 +290,51 @@ fn main_data_spans_frames_after_quiet_passages() {
 /// long blocks only, the noise rises to about -60 dBFS from 1024 samples
 /// before each burst; with window switching it stays far below that until
 /// the last few hundred samples, which the short windows and the polyphase
-/// filter span.
+/// filter span. At 44.1 kHz and 128 kbit/s, and at 22.05 kHz and 64 kbit/s,
+/// where Tables D.3 and D.4 of ISO/IEC 13818-3 drive the model.
 #[test]
 fn attacks_switch_to_short_blocks_and_shorten_pre_echo() {
     const DELAY: usize = 1057;
-    let fs = 44_100.0;
-    let attacks = [22_050 + 162 - 22_050 % 576, 44_100 + 461 - 44_100 % 576];
-    let mut seed = 1u64;
-    let input: Vec<f64> = (0..66_150)
-        .map(|t| {
-            let tone = 0.02 * (TAU * 440.0 * t as f64 / fs).sin();
-            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
-            let noise = (seed >> 11) as f64 / (1u64 << 52) as f64 - 1.0;
-            let burst: f64 = attacks
-                .iter()
-                .filter(|&&a| t >= a)
-                .map(|&a| 0.6 * (-((t - a) as f64) / (0.03 * fs)).exp() * noise)
-                .sum();
-            tone + burst
-        })
-        .collect();
-    let stream = encode_pcm(
-        &config(128, SamplingFrequency::Hz44100, Mode::SingleChannel),
-        &[&input],
-    );
-    let decoded = ffmpeg::decode_mp3(&stream);
-    assert_eq!(decoded.diagnostics, "");
-    for a in attacks {
-        for start in (a - 1024..a - 512).step_by(32) {
-            let noise = (start..start + 32)
-                .map(|t| (f64::from(decoded.samples[t + DELAY]) - input[t]).powi(2))
-                .sum::<f64>()
-                / 32.0;
-            let db = 10.0 * noise.log10();
-            assert!(
-                db < -80.0,
-                "attack at {a}: {db:.1} dBFS of noise {} samples before it",
-                a - start
-            );
+    for (sampling_frequency, kbps) in [
+        (SamplingFrequency::Hz44100, 128),
+        (SamplingFrequency::Hz22050, 64),
+    ] {
+        let fs = f64::from(sampling_frequency.hz());
+        let half = sampling_frequency.hz() as usize / 2;
+        let attacks = [half + 162 - half % 576, 2 * half + 461 - 2 * half % 576];
+        let mut seed = 1u64;
+        let input: Vec<f64> = (0..3 * half)
+            .map(|t| {
+                let tone = 0.02 * (TAU * 440.0 * t as f64 / fs).sin();
+                seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                let noise = (seed >> 11) as f64 / (1u64 << 52) as f64 - 1.0;
+                let burst: f64 = attacks
+                    .iter()
+                    .filter(|&&a| t >= a)
+                    .map(|&a| 0.6 * (-((t - a) as f64) / (0.03 * fs)).exp() * noise)
+                    .sum();
+                tone + burst
+            })
+            .collect();
+        let stream = encode_pcm(
+            &config(kbps, sampling_frequency, Mode::SingleChannel),
+            &[&input],
+        );
+        let decoded = ffmpeg::decode_mp3(&stream);
+        assert_eq!(decoded.diagnostics, "", "{sampling_frequency:?}");
+        for a in attacks {
+            for start in (a - 1024..a - 512).step_by(32) {
+                let noise = (start..start + 32)
+                    .map(|t| (f64::from(decoded.samples[t + DELAY]) - input[t]).powi(2))
+                    .sum::<f64>()
+                    / 32.0;
+                let db = 10.0 * noise.log10();
+                assert!(
+                    db < -80.0,
+                    "{sampling_frequency:?}, attack at {a}: {db:.1} dBFS of noise {} samples before it",
+                    a - start
+                );
+            }
         }
     }
 }

@@ -51,21 +51,31 @@ fn ffmpeg_decodes_silence_in_every_configuration() {
 }
 
 /// Guards the oracle itself: if ffmpeg stopped checking CRCs, a wrong
-/// `crc_check` would pass the test above unnoticed.
+/// `crc_check` would pass the test above unnoticed. In both versions, and in
+/// one and two channels, whose side information the error check covers in
+/// different lengths (clause 2.4.3.1, and clause 2.4.2.4 of ISO/IEC
+/// 13818-3).
 #[test]
 fn ffmpeg_reports_a_corrupted_crc() {
-    let config = StreamConfig {
-        bitrate: Bitrate::from_kbps(Version::Mpeg1, 128).unwrap(),
-        sampling_frequency: SamplingFrequency::Hz44100,
-        mode: Mode::Stereo,
-        crc_protected: true,
-    };
-    let mut stream = encode_silence(&config, 5);
-    stream[5] ^= 1; // low byte of the first frame's crc_check
-    let decoded = ffmpeg::decode_mp3(&stream);
-    assert!(
-        decoded.diagnostics.contains("CRC mismatch"),
-        "ffmpeg reported: {:?}",
-        decoded.diagnostics
-    );
+    for (version, kbps, sampling_frequency) in [
+        (Version::Mpeg1, 128, SamplingFrequency::Hz44100),
+        (Version::Mpeg2, 64, SamplingFrequency::Hz22050),
+    ] {
+        for mode in [Mode::SingleChannel, Mode::Stereo] {
+            let config = StreamConfig {
+                bitrate: Bitrate::from_kbps(version, kbps).unwrap(),
+                sampling_frequency,
+                mode,
+                crc_protected: true,
+            };
+            let mut stream = encode_silence(&config, 5);
+            stream[5] ^= 1; // low byte of the first frame's crc_check
+            let decoded = ffmpeg::decode_mp3(&stream);
+            assert!(
+                decoded.diagnostics.contains("CRC mismatch"),
+                "{config:?}: ffmpeg reported: {:?}",
+                decoded.diagnostics
+            );
+        }
+    }
 }
