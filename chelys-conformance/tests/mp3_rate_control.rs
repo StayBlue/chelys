@@ -108,7 +108,7 @@ fn loud_noise_fits_at_the_lowest_bitrate() {
     };
     let left: Vec<f64> = (0..48_000).map(|_| noise()).collect();
     let right: Vec<f64> = (0..48_000).map(|_| noise()).collect();
-    for fs in SamplingFrequency::ALL {
+    for fs in SamplingFrequency::STANDARD {
         for crc_protected in [false, true] {
             let config = StreamConfig {
                 bitrate: Bitrate::all(fs.version()).next().unwrap(),

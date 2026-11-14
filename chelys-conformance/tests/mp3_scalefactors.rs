@@ -157,7 +157,7 @@ fn assert_close(label: &str, samples: &[f32], expected: &[f32]) {
 
 #[test]
 fn scalefactors_divide_their_bands() {
-    for fs in SamplingFrequency::ALL {
+    for fs in SamplingFrequency::STANDARD {
         let mut rng = Rng(0x5CA1_EFAC);
         let spectra = [
             spectrum(&mut rng, BlockType::Normal, fs),
@@ -245,7 +245,7 @@ fn scalefactors_divide_their_bands() {
 /// values to be sent by band, window and frequency.
 #[test]
 fn short_scalefactors_divide_their_band_and_window() {
-    for fs in SamplingFrequency::ALL {
+    for fs in SamplingFrequency::STANDARD {
         let mut rng = Rng(0x5401_7B1C);
         let spectra = [
             spectrum(&mut rng, BlockType::Short, fs),
@@ -302,7 +302,7 @@ fn short_scalefactors_divide_their_band_and_window() {
 /// decode alike. The lower sampling frequencies have no scfsi.
 #[test]
 fn scfsi_takes_over_the_first_granules_scalefactors() {
-    let mpeg1 = SamplingFrequency::ALL
+    let mpeg1 = SamplingFrequency::STANDARD
         .into_iter()
         .filter(|fs| fs.version() == Version::Mpeg1);
     for fs in mpeg1 {

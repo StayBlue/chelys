@@ -88,7 +88,7 @@ fn align(input: &[f64], output: &[f32], channels: usize, channel: usize) -> (usi
 /// filters and the encoder's frequency inversion.
 #[test]
 fn pcm_round_trips_at_every_sampling_frequency() {
-    for fs in SamplingFrequency::ALL {
+    for fs in SamplingFrequency::STANDARD {
         let input = tones(fs, 1.0, 0.0);
         let stream = encode_pcm_with_global_gain(&config(fs, Mode::SingleChannel), 150, &[&input]);
         let decoded = ffmpeg::decode_mp3(&stream);
@@ -118,7 +118,7 @@ fn short_blocks_round_trip_at_every_sampling_frequency() {
     const CYCLE: [BlockType; 13] = [
         Normal, Normal, Start, Short, Short, Stop, Normal, Start, Short, Stop, Start, Short, Stop,
     ];
-    for fs in SamplingFrequency::ALL {
+    for fs in SamplingFrequency::STANDARD {
         // A tone above the last short scalefactor band at every sampling
         // frequency (line 182 of 192, above band 11's end at 180 or below),
         // in the lines that have no scalefactor.

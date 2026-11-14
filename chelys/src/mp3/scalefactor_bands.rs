@@ -1,12 +1,13 @@
 // Copyright (c) 2026 StayBlue
 // SPDX-License-Identifier: MIT
 
-//! Layer III scalefactor bands (Table B.8, and Table B.2 of ISO/IEC 13818-3
-//! for the lower sampling frequencies).
+//! Layer III scalefactor bands (Table B.8, Table B.2 of ISO/IEC 13818-3 for
+//! the lower sampling frequencies, and US patent 6,185,539 B1 for MPEG-2.5).
 //!
-//! The tables are transcribed as printed: `(scalefactor band, width of band,
-//! index of start, index of end)`, with the end index inclusive. Their
-//! consistency is checked at compile time.
+//! The tables of the standards are transcribed as printed: `(scalefactor
+//! band, width of band, index of start, index of end)`, with the end index
+//! inclusive. The patent prints widths alone, and they are transcribed so.
+//! The consistency of every table is checked at compile time.
 
 use std::ops::Range;
 
@@ -36,6 +37,13 @@ pub const SHORT_WINDOWS: usize = 3;
 const SHORT_WINDOW_LINES: usize = GRANULE_LINES / SHORT_WINDOWS;
 
 /// The bands for long windows (block types 0, 1 and 3).
+///
+/// Spec gap: US 6,185,539 B1 gives tables for MPEG-2.5 at 8 kHz alone. At
+/// 11.025 and 12 kHz, as the patent leaves the bitstream "in all other
+/// respects" as ISO/IEC 13818-3 has it (column 3), the bands are those of
+/// the frequency of ISO/IEC 13818-3 that has the same `sampling_frequency`
+/// code (see `SamplingFrequency::code`), 22.05 and 24 kHz. The same holds
+/// for [`short_bands`].
 pub fn long_bands(sampling_frequency: SamplingFrequency) -> &'static [Band; LONG_BANDS] {
     match sampling_frequency {
         SamplingFrequency::Hz32000 => &LONG_32000,
@@ -44,6 +52,9 @@ pub fn long_bands(sampling_frequency: SamplingFrequency) -> &'static [Band; LONG
         SamplingFrequency::Hz16000 => &LONG_16000,
         SamplingFrequency::Hz22050 => &LONG_22050,
         SamplingFrequency::Hz24000 => &LONG_24000,
+        SamplingFrequency::Hz11025 => &LONG_22050,
+        SamplingFrequency::Hz12000 => &LONG_24000,
+        SamplingFrequency::Hz8000 => &LONG_8000,
     }
 }
 
@@ -56,6 +67,9 @@ pub fn short_bands(sampling_frequency: SamplingFrequency) -> &'static [Band; SHO
         SamplingFrequency::Hz16000 => &SHORT_16000,
         SamplingFrequency::Hz22050 => &SHORT_22050,
         SamplingFrequency::Hz24000 => &SHORT_24000,
+        SamplingFrequency::Hz11025 => &SHORT_22050,
+        SamplingFrequency::Hz12000 => &SHORT_24000,
+        SamplingFrequency::Hz8000 => &SHORT_8000,
     }
 }
 
@@ -78,6 +92,27 @@ pub fn coding_bands(block_type: BlockType, sampling_frequency: SamplingFrequency
             })
         })
         .collect()
+}
+
+/// The scalefactors, in the order of [`coding_bands`], that the encoder keeps
+/// at zero, and so never amplifies: those of the highest of the four
+/// partitions of `scalefac_compress` (clause 2.4.3.2 of ISO/IEC 13818-3) at
+/// MPEG-2.5's 8 kHz, and none otherwise.
+///
+/// Spec reading: US 6,185,539 B1 sets "the scale factors of the scale factor
+/// bands of the highest region ... to zero without exception" (column 3) at
+/// 8 kHz, the region being the last of 6-5-5-5 long or 9-9-9-9 short bands.
+/// That is long bands 16 to 20 and short bands 9 to 11 (scalefactors 27 to
+/// 35 in the order sent), which its table makes the top 100 lines of a long
+/// block and the top 32 lines of each short window.
+pub fn fixed_at_zero(block_type: BlockType, sampling_frequency: SamplingFrequency) -> Range<usize> {
+    if sampling_frequency != SamplingFrequency::Hz8000 {
+        return 0..0;
+    }
+    match block_type {
+        BlockType::Short => 27..SHORT_BANDS * SHORT_WINDOWS,
+        _ => 16..LONG_BANDS,
+    }
 }
 
 /// The windows of a granule of `block_type`: three for short blocks, and one
@@ -206,6 +241,29 @@ const fn bands_with_top<const N: usize>(
         "width does not match start and end"
     );
     assert!(end + 1 == lines, "top row does not end the lines");
+    bands
+}
+
+/// Builds a band table, as [`bands_with_top`] does, from the widths of the
+/// bands alone, the last of which, `top`, carries on to the last of `lines`.
+const fn bands_from_widths<const N: usize>(
+    widths: [usize; N],
+    top: usize,
+    lines: usize,
+) -> [Band; N] {
+    let mut bands = [Band { start: 0, width: 0 }; N];
+    let mut start = 0;
+    let mut i = 0;
+    while i < N {
+        assert!(widths[i] > 0, "empty band");
+        bands[i] = Band {
+            start,
+            width: widths[i],
+        };
+        start += widths[i];
+        i += 1;
+    }
+    assert!(start + top == lines, "the bands do not end the lines");
     bands
 }
 
@@ -485,6 +543,22 @@ const SHORT_24000: [Band; SHORT_BANDS] = bands_with_top(
     SHORT_WINDOW_LINES,
 );
 
+// US 6,185,539 B1, column 4: MPEG-2.5, 8 kHz.
+
+const LONG_8000: [Band; LONG_BANDS] = bands_from_widths(
+    [
+        12, 12, 12, 12, 12, 12, 16, 20, 24, 28, 32, 40, 48, 56, 64, 76, 90, 2, 2, 2, 2,
+    ],
+    2,
+    GRANULE_LINES,
+);
+
+const SHORT_8000: [Band; SHORT_BANDS] = bands_from_widths(
+    [8, 8, 8, 12, 16, 20, 24, 28, 36, 2, 2, 2],
+    26,
+    SHORT_WINDOW_LINES,
+);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -582,5 +656,23 @@ mod tests {
         assert_eq!(ends(SamplingFrequency::Hz16000), (522, 174));
         assert_eq!(ends(SamplingFrequency::Hz22050), (522, 174));
         assert_eq!(ends(SamplingFrequency::Hz24000), (540, 180));
+        assert_eq!(ends(SamplingFrequency::Hz11025), (522, 174));
+        assert_eq!(ends(SamplingFrequency::Hz12000), (540, 180));
+        assert_eq!(ends(SamplingFrequency::Hz8000), (574, 166));
+    }
+
+    /// The highest region of the patent's 8 kHz table holds the top 100
+    /// lines of a long block, the last 2 of them above the bands.
+    #[test]
+    fn fixed_bands_are_the_top_of_the_8_khz_table() {
+        let fs = SamplingFrequency::Hz8000;
+        let long = coding_bands(BlockType::Normal, fs);
+        let fixed = fixed_at_zero(BlockType::Normal, fs);
+        assert_eq!(long[fixed.start].start, 476);
+        assert_eq!(GRANULE_LINES - long[fixed.start].start, 100);
+        let short = coding_bands(BlockType::Short, fs);
+        let fixed = fixed_at_zero(BlockType::Short, fs);
+        assert_eq!(short[fixed.start].start, 3 * 160);
+        assert!(fixed_at_zero(BlockType::Normal, SamplingFrequency::Hz16000).is_empty());
     }
 }

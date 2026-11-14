@@ -17,7 +17,7 @@ fn ffmpeg_decodes_silence_in_every_configuration() {
         },
     ];
     let frames = 50;
-    for sampling_frequency in SamplingFrequency::ALL {
+    for sampling_frequency in SamplingFrequency::STANDARD {
         for bitrate in Bitrate::all(sampling_frequency.version()) {
             for mode in modes {
                 for crc_protected in [false, true] {

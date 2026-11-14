@@ -87,6 +87,13 @@ const PREEMPHASIS_BANDS: std::ops::Range<usize> = LONG_BANDS - 4..LONG_BANDS;
 /// rounding up, so that no band is amplified less than before. Only when they
 /// would pass the limits again does the loop stop.
 ///
+/// At MPEG-2.5's 8 kHz, the scalefactors of the highest region stay zero
+/// (see [`fixed_at_zero`](scalefactor_bands::fixed_at_zero)), and, like
+/// bands taken over with scfsi, their distortion does not keep the loop
+/// going. Spec reading: preemphasis is not used there, as `pretab` would
+/// amplify those bands, where US 6,185,539 B1 codes them with "a
+/// multiplication factor of 1" (claim 1).
+///
 /// The amplified lines are recomputed from `xr` each iteration rather than
 /// multiplied incrementally as clause C.1.5.4.3 describes; the result is
 /// the same.
@@ -108,6 +115,7 @@ pub fn outer_loop(
 ) -> Outcome {
     let bands = scalefactor_bands::coding_bands(block_type, sampling_frequency);
     assert_eq!(xmin.len(), bands.len(), "one xmin per scalefactor");
+    let fixed = scalefactor_bands::fixed_at_zero(block_type, sampling_frequency);
     let reuse = reuse.filter(|reuse| reuse.scfsi.contains(&true));
     assert!(
         reuse.is_none() || intensity.is_none(),
@@ -163,8 +171,9 @@ pub fn outer_loop(
                 .collect()
         };
         let measured_against = allowed_for(&scalefactors);
-        let violated = (0..bands.len())
-            .any(|sb| scalefactors.sent(sb) && distortion[sb] > measured_against[sb]);
+        let violated = (0..bands.len()).any(|sb| {
+            scalefactors.sent(sb) && !fixed.contains(&sb) && distortion[sb] > measured_against[sb]
+        });
         let first = saved.is_none();
         saved = Some(Outcome {
             granule,
@@ -176,6 +185,7 @@ pub fn outer_loop(
         if first
             && scalefactors.can_preemphasise()
             && reuse.is_none()
+            && fixed.is_empty()
             && PREEMPHASIS_BANDS
                 .clone()
                 .all(|sb| distortion[sb] > measured_against[sb])
@@ -187,13 +197,16 @@ pub fn outer_loop(
         let allowed = allowed_for(&scalefactors);
         let sent: Vec<bool> = (0..bands.len()).map(|sb| scalefactors.sent(sb)).collect();
         for (sb, scalefac) in scalefactors.values_mut().iter_mut().enumerate() {
-            if sent[sb] && allowed[sb] - distortion[sb] < 0.0 {
+            if sent[sb] && !fixed.contains(&sb) && allowed[sb] - distortion[sb] < 0.0 {
                 *scalefac += 1;
             }
         }
 
         // C.1.5.4.3.6: the conditions for stopping, in the order of figure C.9.b.
-        if scalefactors.values().iter().all(|&s| s > 0) {
+        let mut free = (scalefactors.values().iter().enumerate())
+            .filter(|(sb, _)| !fixed.contains(sb))
+            .map(|(_, &s)| s);
+        if free.all(|s| s > 0) {
             break;
         }
         if exceeds_limits(&scalefactors) {

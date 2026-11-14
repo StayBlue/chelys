@@ -20,13 +20,15 @@ usage: chelys --sample-rate HZ --channels N [--bitrate KBPS] [--joint-stereo]
               [--intensity-stereo] < input.f32 > output.mp3
 
 Reads interleaved 32-bit little-endian float PCM from stdin and writes MPEG-1
-Layer III to stdout, or MPEG-2 Layer III at 16, 22.05 and 24 kHz.
+Layer III to stdout, or MPEG-2 Layer III at 16, 22.05 and 24 kHz, or
+MPEG-2.5 Layer III at 8, 11.025 and 12 kHz (experimental).
 
-  --sample-rate HZ   32000, 44100 or 48000; or 16000, 22050 or 24000
+  --sample-rate HZ   32000, 44100 or 48000; or 16000, 22050 or 24000; or
+                     8000, 11025 or 12000
   --channels N       1 or 2
   --bitrate KBPS     32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256
-                     or 320; at 16, 22.05 and 24 kHz 8, 16, 24, 32, 40, 48,
-                     56, 64, 80, 96, 112, 128, 144 or 160 (default 128)
+                     or 320; at 16 kHz and below 8, 16, 24, 32, 40, 48, 56,
+                     64, 80, 96, 112, 128, 144 or 160 (default 128)
   --joint-stereo     code each frame of two channels in MS stereo where the
                      channels are alike (default: left/right stereo)
   --intensity-stereo code the upper bands of each frame of two channels in

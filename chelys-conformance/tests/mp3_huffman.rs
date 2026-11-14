@@ -233,7 +233,7 @@ fn region_boundaries_match_the_decoder_at_every_sampling_frequency() {
         *v = rng.signed(1);
     }
     values[559] = 1;
-    for fs in SamplingFrequency::ALL {
+    for fs in SamplingFrequency::STANDARD {
         let mut results = vec![(
             "one table".to_owned(),
             decode(fs, 180, [&values, &values], |c, v| all_pairs(c, v, 1)),
@@ -268,7 +268,7 @@ fn switched_window_regions_match_the_decoder_at_every_sampling_frequency() {
         *v = rng.signed(1);
     }
     values[559] = 1;
-    for fs in SamplingFrequency::ALL {
+    for fs in SamplingFrequency::STANDARD {
         for block_type in [BlockType::Start, BlockType::Short, BlockType::Stop] {
             let both = [&values, &values];
             let results = vec![
@@ -291,7 +291,7 @@ fn switched_window_regions_match_the_decoder_at_every_sampling_frequency() {
 
 #[test]
 fn chosen_coding_decodes_like_a_single_wide_table() {
-    for (seed, fs) in SamplingFrequency::ALL.into_iter().enumerate() {
+    for (seed, fs) in SamplingFrequency::STANDARD.into_iter().enumerate() {
         let mut rng = Rng(100 + seed as u32);
         let mut values = [0; GRANULE_LINES];
         for (i, v) in values.iter_mut().enumerate() {

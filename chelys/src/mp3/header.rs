@@ -2,13 +2,17 @@
 // SPDX-License-Identifier: MIT
 
 //! The 32-bit frame header (clauses 2.4.1.3 and 2.4.2.3, and clause 2.4.2.3
-//! of ISO/IEC 13818-3 for the lower sampling frequencies) and the frame
-//! length it implies (clause 2.4.3.1).
+//! of ISO/IEC 13818-3 for the lower sampling frequencies, and US patent
+//! 6,185,539 B1 for MPEG-2.5) and the frame length it implies (clause
+//! 2.4.3.1).
 
 use crate::bitstream::BitWriter;
 use crate::mp3::GRANULE_LINES;
 
 const SYNCWORD: u32 = 0xFFF;
+/// The sync word that marks MPEG-2.5, "eleven ones and a zero" (US
+/// 6,185,539 B1, column 3).
+const MPEG25_SYNCWORD: u32 = 0xFFE;
 const LAYER_III: u32 = 0b01;
 
 /// The `ID` bit: the standard that codes the stream, and with it the
@@ -18,7 +22,8 @@ pub enum Version {
     /// ISO/IEC 11172-3, `ID` 1.
     Mpeg1,
     /// The extension of ISO/IEC 13818-3 to lower sampling frequencies, `ID`
-    /// 0 (clause 2.4 of ISO/IEC 13818-3).
+    /// 0 (clause 2.4 of ISO/IEC 13818-3), and MPEG-2.5, which codes its
+    /// stream in the same way (see [`SamplingFrequency::mpeg25`]).
     Mpeg2,
 }
 
@@ -104,16 +109,35 @@ pub enum SamplingFrequency {
     Hz22050,
     Hz24000,
     Hz16000,
+    Hz11025,
+    Hz12000,
+    Hz8000,
 }
 
 impl SamplingFrequency {
-    pub const ALL: [Self; 6] = [
+    /// The sampling frequencies of ISO/IEC 11172-3 and 13818-3.
+    pub const STANDARD: [Self; 6] = [
         Self::Hz44100,
         Self::Hz48000,
         Self::Hz32000,
         Self::Hz22050,
         Self::Hz24000,
         Self::Hz16000,
+    ];
+
+    /// The sampling frequencies of MPEG-2.5.
+    pub const MPEG25: [Self; 3] = [Self::Hz11025, Self::Hz12000, Self::Hz8000];
+
+    pub const ALL: [Self; 9] = [
+        Self::Hz44100,
+        Self::Hz48000,
+        Self::Hz32000,
+        Self::Hz22050,
+        Self::Hz24000,
+        Self::Hz16000,
+        Self::Hz11025,
+        Self::Hz12000,
+        Self::Hz8000,
     ];
 
     pub fn hz(self) -> u32 {
@@ -124,22 +148,54 @@ impl SamplingFrequency {
             Self::Hz22050 => 22_050,
             Self::Hz24000 => 24_000,
             Self::Hz16000 => 16_000,
+            Self::Hz11025 => 11_025,
+            Self::Hz12000 => 12_000,
+            Self::Hz8000 => 8_000,
         }
     }
 
+    /// Spec reading: US 6,185,539 B1 changes the sync word of MPEG-2.5 and
+    /// says that "in all other respects the structure of the bit stream is
+    /// unchanged with respect to the Standard ISO/IEC 13818-3" (column 3).
+    /// MPEG-2.5 is therefore coded as ISO/IEC 13818-3 codes its sampling
+    /// frequencies: `ID` 0, one granule a frame, and its bitrates and side
+    /// information.
     pub fn version(self) -> Version {
         match self {
             Self::Hz44100 | Self::Hz48000 | Self::Hz32000 => Version::Mpeg1,
             Self::Hz22050 | Self::Hz24000 | Self::Hz16000 => Version::Mpeg2,
+            Self::Hz11025 | Self::Hz12000 | Self::Hz8000 => Version::Mpeg2,
         }
     }
 
-    /// The `sampling_frequency` field, whose meaning depends on `ID`.
+    /// Whether this is a sampling frequency of MPEG-2.5, which US patent
+    /// 6,185,539 B1 adds to those of ISO/IEC 13818-3, and whose frames begin
+    /// with another sync word.
+    pub fn mpeg25(self) -> bool {
+        Self::MPEG25.contains(&self)
+    }
+
+    /// The `sampling_frequency` field, whose meaning depends on `ID` and,
+    /// for MPEG-2.5, on the sync word.
+    ///
+    /// Spec gap: US 6,185,539 B1 does not give the codes of MPEG-2.5. It
+    /// samples at "preferably half the sampling rate" of ISO/IEC 13818-3,
+    /// and compares its table of scalefactor bands for 8 kHz with the one
+    /// for 16 kHz (column 4), so each frequency takes the code of the one of
+    /// ISO/IEC 13818-3 that is twice as high.
     fn code(self) -> u32 {
         match self {
-            Self::Hz44100 | Self::Hz22050 => 0b00,
-            Self::Hz48000 | Self::Hz24000 => 0b01,
-            Self::Hz32000 | Self::Hz16000 => 0b10,
+            Self::Hz44100 | Self::Hz22050 | Self::Hz11025 => 0b00,
+            Self::Hz48000 | Self::Hz24000 | Self::Hz12000 => 0b01,
+            Self::Hz32000 | Self::Hz16000 | Self::Hz8000 => 0b10,
+        }
+    }
+
+    fn syncword(self) -> u32 {
+        if self.mpeg25() {
+            MPEG25_SYNCWORD
+        } else {
+            SYNCWORD
         }
     }
 }
@@ -232,7 +288,7 @@ impl Header {
             "{:?} is not a bitrate of {:?}",
             self.bitrate, self.sampling_frequency
         );
-        w.write(SYNCWORD, 12);
+        w.write(self.sampling_frequency.syncword(), 12);
         w.write(version.id(), 1);
         w.write(LAYER_III, 2);
         w.write_bool(!self.crc_protected); // protection_bit
@@ -375,6 +431,18 @@ mod tests {
         assert_eq!(header_bytes(&h), [0xFF, 0xF3, 0b1110_1000, 0b1100_0000]);
     }
 
+    /// The sync word "FFE", then the fields of ISO/IEC 13818-3, with the
+    /// `sampling_frequency` code of the frequency twice as high.
+    #[test]
+    fn encodes_mpeg25() {
+        let h = header(64, SamplingFrequency::Hz11025, Mode::Stereo);
+        assert_eq!(header_bytes(&h), [0xFF, 0xE3, 0b1000_0000, 0b0000_0000]);
+        let h = header(8, SamplingFrequency::Hz12000, Mode::SingleChannel);
+        assert_eq!(header_bytes(&h), [0xFF, 0xE3, 0b0001_0100, 0b1100_0000]);
+        let h = header(160, SamplingFrequency::Hz8000, Mode::SingleChannel);
+        assert_eq!(header_bytes(&h), [0xFF, 0xE3, 0b1110_1000, 0b1100_0000]);
+    }
+
     #[test]
     #[should_panic(expected = "is not a bitrate of")]
     fn rejects_a_bitrate_of_the_other_version() {
@@ -417,6 +485,18 @@ mod tests {
             header(64, SamplingFrequency::Hz22050, Mode::Stereo).frame_len(),
             208
         );
+        assert_eq!(
+            header(8, SamplingFrequency::Hz8000, Mode::Stereo).frame_len(),
+            72
+        );
+        assert_eq!(
+            header(160, SamplingFrequency::Hz8000, Mode::Stereo).frame_len(),
+            1440
+        );
+        assert_eq!(
+            header(32, SamplingFrequency::Hz11025, Mode::Stereo).frame_len(),
+            208
+        );
     }
 
     #[test]
@@ -439,12 +519,14 @@ mod tests {
     }
 
     #[test]
-    fn padding_is_never_needed_but_at_44_1_and_22_05_khz() {
+    fn padding_is_never_needed_but_at_44_1_22_05_and_11_025_khz() {
         for fs in [
             SamplingFrequency::Hz48000,
             SamplingFrequency::Hz32000,
             SamplingFrequency::Hz24000,
             SamplingFrequency::Hz16000,
+            SamplingFrequency::Hz12000,
+            SamplingFrequency::Hz8000,
         ] {
             for bitrate in Bitrate::all(fs.version()) {
                 let mut schedule = PaddingSchedule::new(bitrate, fs);
