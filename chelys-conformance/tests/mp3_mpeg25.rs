@@ -292,3 +292,164 @@ fn mpeg25_round_trips() {
         }
     }
 }
+
+/// A steady signal below 3.2 kHz, `seconds` long and fading in and out over
+/// 20 ms, the same at every sampling frequency: four tones over many quieter
+/// sinusoids, spread like noise.
+fn below_3_2_khz(fs: SamplingFrequency, seconds: f64) -> Vec<f64> {
+    let mut seed = 11u64;
+    let mut next = || {
+        seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+        (seed >> 11) as f64 / (1u64 << 53) as f64
+    };
+    let mut components = vec![(300.0, 0.2, 0.0), (900.0, 0.1, 1.0), (1700.0, 0.05, 2.0)];
+    components.push((2600.0, 0.1, 3.0));
+    for _ in 0..150 {
+        components.push((100.0 + 3100.0 * next(), 0.003, TAU * next()));
+    }
+    let rate = f64::from(fs.hz());
+    let len = (seconds * rate) as usize;
+    let fade = (0.02 * rate) as usize;
+    (0..len)
+        .map(|t| {
+            let edge = t.min(len - 1 - t);
+            let gain = if edge < fade {
+                0.5 - 0.5 * (TAU / 2.0 * edge as f64 / fade as f64).cos()
+            } else {
+                1.0
+            };
+            let time = t as f64 / rate;
+            let sum: f64 = (components.iter())
+                .map(|(f, a, phase)| a * (TAU * f * time + phase).sin())
+                .sum();
+            gain * sum
+        })
+        .collect()
+}
+
+/// `samples` at twice their sampling frequency: every other sample is
+/// interpolated with a Blackman-windowed sinc of 64 taps, which passes the
+/// band below 3.2 kHz at the MPEG-2.5 frequencies within 0.01 dB.
+fn upsample(samples: &[f64]) -> Vec<f64> {
+    const HALF_TAPS: isize = 32;
+    let taps: Vec<f64> = (-HALF_TAPS..HALF_TAPS)
+        .map(|k| {
+            let x = k as f64 + 0.5;
+            let n = (k + HALF_TAPS) as f64 + 0.5;
+            let window = 0.42 - 0.5 * (TAU * n / (2 * HALF_TAPS) as f64).cos()
+                + 0.08 * (2.0 * TAU * n / (2 * HALF_TAPS) as f64).cos();
+            (x * TAU / 2.0).sin() / (x * TAU / 2.0) * window
+        })
+        .collect();
+    let at = |t: isize| {
+        usize::try_from(t)
+            .ok()
+            .and_then(|t| samples.get(t))
+            .copied()
+    };
+    (0..samples.len() as isize)
+        .flat_map(|t| {
+            let between = (-HALF_TAPS..HALF_TAPS)
+                .zip(&taps)
+                .map(|(k, tap)| at(t - k).unwrap_or(0.0) * tap)
+                .sum();
+            [samples[t as usize], between]
+        })
+        .collect()
+}
+
+/// How far the coding noise of `stream`, which codes `input` at an MPEG-2.5
+/// sampling frequency, rises above the masking threshold that the model of
+/// `judge`, the frequency twice as high, puts on the input, in its long
+/// scalefactor bands below 3.2 kHz: the noise-to-mask ratio in dB, averaged
+/// over every band of every steady granule, and the share of those bands in
+/// which the noise exceeds the threshold.
+fn noise_to_mask(
+    input: &[f64],
+    stream: &[u8],
+    judge: SamplingFrequency,
+    input_at_judge: &[f64],
+) -> (f64, f64) {
+    use chelys::mp3::filterbank::Filterbank;
+    use chelys::mp3::psychoacoustic::PsychoacousticModel;
+
+    let decoded = chelys_conformance::ffmpeg::decode_mp3(stream);
+    assert_eq!(decoded.diagnostics, "");
+    let lag = (0..3000)
+        .max_by(|&a, &b| {
+            let error = |lag: usize| -> f64 {
+                (input.iter().enumerate())
+                    .map(|(t, x)| {
+                        let y = decoded.samples.get(t + lag).map_or(0.0, |&y| f64::from(y));
+                        (x - y).powi(2)
+                    })
+                    .sum()
+            };
+            error(b).total_cmp(&error(a))
+        })
+        .unwrap();
+    let error: Vec<f64> = (input.iter().enumerate())
+        .map(|(t, x)| decoded.samples.get(t + lag).map_or(0.0, |&y| f64::from(y)) - x)
+        .collect();
+    let error = upsample(&error);
+
+    let granule = |samples: &[f64], g: usize| -> [f64; GRANULE_LINES] {
+        std::array::from_fn(|t| samples.get(g * GRANULE_LINES + t).copied().unwrap_or(0.0))
+    };
+    let mut model = PsychoacousticModel::new(judge);
+    let (mut signal_bank, mut error_bank) = (Filterbank::new(), Filterbank::new());
+    model.granule(&granule(input_at_judge, 0));
+    let bands = scalefactor_bands::long_bands(judge);
+    let cutoff = 3200.0 / f64::from(judge.hz()) * 2.0 * GRANULE_LINES as f64;
+    let granules = input_at_judge.len() / GRANULE_LINES;
+    let mut nmr = Vec::new();
+    for g in 0..granules - 1 {
+        let masking = model.granule(&granule(input_at_judge, g + 1));
+        let xr = signal_bank.granule(&granule(input_at_judge, g), BlockType::Normal);
+        let er = error_bank.granule(&granule(&error, g), BlockType::Normal);
+        if g < 4 || g + 4 > granules {
+            continue;
+        }
+        let xmin = masking.allowed_distortion(&xr, judge);
+        for (band, xmin) in bands.iter().zip(xmin) {
+            if band.end() as f64 > cutoff || xmin == 0.0 {
+                continue;
+            }
+            let noise = er[band.start..band.end()]
+                .iter()
+                .map(|e| e * e)
+                .sum::<f64>()
+                / band.width as f64;
+            nmr.push(10.0 * (noise / xmin).log10());
+        }
+    }
+    let mean = nmr.iter().sum::<f64>() / nmr.len() as f64;
+    let audible = nmr.iter().filter(|&&db| db > 0.0).count() as f64 / nmr.len() as f64;
+    (mean, audible)
+}
+
+/// The coding noise of each MPEG-2.5 sampling frequency, at 16 and 24
+/// kbit/s, stays below the threshold that the model of the frequency twice
+/// as high puts on the input in most bands below 3.2 kHz. With the tables
+/// derived from that frequency's, the noise exceeds it in 37%, 52% and 48%
+/// of those bands at 16 kbit/s, and in 19%, 24% and 23% at 24 kbit/s, at
+/// 8, 11.025 and 12 kHz. The tables of 16 kHz, which MPEG-2.5 used before,
+/// gave 35%, 60% and 52%, and 18%, 23% and 22%: by this measure the two
+/// are not far apart.
+#[test]
+fn mpeg25_noise_to_mask_ratio() {
+    use SamplingFrequency::*;
+    for (half, double) in [(Hz8000, Hz16000), (Hz11025, Hz22050), (Hz12000, Hz24000)] {
+        let input = below_3_2_khz(half, 4.0);
+        let input_at_judge = below_3_2_khz(double, 4.0);
+        for (kbps, most_audible) in [(16, 0.55), (24, 0.27)] {
+            let stream = encode_pcm(&config(half, Mode::SingleChannel, kbps), &[&input]);
+            let (mean, audible) = noise_to_mask(&input, &stream, double, &input_at_judge);
+            assert!(
+                audible < most_audible,
+                "{half:?} at {kbps} kbit/s: {:.1}% of bands audible, mean NMR {mean:.2} dB",
+                100.0 * audible
+            );
+        }
+    }
+}
