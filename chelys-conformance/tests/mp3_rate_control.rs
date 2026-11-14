@@ -547,10 +547,13 @@ fn intensity_stereo_keeps_the_level_of_each_channel() {
 /// `int_scalefac_compress` from 180 sends it in no bits.
 ///
 /// Last, in MS stereo, the tones below 7 kHz the same in both channels:
-/// the side channel is zero below every bound and would need its bands
-/// there marked, which the encoder never sends at these sampling
-/// frequencies, so no frame is coded in intensity stereo, and every tone
-/// below the bounds keeps its level.
+/// the side channel is all but zero below every bound, and would need its
+/// bands there marked, which the encoder never sends at these sampling
+/// frequencies, but for the highest bound: there the right channel, with
+/// the bits it keeps and nothing else to spend them on, codes what the
+/// filterbank leaves of the tones above it in the band below it, more than
+/// a hundred dB down. So the frames are coded in intensity stereo, most of
+/// them from band 18, and every tone keeps its level.
 ///
 /// Each stream is decoded with ffmpeg, mpg123 and LAME. This is the evidence
 /// for the position of the lines above the highest band and the scaling of
@@ -602,13 +605,13 @@ fn intensity_stereo_keeps_the_level_of_each_channel_at_the_lower_sampling_freque
     ]
     .concat();
     let cases = [
-        (&panned_top, false, true),
-        (&panned_top, true, true),
-        (&alike_top, false, true),
-        (&alike_top, true, true),
-        (&alike_below, true, false),
+        (&panned_top, false),
+        (&panned_top, true),
+        (&alike_top, false),
+        (&alike_top, true),
+        (&alike_below, true),
     ];
-    for (levels, ms_stereo, in_intensity) in cases {
+    for (levels, ms_stereo) in cases {
         let (left, right) = (tones(levels, 0), tones(levels, 1));
         let mode = Mode::JointStereo {
             intensity_stereo: true,
@@ -617,23 +620,14 @@ fn intensity_stereo_keeps_the_level_of_each_channel_at_the_lower_sampling_freque
         let stream = encode_pcm(&config(48, fs, mode), &[&left, &right]);
         let intensity = intensity_stereo_frames(&stream);
         let count = intensity.iter().filter(|&&on| on).count();
-        if in_intensity {
-            assert!(
-                count > intensity.len() * 9 / 10,
-                "MS {ms_stereo}: {intensity:?}"
-            );
-        } else {
-            assert_eq!(count, 0, "MS {ms_stereo}: {intensity:?}");
-        }
+        assert!(
+            count > intensity.len() * 9 / 10,
+            "MS {ms_stereo}: {intensity:?}"
+        );
         for Decoder { name, decode } in DECODERS {
             let decoded = decode(&stream);
             assert_eq!(decoded.diagnostics, "", "{name}, MS {ms_stereo}");
             for &(frequency, left_level, right_level) in levels {
-                // Without intensity stereo the frame is short of bits for the
-                // tones above the bounds.
-                if !in_intensity && frequency > 6_000.0 {
-                    continue;
-                }
                 for (channel, level) in [(0, left_level), (1, right_level)] {
                     let decoded = amplitude(&decoded.samples, hz, channel, frequency);
                     assert!(
@@ -710,31 +704,44 @@ fn high_pass(x: impl Fn(usize) -> f64, t: usize) -> f64 {
 /// At 22.05 kHz and 48 kbit/s the tones lie in the bands just below the
 /// bounds of short blocks, bands 4, 7, 8 and 9 (Table B.2 of ISO/IEC
 /// 13818-3), so that the right channel need not mark a band in any window,
-/// and some short blocks are coded in intensity stereo. Amplitudes 2 to 1
-/// take position 4, which decodes the right channel at `i0^2`, 0.5, of the
-/// left.
+/// and some short blocks are coded in intensity stereo. Then tones at 1, 2,
+/// 3 and 4.5 kHz, in bands 3, 6, 7 and 9: band 4, below the lowest bound,
+/// is zero in the right channel, which would need it marked, so the short
+/// blocks coded in intensity stereo are coded from a higher bound.
+/// Amplitudes 2 to 1 take position 4, which decodes the right channel at
+/// `i0^2`, 0.5, of the left.
 ///
 /// In the short granules coded in intensity stereo, the decoded right
 /// channel, high-passed, is that share of the decoded left in ffmpeg,
 /// mpg123 and LAME, within 2%.
 #[test]
 fn intensity_stereo_keeps_the_level_of_each_channel_in_short_blocks() {
+    let below_bounds = [1_200.0, 2_800.0, 3_700.0, 5_000.0];
     let cases = [
         (
             SamplingFrequency::Hz44100,
             64,
             false,
+            below_bounds,
             1.0 / 60f64.to_radians().tan(),
         ),
         (
             SamplingFrequency::Hz44100,
             64,
             true,
+            below_bounds,
             1.0 / 60f64.to_radians().tan(),
         ),
-        (SamplingFrequency::Hz22050, 48, false, 0.5),
+        (SamplingFrequency::Hz22050, 48, false, below_bounds, 0.5),
+        (
+            SamplingFrequency::Hz22050,
+            48,
+            false,
+            [1_000.0, 2_000.0, 3_000.0, 4_500.0],
+            0.5,
+        ),
     ];
-    for (fs, kbps, ms_stereo, share) in cases {
+    for (fs, kbps, ms_stereo, frequencies, share) in cases {
         let hz = f64::from(fs.hz());
         let mut seed = 1u64;
         let left: Vec<f64> = (0..(2.0 * hz) as usize)
@@ -742,7 +749,7 @@ fn intensity_stereo_keeps_the_level_of_each_channel_in_short_blocks() {
                 seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
                 let noise = (seed >> 11) as f64 / (1u64 << 52) as f64 - 1.0;
                 let burst = 0.6 * (-((t % 9600) as f64) / (0.03 * hz)).exp() * noise;
-                let tones: f64 = [1_200.0, 2_800.0, 3_700.0, 5_000.0]
+                let tones: f64 = frequencies
                     .iter()
                     .map(|f| 0.1 * (TAU * f * t as f64 / hz).sin())
                     .sum();
@@ -757,7 +764,10 @@ fn intensity_stereo_keeps_the_level_of_each_channel_in_short_blocks() {
         let stream = encode_pcm(&config(kbps, fs, mode), &[&left, &right]);
         let granules = short_intensity_granules(&stream);
         let coded = granules.iter().filter(|&&on| on).count();
-        assert!(coded >= 4, "{fs:?}, MS {ms_stereo}: {granules:?}");
+        assert!(
+            coded >= 4,
+            "{fs:?}, MS {ms_stereo}, {frequencies:?}: {granules:?}"
+        );
         // The input samples of each short granule coded in intensity
         // stereo, but for the last three.
         let samples: Vec<usize> = (granules.iter().enumerate())
@@ -787,7 +797,7 @@ fn intensity_stereo_keeps_the_level_of_each_channel_in_short_blocks() {
             let decoded_share = gain(1, delay, &samples) / gain(0, delay, &samples);
             assert!(
                 (decoded_share / share - 1.0).abs() < 0.02,
-                "{name}, {fs:?}, MS {ms_stereo}: {decoded_share:.4} for {share:.4}"
+                "{name}, {fs:?}, MS {ms_stereo}, {frequencies:?}: {decoded_share:.4} for {share:.4}"
             );
         }
     }

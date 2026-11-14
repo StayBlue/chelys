@@ -543,26 +543,37 @@ impl Coding for ModelCoding {
 }
 
 /// Annex G.1: if the frame needs more bits than it has, more and more bands
-/// are coded in intensity stereo, down to the lowest bound, and the last
-/// tried is kept even if the frame still needs more. Bounds that would not
-/// lower the bits are not tried (see [`IntensityTry::new`]).
+/// are coded in intensity stereo, down to the lowest bound, which is kept
+/// even if the frame still needs more. Bounds that would not lower the bits
+/// are not tried (see [`IntensityTry::new`]).
 ///
 /// Given the tries worth making, from the fewest bands to the most, and a
 /// function that quantises the frame for a try, returns the try kept: `None`
-/// if there are no tries, or if the function gives up on the last, as
-/// [`quantize_frame`] can whatever the distortion. A try before the last is kept only if the whole
-/// frame is within its allowed distortion, so it is given up at the first
-/// granule that is not; the frame then comes out as if it had been finished
-/// and passed over.
+/// if there are no tries, or if the function gives up on every one, as
+/// [`quantize_frame`] can whatever the distortion. A try before the last is
+/// kept only if the whole frame is within its allowed distortion, so it is
+/// given up at the first granule that is not; the frame then comes out as if
+/// it had been finished and passed over.
+///
+/// Spec gap: G.1 does not say what to do when the frame cannot be coded
+/// from the lowest bound at all, as when at the lower sampling frequencies
+/// the right channel would need a band marked (see [`quantize_frame`]). The
+/// tries are then finished from the lowest bound up, and the first that can
+/// be coded is kept: the most bands that can be coded in intensity stereo,
+/// as G.1 would have from the lowest bound. Tries given up for their
+/// distortion are quantised again to the end.
 fn search_intensity<Try, Frame>(
     tries: &[Try],
     mut quantize: impl FnMut(&Try, IfOutsideAllowance) -> Option<Frame>,
 ) -> Option<Frame> {
-    let (last, earlier) = tries.split_last()?;
+    let (_, earlier) = tries.split_last()?;
     earlier
         .iter()
         .find_map(|intensity| quantize(intensity, IfOutsideAllowance::GiveUp))
-        .or_else(|| quantize(last, IfOutsideAllowance::Finish))
+        .or_else(|| {
+            (tries.iter().rev())
+                .find_map(|intensity| quantize(intensity, IfOutsideAllowance::Finish))
+        })
 }
 
 /// A frame to quantise, the same for each try at coding it: its granules,
@@ -739,8 +750,8 @@ impl IntensityTry {
 /// ISO/IEC 13818-3), but decoders do not agree on it, and no mark is read as
 /// one by all of them. So the encoder sends no marks there: a frame whose
 /// right channel would need one, with no nonzero value in the band just
-/// below the bound, in any window of a short block, is coded from a lower
-/// bound or without intensity stereo.
+/// below the bound, in any window of a short block, is coded from another
+/// bound (see [`search_intensity`]) or without intensity stereo.
 ///
 /// Settled by decoding with ffmpeg, mpg123 and LAME (black box): of the
 /// marks of fields of 1 to 5 bits, 1, 3, 7, 15 and 31, ffmpeg reads only 31
@@ -1304,38 +1315,55 @@ mod tests {
         );
     }
 
-    /// For every pattern of tries within their allowed distortion, up to the
-    /// most a frame can have, the search keeps the first try within it or
-    /// else the last, gives up only on tries before the last, and quantises
-    /// none after the one it keeps.
+    /// How a try at intensity stereo comes out: within its allowed
+    /// distortion, outside it, or not coded at all.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum TryOutcome {
+        Within,
+        Outside,
+        Uncodable,
+    }
+
+    /// For every pattern of outcomes of tries, up to the most a frame can
+    /// have, the search keeps the first try before the last within its
+    /// allowed distortion, or else the one with the most bands that can be
+    /// coded. It gives up only on tries before the last, finishes tries only
+    /// once it has given up on all of those, from the last back, and
+    /// quantises none after the one it keeps.
     #[test]
-    fn intensity_search_keeps_the_first_try_that_fits_or_else_the_last() {
+    fn intensity_search_keeps_the_first_try_that_fits_or_else_the_lowest_that_can_be_coded() {
+        use TryOutcome::*;
         for count in 0..=stereo::INTENSITY_STEPS {
-            for pattern in 0..1u32 << count {
-                let fits = |index: usize| pattern & 1 << index != 0;
+            for pattern in 0..3usize.pow(count as u32) {
+                let outcomes: Vec<_> = (0..count)
+                    .map(|index| {
+                        [Within, Outside, Uncodable][pattern / 3usize.pow(index as u32) % 3]
+                    })
+                    .collect();
                 let tries: Vec<usize> = (0..count).collect();
                 let mut calls = Vec::new();
                 let kept = search_intensity(&tries, |&index, if_outside| {
                     calls.push((index, if_outside));
-                    (fits(index) || if_outside == IfOutsideAllowance::Finish).then_some(index)
+                    match (outcomes[index], if_outside) {
+                        (Within, _) | (Outside, IfOutsideAllowance::Finish) => Some(index),
+                        _ => None,
+                    }
                 });
 
-                let expected = (0..count).find(|&index| fits(index) || index + 1 == count);
-                assert_eq!(kept, expected, "{count} tries, fits {pattern:b}");
-                let expected_calls: Vec<_> = expected
-                    .into_iter()
-                    .flat_map(|kept| 0..=kept)
-                    .map(|index| {
-                        let last = index + 1 == count;
-                        let if_outside = if last {
-                            IfOutsideAllowance::Finish
-                        } else {
-                            IfOutsideAllowance::GiveUp
-                        };
-                        (index, if_outside)
-                    })
-                    .collect();
-                assert_eq!(calls, expected_calls, "{count} tries, fits {pattern:b}");
+                let earlier = count.saturating_sub(1);
+                let within = (0..earlier).find(|&index| outcomes[index] == Within);
+                let expected =
+                    within.or_else(|| (0..count).rev().find(|&i| outcomes[i] != Uncodable));
+                assert_eq!(kept, expected, "{outcomes:?}");
+                let gave_up = (0..within.map_or(earlier, |index| index + 1))
+                    .map(|index| (index, IfOutsideAllowance::GiveUp));
+                let finished = match within {
+                    Some(_) => 0..0,
+                    None => expected.unwrap_or(0)..count,
+                };
+                let finished = (finished.rev()).map(|index| (index, IfOutsideAllowance::Finish));
+                let expected_calls: Vec<_> = gave_up.chain(finished).collect();
+                assert_eq!(calls, expected_calls, "{outcomes:?}");
             }
         }
     }
