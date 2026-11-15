@@ -7,12 +7,13 @@
 use std::f64::consts::TAU;
 
 use chelys::mp3::header::{Bitrate, Mode, SamplingFrequency};
+use chelys::mp3::rate::Rate;
 use chelys::mp3::{GRANULE_LINES, StreamConfig, encode_pcm, encode_silence};
 use chelys_conformance::{DECODERS, Decoder, ffmpeg};
 
 fn config(kbps: u32, sampling_frequency: SamplingFrequency, mode: Mode) -> StreamConfig {
     StreamConfig {
-        bitrate: Bitrate::from_kbps(sampling_frequency.version(), kbps).unwrap(),
+        rate: Rate::Constant(Bitrate::from_kbps(sampling_frequency.version(), kbps).unwrap()),
         sampling_frequency,
         mode,
         crc_protected: false,
@@ -111,7 +112,7 @@ fn loud_noise_fits_at_the_lowest_bitrate() {
     for fs in SamplingFrequency::STANDARD {
         for crc_protected in [false, true] {
             let config = StreamConfig {
-                bitrate: Bitrate::all(fs.version()).next().unwrap(),
+                rate: Rate::Constant(Bitrate::all(fs.version()).next().unwrap()),
                 sampling_frequency: fs,
                 mode: Mode::Stereo,
                 crc_protected,

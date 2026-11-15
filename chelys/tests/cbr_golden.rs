@@ -13,6 +13,7 @@
 use std::f64::consts::TAU;
 
 use chelys::mp3::header::{Bitrate, Mode, SamplingFrequency};
+use chelys::mp3::rate::Rate;
 use chelys::mp3::{StreamConfig, encode_pcm};
 
 /// One and a half seconds: a tone in each channel, apart by a fifth, a
@@ -145,7 +146,7 @@ fn constant_bitrate_streams_are_unchanged() {
             .map(|(fs, kbps, mode, crc_protected, ..)| {
                 scope.spawn(move || {
                     let config = StreamConfig {
-                        bitrate: Bitrate::from_kbps(fs.version(), kbps).unwrap(),
+                        rate: Rate::Constant(Bitrate::from_kbps(fs.version(), kbps).unwrap()),
                         sampling_frequency: fs,
                         mode,
                         crc_protected,

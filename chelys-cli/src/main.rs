@@ -11,8 +11,10 @@
 
 use std::io::{ErrorKind, Read, Write};
 use std::process::ExitCode;
+use std::str::FromStr;
 
 use chelys::mp3::header::{Bitrate, Mode, SamplingFrequency};
+use chelys::mp3::rate::{MeanRate, Rate};
 use chelys::mp3::{Encoder, StreamConfig};
 
 const USAGE: &str = "\
@@ -27,9 +29,12 @@ MPEG-2.5 Layer III at 8, 11.025 and 12 kHz (experimental).
   --sample-rate HZ   32000, 44100 or 48000; or 16000, 22050 or 24000; or
                      8000, 11025 or 12000
   --channels N       1 or 2
-  --bitrate KBPS     32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256
-                     or 320; at 24 kHz and below 8, 16, 24, 32, 40, 48, 56,
-                     64, 80, 96, 112, 128, 144 or 160 (default 128)
+  --bitrate KBPS     the bitrate of every frame: 32, 40, 48, 56, 64, 80, 96,
+                     112, 128, 160, 192, 224, 256 or 320; at 24 kHz and
+                     below 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128,
+                     144 or 160 (default 128); or a whole number between
+                     two of those, kept as the stream's mean, with each
+                     frame at one of the two
   --no-joint-stereo  code two channels as left and right throughout
                      (default: code each frame in MS stereo where the
                      channels are alike)
@@ -43,7 +48,7 @@ MPEG-2.5 Layer III at 8, 11.025 and 12 kHz (experimental).
 struct Options {
     sampling_frequency: SamplingFrequency,
     channels: usize,
-    bitrate: Bitrate,
+    rate: Rate,
     /// On unless turned off, following ffmpeg's command line: its MP3
     /// encoder codes two channels in joint stereo by default, as observed
     /// from the frame headers of its output (ffmpeg n9.0.2).
@@ -58,21 +63,24 @@ struct Options {
     crc_protected: bool,
 }
 
+/// The value after the flag `name`, parsed.
+fn value<T: FromStr>(args: &mut impl Iterator<Item = String>, name: &str) -> Result<T, String> {
+    let value = args.next().ok_or(format!("{name} needs a value"))?;
+    value
+        .parse()
+        .map_err(|_| format!("{name}: not a number: {value}"))
+}
+
 fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
-    let (mut sample_rate, mut channels, mut bitrate) = (None, None, 128);
+    let (mut sample_rate, mut channels, mut bitrate) = (None, None, None);
     let (mut joint_stereo, mut intensity_stereo, mut crc_protected) = (true, false, false);
     let mut args = args.into_iter();
     while let Some(flag) = args.next() {
-        let mut value = |name: &str| -> Result<u32, String> {
-            let value = args.next().ok_or(format!("{name} needs a value"))?;
-            value
-                .parse()
-                .map_err(|_| format!("{name}: not a number: {value}"))
-        };
+        let args = &mut args;
         match flag.as_str() {
-            "--sample-rate" => sample_rate = Some(value("--sample-rate")?),
-            "--channels" => channels = Some(value("--channels")?),
-            "--bitrate" => bitrate = value("--bitrate")?,
+            "--sample-rate" => sample_rate = Some(value::<u32>(args, &flag)?),
+            "--channels" => channels = Some(value::<u32>(args, &flag)?),
+            "--bitrate" => bitrate = Some(value::<u32>(args, &flag)?),
             "--no-joint-stereo" => joint_stereo = false,
             "--intensity-stereo" => intensity_stereo = true,
             "--crc" => crc_protected = true,
@@ -90,16 +98,23 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
         n @ (1 | 2) => n as usize,
         n => return Err(format!("unsupported channel count: {n}")),
     };
-    let bitrate = Bitrate::from_kbps(sampling_frequency.version(), bitrate).ok_or(format!(
-        "unsupported bitrate at {sample_rate} Hz: {bitrate}"
-    ))?;
+    let version = sampling_frequency.version();
+    let kbps = bitrate.unwrap_or(128);
+    let rate = match Bitrate::from_kbps(version, kbps) {
+        Some(bitrate) => Rate::Constant(bitrate),
+        None => kbps
+            .checked_mul(1000)
+            .and_then(|bps| MeanRate::new(version, bps))
+            .map(Rate::Mean)
+            .ok_or(format!("unsupported bitrate at {sample_rate} Hz: {kbps}"))?,
+    };
     if intensity_stereo && channels != 2 {
         return Err("--intensity-stereo needs two channels".to_owned());
     }
     Ok(Options {
         sampling_frequency,
         channels,
-        bitrate,
+        rate,
         joint_stereo,
         intensity_stereo,
         crc_protected,
@@ -120,7 +135,7 @@ fn main() -> ExitCode {
     };
 
     let config = StreamConfig {
-        bitrate: options.bitrate,
+        rate: options.rate,
         sampling_frequency: options.sampling_frequency,
         mode: match (
             options.channels,

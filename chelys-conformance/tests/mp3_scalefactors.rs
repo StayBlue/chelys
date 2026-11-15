@@ -14,6 +14,7 @@
 //! wrong multiplier or preemphasis decodes at least a factor of 2^(1/2) off.
 
 use chelys::mp3::header::{Bitrate, Mode, SamplingFrequency, Version};
+use chelys::mp3::rate::Rate;
 use chelys::mp3::scalefactor_bands::{self, LONG_BANDS};
 use chelys::mp3::scalefactors::{PRETAB, Scalefac, Scalefactors};
 use chelys::mp3::{BlockType, GRANULE_LINES, QuantizedGranule, StreamConfig, encode_granules};
@@ -24,7 +25,7 @@ const GLOBAL_GAIN: u8 = 150;
 fn config(sampling_frequency: SamplingFrequency) -> StreamConfig {
     StreamConfig {
         // The highest: 320 kbit/s, or 160 at the lower sampling frequencies.
-        bitrate: Bitrate::all(sampling_frequency.version()).last().unwrap(),
+        rate: Rate::Constant(Bitrate::all(sampling_frequency.version()).last().unwrap()),
         sampling_frequency,
         mode: Mode::SingleChannel,
         crc_protected: false,

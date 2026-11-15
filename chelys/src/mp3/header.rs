@@ -99,6 +99,23 @@ impl Bitrate {
     pub fn bits_per_second(self) -> u32 {
         self.version.kbps()[usize::from(self.index)] * 1000
     }
+
+    /// The length in bytes of a frame at this bitrate, header included, with
+    /// or without `padding`.
+    ///
+    /// # Panics
+    ///
+    /// If the bitrate is not one of those of the sampling frequency's
+    /// [`Version`].
+    pub fn frame_len(self, sampling_frequency: SamplingFrequency, padding: bool) -> usize {
+        assert_eq!(
+            self.version,
+            sampling_frequency.version(),
+            "{self:?} is not a bitrate of {sampling_frequency:?}"
+        );
+        let (slots, _) = slots_per_frame(self, sampling_frequency);
+        slots + usize::from(padding)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -311,8 +328,8 @@ impl Header {
     /// Frame length in bytes (one slot is one byte in Layer III), header
     /// included.
     pub fn frame_len(&self) -> usize {
-        let (slots, _) = slots_per_frame(self.bitrate, self.sampling_frequency);
-        slots + usize::from(self.padding)
+        self.bitrate
+            .frame_len(self.sampling_frequency, self.padding)
     }
 }
 

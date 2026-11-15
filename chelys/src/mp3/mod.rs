@@ -10,11 +10,14 @@ pub mod header;
 pub mod huffman;
 pub mod loops;
 pub mod psychoacoustic;
+pub mod rate;
 pub mod reservoir;
 pub mod scalefactor_bands;
 pub mod scalefactors;
 pub mod side_info;
 pub mod stereo;
+#[cfg(test)]
+mod stream_check;
 
 use std::collections::VecDeque;
 use std::ops::Range;
@@ -24,6 +27,7 @@ use header::{Bitrate, Emphasis, Header, Mode, PaddingSchedule, SamplingFrequency
 use huffman::{QuadTable, SpectrumCoding};
 use loops::scfsi::{self, GranuleSummary};
 use psychoacoustic::switching::{BlockSwitching, SwitchedMasking};
+use rate::{MeanRateSchedule, Rate};
 use reservoir::Reservoir;
 use scalefactors::Scalefactors;
 use side_info::{GranuleChannel, SideInfo, Window};
@@ -41,9 +45,9 @@ pub enum BlockType {
     Stop,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct StreamConfig {
-    pub bitrate: Bitrate,
+    pub rate: Rate,
     pub sampling_frequency: SamplingFrequency,
     pub mode: Mode,
     pub crc_protected: bool,
@@ -245,8 +249,16 @@ impl QuantizedGranule {
 const MAX_PART2_3_LENGTH: usize = (1 << 12) - 1;
 
 impl StreamConfig {
-    fn header(&self, padding: bool) -> Header {
-        self.frame_header(padding, false, false)
+    /// The bitrate of every frame.
+    ///
+    /// # Panics
+    ///
+    /// If the rate is not [`Rate::Constant`].
+    fn constant_bitrate(&self) -> Bitrate {
+        match self.rate {
+            Rate::Constant(bitrate) => bitrate,
+            rate => panic!("{rate:?} is not a constant bitrate"),
+        }
     }
 
     /// Whether the configured mode allows MS stereo and intensity stereo:
@@ -261,10 +273,16 @@ impl StreamConfig {
         }
     }
 
-    /// The header of a frame, with `mode_extension` switching MS stereo and
-    /// intensity stereo on for this frame alone if `ms_stereo` and
-    /// `intensity_stereo` are set.
-    fn frame_header(&self, padding: bool, ms_stereo: bool, intensity_stereo: bool) -> Header {
+    /// The header of a frame at `bitrate`, with `mode_extension` switching
+    /// MS stereo and intensity stereo on for this frame alone if `ms_stereo`
+    /// and `intensity_stereo` are set.
+    fn frame_header(
+        &self,
+        bitrate: Bitrate,
+        padding: bool,
+        ms_stereo: bool,
+        intensity_stereo: bool,
+    ) -> Header {
         let mode = match self.mode {
             Mode::JointStereo { .. } => Mode::JointStereo {
                 intensity_stereo,
@@ -280,7 +298,7 @@ impl StreamConfig {
         };
         Header {
             crc_protected: self.crc_protected,
-            bitrate: self.bitrate,
+            bitrate,
             sampling_frequency: self.sampling_frequency,
             padding,
             private: false,
@@ -387,7 +405,7 @@ fn frame_contents(
 
 /// Encodes quantised granules, given in order with one entry per channel,
 /// into frames of two granules each, or one at the lower sampling
-/// frequencies.
+/// frequencies, at a constant bitrate.
 ///
 /// Main data is not shared between frames: `main_data_begin` is always 0. In
 /// joint stereo every frame has MS stereo and intensity stereo on as the
@@ -397,8 +415,9 @@ fn frame_contents(
 ///
 /// # Panics
 ///
-/// If the granules do not divide into frames for the configured channels, or
-/// a frame's granules do not fit in it.
+/// If the rate is not [`Rate::Constant`], the granules do not divide into
+/// frames for the configured channels, or a frame's granules do not fit in
+/// it.
 pub fn encode_granules(config: &StreamConfig, granules: &[Vec<QuantizedGranule>]) -> Vec<u8> {
     let channels = config.mode.channels();
     let per_frame = config.sampling_frequency.version().granules();
@@ -411,10 +430,12 @@ pub fn encode_granules(config: &StreamConfig, granules: &[Vec<QuantizedGranule>]
         "each granule needs one entry per channel"
     );
     let (ms_stereo, intensity_stereo) = config.joint_stereo();
-    let mut padding = PaddingSchedule::new(config.bitrate, config.sampling_frequency);
+    let bitrate = config.constant_bitrate();
+    let mut padding = PaddingSchedule::new(bitrate, config.sampling_frequency);
     let mut writer = FrameWriter::default();
     for frame in granules.chunks_exact(per_frame) {
-        let header = config.frame_header(padding.next_padding(), ms_stereo, intensity_stereo);
+        let header =
+            config.frame_header(bitrate, padding.next_padding(), ms_stereo, intensity_stereo);
         let (side_info, main_data) = frame_contents(&header, frame, 0);
         writer.write(&header, &side_info, &main_data);
     }
@@ -436,7 +457,7 @@ pub fn encode_pcm(config: &StreamConfig, channels: &[&[f64]]) -> Vec<u8> {
     out
 }
 
-/// Encodes PCM at the configured bitrate as it arrives.
+/// Encodes PCM at the configured rate as it arrives.
 ///
 /// Psychoacoustic model 2 chooses each granule's block type, switching to
 /// short blocks for attacks, and sets the distortion each scalefactor band
@@ -455,6 +476,10 @@ pub fn encode_pcm(config: &StreamConfig, channels: &[&[f64]]) -> Vec<u8> {
 pub struct Encoder(FrameEncoder<ModelCoding>);
 
 impl Encoder {
+    /// # Panics
+    ///
+    /// If the rate's bitrates are not of the version of the sampling
+    /// frequency.
     pub fn new(config: StreamConfig) -> Self {
         let fs = config.sampling_frequency;
         let (ms_allowed, intensity_allowed) = config.joint_stereo();
@@ -466,7 +491,8 @@ impl Encoder {
             intensity_allowed,
             sampling_frequency: fs,
         };
-        let reservoir = Reservoir::new(config.header(true).frame_len(), fs.version());
+        let shortest = config.rate.lowest().frame_len(fs, true);
+        let reservoir = Reservoir::new(shortest, fs.version());
         Self(FrameEncoder::new(config, coding, reservoir))
     }
 
@@ -519,12 +545,7 @@ impl Coding for ModelCoding {
         Some((masking.block_type(), (masking, Vec::new())))
     }
 
-    fn quantize(
-        &mut self,
-        mut frame: Vec<Vec<Filtered<Analysis>>>,
-        mean_bits: usize,
-        reservoir: &mut Reservoir,
-    ) -> CodedFrame {
+    fn prepare(&mut self, frame: &mut [Vec<Filtered<Analysis>>]) {
         let fs = self.sampling_frequency;
         for granule in frame.iter_mut() {
             for filtered in granule.iter_mut() {
@@ -532,14 +553,23 @@ impl Coding for ModelCoding {
                 *xmin = masking.allowed_distortion(&filtered.xr, fs);
             }
         }
-        let ms_stereo = self.ms_allowed && middle_side_frame(&frame);
-        let steps = if self.intensity_allowed && intensity_frame(&frame) {
+    }
+
+    fn quantize(
+        &mut self,
+        frame: &[Vec<Filtered<Analysis>>],
+        mean_bits: usize,
+        reservoir: &mut Reservoir,
+    ) -> CodedFrame {
+        let fs = self.sampling_frequency;
+        let ms_stereo = self.ms_allowed && middle_side_frame(frame);
+        let steps = if self.intensity_allowed && intensity_frame(frame) {
             0..stereo::INTENSITY_STEPS
         } else {
             0..0
         };
         let to_quantize = FrameToQuantize {
-            frame: &frame,
+            frame,
             ms_stereo,
             mean_bits,
             sampling_frequency: fs,
@@ -550,7 +580,7 @@ impl Coding for ModelCoding {
             Vec::new()
         } else {
             steps
-                .filter_map(|step| IntensityTry::new(&frame, &plain.granules, step, fs))
+                .filter_map(|step| IntensityTry::new(frame, &plain.granules, step, fs))
                 .collect()
         };
         let kept = search_intensity(&tries, |intensity, if_outside| {
@@ -980,27 +1010,28 @@ impl<F: FnMut(usize, usize) -> BlockType> Coding for FixedGainCoding<F> {
 
     fn quantize(
         &mut self,
-        mut frame: Vec<Vec<Filtered<()>>>,
+        frame: &[Vec<Filtered<()>>],
         mean_bits: usize,
         reservoir: &mut Reservoir,
     ) -> CodedFrame {
         let (global_gain, fs) = (self.global_gain, self.sampling_frequency);
         let mut granules = Vec::with_capacity(frame.len());
-        for granule in frame.iter_mut() {
+        for granule in frame {
+            let mut lines: Vec<_> = granule.iter().map(|filtered| filtered.xr).collect();
             if self.ms_stereo {
-                let [left, right] = &mut granule[..] else {
+                let [left, right] = &granule[..] else {
                     unreachable!("MS stereo has two channels")
                 };
                 assert_eq!(
                     left.block_type, right.block_type,
                     "MS stereo needs one block type"
                 );
-                (left.xr, right.xr) = stereo::middle_side(&left.xr, &right.xr);
+                let (middle, side) = stereo::middle_side(&left.xr, &right.xr);
+                lines = vec![middle, side];
             }
-            let quantized: Vec<_> = granule
-                .iter()
-                .map(|filtered| {
-                    let values = loops::quantize(&filtered.xr, global_gain).unwrap_or_else(|| {
+            let quantized: Vec<_> = (granule.iter().zip(&lines))
+                .map(|(filtered, xr)| {
+                    let values = loops::quantize(xr, global_gain).unwrap_or_else(|| {
                         panic!("a granule is too loud for global_gain {global_gain}")
                     });
                     let granule =
@@ -1050,15 +1081,52 @@ trait Coding {
         pcm: &[f64; GRANULE_LINES],
     ) -> Option<(BlockType, Self::Analysis)>;
 
+    /// Readies a frame's granules, indexed `[gr][ch]`, for quantisation,
+    /// once however many times the frame is quantised.
+    fn prepare(&mut self, _frame: &mut [Vec<Filtered<Self::Analysis>>]) {}
+
     /// Quantises a frame's granules, indexed `[gr][ch]`, given the share of
     /// the frame's main data of each granule of each channel, accounting in
     /// the reservoir for the bits each uses.
     fn quantize(
         &mut self,
-        frame: Vec<Vec<Filtered<Self::Analysis>>>,
+        frame: &[Vec<Filtered<Self::Analysis>>],
         mean_bits: usize,
         reservoir: &mut Reservoir,
     ) -> CodedFrame;
+}
+
+/// How [`FrameEncoder`] chooses the bitrate of each frame.
+enum Schedule {
+    Constant(Bitrate, PaddingSchedule),
+    Mean(MeanRateSchedule),
+}
+
+impl Schedule {
+    fn new(config: &StreamConfig) -> Self {
+        let fs = config.sampling_frequency;
+        assert_eq!(
+            config.rate.version(),
+            fs.version(),
+            "{:?} is not a rate of {fs:?}",
+            config.rate
+        );
+        match config.rate {
+            Rate::Constant(bitrate) => Self::Constant(bitrate, PaddingSchedule::new(bitrate, fs)),
+            Rate::Mean(mean) => Self::Mean(MeanRateSchedule::new(mean, fs)),
+        }
+    }
+}
+
+/// A frame quantised at one bitrate, with the reservoir after it.
+struct FrameAtBitrate {
+    bitrate: Bitrate,
+    padding: bool,
+    coded: CodedFrame,
+    main_data_begin: usize,
+    /// The bits of the frame's main data slot beyond the granules' shares.
+    unshared_bits: usize,
+    reservoir: Reservoir,
 }
 
 /// Runs each channel through its filterbank granule by granule as its PCM
@@ -1066,12 +1134,14 @@ trait Coding {
 struct FrameEncoder<C> {
     config: StreamConfig,
     coding: C,
+    /// The reservoir between frames.
     reservoir: Reservoir,
     /// One for each channel.
     filterbanks: Vec<filterbank::Filterbank>,
-    padding: PaddingSchedule,
+    schedule: Schedule,
     writer: FrameWriter,
-    main_data_begin: usize,
+    /// The bytes the reservoir holds for the next frame.
+    reservoir_bytes: usize,
     /// Each channel's PCM from the first granule not yet filtered.
     pcm: Vec<Vec<f64>>,
     /// The samples each channel has been given.
@@ -1084,15 +1154,15 @@ impl<C: Coding> FrameEncoder<C> {
     fn new(config: StreamConfig, coding: C, reservoir: Reservoir) -> Self {
         let channels = config.mode.channels();
         Self {
+            schedule: Schedule::new(&config),
             config,
             coding,
             reservoir,
             filterbanks: (0..channels)
                 .map(|_| filterbank::Filterbank::new())
                 .collect(),
-            padding: PaddingSchedule::new(config.bitrate, config.sampling_frequency),
             writer: FrameWriter::default(),
-            main_data_begin: 0,
+            reservoir_bytes: 0,
             pcm: vec![Vec::new(); channels],
             samples: 0,
             frames: 0,
@@ -1170,7 +1240,7 @@ impl<C: Coding> FrameEncoder<C> {
             }
         }
         let granules = fs.version().granules();
-        let filtered: Vec<Vec<Filtered<C::Analysis>>> = (0..granules)
+        let mut filtered: Vec<Vec<Filtered<C::Analysis>>> = (0..granules)
             .map(|gr| {
                 (filterbanks.iter_mut().enumerate())
                     .map(|(channel, filterbank)| {
@@ -1191,29 +1261,67 @@ impl<C: Coding> FrameEncoder<C> {
                     .collect()
             })
             .collect();
-        // mode_extension does not change the frame's length.
-        let padded = self.padding.next_padding();
-        let slot_bits = main_data_bits(&self.config.header(padded));
-        let shares = granules * self.pcm.len();
-        let mean_bits = slot_bits / shares;
+        coding.prepare(&mut filtered);
         let block_types: Vec<BlockType> = filtered.iter().flatten().map(|f| f.block_type).collect();
-        let coded = self
-            .coding
-            .quantize(filtered, mean_bits, &mut self.reservoir);
+        let kept = match &mut self.schedule {
+            Schedule::Constant(bitrate, padding) => {
+                let (bitrate, padding) = (*bitrate, padding.next_padding());
+                self.quantize_at(&filtered, bitrate, padding)
+            }
+            Schedule::Mean(schedule) => {
+                let (bitrate, padding) = schedule.next_frame();
+                self.quantize_at(&filtered, bitrate, padding)
+            }
+        };
+        let FrameAtBitrate {
+            bitrate,
+            padding,
+            coded,
+            main_data_begin,
+            unshared_bits,
+            reservoir,
+        } = kept;
         assert!(
             (coded.granules.iter().flatten())
                 .map(|q| q.block_type)
                 .eq(block_types),
             "the granules keep their block types"
         );
-        let header = self
-            .config
-            .frame_header(padded, coded.ms_stereo, coded.intensity_stereo);
-        let (side_info, main_data) = frame_contents(&header, &coded.granules, self.main_data_begin);
+        let header =
+            self.config
+                .frame_header(bitrate, padding, coded.ms_stereo, coded.intensity_stereo);
+        let (side_info, main_data) = frame_contents(&header, &coded.granules, main_data_begin);
         self.writer.write(&header, &side_info, &main_data);
-        self.main_data_begin = self.reservoir.end_frame(slot_bits - shares * mean_bits);
-        self.writer.keep_unused(self.main_data_begin);
+        self.reservoir = reservoir;
+        self.reservoir_bytes = self.reservoir.end_frame(unshared_bits);
+        self.writer.keep_unused(self.reservoir_bytes);
         self.frames += 1;
+    }
+
+    /// Quantises a frame at `bitrate`, with or without `padding`, from the
+    /// reservoir as the frame finds it.
+    fn quantize_at(
+        &mut self,
+        frame: &[Vec<Filtered<C::Analysis>>],
+        bitrate: Bitrate,
+        padding: bool,
+    ) -> FrameAtBitrate {
+        let fs = self.config.sampling_frequency;
+        let mut reservoir = self.reservoir.for_frame(bitrate.frame_len(fs, true));
+        let main_data_begin = reservoir.bytes();
+        // mode_extension does not change the frame's length.
+        let slot_bits = main_data_bits(&self.config.frame_header(bitrate, padding, false, false));
+        let shares = frame.len() * self.pcm.len();
+        let mean_bits = slot_bits / shares;
+        let coded = self.coding.quantize(frame, mean_bits, &mut reservoir);
+        FrameAtBitrate {
+            bitrate,
+            padding,
+            coded,
+            main_data_begin,
+            unshared_bits: slot_bits - shares * mean_bits,
+            reservoir,
+        }
     }
 }
 
@@ -1237,7 +1345,7 @@ mod tests {
 
     fn config(crc_protected: bool) -> StreamConfig {
         StreamConfig {
-            bitrate: Bitrate::from_kbps(Version::Mpeg1, 128).unwrap(),
+            rate: Rate::Constant(Bitrate::from_kbps(Version::Mpeg1, 128).unwrap()),
             sampling_frequency: SamplingFrequency::Hz44100,
             mode: Mode::Stereo,
             crc_protected,
@@ -1414,7 +1522,7 @@ mod tests {
     #[test]
     fn streaming_does_not_depend_on_how_the_input_is_divided() {
         let config = StreamConfig {
-            bitrate: Bitrate::from_kbps(Version::Mpeg1, 32).unwrap(),
+            rate: Rate::Constant(Bitrate::from_kbps(Version::Mpeg1, 32).unwrap()),
             sampling_frequency: SamplingFrequency::Hz44100,
             mode: Mode::JointStereo {
                 intensity_stereo: false,
@@ -1438,14 +1546,17 @@ mod tests {
             .collect();
         let (left, right): (Vec<f64>, Vec<f64>) = pcm.iter().map(|&[l, r]| (l, r)).unzip();
         let whole = encode_pcm(&config, &[&left, &right]);
-        let mut padding = PaddingSchedule::new(config.bitrate, config.sampling_frequency);
+        stream_check::frames(&whole);
+        let bitrate = config.constant_bitrate();
+        let fs = config.sampling_frequency;
+        let mut padding = PaddingSchedule::new(bitrate, fs);
         let frames = samples.div_ceil(Version::Mpeg1.samples_per_frame()) + 1;
-        let frame_lens = (0..frames).map(|_| config.header(padding.next_padding()).frame_len());
+        let frame_lens = (0..frames).map(|_| bitrate.frame_len(fs, padding.next_padding()));
         assert_eq!(whole.len(), frame_lens.sum::<usize>());
 
         // Frames without padding have the smallest slots, and so span the
         // most frames for the same bytes.
-        let header = config.header(false);
+        let header = config.frame_header(bitrate, false, false, false);
         let slot = main_data_bits(&header) / 8;
         let overhead = header.frame_len() - slot;
         let streams = std::thread::scope(|scope| {
@@ -1464,7 +1575,7 @@ mod tests {
                     let mut furthest = 0;
                     for (left, right) in left.chunks(chunk).zip(right.chunks(chunk)) {
                         encoder.encode(&[left, right], &mut out);
-                        let begin = encoder.0.main_data_begin;
+                        let begin = encoder.0.reservoir_bytes;
                         furthest = furthest.max(begin);
                         let held = encoder.0.writer.out.len();
                         let most = begin + begin.div_ceil(slot) * overhead;
@@ -1482,6 +1593,77 @@ mod tests {
                 furthest > slot,
                 "main data reaches back {furthest} bytes, within the frame before"
             );
+        }
+    }
+
+    /// Silence, full-scale noise, a quiet tone, bursts of noise with sharp
+    /// onsets, and silence again, over `seconds` seconds at `fs`, in two
+    /// channels that differ in the noise.
+    fn varied(fs: SamplingFrequency, seconds: f64) -> [Vec<f64>; 2] {
+        let hz = f64::from(fs.hz());
+        let mut seed = 7;
+        let (mut left, mut right) = (Vec::new(), Vec::new());
+        for t in 0..(seconds * hz) as usize {
+            let s = t as f64 / hz / seconds;
+            let (common, own) = (noise(&mut seed), noise(&mut seed));
+            let tone = (std::f64::consts::TAU * 440.0 * t as f64 / hz).sin();
+            let (l, r) = match s {
+                s if s < 0.15 => (0.0, 0.0),
+                s if s < 0.4 => (0.9 * common, 0.9 * (0.5 * common + 0.5 * own)),
+                s if s < 0.6 => (0.01 * tone, 0.01 * tone),
+                s if s < 0.9 => {
+                    let burst = 0.7 * (-(s - 0.6) % 0.1 * seconds / 0.02).exp();
+                    (burst * common + 0.05 * tone, burst * own)
+                }
+                _ => (0.0, 0.0),
+            };
+            left.push(l);
+            right.push(r);
+        }
+        [left, right]
+    }
+
+    const MS: Mode = Mode::JointStereo {
+        intensity_stereo: false,
+        ms_stereo: true,
+    };
+
+    fn encode(config: StreamConfig, [left, right]: &[Vec<f64>; 2]) -> Vec<u8> {
+        match config.mode {
+            Mode::SingleChannel => encode_pcm(&config, &[left]),
+            _ => encode_pcm(&config, &[left, right]),
+        }
+    }
+
+    /// A mean bitrate between two of the table switches between them, and
+    /// the stream is as long as its schedule makes it.
+    #[test]
+    fn a_mean_bitrate_switches_between_its_neighbours() {
+        for (fs, kbps, neighbours) in [
+            (SamplingFrequency::Hz44100, 150, [128, 160]),
+            (SamplingFrequency::Hz22050, 100, [96, 112]),
+        ] {
+            let mean = rate::MeanRate::new(fs.version(), kbps * 1000).unwrap();
+            let config = StreamConfig {
+                rate: Rate::Mean(mean),
+                sampling_frequency: fs,
+                mode: MS,
+                crc_protected: false,
+            };
+            let frames = stream_check::frames(&encode(config, &varied(fs, 0.5)));
+            let mut schedule = MeanRateSchedule::new(mean, fs);
+            for (k, frame) in frames.iter().enumerate() {
+                let (bitrate, padding) = schedule.next_frame();
+                assert_eq!(
+                    (frame.bitrate, frame.padding),
+                    (bitrate, padding),
+                    "frame {k}"
+                );
+            }
+            let used: std::collections::BTreeSet<u32> = (frames.iter())
+                .map(|f| f.bitrate.bits_per_second() / 1000)
+                .collect();
+            assert_eq!(used.into_iter().collect::<Vec<_>>(), neighbours, "{fs:?}");
         }
     }
 }

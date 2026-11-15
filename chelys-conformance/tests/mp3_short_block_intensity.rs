@@ -15,6 +15,7 @@
 //! stereo, tells the two apart.
 
 use chelys::mp3::header::{Bitrate, Mode, SamplingFrequency, Version};
+use chelys::mp3::rate::Rate;
 use chelys::mp3::scalefactor_bands::{self, SHORT_BANDS, SHORT_WINDOWS};
 use chelys::mp3::scalefactors::ZeroPart;
 use chelys::mp3::{BlockType, GRANULE_LINES, QuantizedGranule, StreamConfig, encode_granules};
@@ -115,7 +116,7 @@ fn stream(fs: SamplingFrequency, left_line: usize, right: Option<&QuantizedGranu
         None => Mode::Stereo,
     };
     let config = StreamConfig {
-        bitrate: Bitrate::from_kbps(fs.version(), 160).unwrap(),
+        rate: Rate::Constant(Bitrate::from_kbps(fs.version(), 160).unwrap()),
         sampling_frequency: fs,
         mode,
         crc_protected: false,

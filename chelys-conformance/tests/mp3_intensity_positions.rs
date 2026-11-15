@@ -22,6 +22,7 @@
 //! ffmpeg, mpg123 and LAME.
 
 use chelys::mp3::header::{Bitrate, Mode, SamplingFrequency};
+use chelys::mp3::rate::Rate;
 use chelys::mp3::scalefactor_bands::{self, LONG_BANDS, SHORT_WINDOWS};
 use chelys::mp3::scalefactors::ZeroPart;
 use chelys::mp3::stereo::INTENSITY_SCALE;
@@ -74,7 +75,7 @@ fn stream(
     let left = QuantizedGranule::new(200, values, BlockType::Normal, fs);
     let right = right_channel(fs, intensity);
     let config = StreamConfig {
-        bitrate: Bitrate::from_kbps(fs.version(), 160).unwrap(),
+        rate: Rate::Constant(Bitrate::from_kbps(fs.version(), 160).unwrap()),
         sampling_frequency: fs,
         mode,
         crc_protected: false,

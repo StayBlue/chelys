@@ -7,13 +7,14 @@
 use std::f64::consts::TAU;
 
 use chelys::mp3::header::{Bitrate, Mode, SamplingFrequency};
+use chelys::mp3::rate::Rate;
 use chelys::mp3::{BlockType, StreamConfig, encode_pcm_with_global_gain, encode_with_block_types};
 use chelys_conformance::ffmpeg;
 
 fn config(sampling_frequency: SamplingFrequency, mode: Mode) -> StreamConfig {
     StreamConfig {
         // The highest: 320 kbit/s, or 160 at the lower sampling frequencies.
-        bitrate: Bitrate::all(sampling_frequency.version()).last().unwrap(),
+        rate: Rate::Constant(Bitrate::all(sampling_frequency.version()).last().unwrap()),
         sampling_frequency,
         mode,
         crc_protected: false,

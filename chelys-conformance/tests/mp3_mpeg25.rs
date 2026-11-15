@@ -6,6 +6,7 @@
 use std::f64::consts::TAU;
 
 use chelys::mp3::header::{Bitrate, Mode, SamplingFrequency, Version};
+use chelys::mp3::rate::Rate;
 use chelys::mp3::scalefactor_bands;
 use chelys::mp3::scalefactors::Scalefactors;
 use chelys::mp3::{
@@ -16,7 +17,7 @@ use chelys_conformance::DECODERS;
 
 fn config(sampling_frequency: SamplingFrequency, mode: Mode, kbps: u32) -> StreamConfig {
     StreamConfig {
-        bitrate: Bitrate::from_kbps(Version::Mpeg2, kbps).unwrap(),
+        rate: Rate::Constant(Bitrate::from_kbps(Version::Mpeg2, kbps).unwrap()),
         sampling_frequency,
         mode,
         crc_protected: false,

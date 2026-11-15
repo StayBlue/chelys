@@ -27,9 +27,17 @@ const BORROW_SHARE: f64 = 0.6;
 /// The fill is kept in bits, and can dip below zero within a frame for
 /// granules quantised without regard to it; a frame must end with a fill
 /// of zero or more.
+///
+/// The reservoir has two limits. Between frames it holds what the frames
+/// the stream may still have could begin in: no more than the limit of the
+/// shortest of them. Once a frame's length is chosen, [`for_frame`]
+/// (Self::for_frame) lowers that to the frame's own limit.
 #[derive(Clone, Debug)]
 pub struct Reservoir {
     bits: isize,
+    /// The limit between frames.
+    stream_max_bytes: usize,
+    /// The limit of the frame being coded.
     max_bytes: usize,
 }
 
@@ -38,18 +46,32 @@ impl Reservoir {
     /// bounded by the decoder's buffer and the largest `main_data_begin`.
     ///
     /// Spec reading: clause 2.4.3.4.4 bounds the reservoir by the 7680-bit
-    /// buffer less the frame, and asks for the same buffer at every sampling
-    /// frequency. The largest frame, with padding, is used so that every
-    /// frame fits.
+    /// buffer less the frame ("a maximum deviation (short time buffer) of
+    /// 7 680 - 4*768 = 4 608 bits is allowed at 64 kbits/s"), and asks for
+    /// the same buffer at every sampling frequency. Where the frame's length
+    /// varies with padding, its longest, with padding, is used, so that one
+    /// limit holds for every frame at a bitrate.
+    ///
+    /// Spec reading: the clause has `main_data_begin` "always set to 0" at
+    /// `bitrate_index` 14, 320 kbit/s, where at 48 kHz a frame fills the
+    /// buffer. Below 48 kHz a frame at the highest bitrates is longer than
+    /// the buffer: 1044 or 1045 bytes at 320 kbit/s and 44.1 kHz, and 1440
+    /// at 32 kHz, where the buffer holds 960. As the bitrate table offers
+    /// those bitrates, the clause is not read as forbidding them; their
+    /// frames are coded as at 48 kHz, with all their main data "allocated
+    /// between adjacent header words".
     ///
     /// Spec gap: ISO/IEC 13818-3 does not restate the buffer for the lower
     /// sampling frequencies, and refers to ISO/IEC 11172-3 for
     /// `main_data_begin`, so the same buffer is assumed there.
     pub fn new(largest_frame_bytes: usize, version: Version) -> Self {
         let max_main_data_begin = (1 << version.main_data_begin_bits()) - 1;
-        let max_bytes =
-            (BUFFER_BITS.saturating_sub(8 * largest_frame_bytes) / 8).min(max_main_data_begin);
-        Self { bits: 0, max_bytes }
+        let max_bytes = Self::buffer_bytes(largest_frame_bytes).min(max_main_data_begin);
+        Self {
+            bits: 0,
+            stream_max_bytes: max_bytes,
+            max_bytes,
+        }
     }
 
     /// A reservoir that never holds anything: every frame's main data starts
@@ -57,11 +79,42 @@ impl Reservoir {
     pub fn disabled() -> Self {
         Self {
             bits: 0,
+            stream_max_bytes: 0,
             max_bytes: 0,
         }
     }
 
-    /// The largest number of bytes the reservoir may hold.
+    /// What the buffer leaves of its 7680 bits beside a frame of
+    /// `frame_bytes`, in whole bytes.
+    fn buffer_bytes(frame_bytes: usize) -> usize {
+        BUFFER_BITS.saturating_sub(8 * frame_bytes) / 8
+    }
+
+    /// The reservoir as it starts a frame of at most `largest_frame_bytes`:
+    /// limited by what the buffer leaves beside the frame (see
+    /// [`new`](Self::new)), with the bytes beyond that left behind as
+    /// stuffing. Its [`bytes`](Self::bytes) are then the frame's
+    /// `main_data_begin`.
+    ///
+    /// Spec gap: clause 2.4.3.4.4 works out the bound for frames of one
+    /// length, as at a constant bitrate, where it is the same for every
+    /// frame. Where the bitrate changes from frame to frame, the bound is
+    /// taken from each frame's own length, as the buffer holds the frame
+    /// being decoded beside the main data it begins in (clause 2.4.3.4.3:
+    /// "all main data are resident in the input buffer when the header of
+    /// the next frame is arriving"); so the bytes a frame finds are limited
+    /// only once its bitrate has been chosen.
+    pub fn for_frame(&self, largest_frame_bytes: usize) -> Self {
+        let max_bytes = Self::buffer_bytes(largest_frame_bytes).min(self.stream_max_bytes);
+        Self {
+            bits: self.bits.min(8 * max_bytes as isize),
+            stream_max_bytes: self.stream_max_bytes,
+            max_bytes,
+        }
+    }
+
+    /// The largest number of bytes the reservoir may hold in the frame
+    /// being coded.
     pub fn max_bytes(&self) -> usize {
         self.max_bytes
     }
@@ -103,11 +156,14 @@ impl Reservoir {
     }
 
     /// Ends a frame whose main data slot held `unshared_bits` more than the
-    /// granules' shares, and returns the next frame's `main_data_begin`.
+    /// granules' shares, and returns the bytes the reservoir keeps for the
+    /// frames after it: the next frame's `main_data_begin`, unless its
+    /// length lowers it (see [`for_frame`](Self::for_frame)).
     ///
     /// The reservoir keeps whole bytes only, since main data starts on a
-    /// byte. Bytes beyond its maximum are left behind as stuffing (clause
-    /// C.1.5.4.2.2): the next frame's main data simply starts after them.
+    /// byte. Bytes beyond its limit between frames are left behind as
+    /// stuffing (clause C.1.5.4.2.2): the next frame's main data simply
+    /// starts after them.
     ///
     /// # Panics
     ///
@@ -120,8 +176,9 @@ impl Reservoir {
             "a frame's granules overflow it by {} bits",
             -self.bits
         );
-        let bytes = self.bytes().min(self.max_bytes);
+        let bytes = self.bytes().min(self.stream_max_bytes);
         self.bits = 8 * bytes as isize;
+        self.max_bytes = self.stream_max_bytes;
         bytes
     }
 }
@@ -167,6 +224,27 @@ mod tests {
         assert_eq!(reservoir.end_frame(0), 160);
         // 0.8 * 160 = 128 bytes are kept; 32 are released.
         assert_eq!(reservoir.granule_bits(500, 0.0), 500 + 8 * 32);
+    }
+
+    /// Between frames the reservoir keeps what the shortest frame could
+    /// begin in; a longer frame finds only what the buffer leaves beside
+    /// it, and the rest becomes stuffing.
+    #[test]
+    fn a_longer_frame_finds_less_of_the_reservoir() {
+        // 32 kbit/s at 48 kHz: 96-byte frames, so main_data_begin's 511.
+        let mut reservoir = Reservoir::new(96, Version::Mpeg1);
+        reservoir.granule_done(8 * 600, 0);
+        assert_eq!(reservoir.end_frame(0), 511);
+        // 192 kbit/s: 576 bytes leave 384 of the buffer's 960.
+        let frame = reservoir.for_frame(576);
+        assert_eq!((frame.bytes(), frame.max_bytes()), (384, 384));
+        // 320 kbit/s fills the buffer.
+        assert_eq!(reservoir.for_frame(960).bytes(), 0);
+        // The frame does not change what the stream keeps.
+        let mut frame = reservoir.for_frame(576);
+        frame.granule_done(0, 0);
+        assert_eq!(frame.end_frame(8 * 400), 511);
+        assert_eq!(frame.max_bytes(), 511);
     }
 
     #[test]
