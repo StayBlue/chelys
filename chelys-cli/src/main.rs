@@ -17,7 +17,7 @@ use chelys::mp3::{Encoder, StreamConfig};
 
 const USAGE: &str = "\
 usage: chelys --sample-rate HZ --channels N [--bitrate KBPS]
-              [--no-joint-stereo] [--intensity-stereo]
+              [--no-joint-stereo] [--intensity-stereo] [--crc]
               < input.f32 > output.mp3
 
 Reads interleaved 32-bit little-endian float PCM from stdin and writes MPEG-1
@@ -36,7 +36,9 @@ MPEG-2.5 Layer III at 8, 11.025 and 12 kHz (experimental).
   --intensity-stereo code the upper bands of each frame of two channels in
                      intensity stereo where the frame is short of bits,
                      keeping only the level of each channel there and not
-                     its fine structure; for low bitrates (default: off)";
+                     its fine structure; for low bitrates (default: off)
+  --crc              protect each frame's header and side information with
+                     a CRC-16 check word (default: off)";
 
 struct Options {
     sampling_frequency: SamplingFrequency,
@@ -53,11 +55,12 @@ struct Options {
     /// the stereo image above its bound for bits, a trade for low bitrates,
     /// which content that relies on the image may not want even there.
     intensity_stereo: bool,
+    crc_protected: bool,
 }
 
 fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
     let (mut sample_rate, mut channels, mut bitrate) = (None, None, 128);
-    let (mut joint_stereo, mut intensity_stereo) = (true, false);
+    let (mut joint_stereo, mut intensity_stereo, mut crc_protected) = (true, false, false);
     let mut args = args.into_iter();
     while let Some(flag) = args.next() {
         let mut value = |name: &str| -> Result<u32, String> {
@@ -72,6 +75,7 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
             "--bitrate" => bitrate = value("--bitrate")?,
             "--no-joint-stereo" => joint_stereo = false,
             "--intensity-stereo" => intensity_stereo = true,
+            "--crc" => crc_protected = true,
             // An empty message asks for the usage text alone.
             "-h" | "--help" => return Err(String::new()),
             other => return Err(format!("unknown argument: {other}")),
@@ -98,6 +102,7 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
         bitrate,
         joint_stereo,
         intensity_stereo,
+        crc_protected,
     })
 }
 
@@ -129,7 +134,7 @@ fn main() -> ExitCode {
                 ms_stereo,
             },
         },
-        crc_protected: false,
+        crc_protected: options.crc_protected,
     };
     match encode(config, options.channels) {
         Ok(()) => ExitCode::SUCCESS,
