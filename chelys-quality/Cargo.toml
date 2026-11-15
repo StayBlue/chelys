@@ -1,0 +1,11 @@
+[package]
+name = "chelys-quality"
+description = "Judges chelys output by blind listening tests and by PEAQ, with outside tools as black boxes."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+chelys = { path = "../chelys" }
+chelys-conformance = { path = "../chelys-conformance" }

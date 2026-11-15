@@ -11,10 +11,16 @@
 //! says "Settled by decoding with" the decoders that settled it and names
 //! the test. That evidence was recorded with ffmpeg n9.0.2, mpg123 1.33.7
 //! and LAME 4.0 (64-bit); other versions could decode differently.
+//!
+//! Quality is graded with PEAQ (ITU-R BS.1387) as GstPEAQ computes it, also
+//! as a black box (see [`peaq`]). Its grades were recorded with GstPEAQ
+//! 0.6.1, which states that it does not meet the recommendation's
+//! conformance requirements.
 
 pub mod ffmpeg;
 pub mod lame;
 pub mod mpg123;
+pub mod peaq;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
