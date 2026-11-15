@@ -123,3 +123,17 @@ and LAME may settle it, documented as for the standards.
 *User, 2026-11-15, when the document was given: the wording was proposed by
 the agent and approved by the user.*
 *User, 2026-11-15: the document's title corrected to its heading.*
+
+## PEAQ as evidence of quality
+
+The quality of chelys's output may be judged with PEAQ (ITU-R BS.1387) as
+computed by GstPEAQ, run as a black box like the decoders: only its grades and
+the measures it reports are used. Its grades guide tuning, such as the defaults
+of rate control; they do not settle gaps in the standards. Both signals are
+given to it at 48 kHz as 16-bit PCM. Record the GstPEAQ version the evidence
+was recorded with (currently 0.6.1) in the `chelys-conformance` crate's
+documentation, next to the decoders', and update it when the evidence is
+recorded again with another version.
+
+*User, 2026-11-15, when listening tests proved too laborious and GstPEAQ was
+installed: the wording was proposed by the agent and approved by the user.*
