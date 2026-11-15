@@ -28,7 +28,7 @@ MPEG-2.5 Layer III at 8, 11.025 and 12 kHz (experimental).
                      8000, 11025 or 12000
   --channels N       1 or 2
   --bitrate KBPS     32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256
-                     or 320; at 16 kHz and below 8, 16, 24, 32, 40, 48, 56,
+                     or 320; at 24 kHz and below 8, 16, 24, 32, 40, 48, 56,
                      64, 80, 96, 112, 128, 144 or 160 (default 128)
   --no-joint-stereo  code two channels as left and right throughout
                      (default: code each frame in MS stereo where the
