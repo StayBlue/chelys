@@ -47,7 +47,7 @@ MPEG-2.5 Layer III at 8, 11.025 and 12 kHz (experimental).
                      the list above (default: the lowest)
   --max-bitrate KBPS with --vbr, the highest (default: the highest)
   --vbr-noise DB     with --vbr, allow each band this many dB more noise
-                     than the model does, or less if negative (default 0)
+                     than the model does, or less if negative (default 4)
   --no-joint-stereo  code two channels as left and right throughout
                      (default: code each frame in MS stereo where the
                      channels are alike)
@@ -80,6 +80,18 @@ struct Options {
     intensity_stereo: bool,
     crc_protected: bool,
 }
+
+/// The noise `--vbr` allows each band beyond what the psychoacoustic model
+/// does, in dB, unless `--vbr-noise` says otherwise. The model's own
+/// allowance spends more bits than listeners need. Graded with PEAQ
+/// (GstPEAQ 0.6.1, black box), 22 tracks of pop music at 44.1 kHz in stereo
+/// averaged 238 kbit/s and a grade of -0.10 at 0 dB, 196 kbit/s and -0.26
+/// at 3 dB, and 184 kbit/s and -0.35 at 4 dB, -0.65 at worst. Above 4 dB,
+/// the worst track, sparse and tonal, fell quickly: -1.07 at 5 dB, and at
+/// 6 dB -1.76 at 117 kbit/s, below its grade at a constant 128 kbit/s. In
+/// a blind ABX test of that track's worst passage at 4 dB, a listener could
+/// not tell it from the input.
+const DEFAULT_VBR_NOISE_DB: f64 = 4.0;
 
 /// The value after the flag `name`, parsed.
 fn value<T: FromStr>(args: &mut impl Iterator<Item = String>, name: &str) -> Result<T, String> {
@@ -142,7 +154,7 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
         if lowest.bits_per_second() > highest.bits_per_second() {
             return Err("--min-bitrate is above --max-bitrate".to_owned());
         }
-        let noise_offset_db = vbr_noise.unwrap_or(0.0);
+        let noise_offset_db = vbr_noise.unwrap_or(DEFAULT_VBR_NOISE_DB);
         if !noise_offset_db.is_finite() {
             return Err(format!(
                 "--vbr-noise: not a finite number: {noise_offset_db}"
