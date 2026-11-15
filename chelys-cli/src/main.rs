@@ -8,8 +8,12 @@
 //! ```sh
 //! ffmpeg -i song.flac -f f32le -ar 44100 -ac 2 - | chelys --sample-rate 44100 --channels 2 > song.mp3
 //! ```
+//!
+//! Where stdout is a file, as there, the stream starts with a Xing/Info
+//! tag, written once the stream has ended.
 
-use std::io::{ErrorKind, Read, Write};
+use std::fs::File;
+use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::process::ExitCode;
 use std::str::FromStr;
 
@@ -53,7 +57,11 @@ MPEG-2.5 Layer III at 8, 11.025 and 12 kHz (experimental).
                      its fine structure; for low bitrates; with --vbr, only
                      at the highest bitrate (default: off)
   --crc              protect each frame's header and side information with
-                     a CRC-16 check word (default: off)";
+                     a CRC-16 check word (default: off)
+
+Where stdout is a file, the stream starts with a Xing/Info tag: its length,
+a table to seek by, and the samples to trim at its start and end. Through a
+pipe it has none, as the tag is known only once the stream has ended.";
 
 struct Options {
     sampling_frequency: SamplingFrequency,
@@ -215,8 +223,12 @@ fn main() -> ExitCode {
 fn encode(config: StreamConfig, channels: usize) -> Result<(), String> {
     let frame_bytes = 4 * channels;
     let mut stdin = std::io::stdin().lock();
+    let file = seekable_stdout();
     let mut stdout = std::io::stdout().lock();
-    let mut encoder = Encoder::new(config);
+    let mut encoder = match file {
+        Some(_) => Encoder::with_info_tag(config),
+        None => Encoder::new(config),
+    };
     let mut input = vec![0; 64 * 1024];
     // Bytes read but not yet decoded: the start of an incomplete sample frame.
     let mut held = 0;
@@ -249,8 +261,44 @@ fn encode(config: StreamConfig, channels: usize) -> Result<(), String> {
             "input is not a whole number of {frame_bytes}-byte sample frames"
         ));
     }
-    encoder.finish(&mut stream);
-    write(&mut stdout, &mut stream)
+    let tag = encoder.finish(&mut stream);
+    write(&mut stdout, &mut stream)?;
+    stdout.flush().map_err(|e| format!("writing stdout: {e}"))?;
+    match (tag, file) {
+        (Some(tag), Some(mut file)) => write_tag(&mut file, &tag),
+        _ => Ok(()),
+    }
+}
+
+/// stdout, if it is a regular file at its start, which the Xing/Info tag
+/// can be written back into once the stream has ended.
+#[cfg(unix)]
+fn seekable_stdout() -> Option<File> {
+    use std::os::fd::AsFd;
+    let fd = std::io::stdout().as_fd().try_clone_to_owned().ok()?;
+    let mut file = File::from(fd);
+    let at_start = file.stream_position().ok()? == 0;
+    (file.metadata().ok()?.is_file() && at_start).then_some(file)
+}
+
+#[cfg(not(unix))]
+fn seekable_stdout() -> Option<File> {
+    None
+}
+
+/// Writes the Xing/Info tag's frame over the start of the stream in `file`.
+/// A file opened for appending takes the write at its end instead; that is
+/// undone, and the stream keeps the placeholder, a silent frame.
+fn write_tag(file: &mut File, tag: &[u8]) -> Result<(), String> {
+    let error = |e: std::io::Error| format!("writing the Xing/Info tag: {e}");
+    let len = file.metadata().map_err(error)?.len();
+    file.seek(SeekFrom::Start(0)).map_err(error)?;
+    file.write_all(tag).map_err(error)?;
+    if file.stream_position().map_err(error)? != tag.len() as u64 {
+        file.set_len(len).map_err(error)?;
+        eprintln!("chelys: stdout is appended to, so the Xing/Info tag is left out");
+    }
+    Ok(())
 }
 
 /// Writes `stream` to `stdout` and empties it.

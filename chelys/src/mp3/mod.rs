@@ -8,6 +8,7 @@ mod crc;
 pub mod filterbank;
 pub mod header;
 pub mod huffman;
+pub mod info_tag;
 pub mod loops;
 pub mod psychoacoustic;
 pub mod rate;
@@ -452,7 +453,7 @@ pub fn encode_granules(config: &StreamConfig, granules: &[Vec<QuantizedGranule>]
 }
 
 /// Encodes PCM, one slice of samples (nominally -1.0 to 1.0) per channel, in
-/// one go, with an [`Encoder`].
+/// one go, with an [`Encoder`], without a Xing/Info tag.
 ///
 /// # Panics
 ///
@@ -463,6 +464,21 @@ pub fn encode_pcm(config: &StreamConfig, channels: &[&[f64]]) -> Vec<u8> {
     let mut out = Vec::new();
     encoder.encode(channels, &mut out);
     encoder.finish(&mut out);
+    out
+}
+
+/// Encodes PCM like [`encode_pcm`], with a Xing/Info tag at the start (see
+/// [`Encoder::with_info_tag`]).
+///
+/// # Panics
+///
+/// As [`encode_pcm`].
+pub fn encode_pcm_with_info_tag(config: &StreamConfig, channels: &[&[f64]]) -> Vec<u8> {
+    let mut encoder = Encoder::with_info_tag(*config);
+    let mut out = Vec::new();
+    encoder.encode(channels, &mut out);
+    let tag = encoder.finish(&mut out).expect("an encoder with a tag");
+    out[..tag.len()].copy_from_slice(&tag);
     out
 }
 
@@ -495,7 +511,19 @@ pub fn encode_pcm(config: &StreamConfig, channels: &[&[f64]]) -> Vec<u8> {
 ///
 /// The stream does not depend on how the input is divided between calls to
 /// [`encode`](Self::encode).
-pub struct Encoder(FrameEncoder<ModelCoding>);
+pub struct Encoder {
+    frames: FrameEncoder<ModelCoding>,
+    tag: Option<TagState>,
+}
+
+/// The Xing/Info tag of an [`Encoder`] that writes one.
+struct TagState {
+    header: Header,
+    /// Whether the tag's frame has been written, as a placeholder.
+    written: bool,
+    /// The CRC of the stream after the tag's frame so far.
+    music_crc: u16,
+}
 
 impl Encoder {
     /// # Panics
@@ -521,7 +549,32 @@ impl Encoder {
         };
         let shortest = config.rate.lowest().frame_len(fs, true);
         let reservoir = Reservoir::new(shortest, fs.version());
-        Self(FrameEncoder::new(config, coding, reservoir))
+        Self {
+            frames: FrameEncoder::new(config, coding, reservoir),
+            tag: None,
+        }
+    }
+
+    /// An encoder whose stream starts with a frame for a Xing/Info tag (see
+    /// [`info_tag`]): the number of frames and bytes, a table to seek by,
+    /// and the samples added before and after the input, which make the
+    /// decoded output the input exactly for decoders that apply them. As
+    /// those are known only at the end, the frame is written as a
+    /// placeholder, silent and with no tag, and [`finish`](Self::finish)
+    /// returns it with the tag, to be written over it.
+    ///
+    /// # Panics
+    ///
+    /// As [`new`](Self::new).
+    pub fn with_info_tag(config: StreamConfig) -> Self {
+        Self {
+            tag: Some(TagState {
+                header: info_tag::header(&config),
+                written: false,
+                music_crc: info_tag::MUSIC_CRC_START,
+            }),
+            ..Self::new(config)
+        }
     }
 
     /// Encodes `channels`, one slice of samples (nominally -1.0 to 1.0) per
@@ -539,14 +592,45 @@ impl Encoder {
     /// If the channel count does not match the configured mode, or the
     /// channels have different numbers of samples.
     pub fn encode(&mut self, channels: &[&[f64]], out: &mut Vec<u8>) {
-        self.0.encode(channels, out);
+        let start = self.write_placeholder(out);
+        self.frames.encode(channels, out);
+        self.add_to_crc(&out[start..]);
     }
 
     /// Ends the stream: pads the input with silence to whole frames, at
     /// least [`DELAY`] samples past the input, and appends the rest of the
-    /// stream to `out`.
-    pub fn finish(self, out: &mut Vec<u8>) {
-        self.0.finish(out);
+    /// stream to `out`. For an encoder made [`with_info_tag`]
+    /// (Self::with_info_tag), returns the tag's frame, to be written over
+    /// the first bytes of the stream.
+    pub fn finish(mut self, out: &mut Vec<u8>) -> Option<Vec<u8>> {
+        let start = self.write_placeholder(out);
+        let config = self.frames.config;
+        let ended = self.frames.finish(out);
+        let mut tag = self.tag?;
+        tag.music_crc = info_tag::music_crc(tag.music_crc, &out[start..]);
+        let stream = info_tag::Stream {
+            config: &config,
+            frame_lens: &ended.frame_lens,
+            samples: ended.samples,
+            music_crc: tag.music_crc,
+        };
+        Some(info_tag::frame(&tag.header, &stream))
+    }
+
+    /// Writes the tag's placeholder to `out` if it is the first thing
+    /// written, and returns where the frames after it start.
+    fn write_placeholder(&mut self, out: &mut Vec<u8>) -> usize {
+        if let Some(tag) = self.tag.as_mut().filter(|tag| !tag.written) {
+            out.extend(info_tag::placeholder(&tag.header));
+            tag.written = true;
+        }
+        out.len()
+    }
+
+    fn add_to_crc(&mut self, bytes: &[u8]) {
+        if let Some(tag) = &mut self.tag {
+            tag.music_crc = info_tag::music_crc(tag.music_crc, bytes);
+        }
     }
 }
 
@@ -1206,8 +1290,16 @@ struct FrameEncoder<C> {
     pcm: Vec<Vec<f64>>,
     /// The samples each channel has been given.
     samples: usize,
-    /// The frames written.
-    frames: usize,
+    /// The length of each frame written.
+    frame_lens: Vec<usize>,
+}
+
+/// What a [`FrameEncoder`] wrote, once it has finished.
+struct Ended {
+    /// The length of each frame.
+    frame_lens: Vec<usize>,
+    /// The samples each channel was given.
+    samples: usize,
 }
 
 impl<C: Coding> FrameEncoder<C> {
@@ -1225,7 +1317,7 @@ impl<C: Coding> FrameEncoder<C> {
             reservoir_bytes: 0,
             pcm: vec![Vec::new(); channels],
             samples: 0,
-            frames: 0,
+            frame_lens: Vec::new(),
         }
     }
 
@@ -1257,10 +1349,10 @@ impl<C: Coding> FrameEncoder<C> {
     /// Pads the input with silence to whole frames, at least [`DELAY`]
     /// samples past it, so that the decoded output holds all of the input,
     /// codes them, and appends the rest of the stream to `out`.
-    fn finish(mut self, out: &mut Vec<u8>) {
+    fn finish(mut self, out: &mut Vec<u8>) -> Ended {
         let frame_samples = self.samples_per_frame();
         let frames = (self.samples + DELAY).div_ceil(frame_samples);
-        let remaining = frames - self.frames;
+        let remaining = frames - self.frame_lens.len();
         for pcm in &mut self.pcm {
             pcm.resize(remaining * frame_samples + GRANULE_LINES, 0.0);
         }
@@ -1268,6 +1360,10 @@ impl<C: Coding> FrameEncoder<C> {
             self.encode_frame(frame * frame_samples);
         }
         self.writer.finish(out);
+        Ended {
+            frame_lens: self.frame_lens,
+            samples: self.samples,
+        }
     }
 
     fn samples_per_frame(&self) -> usize {
@@ -1290,7 +1386,7 @@ impl<C: Coding> FrameEncoder<C> {
                 .try_into()
                 .expect("a granule of PCM")
         };
-        if self.frames == 0 {
+        if self.frame_lens.is_empty() {
             for channel in 0..pcm.len() {
                 assert!(
                     coding
@@ -1368,7 +1464,7 @@ impl<C: Coding> FrameEncoder<C> {
         self.reservoir = reservoir;
         self.reservoir_bytes = self.reservoir.end_frame(unshared_bits);
         self.writer.keep_unused(self.reservoir_bytes);
-        self.frames += 1;
+        self.frame_lens.push(header.frame_len());
     }
 
     /// Quantises a frame at `bitrate`, with or without `padding`, from the
@@ -1652,9 +1748,9 @@ mod tests {
                     let mut furthest = 0;
                     for (left, right) in left.chunks(chunk).zip(right.chunks(chunk)) {
                         encoder.encode(&[left, right], &mut out);
-                        let begin = encoder.0.reservoir_bytes;
+                        let begin = encoder.frames.reservoir_bytes;
                         furthest = furthest.max(begin);
-                        let held = encoder.0.writer.out.len();
+                        let held = encoder.frames.writer.out.len();
                         let most = begin + begin.div_ceil(slot) * overhead;
                         assert!(held <= most, "{held} bytes held in chunks of {chunk}");
                     }
