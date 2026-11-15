@@ -35,6 +35,15 @@ use side_info::{GranuleChannel, SideInfo, Window};
 /// Frequency lines in a granule (clause 2.1.70).
 pub const GRANULE_LINES: usize = 576;
 
+/// The samples by which a decoder's output lags the encoder's input: the
+/// delays of the analysis and synthesis polyphase filterbanks and of the
+/// overlapping blocks of the hybrid filterbank, together. An [`Encoder`]
+/// ends the stream at least this far past the input, so that the decoded
+/// output holds all of it.
+///
+/// Spec gap: the standard does not give the delay.
+pub const DELAY: usize = 1057;
+
 /// The window and transform of a granule's block (clause C.1.5.3.3, figure
 /// C.7): `block_type` 0 to 3 of clause 2.4.2.7.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -533,8 +542,8 @@ impl Encoder {
         self.0.encode(channels, out);
     }
 
-    /// Ends the stream: pads the input with silence to whole frames, plus
-    /// one more frame to flush the filterbank, and appends the rest of the
+    /// Ends the stream: pads the input with silence to whole frames, at
+    /// least [`DELAY`] samples past the input, and appends the rest of the
     /// stream to `out`.
     pub fn finish(self, out: &mut Vec<u8>) {
         self.0.finish(out);
@@ -1245,12 +1254,12 @@ impl<C: Coding> FrameEncoder<C> {
         self.writer.take_final(out);
     }
 
-    /// Pads the input with silence to whole frames, plus one more frame to
-    /// flush the filterbank, codes them, and appends the rest of the stream
-    /// to `out`.
+    /// Pads the input with silence to whole frames, at least [`DELAY`]
+    /// samples past it, so that the decoded output holds all of the input,
+    /// codes them, and appends the rest of the stream to `out`.
     fn finish(mut self, out: &mut Vec<u8>) {
         let frame_samples = self.samples_per_frame();
-        let frames = self.samples.div_ceil(frame_samples) + 1;
+        let frames = (self.samples + DELAY).div_ceil(frame_samples);
         let remaining = frames - self.frames;
         for pcm in &mut self.pcm {
             pcm.resize(remaining * frame_samples + GRANULE_LINES, 0.0);
@@ -1583,8 +1592,8 @@ mod tests {
     }
 
     /// However the input is divided between calls, the encoder writes the
-    /// same stream, of whole frames for the input padded with silence plus
-    /// one more, and holds back no more than the next frame's main data can
+    /// same stream, of whole frames for the input padded with silence to at
+    /// least [`DELAY`] samples past it, and holds back no more than the next frame's main data can
     /// begin in: its `main_data_begin` bytes, and the header and side
     /// information of each frame after the first of them.
     #[test]
@@ -1618,7 +1627,7 @@ mod tests {
         let bitrate = config.constant_bitrate();
         let fs = config.sampling_frequency;
         let mut padding = PaddingSchedule::new(bitrate, fs);
-        let frames = samples.div_ceil(Version::Mpeg1.samples_per_frame()) + 1;
+        let frames = (samples + DELAY).div_ceil(Version::Mpeg1.samples_per_frame());
         let frame_lens = (0..frames).map(|_| bitrate.frame_len(fs, padding.next_padding()));
         assert_eq!(whole.len(), frame_lens.sum::<usize>());
 
@@ -1749,7 +1758,8 @@ mod tests {
                     let frames = stream_check::frames(&encode(config, &input));
                     let samples = fs.version().samples_per_frame();
                     let case = format!("{fs:?} from {} to {} kbit/s", kbps[0], kbps[1]);
-                    assert_eq!(frames.len(), input[0].len().div_ceil(samples) + 1, "{case}");
+                    let expected = (input[0].len() + DELAY).div_ceil(samples);
+                    assert_eq!(frames.len(), expected, "{case}");
                     assert!(frames.iter().all(|f| !f.padding), "{case}");
                     let kbps_of = |f: &stream_check::Frame| f.bitrate.bits_per_second() / 1000;
                     let used: std::collections::BTreeSet<u32> =
