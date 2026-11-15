@@ -110,3 +110,16 @@ feature's commit.
 *User, 2026-11-12, when committing short blocks: two commits, one for the
 ffmpeg evidence, as with the earlier evidence. The entry was proposed by the
 agent and approved by the user.*
+
+## Xing/Info header
+
+The Xing/Info header, which gives a stream's length, seek points and encoder
+delay and padding, and which no ISO standard defines, is implemented from
+"Mp3 Info Tag rev 1 specifications - draft 0" only, under the same clean-room
+rules as the standards; it is the one source added for it. Where it leaves
+something open or contradicts itself, black-box decoding with ffmpeg, mpg123
+and LAME may settle it, documented as for the standards.
+
+*User, 2026-11-15, when the document was given: the wording was proposed by
+the agent and approved by the user.*
+*User, 2026-11-15: the document's title corrected to its heading.*
