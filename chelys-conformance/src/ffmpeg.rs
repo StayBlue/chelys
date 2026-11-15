@@ -54,3 +54,45 @@ pub fn probe_mp3(stream: &[u8]) -> StreamInfo {
         channels: field("channels").parse().unwrap(),
     }
 }
+
+/// The duration in seconds that ffprobe gives a stream.
+pub fn duration_mp3(stream: &[u8]) -> f64 {
+    let file = TempFile::new("mp3", stream);
+    let output = run(Command::new("ffprobe")
+        .args(["-v", "error", "-show_entries", "format=duration"])
+        .args(["-of", "default=noprint_wrappers=1:nokey=1"])
+        .arg(file.path()));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    stdout
+        .trim()
+        .parse()
+        .unwrap_or_else(|_| panic!("ffprobe gave no duration: {stdout:?}"))
+}
+
+/// Decodes `seconds` of an MP3 stream from where ffmpeg seeks to for
+/// `from` seconds by the stream's Xing table of contents (its `usetoc`
+/// option), without decoding from earlier to get there exactly.
+pub fn decode_mp3_seeking(stream: &[u8], from: f64, seconds: f64) -> Decoded {
+    let file = TempFile::new("mp3", stream);
+    let output = run(Command::new("ffmpeg")
+        .args([
+            "-nostdin",
+            "-v",
+            "error",
+            "-noaccurate_seek",
+            "-usetoc",
+            "1",
+        ])
+        .args(["-ss", &from.to_string(), "-f", "mp3", "-i"])
+        .arg(file.path())
+        .args(["-t", &seconds.to_string()])
+        .args(["-f", "f32le", "-acodec", "pcm_f32le", "-"]));
+    Decoded {
+        samples: output
+            .stdout
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect(),
+        diagnostics: String::from_utf8_lossy(&output.stderr).into_owned(),
+    }
+}
