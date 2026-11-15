@@ -14,12 +14,13 @@ use std::process::ExitCode;
 use std::str::FromStr;
 
 use chelys::mp3::header::{Bitrate, Mode, SamplingFrequency};
-use chelys::mp3::rate::{MeanRate, Rate};
+use chelys::mp3::rate::{MeanRate, Rate, VariableRate};
 use chelys::mp3::{Encoder, StreamConfig};
 
 const USAGE: &str = "\
-usage: chelys --sample-rate HZ --channels N [--bitrate KBPS]
-              [--no-joint-stereo] [--intensity-stereo] [--crc]
+usage: chelys --sample-rate HZ --channels N
+              [--bitrate KBPS | --vbr [--min-bitrate KBPS] [--max-bitrate KBPS]
+              [--vbr-noise DB]] [--no-joint-stereo] [--intensity-stereo] [--crc]
               < input.f32 > output.mp3
 
 Reads interleaved 32-bit little-endian float PCM from stdin and writes MPEG-1
@@ -35,13 +36,22 @@ MPEG-2.5 Layer III at 8, 11.025 and 12 kHz (experimental).
                      144 or 160 (default 128); or a whole number between
                      two of those, kept as the stream's mean, with each
                      frame at one of the two
+  --vbr              give each frame the lowest bitrate at which the noise
+                     of every band stays within what the psychoacoustic
+                     model allows (experimental)
+  --min-bitrate KBPS with --vbr, the lowest bitrate a frame may have, from
+                     the list above (default: the lowest)
+  --max-bitrate KBPS with --vbr, the highest (default: the highest)
+  --vbr-noise DB     with --vbr, allow each band this many dB more noise
+                     than the model does, or less if negative (default 0)
   --no-joint-stereo  code two channels as left and right throughout
                      (default: code each frame in MS stereo where the
                      channels are alike)
   --intensity-stereo code the upper bands of each frame of two channels in
                      intensity stereo where the frame is short of bits,
                      keeping only the level of each channel there and not
-                     its fine structure; for low bitrates (default: off)
+                     its fine structure; for low bitrates; with --vbr, only
+                     at the highest bitrate (default: off)
   --crc              protect each frame's header and side information with
                      a CRC-16 check word (default: off)";
 
@@ -73,6 +83,7 @@ fn value<T: FromStr>(args: &mut impl Iterator<Item = String>, name: &str) -> Res
 
 fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
     let (mut sample_rate, mut channels, mut bitrate) = (None, None, None);
+    let (mut vbr, mut min_bitrate, mut max_bitrate, mut vbr_noise) = (false, None, None, None);
     let (mut joint_stereo, mut intensity_stereo, mut crc_protected) = (true, false, false);
     let mut args = args.into_iter();
     while let Some(flag) = args.next() {
@@ -81,6 +92,10 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
             "--sample-rate" => sample_rate = Some(value::<u32>(args, &flag)?),
             "--channels" => channels = Some(value::<u32>(args, &flag)?),
             "--bitrate" => bitrate = Some(value::<u32>(args, &flag)?),
+            "--vbr" => vbr = true,
+            "--min-bitrate" => min_bitrate = Some(value::<u32>(args, &flag)?),
+            "--max-bitrate" => max_bitrate = Some(value::<u32>(args, &flag)?),
+            "--vbr-noise" => vbr_noise = Some(value::<f64>(args, &flag)?),
             "--no-joint-stereo" => joint_stereo = false,
             "--intensity-stereo" => intensity_stereo = true,
             "--crc" => crc_protected = true,
@@ -99,14 +114,50 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
         n => return Err(format!("unsupported channel count: {n}")),
     };
     let version = sampling_frequency.version();
-    let kbps = bitrate.unwrap_or(128);
-    let rate = match Bitrate::from_kbps(version, kbps) {
-        Some(bitrate) => Rate::Constant(bitrate),
-        None => kbps
-            .checked_mul(1000)
-            .and_then(|bps| MeanRate::new(version, bps))
-            .map(Rate::Mean)
-            .ok_or(format!("unsupported bitrate at {sample_rate} Hz: {kbps}"))?,
+    let table_bitrate = |kbps: u32| {
+        Bitrate::from_kbps(version, kbps)
+            .ok_or(format!("unsupported bitrate at {sample_rate} Hz: {kbps}"))
+    };
+    let rate = if vbr {
+        if bitrate.is_some() {
+            return Err("--bitrate and --vbr exclude each other".to_owned());
+        }
+        let mut bitrates = Bitrate::all(version);
+        let lowest = match min_bitrate {
+            Some(kbps) => table_bitrate(kbps)?,
+            None => bitrates.next().expect("a table of bitrates"),
+        };
+        let highest = match max_bitrate {
+            Some(kbps) => table_bitrate(kbps)?,
+            None => bitrates.last().expect("a table of bitrates"),
+        };
+        if lowest.bits_per_second() > highest.bits_per_second() {
+            return Err("--min-bitrate is above --max-bitrate".to_owned());
+        }
+        let noise_offset_db = vbr_noise.unwrap_or(0.0);
+        if !noise_offset_db.is_finite() {
+            return Err(format!(
+                "--vbr-noise: not a finite number: {noise_offset_db}"
+            ));
+        }
+        Rate::Variable(VariableRate {
+            lowest,
+            highest,
+            noise_offset_db,
+        })
+    } else {
+        if min_bitrate.is_some() || max_bitrate.is_some() || vbr_noise.is_some() {
+            return Err("--min-bitrate, --max-bitrate and --vbr-noise need --vbr".to_owned());
+        }
+        let kbps = bitrate.unwrap_or(128);
+        match Bitrate::from_kbps(version, kbps) {
+            Some(bitrate) => Rate::Constant(bitrate),
+            None => kbps
+                .checked_mul(1000)
+                .and_then(|bps| MeanRate::new(version, bps))
+                .map(Rate::Mean)
+                .ok_or(format!("unsupported bitrate at {sample_rate} Hz: {kbps}"))?,
+        }
     };
     if intensity_stereo && channels != 2 {
         return Err("--intensity-stereo needs two channels".to_owned());

@@ -259,6 +259,40 @@ fn fit(
     }
 }
 
+/// How far a quantised granule's noise goes beyond its allowance: the
+/// largest ratio, over its scalefactor bands, of the distortion `xfsf` to
+/// the allowed distortion `xmin`, both as the outer loop measures them, of
+/// the lines `xr` the granule was quantised from. At most 1 if every band is
+/// within its allowance.
+///
+/// Unlike the outer loop's own test, every band counts: those whose
+/// scalefactors are taken over with scfsi, or fixed at zero, are noise as
+/// much as the rest. A band whose lines are all zero allows no distortion
+/// and has none. Spec gap: the lines above the last scalefactor band have
+/// no allowed distortion (clause C.1.5.4.1 gives `xmin` for the bands
+/// only), and are not measured.
+pub fn excess(
+    xr: &[f64; GRANULE_LINES],
+    xmin: &[f64],
+    granule: &QuantizedGranule,
+    sampling_frequency: SamplingFrequency,
+) -> f64 {
+    let bands = scalefactor_bands::coding_bands(granule.block_type, sampling_frequency);
+    assert_eq!(xmin.len(), bands.len(), "one xmin per scalefactor");
+    let amplified = amplify(xr, &granule.scalefactors, &bands);
+    let distortion = distortion(&amplified, granule, &bands);
+    (distortion.iter().zip(xmin).enumerate())
+        .map(|(sb, (&distortion, &xmin))| {
+            let allowed = xmin * granule.scalefactors.amplification(sb).powi(2);
+            match (distortion, allowed) {
+                (0.0, _) => 0.0,
+                (_, 0.0) => f64::INFINITY,
+                _ => distortion / allowed,
+            }
+        })
+        .fold(0.0, f64::max)
+}
+
 /// `xr` with each scalefactor band multiplied by its amplification. Lines
 /// above the last band have no scalefactor and stay as they are.
 fn amplify(

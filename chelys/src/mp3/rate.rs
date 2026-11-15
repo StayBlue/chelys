@@ -5,7 +5,8 @@
 //! variable bitrate by switching the bitrate_index. The switching of the
 //! bitrate_index can be used either to optimize storage requirements on DSM
 //! or to interpolate any mean data rate by switching between nearby values
-//! in the bitrate table." [`Rate::Mean`] does the second.
+//! in the bitrate table." [`Rate::Variable`] does the first, and
+//! [`Rate::Mean`] the second.
 
 use super::header::{Bitrate, SamplingFrequency, Version};
 
@@ -16,6 +17,7 @@ pub enum Rate {
     /// [`PaddingSchedule`](super::header::PaddingSchedule) has it.
     Constant(Bitrate),
     Mean(MeanRate),
+    Variable(VariableRate),
 }
 
 impl Rate {
@@ -29,6 +31,7 @@ impl Rate {
         match self {
             Self::Constant(bitrate) => bitrate,
             Self::Mean(mean) => mean.lower,
+            Self::Variable(variable) => variable.lowest,
         }
     }
 }
@@ -62,6 +65,50 @@ impl MeanRate {
 
     pub fn bits_per_second(self) -> u32 {
         self.bits_per_second
+    }
+}
+
+/// A bitrate for each frame by the noise its granules leave: the lowest of
+/// those tried from `lowest` to `highest` at which the quantisation noise of
+/// every scalefactor band stays within what the psychoacoustic model allows
+/// it, raised by `noise_offset_db`.
+///
+/// The offset scales the allowed distortion `xmin` of every band by
+/// `10^(noise_offset_db / 10)` before the iteration loops see it: above 0
+/// it allows more noise, and gives smaller frames, below 0 less. It departs
+/// from Annex C, whose loops take `xmin` as the model gives it, and is 0
+/// for that.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VariableRate {
+    pub lowest: Bitrate,
+    pub highest: Bitrate,
+    pub noise_offset_db: f64,
+}
+
+impl VariableRate {
+    /// The bitrates a frame may have, lowest first.
+    ///
+    /// # Panics
+    ///
+    /// If `lowest` and `highest` are bitrates of different versions, or
+    /// `lowest` is above `highest`.
+    pub fn bitrates(self) -> Vec<Bitrate> {
+        let version = self.lowest.version();
+        assert_eq!(
+            version,
+            self.highest.version(),
+            "the lowest and highest bitrates are of one version"
+        );
+        let range = self.lowest.bits_per_second()..=self.highest.bits_per_second();
+        assert!(!range.is_empty(), "the lowest bitrate is above the highest");
+        Bitrate::all(version)
+            .filter(|b| range.contains(&b.bits_per_second()))
+            .collect()
+    }
+
+    /// The factor `noise_offset_db` scales the allowed distortion by.
+    pub fn noise_factor(self) -> f64 {
+        10f64.powf(self.noise_offset_db / 10.0)
     }
 }
 
@@ -124,6 +171,51 @@ impl MeanRateSchedule {
     }
 }
 
+/// Searches the bitrates of a [`VariableRate`] for a frame, given their
+/// number, the index to start from, and a function that codes the frame at
+/// the bitrate of an index and says whether its noise stays within its
+/// allowance. Returns the index kept and the frame coded at it.
+///
+/// From the start, the search goes down while the frame stays within its
+/// allowance, and keeps the last bitrate at which it did; if it is not
+/// within it at the start, the search goes up until it is, and keeps the
+/// highest bitrate if it never is.
+///
+/// Spec gap: neither standard says how to choose a frame's bitrate. The
+/// noise left by the iteration loops does not fall steadily as the bits
+/// rise (preemphasis, `scalefac_scale` and scfsi switch at thresholds of
+/// their own), so the lowest bitrate tried at which the frame is within its
+/// allowance need not be the lowest at which it would be. Starting from the
+/// bitrate of the frame before keeps the tries few where the signal is
+/// steady, two for most frames.
+pub fn search_variable<T>(
+    count: usize,
+    start: usize,
+    mut code: impl FnMut(usize) -> (T, bool),
+) -> (usize, T) {
+    assert!(start < count, "the start is one of the bitrates");
+    let (mut coded, within) = code(start);
+    let mut index = start;
+    if within {
+        while index > 0 {
+            let (lower, within) = code(index - 1);
+            if !within {
+                break;
+            }
+            (index, coded) = (index - 1, lower);
+        }
+    } else {
+        while index + 1 < count {
+            let (higher, within) = code(index + 1);
+            (index, coded) = (index + 1, higher);
+            if within {
+                break;
+            }
+        }
+    }
+    (index, coded)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -182,6 +274,57 @@ mod tests {
                 for k in 0..300 {
                     let frame = schedule.next_frame();
                     assert_eq!(frame, (bitrate, padding.next_padding()), "{fs:?}, {k}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_variable_rate_offers_the_bitrates_between_its_bounds() {
+        let at = |kbps| Bitrate::from_kbps(Version::Mpeg1, kbps).unwrap();
+        let rate = VariableRate {
+            lowest: at(64),
+            highest: at(128),
+            noise_offset_db: 0.0,
+        };
+        let kbps: Vec<u32> = (rate.bitrates().iter())
+            .map(|b| b.bits_per_second() / 1000)
+            .collect();
+        assert_eq!(kbps, [64, 80, 96, 112, 128]);
+        assert_eq!(rate.noise_factor(), 1.0);
+        let louder = VariableRate {
+            noise_offset_db: 10.0,
+            ..rate
+        };
+        assert!((louder.noise_factor() - 10.0).abs() < 1e-12);
+    }
+
+    /// For every pattern of bitrates within and outside the allowance, and
+    /// every start, the search keeps the bitrate the walk from the start
+    /// stops at, and tries only those it passes.
+    #[test]
+    fn the_search_walks_down_while_within_and_up_until_within() {
+        for count in 1..=6usize {
+            for pattern in 0..1usize << count {
+                let within = |index: usize| pattern >> index & 1 == 1;
+                for start in 0..count {
+                    let mut tried = Vec::new();
+                    let (index, coded) = search_variable(count, start, |index| {
+                        tried.push(index);
+                        (index * 10, within(index))
+                    });
+                    assert_eq!(coded, index * 10);
+                    let expected: Vec<usize> = if within(start) {
+                        let lowest = (0..=start).rev().take_while(|&i| within(i)).last();
+                        let lowest = lowest.unwrap();
+                        assert_eq!(index, lowest, "{pattern:b} from {start}");
+                        (lowest.saturating_sub(1)..=start).rev().collect()
+                    } else {
+                        let first = (start..count).find(|&i| within(i));
+                        assert_eq!(index, first.unwrap_or(count - 1), "{pattern:b}");
+                        (start..=index).collect()
+                    };
+                    assert_eq!(tried, expected, "{pattern:b} from {start}");
                 }
             }
         }

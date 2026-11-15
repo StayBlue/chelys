@@ -10,7 +10,7 @@ mod outer;
 pub mod scfsi;
 
 pub use inner::{inner_loop, quantize, step_size};
-pub use outer::{Outcome, Reuse, outer_loop};
+pub use outer::{Outcome, Reuse, excess, outer_loop};
 
 use super::header::SamplingFrequency;
 use super::stereo::IntensityPositions;
