@@ -13,7 +13,11 @@
 //! has "Xing" "mostly at 0x24", and does not say where it goes in frames
 //! whose side information is shorter. The tag starts after the side
 //! information in every frame here, and its fields keep their places
-//! relative to it.
+//! relative to it. Settled by decoding with ffmpeg, mpg123 and LAME (black
+//! box): all three read the frame count, and mpg123 and LAME the encoder
+//! delay and padding, in frames of one and two channels at every sampling
+//! frequency; the conformance test is
+//! `decoders_read_the_tag_at_every_sampling_frequency`.
 
 use super::header::{Bitrate, Emphasis, Header, Mode, SamplingFrequency};
 use super::rate::Rate;
@@ -27,7 +31,10 @@ const TAG_LEN: usize = 156;
 /// Spec reading: the document's dump has the flags `0x0000000F`, and after
 /// them the frame count, the byte count, the table of contents and the
 /// quality, in that order. The comment beside the dump lists the table first;
-/// the dump is followed, and all four fields are sent.
+/// the dump is followed, and all four fields are sent. Settled by decoding
+/// with ffmpeg, mpg123 and LAME (black box): read in this order, ffmpeg and
+/// mpg123 take the frame count as sent; the conformance test is
+/// `decoders_read_the_tag_at_every_sampling_frequency`.
 const FLAGS: u32 = 0xF;
 
 /// The samples by which a decoder delays its output, that the encoder delay
@@ -36,7 +43,11 @@ const FLAGS: u32 = 0xF;
 /// Spec gap: the document has the encoder delay be "how many samples were
 /// added at start", so that the frames' samples less the delay and the
 /// padding are "the exact number of samples in original wav", but not
-/// whether the decoder's own delay is among them.
+/// whether the decoder's own delay is among them. Settled by decoding with
+/// mpg123 and LAME (black box): both skip 529 samples more than the delay
+/// the tag gives, and so give the input exactly when it is [`DELAY`] less
+/// 529; the conformance test is
+/// `decoders_read_the_tag_at_every_sampling_frequency`.
 const DECODER_DELAY: usize = 529;
 
 /// The frame that holds the tag, at a bitrate whose frames hold it: the
@@ -120,7 +131,8 @@ pub struct Stream<'a> {
 /// that "CRC-16 routines are present in both mp3 encoder and decoders", but
 /// gives no generator polynomial. The one an MP3 encoder has is that of the
 /// `crc_check` word (clause 2.4.3.1), so that is used, from the all-zero
-/// state.
+/// state. No decoder settled it: ffmpeg, mpg123 and LAME decoded the same
+/// with either CRC wrong.
 pub fn music_crc(register: u16, bytes: &[u8]) -> u16 {
     crc::update(register, bytes.iter().copied())
 }
@@ -153,6 +165,10 @@ pub fn frame(header: &Header, stream: &Stream) -> Vec<u8> {
     tag.extend_from_slice(&FLAGS.to_be_bytes());
     // Spec reading: the frames after the tag's, and the bytes of the
     // stream with it. The document's dump has the fields big-endian.
+    // Settled by decoding with ffmpeg and mpg123 (black box): with the
+    // tag's frame left out of the count, ffmpeg gives the duration of the
+    // frames after it and mpg123 the input's samples exactly; the
+    // conformance test is `decoders_read_the_tag_at_every_sampling_frequency`.
     tag.extend_from_slice(&(frames as u32).to_be_bytes());
     tag.extend_from_slice(&length(bytes).to_be_bytes());
     tag.extend(table_of_contents(tag_len, stream.frame_lens, bytes));
@@ -223,9 +239,13 @@ fn length(bytes: usize) -> u32 {
 /// Spec gap: the document names the table but does not say what it holds.
 /// Each entry is the byte offset, from the start of the tag's frame, of the
 /// frame after it at which that percent of the frames begins, over the
-/// stream's bytes with the tag's frame. (The document's dump, whose tag's
-/// frame is 417 of 12481 bytes, has 0 for the first entry, where this
-/// reading has 8.)
+/// stream's bytes with the tag's frame. Settled by decoding with ffmpeg
+/// (black box): seeking by the table (its `usetoc` option), ffmpeg lands
+/// within a frame of where it was asked to, and with the offsets counted
+/// from the first frame after the tag's, some 2000 samples early in a short
+/// stream at 8 kHz; the conformance test is `ffmpeg_seeks_by_the_table`.
+/// (The document's dump, whose tag's frame is 417 of 12481 bytes, has 0 for
+/// the first entry, where this reading has 8.)
 fn table_of_contents(tag_len: usize, frame_lens: &[usize], bytes: usize) -> Vec<u8> {
     let mut offsets = Vec::with_capacity(frame_lens.len());
     let mut offset = tag_len;
@@ -249,7 +269,13 @@ fn table_of_contents(tag_len: usize, frame_lens: &[usize], bytes: usize) -> Vec<
 /// Spec gap: the document leaves the string to the encoder, and says
 /// nothing of a shorter one. (Its heading for the field, "bytes $9A-$A4",
 /// is 11 bytes; its "9 characters" and its dump put it at 0x9C to 0xA4.)
-/// The encoder gives its own name.
+/// The encoder gives its own name. Decoding with ffmpeg, mpg123 and LAME
+/// (black box) showed that ffmpeg applies the encoder delay and padding
+/// only when the string starts with "LAME" or "Lav", and so not to these
+/// streams, which it decodes with the delay and the padding in, while
+/// mpg123 and LAME apply them whatever the string; the conformance tests
+/// are `ffmpeg_applies_the_delays_for_some_encoders_only` and
+/// `decoders_read_the_tag_at_every_sampling_frequency`.
 fn encoder_version() -> [u8; 9] {
     let mut version = [b' '; 9];
     let name = concat!("chelys", env!("CARGO_PKG_VERSION"));

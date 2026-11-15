@@ -42,7 +42,11 @@ pub const GRANULE_LINES: usize = 576;
 /// ends the stream at least this far past the input, so that the decoded
 /// output holds all of it.
 ///
-/// Spec gap: the standard does not give the delay.
+/// Spec gap: the standard does not give the delay. Settled by decoding
+/// with mpg123 and LAME (black box): given an encoder delay of this less
+/// their own (see [`info_tag`]), both give the input sample for sample; the
+/// conformance test is `decoders_read_the_tag_at_every_sampling_frequency`.
+/// ffmpeg's output, untrimmed, lags the input by as much.
 pub const DELAY: usize = 1057;
 
 /// The window and transform of a granule's block (clause C.1.5.3.3, figure
