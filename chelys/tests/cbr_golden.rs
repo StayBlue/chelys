@@ -79,7 +79,7 @@ const STREAMS: [(SamplingFrequency, u32, Mode, bool, usize, u64); 8] = [
         MS,
         false,
         24659,
-        0xC3A0_076F_BD8E_288B,
+        0x4F95_8AA2_A1FA_2C4D,
     ),
     (
         SamplingFrequency::Hz44100,
@@ -87,7 +87,7 @@ const STREAMS: [(SamplingFrequency, u32, Mode, bool, usize, u64); 8] = [
         MS_IS,
         false,
         12329,
-        0x5CE3_075A_1515_7B63,
+        0x1132_6E9E_1B3D_427D,
     ),
     (
         SamplingFrequency::Hz32000,
@@ -103,7 +103,7 @@ const STREAMS: [(SamplingFrequency, u32, Mode, bool, usize, u64); 8] = [
         Mode::SingleChannel,
         false,
         12288,
-        0x86A1_FF1E_69EB_431A,
+        0xF1FC_70ED_87FB_AC54,
     ),
     (
         SamplingFrequency::Hz22050,
@@ -111,7 +111,7 @@ const STREAMS: [(SamplingFrequency, u32, Mode, bool, usize, u64); 8] = [
         MS_IS,
         false,
         6269,
-        0x830D_C638_B568_4CFD,
+        0xB8A7_F074_A631_E9E4,
     ),
     (
         SamplingFrequency::Hz16000,
@@ -119,7 +119,7 @@ const STREAMS: [(SamplingFrequency, u32, Mode, bool, usize, u64); 8] = [
         Mode::SingleChannel,
         true,
         1584,
-        0x332A_DF6A_C9B9_6E81,
+        0xE851_A6F7_F06A_8AD8,
     ),
     (
         SamplingFrequency::Hz8000,
@@ -127,7 +127,7 @@ const STREAMS: [(SamplingFrequency, u32, Mode, bool, usize, u64); 8] = [
         MS,
         false,
         3312,
-        0x1EFA_66CE_6C5D_1840,
+        0x60BB_8841_2E89_08F6,
     ),
     (
         SamplingFrequency::Hz11025,
@@ -135,7 +135,7 @@ const STREAMS: [(SamplingFrequency, u32, Mode, bool, usize, u64); 8] = [
         Mode::Stereo,
         false,
         4858,
-        0x9EDD_100F_04D3_A495,
+        0x57B5_EAED_35CE_6B69,
     ),
 ];
 

@@ -10,7 +10,7 @@ mod outer;
 pub mod scfsi;
 
 pub use inner::{inner_loop, quantize, step_size};
-pub use outer::{Outcome, Reuse, excess, outer_loop};
+pub use outer::{Bits, Outcome, Reuse, excess, outer_loop};
 
 use super::header::SamplingFrequency;
 use super::stereo::IntensityPositions;
@@ -27,14 +27,14 @@ use super::{BlockType, GRANULE_LINES, QuantizedGranule};
 ///
 /// # Panics
 ///
-/// If the scalefactors that `intensity` marks do not fit in
-/// `available_bits`, which takes fewer than its
+/// If the scalefactors that `intensity` marks do not fit in the
+/// [`available`](Bits::available) bits, which takes fewer than its
 /// [`silent_bits`](IntensityPositions::silent_bits).
 pub fn quantize_granule(
     xr: &[f64; GRANULE_LINES],
     xmin: &[f64],
     block_type: BlockType,
-    available_bits: usize,
+    bits: Bits,
     sampling_frequency: SamplingFrequency,
     reuse: Option<Reuse>,
     intensity: Option<&IntensityPositions>,
@@ -45,8 +45,9 @@ pub fn quantize_granule(
         if let Some(intensity) = intensity {
             intensity.mark(&mut granule.scalefactors, &granule.values);
             assert!(
-                granule.bit_len(sampling_frequency) <= available_bits,
-                "the intensity stereo positions do not fit in {available_bits} bits"
+                granule.bit_len(sampling_frequency) <= bits.available,
+                "the intensity stereo positions do not fit in {} bits",
+                bits.available
             );
         }
         return Outcome {
@@ -58,7 +59,7 @@ pub fn quantize_granule(
         xr,
         xmin,
         block_type,
-        available_bits,
+        bits,
         sampling_frequency,
         reuse,
         intensity,

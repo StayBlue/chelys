@@ -574,6 +574,7 @@ impl Encoder {
             ms_allowed,
             intensity_allowed,
             noise_factor,
+            save_bits: !matches!(config.rate, Rate::Variable(_)),
             sampling_frequency: fs,
         };
         let shortest = config.rate.lowest().frame_len(fs, true);
@@ -742,6 +743,10 @@ struct ModelCoding {
     /// The factor the allowed distortion of every band is scaled by: 1 but
     /// at a variable bitrate (see [`rate::VariableRate`]).
     noise_factor: f64,
+    /// Whether a normal block within its allowance may leave bits to the
+    /// reservoir: but at a variable bitrate, where a frame is given the
+    /// lowest bitrate that keeps it within its allowance instead.
+    save_bits: bool,
     sampling_frequency: SamplingFrequency,
 }
 
@@ -788,6 +793,7 @@ impl Coding for ModelCoding {
             frame,
             ms_stereo,
             mean_bits,
+            save_bits: self.save_bits,
             sampling_frequency: fs,
         };
         let plain = quantize_frame(&to_quantize, None, reservoir, IfOutsideAllowance::Finish)
@@ -860,6 +866,9 @@ struct FrameToQuantize<'a> {
     frame: &'a [Vec<Filtered<Analysis>>],
     ms_stereo: bool,
     mean_bits: usize,
+    /// Whether a normal block within its allowance may leave bits to the
+    /// reservoir (see [`loops::outer_loop`]).
+    save_bits: bool,
     sampling_frequency: SamplingFrequency,
 }
 
@@ -1078,6 +1087,7 @@ fn quantize_frame(
         frame,
         ms_stereo,
         mean_bits,
+        save_bits,
         sampling_frequency: fs,
     } = to_quantize;
     let mut reservoir = reservoir.clone();
@@ -1143,8 +1153,11 @@ fn quantize_frame(
                 }
                 _ => None,
             };
-            let outcome =
-                loops::quantize_granule(xr, xmin, block_type, available_bits, fs, reuse, intensity);
+            let bits = loops::Bits {
+                available: available_bits,
+                least: save_bits.then(|| reservoir.least_use(mean_bits)),
+            };
+            let outcome = loops::quantize_granule(xr, xmin, block_type, bits, fs, reuse, intensity);
             if gr == 0 {
                 first[channel] = Some((summary, outcome.granule.scalefactors.clone()));
             }

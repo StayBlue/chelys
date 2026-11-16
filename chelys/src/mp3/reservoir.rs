@@ -148,6 +148,14 @@ impl Reservoir {
         mean_bits + 8 * extra.min(held)
     }
 
+    /// The fewest bits a granule with the share `mean_bits` must use for the
+    /// reservoir to hold what it leaves unused: below that, the bits it
+    /// leaves would end up as stuffing.
+    pub fn least_use(&self, mean_bits: usize) -> usize {
+        let room = 8 * self.max_bytes as isize - self.bits;
+        usize::try_from(mean_bits as isize - room).unwrap_or(0)
+    }
+
     /// Accounts for a granule that used `used` bits of main data, against
     /// its share `mean_bits`: what it left unused goes to the reservoir, what
     /// it took beyond its share comes out of it.
@@ -214,6 +222,18 @@ mod tests {
         assert_eq!(reservoir.granule_bits(1000, 380.0), 1000 + 8 * 30);
         // A large demand is limited to what the reservoir holds.
         assert_eq!(reservoir.granule_bits(1000, 5000.0), 1000 + 8 * 50);
+    }
+
+    #[test]
+    fn a_granule_may_leave_only_what_the_reservoir_has_room_for() {
+        let mut reservoir = Reservoir::new(800, Version::Mpeg1);
+        assert_eq!(reservoir.max_bytes(), 160);
+        assert_eq!(reservoir.least_use(1000), 0);
+        reservoir.granule_done(1000, 600);
+        // 400 bits held, 880 of room left.
+        assert_eq!(reservoir.least_use(1000), 120);
+        assert_eq!(reservoir.least_use(500), 0);
+        assert_eq!(Reservoir::disabled().least_use(500), 500);
     }
 
     #[test]

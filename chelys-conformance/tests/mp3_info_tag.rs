@@ -190,7 +190,11 @@ fn decoders_read_the_tag_at_every_sampling_frequency() {
 /// was asked to, in a stream whose frames are small beside the tag's, so
 /// that a table whose offsets left out the tag's frame would send it some
 /// 2000 samples early. The decoded output, untrimmed, lags by [`DELAY`]
-/// from wherever decoding starts.
+/// from wherever decoding starts. The frames whose main data begins before
+/// the frame decoding starts at decode as silence; at 8 kbit/s and 8 kHz a
+/// frame holds 59 bytes of main data, so the bit reservoir's 255 bytes
+/// reach back at most five frames, 2880 samples, and the output is compared
+/// after them.
 #[test]
 fn ffmpeg_seeks_by_the_table() {
     let fs = SamplingFrequency::Hz8000;
@@ -201,19 +205,19 @@ fn ffmpeg_seeks_by_the_table() {
         crc_protected: false,
         flags: Flags::default(),
     };
-    let input: Vec<f64> = chirp(fs, 4 * 8000).iter().map(|x| x / 30.0).collect();
+    let input: Vec<f64> = chirp(fs, 5 * 8000).iter().map(|x| x / 30.0).collect();
     let stream = encode_pcm_with_info_tag(&config, &[&input]);
     for from in [1.0, 2.0, 3.0] {
-        let decoded = ffmpeg::decode_mp3_seeking(&stream, from, 0.5);
+        let decoded = ffmpeg::decode_mp3_seeking(&stream, from, 1.0);
         assert_eq!(decoded.diagnostics, "", "from {from} s");
         let output = &decoded.samples;
-        // The input sample that the decoded output's sample 1000 is,
-        // where it lines up best with the input.
+        // The input sample that the decoded output's sample 0 is, where its
+        // samples from 4000 on line up best with the input.
         let target = (from * 8000.0) as usize;
         let start = (target - 3000..target + 3000)
             .min_by(|&a, &b| {
                 let error = |k: usize| -> f64 {
-                    (1000..2600)
+                    (4000..5600)
                         .map(|t| (input[k + t] - f64::from(output[t])).powi(2))
                         .sum()
                 };

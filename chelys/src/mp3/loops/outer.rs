@@ -4,7 +4,7 @@
 //! The outer iteration loop, or distortion control loop (clause C.1.5.4.3,
 //! figure C.9.b).
 
-use super::inner::{inner_loop, step_size};
+use super::inner::{inner_loop, quantize, step_size};
 use crate::mp3::header::SamplingFrequency;
 use crate::mp3::scalefactor_bands::{self, Band, LONG_BANDS};
 use crate::mp3::scalefactors::{PRETAB, Scalefactors, ZeroPart};
@@ -20,6 +20,28 @@ pub struct Reuse<'a> {
     pub scfsi: [bool; SCFSI_BANDS],
 }
 
+/// The bits a granule may use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Bits {
+    /// The most it may use with its scalefactors, `max_bits` (clause
+    /// C.1.5.4.2.2).
+    pub available: usize,
+    /// If given, the fewest a normal block within its allowance must use:
+    /// it may leave the rest unused (see [`outer_loop`]). If not, it uses
+    /// all it can, as Annex C has it.
+    pub least: Option<usize>,
+}
+
+impl Bits {
+    /// `available` bits, all of which a granule uses if it can.
+    pub fn all(available: usize) -> Self {
+        Self {
+            available,
+            least: None,
+        }
+    }
+}
+
 /// A granule quantised by the iteration loops.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Outcome {
@@ -32,10 +54,14 @@ pub struct Outcome {
 /// The upper scalefactor bands whose distortion decides preemphasis.
 const PREEMPHASIS_BANDS: std::ops::Range<usize> = LONG_BANDS - 4..LONG_BANDS;
 
+/// How much more noise than its allowance, in dB, a normal block within its
+/// allowance may be given to save bits (see [`outer_loop`]).
+const SAVING_NOISE_DB: f64 = 4.0;
+
 /// Quantises the nonzero lines `xr` of a granule of `block_type` in at most
-/// `available_bits`, amplifying the scalefactor bands whose quantisation
-/// noise exceeds the allowed distortion `xmin`. The lines and `xmin` are in
-/// the order they are sent; for short blocks each scalefactor band counts
+/// the [`available`](Bits::available) `bits`, amplifying the scalefactor
+/// bands whose quantisation noise exceeds the allowed distortion `xmin`.
+/// The lines and `xmin` are in the order they are sent; for short blocks each scalefactor band counts
 /// once per window (see
 /// [`coding_bands`](crate::mp3::scalefactor_bands::coding_bands)).
 ///
@@ -110,6 +136,37 @@ const PREEMPHASIS_BANDS: std::ops::Range<usize> = LONG_BANDS - 4..LONG_BANDS;
 /// amplify those bands, where US 6,185,539 B1 codes them with "a
 /// multiplication factor of 1" (claim 1).
 ///
+/// Given the [`least`](Bits::least) bits, a normal block that ends within
+/// its allowance is not left with the finest step that fits, but given the
+/// coarsest step at which no band's distortion exceeds its allowance raised
+/// by [`SAVING_NOISE_DB`], as long as it still uses at least that many; the
+/// bits it leaves are the bit reservoir's, for granules short of bits.
+/// Spec reading: clause C.1.5.4.4 has the inner loop take the finest step
+/// that fits whatever the distortion, so that a granule spends all the bits
+/// it is given, and the reservoir gains only what a granule cannot spend
+/// (clause C.1.5.4.2.2). This deliberately departs from that. In a track at
+/// 128 kbit/s, three granules in four met their allowance from the first
+/// iteration and spent their bits lowering noise the model had already
+/// judged inaudible, while the rest went short. The least is what the
+/// reservoir has room for: bits saved beyond that would be lost as
+/// stuffing. Graded with PEAQ (GstPEAQ 0.6.1, black box), 22 tracks of pop
+/// music at 44.1 kHz in stereo rose from a mean of -1.21 to -0.69 at
+/// 128 kbit/s (from -1.61 to -0.98 for the worst track), from -2.60 to
+/// -1.88 at 96 kbit/s, and from -0.23 to -0.18 at 192 kbit/s; every one of
+/// its measures improved at 128 kbit/s, the frames with audible distortion
+/// falling from 34% to 18%. At 128 kbit/s, saving down to the allowance
+/// itself graded -0.86, and 3, 5 and 6 dB above it -0.72, -0.70 and -0.73;
+/// 4 dB is also what `--vbr` allows by default. Without the limit of the
+/// reservoir, 192 kbit/s fell to -0.37 (measured with every block type
+/// saving bits).
+///
+/// Start, short and stop blocks keep the finest step that fits. The model
+/// allows a granule around an attack noise by the attack's energy, which
+/// spreads before it; with them saving bits too, the noise ahead of an
+/// attack rose by up to 33 dB (see the test
+/// `attacks_switch_to_short_blocks_and_shorten_pre_echo`) for a mean grade
+/// of -0.67 at 128 kbit/s.
+///
 /// The amplified lines are recomputed from `xr` each iteration rather than
 /// multiplied incrementally as clause C.1.5.4.3 describes; the result is
 /// the same.
@@ -118,17 +175,21 @@ const PREEMPHASIS_BANDS: std::ops::Range<usize> = LONG_BANDS - 4..LONG_BANDS;
 ///
 /// If `xr` cannot be quantised even without scalefactors, which takes lines
 /// far beyond the decoder's output range, or the marks of `intensity` take
-/// more than `available_bits`, which takes fewer than its
+/// more than the available bits, which takes fewer than its
 /// [`silent_bits`](IntensityPositions::silent_bits).
 pub fn outer_loop(
     xr: &[f64; GRANULE_LINES],
     xmin: &[f64],
     block_type: BlockType,
-    available_bits: usize,
+    bits: Bits,
     sampling_frequency: SamplingFrequency,
     reuse: Option<Reuse>,
     intensity: Option<&IntensityPositions>,
 ) -> Outcome {
+    let Bits {
+        available: available_bits,
+        least: least_bits,
+    } = bits;
     let bands = scalefactor_bands::coding_bands(block_type, sampling_frequency);
     assert_eq!(xmin.len(), bands.len(), "one xmin per scalefactor");
     let fixed = scalefactor_bands::fixed_at_zero(block_type, sampling_frequency);
@@ -150,8 +211,9 @@ pub fn outer_loop(
             }
         }
     }
-    // The least excess measured, and the result that had it.
-    let mut best: Option<(f64, Outcome)> = None;
+    // The least excess measured, and the result that had it, with its
+    // scalefactors before any intensity stereo marks.
+    let mut best: Option<(f64, Outcome, Scalefactors)> = None;
     let mut start_gain = None;
 
     loop {
@@ -171,13 +233,13 @@ pub fn outer_loop(
                     xr,
                     xmin,
                     block_type,
-                    available_bits,
+                    bits,
                     sampling_frequency,
                     None,
                     intensity,
                 );
             }
-            return best.expect("lines without scalefactors always quantise").1;
+            break;
         };
         start_gain = Some(granule.global_gain);
 
@@ -194,12 +256,12 @@ pub fn outer_loop(
             .sum();
         let violated = excess > 0.0;
         let first = best.is_none();
-        if best.as_ref().is_none_or(|(least, _)| excess < *least) {
+        if best.as_ref().is_none_or(|(least, ..)| excess < *least) {
             let outcome = Outcome {
                 granule,
                 within_allowance: !violated,
             };
-            best = Some((excess, outcome));
+            best = Some((excess, outcome, scalefactors.clone()));
         }
 
         // C.1.5.4.3.4: preemphasis, which raises the allowed distortion of the
@@ -241,7 +303,89 @@ pub fn outer_loop(
             break;
         }
     }
-    best.expect("the loop runs at least once").1
+    let (_, outcome, scalefactors) = best.expect("lines without scalefactors always quantise");
+    match least_bits {
+        Some(least_bits) if outcome.within_allowance && block_type == BlockType::Normal => {
+            let to_save = ToSave {
+                xr,
+                xmin,
+                scalefactors: &scalefactors,
+                bands: &bands,
+                fixed,
+                sampling_frequency,
+                intensity,
+            };
+            let granule = to_save.coarsest(outcome.granule, available_bits, least_bits);
+            Outcome {
+                granule,
+                within_allowance: true,
+            }
+        }
+        _ => outcome,
+    }
+}
+
+/// A granule that met its allowance, to quantise with a coarser step.
+struct ToSave<'a> {
+    xr: &'a [f64; GRANULE_LINES],
+    xmin: &'a [f64],
+    /// Its scalefactors before any intensity stereo marks.
+    scalefactors: &'a Scalefactors,
+    bands: &'a [Band],
+    fixed: std::ops::Range<usize>,
+    sampling_frequency: SamplingFrequency,
+    intensity: Option<&'a IntensityPositions>,
+}
+
+impl ToSave<'_> {
+    /// The granule with the coarsest step, from that of `granule` up, at
+    /// which no band's distortion exceeds its allowance raised by
+    /// [`SAVING_NOISE_DB`], and which takes between `least_bits` and
+    /// `available_bits`. Every band counts, those taken over with scfsi
+    /// too, but for those fixed at zero. In the right channel of a frame
+    /// coded in intensity stereo, a step that would leave a band below the
+    /// bound with nothing in it, and so marked, fails too: at the lower
+    /// sampling frequencies the frame could not then be coded in intensity
+    /// stereo (see `quantize_frame`). The search stops at the first step
+    /// that fails, as distortion and bits follow the step only roughly.
+    fn coarsest(
+        &self,
+        granule: QuantizedGranule,
+        available_bits: usize,
+        least_bits: usize,
+    ) -> QuantizedGranule {
+        let fs = self.sampling_frequency;
+        let amplified = amplify(self.xr, self.scalefactors, self.bands);
+        let raised = 10f64.powf(SAVING_NOISE_DB / 10.0);
+        let allowed: Vec<f64> = (self.xmin.iter().enumerate())
+            .map(|(sb, xmin)| raised * xmin * self.scalefactors.amplification(sb).powi(2))
+            .collect();
+        let mut kept = granule;
+        for global_gain in kept.global_gain.saturating_add(1)..=u8::MAX {
+            let Some(values) = quantize(&amplified, global_gain) else {
+                break;
+            };
+            let mut coarser = QuantizedGranule::new(global_gain, values, kept.block_type, fs);
+            coarser.scalefactors = self.scalefactors.clone();
+            let distortion = distortion(&amplified, &coarser, self.bands);
+            if (0..self.bands.len())
+                .any(|sb| !self.fixed.contains(&sb) && distortion[sb] > allowed[sb])
+            {
+                break;
+            }
+            if let Some(intensity) = self.intensity {
+                intensity.mark(&mut coarser.scalefactors, &coarser.values);
+                if coarser.scalefactors.marks_any() && !kept.scalefactors.marks_any() {
+                    break;
+                }
+            }
+            if !(least_bits..=available_bits).contains(&coarser.bit_len(fs)) {
+                break;
+            }
+            kept = coarser;
+        }
+        kept
+    }
 }
 
 /// The inner loop for the lines `amplified` by `scalefactors`, in at most
@@ -403,7 +547,7 @@ mod tests {
             &xr,
             &[f64::INFINITY; LONG_BANDS],
             BlockType::Normal,
-            1500,
+            Bits::all(1500),
             FS,
             None,
             None,
@@ -430,7 +574,16 @@ mod tests {
                 f64::INFINITY
             }
         });
-        let granule = outer_loop(&xr, &xmin, BlockType::Normal, 1500, FS, None, None).granule;
+        let granule = outer_loop(
+            &xr,
+            &xmin,
+            BlockType::Normal,
+            Bits::all(1500),
+            FS,
+            None,
+            None,
+        )
+        .granule;
         assert!(total_bits(&granule) <= 1500);
         for sb in 4..8 {
             assert!(granule.scalefactors.values()[sb] > 0, "band {sb}");
@@ -451,7 +604,7 @@ mod tests {
                 &xr,
                 &[0.0; LONG_BANDS],
                 BlockType::Normal,
-                bits,
+                Bits::all(bits),
                 FS,
                 None,
                 None,
@@ -478,18 +631,34 @@ mod tests {
             }
         });
         assert!(
-            outer_loop(&xr, &xmin, BlockType::Normal, 1500, FS, None, None)
-                .granule
-                .scalefactors
-                .preflag
+            outer_loop(
+                &xr,
+                &xmin,
+                BlockType::Normal,
+                Bits::all(1500),
+                FS,
+                None,
+                None
+            )
+            .granule
+            .scalefactors
+            .preflag
         );
         let mut xmin = xmin;
         xmin[LONG_BANDS - 1] = f64::INFINITY;
         assert!(
-            !outer_loop(&xr, &xmin, BlockType::Normal, 1500, FS, None, None)
-                .granule
-                .scalefactors
-                .preflag
+            !outer_loop(
+                &xr,
+                &xmin,
+                BlockType::Normal,
+                Bits::all(1500),
+                FS,
+                None,
+                None
+            )
+            .granule
+            .scalefactors
+            .preflag
         );
     }
 
@@ -517,7 +686,7 @@ mod tests {
                 &xr,
                 &[0.0; LONG_BANDS],
                 BlockType::Normal,
-                bits,
+                Bits::all(bits),
                 FS,
                 Some(reuse),
                 None,
@@ -549,8 +718,24 @@ mod tests {
         };
         let xmin = [1e-9; LONG_BANDS];
         assert_eq!(
-            outer_loop(&xr, &xmin, BlockType::Normal, 1500, FS, Some(reuse), None),
-            outer_loop(&xr, &xmin, BlockType::Normal, 1500, FS, None, None)
+            outer_loop(
+                &xr,
+                &xmin,
+                BlockType::Normal,
+                Bits::all(1500),
+                FS,
+                Some(reuse),
+                None
+            ),
+            outer_loop(
+                &xr,
+                &xmin,
+                BlockType::Normal,
+                Bits::all(1500),
+                FS,
+                None,
+                None
+            )
         );
     }
 
@@ -568,7 +753,7 @@ mod tests {
                 &xr,
                 &[0.0; LONG_BANDS],
                 BlockType::Normal,
-                bits,
+                Bits::all(bits),
                 FS,
                 None,
                 Some(&positions),
@@ -585,12 +770,68 @@ mod tests {
             &xr,
             &[f64::INFINITY; LONG_BANDS],
             BlockType::Normal,
-            1500,
+            Bits::all(1500),
             FS,
             None,
             Some(&positions),
         );
         assert!(outcome.within_allowance);
+    }
+
+    /// A normal block within its allowance, given the least bits it must
+    /// use, takes a coarser step and fewer bits, with no band's distortion
+    /// beyond its allowance raised by [`SAVING_NOISE_DB`]; but no fewer bits
+    /// than the least, and a short block keeps the finest step that fits.
+    #[test]
+    fn a_granule_within_its_allowance_saves_bits() {
+        let xr = spectrum();
+        let bands = scalefactor_bands::long_bands(FS);
+        let plain = inner_loop(&xr, 1500, BlockType::Normal, FS, None).unwrap();
+        // The allowance admits the noise of the finest step that fits, and
+        // raised, that of four steps coarser, and of those between.
+        let raised = 10f64.powf(SAVING_NOISE_DB / 10.0);
+        let mut xmin = distortion(&xr, &plain, bands);
+        for gain in plain.global_gain + 1..=plain.global_gain + 4 {
+            let values = quantize(&xr, gain).unwrap();
+            let coarser = QuantizedGranule::new(gain, values, BlockType::Normal, FS);
+            for (xmin, noise) in xmin.iter_mut().zip(distortion(&xr, &coarser, bands)) {
+                *xmin = f64::max(*xmin, 1.000_001 * noise / raised);
+            }
+        }
+        let quantize = |block_type, least| {
+            let bits = Bits {
+                available: 1500,
+                least,
+            };
+            outer_loop(&xr, &xmin, block_type, bits, FS, None, None)
+        };
+        let spent = quantize(BlockType::Normal, None);
+        assert!(spent.within_allowance);
+        assert_eq!(spent.granule.global_gain, plain.global_gain);
+
+        let saved = quantize(BlockType::Normal, Some(0));
+        assert!(saved.within_allowance);
+        assert!(saved.granule.global_gain >= plain.global_gain + 4);
+        assert!(total_bits(&saved.granule) < total_bits(&spent.granule));
+        let noise = distortion(&xr, &saved.granule, bands);
+        for sb in 0..LONG_BANDS {
+            assert!(noise[sb] <= raised * xmin[sb], "band {sb}");
+        }
+
+        let least = total_bits(&spent.granule) - 1;
+        let limited = quantize(BlockType::Normal, Some(least)).granule;
+        assert!(total_bits(&limited) >= least);
+
+        let short_xmin =
+            vec![f64::INFINITY; scalefactor_bands::coding_bands(BlockType::Short, FS).len()];
+        let short = |least| {
+            let bits = Bits {
+                available: 1500,
+                least,
+            };
+            outer_loop(&xr, &short_xmin, BlockType::Short, bits, FS, None, None).granule
+        };
+        assert_eq!(short(Some(0)), short(None));
     }
 
     /// The conversion to `scalefac_scale` never amplifies a band less.
