@@ -16,6 +16,10 @@
 //! as a black box (see [`peaq`]). Its grades were recorded with GstPEAQ
 //! 0.6.1, which states that it does not meet the recommendation's
 //! conformance requirements.
+//!
+//! LAME's encoder is run as a black box too, as a benchmark: only the PEAQ
+//! grades of its decoded output are compared with chelys's. The benchmark
+//! was run with LAME 4.0 (64-bit).
 
 pub mod ffmpeg;
 pub mod lame;

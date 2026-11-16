@@ -137,3 +137,17 @@ recorded again with another version.
 
 *User, 2026-11-15, when listening tests proved too laborious and GstPEAQ was
 installed: the wording was proposed by the agent and approved by the user.*
+
+## LAME's encoder as a benchmark
+
+LAME's encoder may be run as a black box to benchmark the quality of chelys's
+output. Only the PEAQ grades and measures of its decoded output are used. They
+are taken from the same input, at the same bitrate (at a variable bitrate, at
+the same average size), and through the same decoding and grading as chelys's
+output. Its bitstreams are not inspected beyond decoding them, and its choices
+are not copied: its grades show how far chelys's tuning has to go, not how to
+get there. Record the LAME version the benchmark was run with in the
+`chelys-conformance` crate's documentation, next to the decoders'.
+
+*User, 2026-11-16, when the gap to an established encoder was to be measured:
+the wording was proposed by the agent and approved by the user.*
