@@ -67,6 +67,10 @@ const MS: Mode = Mode::JointStereo {
 /// Xing/Info tag, they read it, and give the input exactly; where they do
 /// not, the stream has no tag, and their output is untrimmed, the input
 /// lagging by [`DELAY`] in mpg123's and by 529 samples less in LAME's.
+///
+/// This is the evidence for free format at MPEG-2.5's sampling
+/// frequencies, and for the tag's frame in free format, which the bitrate
+/// and the tag mark as settled by decoding with mpg123 and LAME.
 #[test]
 fn mpg123_and_lame_decode_free_format() {
     use SamplingFrequency::*;

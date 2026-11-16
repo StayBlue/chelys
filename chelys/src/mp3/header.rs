@@ -122,7 +122,10 @@ impl Bitrate {
     ///
     /// Spec gap: US 6,185,539 B1 does not mention free format. MPEG-2.5,
     /// which extends ISO/IEC 13818-3, has it as that standard does, with
-    /// the same bounds.
+    /// the same bounds. Settled by decoding with mpg123 and LAME (black
+    /// box): both decode every frame of it at 8, 11.025 and 12 kHz; the
+    /// conformance test is `mpg123_and_lame_decode_free_format`. ffmpeg
+    /// decodes no free format.
     pub fn free(version: Version, bits_per_second: u32) -> Option<Self> {
         let table = version.kbps();
         let highest = table[table.len() - 1] * 1000;

@@ -72,6 +72,10 @@ const DECODER_DELAY: usize = 529;
 /// of ISO/IEC 11172-3), and whose frames' length a decoder learns from the
 /// distance between their headers. The tag's frame is at the stream's
 /// bitrate, and a stream whose frames do not hold the tag has none: `None`.
+/// Settled by decoding with mpg123 and LAME (black box): both find the
+/// frames after the tag's, and read the tag, giving the input exactly; the
+/// conformance test is `mpg123_and_lame_decode_free_format`. ffmpeg
+/// decodes no free format.
 pub fn header(config: &StreamConfig) -> Option<Header> {
     let fs = config.sampling_frequency;
     let channels = config.mode.channels();
