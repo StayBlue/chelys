@@ -31,3 +31,19 @@ pub fn sample_rate(stream: &[u8]) -> u32 {
         .arg(file.path()));
     wav_sample_rate(&output.stdout)
 }
+
+/// mpg123's account of a stream's first frame header, from its most
+/// verbose output: the lines that begin "Channels:" and "Bitrate:", which
+/// give `copyright`, `original/copy` and, as the "Extension value",
+/// `private_bit`.
+pub fn describe_header(stream: &[u8]) -> String {
+    let file = TempFile::new("mp3", stream);
+    let output = run(Command::new("mpg123")
+        .args(["-vvv", "-t", "-n", "1"])
+        .arg(file.path()));
+    String::from_utf8_lossy(&output.stderr)
+        .lines()
+        .filter(|line| line.starts_with("Channels:") || line.starts_with("Bitrate:"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
