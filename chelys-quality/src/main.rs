@@ -6,6 +6,8 @@
 //! trial, one of the two at random (X), and counts how often the listener
 //! tells which X is; or by PEAQ's grade. The encoding is decoded with
 //! ffmpeg, played with ffplay and graded with GstPEAQ, all as black boxes.
+//! Another encoder's output, such as LAME's when it is the benchmark, is
+//! judged the same way, lined up by its own delay.
 
 mod abx;
 mod clip;
@@ -19,19 +21,22 @@ use clip::Clip;
 
 const USAGE: &str = "\
 usage: chelys-quality abx --sample-rate HZ --channels N [--trials N]
-                          [--from SECONDS] [--to SECONDS]
+                          [--from SECONDS] [--to SECONDS] [--delay SAMPLES]
                           ORIGINAL.f32 ENCODED.mp3
        chelys-quality diff --sample-rate HZ --channels N
-                           [--from SECONDS] [--to SECONDS]
+                           [--from SECONDS] [--to SECONDS] [--delay SAMPLES]
                            ORIGINAL.f32 ENCODED.mp3 > difference.f32
        chelys-quality grade --sample-rate HZ --channels N
-                            [--from SECONDS] [--to SECONDS]
+                            [--from SECONDS] [--to SECONDS] [--delay SAMPLES]
                             ORIGINAL.f32 ENCODED.mp3
+       chelys-quality lag --sample-rate HZ --channels N
+                          ORIGINAL.f32 ENCODED.mp3
 
 ORIGINAL.f32 is interleaved 32-bit little-endian float PCM, as the chelys
-encoder reads it, and ENCODED.mp3 is what the encoder made of it. ffmpeg
-decodes the MP3, ffplay plays the sound, and GstPEAQ grades it, through
-gst-launch-1.0; each must be installed for the commands that use it.
+encoder reads it, and ENCODED.mp3 is what an encoder made of it: chelys, or
+another encoder judged beside it. ffmpeg decodes the MP3, ffplay plays the
+sound, and GstPEAQ grades it, through gst-launch-1.0; each must be installed
+for the commands that use it.
 
   abx   a blind ABX test: in each trial, play A (the original), B (the
         encoding) and X (one of the two at random) as often as needed, then
@@ -43,12 +48,18 @@ gst-launch-1.0; each must be installed for the commands that use it.
         Objective Difference Grade, from 0 (imperceptible) down to -4 (very
         annoying), and the bandwidths of the original and the encoding,
         which weigh heavily in it
+  lag   print the delay, in samples per channel from 0 to 8192, by which
+        ffmpeg's decoding of the encoding lags the original, found where
+        the two correlate best; give it to the others with --delay
 
   --sample-rate HZ  the sampling frequency of both
   --channels N      1 or 2
   --trials N        with abx, the number of trials (default 16)
   --from SECONDS    use only the part from this time on (default: the start)
   --to SECONDS      use only the part up to this time (default: the end)
+  --delay SAMPLES   the samples per channel by which ffmpeg's decoding of
+                    the encoding lags the original (default: chelys's
+                    1057, which ffmpeg does not remove)
 
 To learn what coding noise sounds like, first take the test with an encoding
 at a low bitrate, such as 32 kbit/s, and raise the bitrate from there.";
@@ -57,6 +68,7 @@ enum Command {
     Abx { trials: usize },
     Diff,
     Grade,
+    Lag,
 }
 
 struct Options {
@@ -67,6 +79,7 @@ struct Options {
     encoded: String,
     from: Option<f64>,
     to: Option<f64>,
+    delay: usize,
 }
 
 /// The value after the flag `name`, parsed.
@@ -84,7 +97,7 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
     let mut args = args.into_iter();
     let command = args.next().ok_or("no command given")?;
     let (mut sample_rate, mut channels, mut trials) = (None, None, None);
-    let (mut from, mut to) = (None, None);
+    let (mut from, mut to, mut delay) = (None, None, None);
     let mut paths = Vec::new();
     while let Some(arg) = args.next() {
         let args = &mut args;
@@ -94,6 +107,7 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
             "--trials" => trials = Some(value::<usize>(args, &arg)?),
             "--from" => from = Some(value::<f64>(args, &arg)?),
             "--to" => to = Some(value::<f64>(args, &arg)?),
+            "--delay" => delay = Some(value::<usize>(args, &arg)?),
             "-h" | "--help" => return Err(String::new()),
             flag if flag.starts_with("--") => return Err(format!("unknown argument: {flag}")),
             _ => paths.push(arg),
@@ -106,9 +120,15 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
                 n => n,
             },
         },
-        "diff" | "grade" if trials.is_some() => return Err("--trials needs abx".to_owned()),
+        "diff" | "grade" | "lag" if trials.is_some() => {
+            return Err("--trials needs abx".to_owned());
+        }
+        "lag" if from.is_some() || to.is_some() || delay.is_some() => {
+            return Err("lag takes no --from, --to or --delay".to_owned());
+        }
         "diff" => Command::Diff,
         "grade" => Command::Grade,
+        "lag" => Command::Lag,
         "-h" | "--help" => return Err(String::new()),
         other => return Err(format!("unknown command: {other}")),
     };
@@ -127,6 +147,7 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
         encoded,
         from,
         to,
+        delay: delay.unwrap_or(chelys::mp3::DELAY),
     })
 }
 
@@ -142,21 +163,33 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let result = Clip::load(
-        options.sample_rate,
-        options.channels,
-        &options.original,
-        &options.encoded,
-    )
-    .and_then(|clip| clip.section(options.from, options.to))
-    .and_then(|clip| match options.command {
-        Command::Abx { trials } => abx::run(&clip, trials),
-        Command::Diff => write_difference(&clip),
-        Command::Grade => {
-            print_grade(&clip);
-            Ok(())
-        }
-    });
+    let result = if let Command::Lag = options.command {
+        clip::lag(
+            options.sample_rate,
+            options.channels,
+            &options.original,
+            &options.encoded,
+        )
+        .map(|lag| println!("{lag}"))
+    } else {
+        Clip::load(
+            options.sample_rate,
+            options.channels,
+            &options.original,
+            &options.encoded,
+            options.delay,
+        )
+        .and_then(|clip| clip.section(options.from, options.to))
+        .and_then(|clip| match options.command {
+            Command::Abx { trials } => abx::run(&clip, trials),
+            Command::Diff => write_difference(&clip),
+            Command::Grade => {
+                print_grade(&clip);
+                Ok(())
+            }
+            Command::Lag => unreachable!("lag needs no clip"),
+        })
+    };
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
