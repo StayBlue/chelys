@@ -66,7 +66,13 @@ const DECODER_DELAY: usize = 529;
 /// bitrate's average is known only once the stream has ended, after the
 /// frame has been written, so its tag takes the lowest bitrate that holds
 /// it.
-pub fn header(config: &StreamConfig) -> Header {
+///
+/// Spec gap: the document does not mention free format, whose bitrate does
+/// not change ("in free format, fixed bitrate is required", clause 2.4.2.3
+/// of ISO/IEC 11172-3), and whose frames' length a decoder learns from the
+/// distance between their headers. The tag's frame is at the stream's
+/// bitrate, and a stream whose frames do not hold the tag has none: `None`.
+pub fn header(config: &StreamConfig) -> Option<Header> {
     let fs = config.sampling_frequency;
     let channels = config.mode.channels();
     let side_info = SideInfo::len_bytes(fs.version(), channels);
@@ -77,11 +83,14 @@ pub fn header(config: &StreamConfig) -> Header {
             .min_by_key(|b| b.bits_per_second().abs_diff(mean.bits_per_second())),
         Rate::Variable(_) => None,
     };
-    let bitrate = preferred.filter(holds).unwrap_or_else(|| {
-        Bitrate::all(fs.version())
-            .find(holds)
-            .expect("the highest bitrate's frames hold the tag")
-    });
+    let bitrate = match preferred {
+        Some(free) if free.is_free() => Some(free).filter(holds)?,
+        _ => preferred.filter(holds).unwrap_or_else(|| {
+            Bitrate::all(fs.version())
+                .find(holds)
+                .expect("the highest bitrate's frames hold the tag")
+        }),
+    };
     let mode = match config.mode {
         Mode::JointStereo { .. } => Mode::JointStereo {
             intensity_stereo: false,
@@ -89,7 +98,7 @@ pub fn header(config: &StreamConfig) -> Header {
         },
         mode => mode,
     };
-    Header {
+    Some(Header {
         crc_protected: false,
         bitrate,
         sampling_frequency: fs,
@@ -99,7 +108,7 @@ pub fn header(config: &StreamConfig) -> Header {
         copyright: false,
         original: false,
         emphasis: Emphasis::None,
-    }
+    })
 }
 
 /// The tag's frame with nothing in it but its header: what the stream
@@ -350,7 +359,7 @@ mod tests {
             noise_offset_db: 0.0,
         });
         let config = config(fs, rate, Mode::Stereo);
-        let header = header(&config);
+        let header = header(&config).unwrap();
         // 192 bytes of tag need 64 kbit/s: 208-byte frames.
         assert_eq!(header.bitrate, kbps(fs, 64));
         assert!(!header.crc_protected);
@@ -395,27 +404,27 @@ mod tests {
         let fs = SamplingFrequency::Hz48000;
         let mono = config(fs, Rate::Constant(kbps(fs, 64)), Mode::SingleChannel);
         // 4 + 17 + 156 = 177 bytes fit in 192.
-        assert_eq!(header(&mono).bitrate, kbps(fs, 64));
+        assert_eq!(header(&mono).unwrap().bitrate, kbps(fs, 64));
         let stereo = config(fs, Rate::Constant(kbps(fs, 56)), Mode::Stereo);
         // 192 bytes do not fit in 168; 64 kbit/s's 192 do.
-        assert_eq!(header(&stereo).bitrate, kbps(fs, 64));
+        assert_eq!(header(&stereo).unwrap().bitrate, kbps(fs, 64));
         let stream = Stream {
             config: &mono,
             frame_lens: &[192; 10],
             samples: 10 * 1152 - 528 - 600,
             music_crc: 0,
         };
-        let frame = frame(&header(&mono), &stream);
+        let frame = frame(&header(&mono).unwrap(), &stream);
         assert_eq!(&frame[4 + 17..4 + 21], b"Info");
         assert_eq!(frame[4 + 17 + 129], 0x11);
         // A mean rate takes the nearest bitrate of the table.
         let mean = crate::mp3::rate::MeanRate::new(fs.version(), 150_000).unwrap();
         let near = config(fs, Rate::Mean(mean), Mode::Stereo);
-        assert_eq!(header(&near).bitrate, kbps(fs, 160));
+        assert_eq!(header(&near).unwrap().bitrate, kbps(fs, 160));
         // At 8 kHz in one channel the tag takes 4 + 9 + 156 = 169 bytes:
         // 24 kbit/s's 216.
         let fs = SamplingFrequency::Hz8000;
         let low = config(fs, Rate::Constant(kbps(fs, 8)), Mode::SingleChannel);
-        assert_eq!(header(&low).bitrate, kbps(fs, 24));
+        assert_eq!(header(&low).unwrap().bitrate, kbps(fs, 24));
     }
 }

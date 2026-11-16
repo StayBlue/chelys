@@ -471,8 +471,8 @@ pub fn encode_pcm(config: &StreamConfig, channels: &[&[f64]]) -> Vec<u8> {
     out
 }
 
-/// Encodes PCM like [`encode_pcm`], with a Xing/Info tag at the start (see
-/// [`Encoder::with_info_tag`]).
+/// Encodes PCM like [`encode_pcm`], with a Xing/Info tag at the start if
+/// the stream has one (see [`Encoder::with_info_tag`]).
 ///
 /// # Panics
 ///
@@ -481,8 +481,9 @@ pub fn encode_pcm_with_info_tag(config: &StreamConfig, channels: &[&[f64]]) -> V
     let mut encoder = Encoder::with_info_tag(*config);
     let mut out = Vec::new();
     encoder.encode(channels, &mut out);
-    let tag = encoder.finish(&mut out).expect("an encoder with a tag");
-    out[..tag.len()].copy_from_slice(&tag);
+    if let Some(tag) = encoder.finish(&mut out) {
+        out[..tag.len()].copy_from_slice(&tag);
+    }
     out
 }
 
@@ -565,15 +566,17 @@ impl Encoder {
     /// decoded output the input exactly for decoders that apply them. As
     /// those are known only at the end, the frame is written as a
     /// placeholder, silent and with no tag, and [`finish`](Self::finish)
-    /// returns it with the tag, to be written over it.
+    /// returns it with the tag, to be written over it. A stream in free
+    /// format whose frames are too short for the tag has none, as its
+    /// bitrate cannot change for the tag's frame ([`info_tag::header`]).
     ///
     /// # Panics
     ///
     /// As [`new`](Self::new).
     pub fn with_info_tag(config: StreamConfig) -> Self {
         Self {
-            tag: Some(TagState {
-                header: info_tag::header(&config),
+            tag: info_tag::header(&config).map(|header| TagState {
+                header,
                 written: false,
                 music_crc: info_tag::MUSIC_CRC_START,
             }),
@@ -604,8 +607,8 @@ impl Encoder {
     /// Ends the stream: pads the input with silence to whole frames, at
     /// least [`DELAY`] samples past the input, and appends the rest of the
     /// stream to `out`. For an encoder made [`with_info_tag`]
-    /// (Self::with_info_tag), returns the tag's frame, to be written over
-    /// the first bytes of the stream.
+    /// (Self::with_info_tag), returns the tag's frame, if the stream has
+    /// one, to be written over the first bytes of the stream.
     pub fn finish(mut self, out: &mut Vec<u8>) -> Option<Vec<u8>> {
         let start = self.write_placeholder(out);
         let config = self.frames.config;
@@ -1918,6 +1921,75 @@ mod tests {
                         frames[..silent].iter().all(|f| kbps_of(f) == kbps[0]),
                         "{case}"
                     );
+                });
+            }
+        });
+    }
+
+    /// In free format every frame has `bitrate_index` 0 and `N` or `N + 1`
+    /// slots, padded as at a bitrate of the table, keeps to the rules of the
+    /// bit reservoir, from frames shorter than any of the table to frames
+    /// longer than the decoder's buffer. Where its frames hold the
+    /// Xing/Info tag, the tag's frame is in free format too; where they do
+    /// not, the stream has none.
+    #[test]
+    fn free_format_streams_keep_their_bitrate() {
+        use SamplingFrequency::*;
+        let cases = [
+            (Hz44100, 100_000, Mode::Stereo, false, true),
+            (Hz48000, 12_667, Mode::SingleChannel, true, false),
+            (Hz32000, 319_999, MS, false, true),
+            (Hz22050, 50_000, MS, true, false),
+            (Hz24000, 8_001, Mode::SingleChannel, false, false),
+            (Hz16000, 159_999, Mode::Stereo, true, true),
+            (Hz11025, 33_333, MS, false, true),
+            (Hz8000, 20_000, Mode::SingleChannel, true, true),
+        ];
+        std::thread::scope(|scope| {
+            for (fs, bits_per_second, mode, crc_protected, tagged) in cases {
+                scope.spawn(move || {
+                    let bitrate = Bitrate::free(fs.version(), bits_per_second).unwrap();
+                    let config = StreamConfig {
+                        rate: Rate::Constant(bitrate),
+                        sampling_frequency: fs,
+                        mode,
+                        crc_protected,
+                    };
+                    let case = format!("{fs:?} at {bits_per_second} bit/s");
+                    let input = varied(fs, 1.0);
+                    let mut encoder = Encoder::with_info_tag(config);
+                    let mut stream = Vec::new();
+                    match mode {
+                        Mode::SingleChannel => encoder.encode(&[&input[0]], &mut stream),
+                        _ => encoder.encode(&[&input[0], &input[1]], &mut stream),
+                    }
+                    let tag = encoder.finish(&mut stream);
+                    assert_eq!(tag.is_some(), tagged, "{case}");
+                    if let Some(tag) = tag {
+                        stream[..tag.len()].copy_from_slice(&tag);
+                    }
+                    let frames = stream_check::free_frames(&stream, bitrate);
+                    let samples = fs.version().samples_per_frame();
+                    let expected = (input[0].len() + DELAY).div_ceil(samples);
+                    assert_eq!(frames.len(), expected + usize::from(tagged), "{case}");
+                    // After k frames the stream holds floor(k * N) slots,
+                    // with N as exact as 144 * bit_rate / fs (72 at the lower
+                    // sampling frequencies) can be; the tag's frame, which
+                    // is not padded, takes the place of the first.
+                    let numerator = samples as u64 / 8 * u64::from(bits_per_second);
+                    let hz = u64::from(fs.hz());
+                    let mut total = 0;
+                    for (k, frame) in frames.iter().enumerate() {
+                        total += frame.len as u64;
+                        let k = (k + 1 - usize::from(tagged)) as u64;
+                        let floor = usize::from(tagged) as u64 * (numerator / hz);
+                        assert_eq!(total, floor + k * numerator / hz, "{case}, frame {k}");
+                    }
+                    if bitrate.frame_len(fs, true) * 8 > 7680 {
+                        assert!(frames.iter().all(|f| f.main_data_begin == 0), "{case}");
+                    } else {
+                        assert!(frames.iter().any(|f| f.main_data_begin > 0), "{case}");
+                    }
                 });
             }
         });

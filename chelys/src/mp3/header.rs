@@ -8,6 +8,7 @@
 
 use crate::bitstream::BitWriter;
 use crate::mp3::GRANULE_LINES;
+use crate::mp3::side_info::SideInfo;
 
 const SYNCWORD: u32 = 0xFFF;
 /// The sync word that marks MPEG-2.5, "eleven ones and a zero" (US
@@ -71,25 +72,80 @@ impl Version {
     }
 }
 
-/// A Layer III bitrate from the `bitrate_index` table of a [`Version`]. Free
-/// format is not supported.
+/// A Layer III bitrate: one of the `bitrate_index` table of a [`Version`],
+/// or a free format bitrate, sent as `bitrate_index` 0.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Bitrate {
     version: Version,
+    /// The `bitrate_index`, 0 in free format.
     index: u8,
+    bits_per_second: u32,
 }
 
 impl Bitrate {
     pub fn from_kbps(version: Version, kbps: u32) -> Option<Self> {
         let index = version.kbps()[1..].iter().position(|&k| k == kbps)? + 1;
-        Some(Self {
+        Some(Self::from_index(version, index as u8))
+    }
+
+    fn from_index(version: Version, index: u8) -> Self {
+        Self {
             version,
-            index: index as u8,
-        })
+            index,
+            bits_per_second: version.kbps()[usize::from(index)] * 1000,
+        }
     }
 
     pub fn all(version: Version) -> impl Iterator<Item = Self> {
-        (1..version.kbps().len() as u8).map(move |index| Self { version, index })
+        (1..version.kbps().len() as u8).map(move |index| Self::from_index(version, index))
+    }
+
+    /// A free format bitrate (clause 2.1.67, and clause 2.1.118 of ISO/IEC
+    /// 13818-3): "any bitrate other than the defined bitrates that is less
+    /// than the maximum valid bitrate", here in whole bits per second, and
+    /// none where its frames are too short for the header, the `crc_check`
+    /// word and the side information of two channels at the version's
+    /// highest sampling frequency, whose frames are the shortest. A frame
+    /// at a free format bitrate holds `N` or `N + 1` slots, as at one of
+    /// the table (clause 2.4.2.3).
+    ///
+    /// Spec reading: clause 2.4.2.3 adds that a decoder "is also not
+    /// required to support bitrates higher than [...] 320 kbits/s" in free
+    /// format, or
+    /// 160 kbit/s at the lower sampling frequencies (clause 2.4.2.3 of
+    /// ISO/IEC 13818-3), as though there were such bitrates; the definition
+    /// excludes them, and is followed.
+    ///
+    /// Spec gap: neither standard bounds a free format bitrate from below.
+    /// The bound here keeps every frame within the syntax of clause
+    /// 2.4.1.2 in any mode.
+    ///
+    /// Spec gap: US 6,185,539 B1 does not mention free format. MPEG-2.5,
+    /// which extends ISO/IEC 13818-3, has it as that standard does, with
+    /// the same bounds.
+    pub fn free(version: Version, bits_per_second: u32) -> Option<Self> {
+        let table = version.kbps();
+        let highest = table[table.len() - 1] * 1000;
+        let defined = table[1..]
+            .iter()
+            .any(|&kbps| kbps * 1000 == bits_per_second);
+        let fullest = Header::LEN_BYTES + 2 + SideInfo::len_bytes(version, 2);
+        let shortest = SamplingFrequency::ALL
+            .into_iter()
+            .filter(|fs| fs.version() == version)
+            .map(|fs| slots_per_frame(version, bits_per_second, fs).0)
+            .min()
+            .expect("sampling frequencies of every version");
+        (!defined && bits_per_second < highest && shortest >= fullest).then_some(Self {
+            version,
+            index: 0,
+            bits_per_second,
+        })
+    }
+
+    /// Whether this is a free format bitrate.
+    pub fn is_free(self) -> bool {
+        self.index == 0
     }
 
     pub fn version(self) -> Version {
@@ -97,7 +153,7 @@ impl Bitrate {
     }
 
     pub fn bits_per_second(self) -> u32 {
-        self.version.kbps()[usize::from(self.index)] * 1000
+        self.bits_per_second
     }
 
     /// The length in bytes of a frame at this bitrate, header included, with
@@ -113,7 +169,7 @@ impl Bitrate {
             sampling_frequency.version(),
             "{self:?} is not a bitrate of {sampling_frequency:?}"
         );
-        let (slots, _) = slots_per_frame(self, sampling_frequency);
+        let (slots, _) = slots_per_frame(self.version, self.bits_per_second, sampling_frequency);
         slots + usize::from(padding)
     }
 }
@@ -339,9 +395,13 @@ impl Header {
 /// place of 144 at the lower sampling frequencies (clause 2.4.3.2 of ISO/IEC
 /// 13818-3), returned as the truncated slot count and the remainder of the
 /// division. Both constants are a frame's samples over the 8 bits of a slot.
-fn slots_per_frame(bitrate: Bitrate, sampling_frequency: SamplingFrequency) -> (usize, u32) {
-    let samples = sampling_frequency.version().samples_per_frame() as u32;
-    let numerator = samples / 8 * bitrate.bits_per_second();
+fn slots_per_frame(
+    version: Version,
+    bits_per_second: u32,
+    sampling_frequency: SamplingFrequency,
+) -> (usize, u32) {
+    let samples = version.samples_per_frame() as u32;
+    let numerator = samples / 8 * bits_per_second;
     let fs = sampling_frequency.hz();
     ((numerator / fs) as usize, numerator % fs)
 }
@@ -362,7 +422,8 @@ pub struct PaddingSchedule {
 
 impl PaddingSchedule {
     pub fn new(bitrate: Bitrate, sampling_frequency: SamplingFrequency) -> Self {
-        let (_, remainder_step) = slots_per_frame(bitrate, sampling_frequency);
+        let (_, remainder_step) =
+            slots_per_frame(bitrate.version, bitrate.bits_per_second, sampling_frequency);
         Self {
             remainder_step,
             sampling_frequency_hz: sampling_frequency.hz(),
@@ -560,5 +621,48 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Free format bitrates lie below the highest of the table and leave
+    /// out its own, and start where a frame at the version's highest
+    /// sampling frequency holds the header, `crc_check` and the side
+    /// information of two channels: 38 bytes at 48 kHz from 12 667 bit/s,
+    /// and 23 at 24 kHz from 7 667, where 8 kbit/s is in the table.
+    #[test]
+    fn free_format_bitrates() {
+        use Version::*;
+        let free = |version, bps| Bitrate::free(version, bps).map(|b| b.bits_per_second());
+        assert_eq!(free(Mpeg1, 12_666), None);
+        assert_eq!(free(Mpeg1, 12_667), Some(12_667));
+        assert_eq!(free(Mpeg1, 100_000), Some(100_000));
+        assert_eq!(free(Mpeg1, 128_000), None);
+        assert_eq!(free(Mpeg1, 319_999), Some(319_999));
+        assert_eq!(free(Mpeg1, 320_000), None);
+        assert_eq!(free(Mpeg1, 640_000), None);
+        assert_eq!(free(Mpeg2, 7_666), None);
+        assert_eq!(free(Mpeg2, 8_000), None);
+        assert_eq!(free(Mpeg2, 8_001), Some(8_001));
+        assert_eq!(free(Mpeg2, 159_999), Some(159_999));
+        assert_eq!(free(Mpeg2, 160_000), None);
+
+        let shortest = Bitrate::free(Mpeg1, 12_667).unwrap();
+        assert_eq!(shortest.frame_len(SamplingFrequency::Hz48000, false), 38);
+        assert_eq!(shortest.frame_len(SamplingFrequency::Hz32000, false), 57);
+
+        // bitrate_index 0, and N or N + 1 slots: 144 * 100 000 / 44 100 is
+        // 326.5, so that padding alternates.
+        let mut h = header(128, SamplingFrequency::Hz44100, Mode::Stereo);
+        h.bitrate = Bitrate::free(Mpeg1, 100_000).unwrap();
+        let mut w = BitWriter::new();
+        h.write(&mut w);
+        assert_eq!(w.into_bytes()[2] >> 4, 0);
+        let mut padding = PaddingSchedule::new(h.bitrate, SamplingFrequency::Hz44100);
+        let lens: Vec<_> = (0..4)
+            .map(|_| {
+                h.bitrate
+                    .frame_len(SamplingFrequency::Hz44100, padding.next_padding())
+            })
+            .collect();
+        assert_eq!(lens, [326, 327, 326, 327]);
     }
 }

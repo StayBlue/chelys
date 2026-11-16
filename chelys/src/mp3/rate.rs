@@ -14,7 +14,8 @@ use super::header::{Bitrate, SamplingFrequency, Version};
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Rate {
     /// Every frame at one bitrate, padded as
-    /// [`PaddingSchedule`](super::header::PaddingSchedule) has it.
+    /// [`PaddingSchedule`](super::header::PaddingSchedule) has it. The one
+    /// rate that may be free format ([`Bitrate::free`]).
     Constant(Bitrate),
     Mean(MeanRate),
     Variable(VariableRate),
@@ -90,9 +91,15 @@ impl VariableRate {
     ///
     /// # Panics
     ///
-    /// If `lowest` and `highest` are bitrates of different versions, or
-    /// `lowest` is above `highest`.
+    /// If `lowest` and `highest` are bitrates of different versions or of
+    /// free format, which allows no switching ("in free format, fixed
+    /// bitrate is required", clause 2.4.2.3), or `lowest` is above
+    /// `highest`.
     pub fn bitrates(self) -> Vec<Bitrate> {
+        assert!(
+            !self.lowest.is_free() && !self.highest.is_free(),
+            "a variable bitrate is not free format"
+        );
         let version = self.lowest.version();
         assert_eq!(
             version,

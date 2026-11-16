@@ -29,8 +29,24 @@ pub struct Frame {
 /// # Panics
 ///
 /// If the stream breaks one of those rules, or does not end with a whole
-/// frame.
+/// frame, or has a frame in free format.
 pub fn frames(stream: &[u8]) -> Vec<Frame> {
+    walk(stream, None)
+}
+
+/// The frames of a stream in free format at `bitrate`, after the same
+/// checks as [`frames`], which a decoder learns from the distance between
+/// headers.
+///
+/// # Panics
+///
+/// As [`frames`], or if a frame is not in free format.
+pub fn free_frames(stream: &[u8], bitrate: Bitrate) -> Vec<Frame> {
+    assert!(bitrate.is_free(), "{bitrate:?} is not free format");
+    walk(stream, Some(bitrate))
+}
+
+fn walk(stream: &[u8], free: Option<Bitrate>) -> Vec<Frame> {
     let mut frames = Vec::new();
     let mut at = 0;
     // Main data slot bytes before the frame, and the bits of main data
@@ -57,9 +73,14 @@ pub fn frames(stream: &[u8]) -> Vec<Frame> {
             .into_iter()
             .find(|fs| fs.hz() == hz)
             .unwrap();
-        let bitrate = Bitrate::all(version)
-            .nth(usize::from(header[2] >> 4) - 1)
-            .expect("a bitrate of the table");
+        let bitrate = match (header[2] >> 4, free) {
+            (0, Some(free)) => free,
+            (0, None) => panic!("free format at {at}"),
+            (_, Some(_)) => panic!("not free format at {at}"),
+            (index, None) => Bitrate::all(version)
+                .nth(usize::from(index) - 1)
+                .expect("a bitrate of the table"),
+        };
         let padding = header[2] >> 1 & 1 == 1;
         let len = bitrate.frame_len(fs, padding);
         let crc = if header[1] & 1 == 0 { 2 } else { 0 };

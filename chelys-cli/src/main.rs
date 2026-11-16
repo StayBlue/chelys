@@ -23,9 +23,10 @@ use chelys::mp3::{Encoder, StreamConfig};
 
 const USAGE: &str = "\
 usage: chelys --sample-rate HZ --channels N
-              [--bitrate KBPS | --vbr [--min-bitrate KBPS] [--max-bitrate KBPS]
-              [--vbr-noise DB]] [--no-joint-stereo] [--dual-channel]
-              [--intensity-stereo] [--crc] < input.f32 > output.mp3
+              [--bitrate KBPS [--free-format] | --vbr [--min-bitrate KBPS]
+              [--max-bitrate KBPS] [--vbr-noise DB]] [--no-joint-stereo]
+              [--dual-channel] [--intensity-stereo] [--crc]
+              < input.f32 > output.mp3
 
 Reads interleaved 32-bit little-endian float PCM from stdin and writes MPEG-1
 Layer III to stdout, or MPEG-2 Layer III at 16, 22.05 and 24 kHz, or
@@ -40,6 +41,11 @@ MPEG-2.5 Layer III at 8, 11.025 and 12 kHz (experimental).
                      144 or 160 (default 128); or a whole number between
                      two of those, kept as the stream's mean, with each
                      frame at one of the two
+  --free-format      code every frame at --bitrate in free format, which
+                     need not be in the list: 13 to 319, or 9 to 159 at
+                     24 kHz and below; for links of a fixed capacity.
+                     mpg123 and LAME decode it; ffmpeg (n9.0.2) does not
+                     (default: off)
   --vbr              give each frame the lowest bitrate at which the noise
                      of every band stays within what the psychoacoustic
                      model allows (experimental)
@@ -64,7 +70,8 @@ MPEG-2.5 Layer III at 8, 11.025 and 12 kHz (experimental).
 
 Where stdout is a file, the stream starts with a Xing/Info tag: its length,
 a table to seek by, and the samples to trim at its start and end. Through a
-pipe it has none, as the tag is known only once the stream has ended.";
+pipe it has none, as the tag is known only once the stream has ended, and
+in free format none where the frames are too short to hold it.";
 
 struct Options {
     sampling_frequency: SamplingFrequency,
@@ -108,6 +115,7 @@ fn value<T: FromStr>(args: &mut impl Iterator<Item = String>, name: &str) -> Res
 fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
     let (mut sample_rate, mut channels, mut bitrate) = (None, None, None);
     let (mut vbr, mut min_bitrate, mut max_bitrate, mut vbr_noise) = (false, None, None, None);
+    let mut free_format = false;
     let (mut joint_stereo, mut dual_channel) = (true, false);
     let (mut intensity_stereo, mut crc_protected) = (false, false);
     let mut args = args.into_iter();
@@ -117,6 +125,7 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
             "--sample-rate" => sample_rate = Some(value::<u32>(args, &flag)?),
             "--channels" => channels = Some(value::<u32>(args, &flag)?),
             "--bitrate" => bitrate = Some(value::<u32>(args, &flag)?),
+            "--free-format" => free_format = true,
             "--vbr" => vbr = true,
             "--min-bitrate" => min_bitrate = Some(value::<u32>(args, &flag)?),
             "--max-bitrate" => max_bitrate = Some(value::<u32>(args, &flag)?),
@@ -145,8 +154,8 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
             .ok_or(format!("unsupported bitrate at {sample_rate} Hz: {kbps}"))
     };
     let rate = if vbr {
-        if bitrate.is_some() {
-            return Err("--bitrate and --vbr exclude each other".to_owned());
+        if bitrate.is_some() || free_format {
+            return Err("--bitrate and --free-format exclude --vbr".to_owned());
         }
         let mut bitrates = Bitrate::all(version);
         let lowest = match min_bitrate {
@@ -176,13 +185,32 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
             return Err("--min-bitrate, --max-bitrate and --vbr-noise need --vbr".to_owned());
         }
         let kbps = bitrate.unwrap_or(128);
-        match Bitrate::from_kbps(version, kbps) {
-            Some(bitrate) => Rate::Constant(bitrate),
-            None => kbps
+        if free_format {
+            let free = kbps
                 .checked_mul(1000)
-                .and_then(|bps| MeanRate::new(version, bps))
-                .map(Rate::Mean)
-                .ok_or(format!("unsupported bitrate at {sample_rate} Hz: {kbps}"))?,
+                .and_then(|bps| Bitrate::free(version, bps));
+            match free {
+                Some(bitrate) => Rate::Constant(bitrate),
+                None if Bitrate::from_kbps(version, kbps).is_some() => {
+                    return Err(format!(
+                        "--free-format: {kbps} kbit/s is in the list; leave out --free-format"
+                    ));
+                }
+                None => {
+                    return Err(format!(
+                        "--free-format: unsupported bitrate at {sample_rate} Hz: {kbps}"
+                    ));
+                }
+            }
+        } else {
+            match Bitrate::from_kbps(version, kbps) {
+                Some(bitrate) => Rate::Constant(bitrate),
+                None => kbps
+                    .checked_mul(1000)
+                    .and_then(|bps| MeanRate::new(version, bps))
+                    .map(Rate::Mean)
+                    .ok_or(format!("unsupported bitrate at {sample_rate} Hz: {kbps}"))?,
+            }
         }
     };
     if intensity_stereo && channels != 2 {
