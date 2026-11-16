@@ -11,7 +11,8 @@
 
 use super::{PairTable, QuadTable, pair_table};
 use crate::bitstream::BitWriter;
-use crate::mp3::scalefactor_bands::Band;
+use crate::mp3::header::SamplingFrequency;
+use crate::mp3::scalefactor_bands::{Band, MIXED_LONG_LINES};
 use crate::mp3::{BlockType, GRANULE_LINES};
 
 /// The largest magnitude allowed in the `big_values` partition (clause
@@ -34,17 +35,39 @@ pub struct SpectrumCoding {
     /// defaults the decoder sets (clause 2.4.2.7).
     pub region0_count: u8,
     pub region1_count: u8,
+    /// Where region 1 begins in a mixed block, which `region0_count` does
+    /// not say at every sampling frequency; `None` for other block types.
+    pub mixed_region1: Option<usize>,
     pub count1_table: QuadTable,
 }
 
 impl SpectrumCoding {
-    /// Partitions `values` of a granule of `block_type` and chooses tables
-    /// following clause C.1.5.4.4.
+    /// Partitions `values` of a granule of `block_type` at
+    /// `sampling_frequency` and chooses tables following clause C.1.5.4.4.
+    ///
+    /// Spec reading: a mixed block's `region0_count` of 7 puts 8 bands in
+    /// region 0 (clause 2.4.2.7). In ISO/IEC 11172-3 a mixed block has
+    /// "8+9*3=35" scalefactor bands, so these are its 8 long bands, which
+    /// end at line 36, where its short bands begin. ISO/IEC 13818-3 does not
+    /// say which they are at its sampling frequencies, where a mixed block
+    /// sends 6 long bands and 8 long bands of the table would end at line
+    /// 54. Region 1 is taken to begin at line 36 there too, below the short
+    /// bands, as for the short blocks of every sampling frequency.
+    ///
+    /// Spec gap: US 6,185,539 B1 does not say where region 1 of a mixed
+    /// block begins at MPEG-2.5's 11.025 and 12 kHz either. There a mixed
+    /// block codes both regions with the same table, so that it decodes
+    /// alike wherever region 1 begins.
     ///
     /// # Panics
     ///
     /// If a magnitude exceeds [`MAX_MAGNITUDE`].
-    pub fn choose(values: &[i32; GRANULE_LINES], block_type: BlockType, bands: &[Band]) -> Self {
+    pub fn choose(
+        values: &[i32; GRANULE_LINES],
+        block_type: BlockType,
+        bands: &[Band],
+        sampling_frequency: SamplingFrequency,
+    ) -> Self {
         assert!(
             values.iter().all(|v| v.unsigned_abs() <= MAX_MAGNITUDE),
             "quantised magnitudes are limited to {MAX_MAGNITUDE}"
@@ -74,10 +97,10 @@ impl SpectrumCoding {
         // With window_switching_flag set, region0_count and region1_count are
         // not sent but set by default: region 0 holds 8 long bands, or 9
         // short bands counted once per window, and region 1 the rest (clause
-        // 2.4.2.7).
+        // 2.4.2.7). A mixed block has the count of long blocks.
         let (region0_count, region1_count) = match block_type {
             BlockType::Normal => subdivide(big_values, bands),
-            BlockType::Start | BlockType::Stop => (7, 36),
+            BlockType::Start | BlockType::Stop | BlockType::Mixed => (7, 36),
             BlockType::Short => (8, 36),
         };
         let mut coding = Self {
@@ -86,8 +109,14 @@ impl SpectrumCoding {
             table_select: [0; 3],
             region0_count,
             region1_count,
+            mixed_region1: (block_type == BlockType::Mixed).then_some(MIXED_LONG_LINES),
             count1_table,
         };
+        if block_type == BlockType::Mixed && sampling_frequency.mpeg25() {
+            let table = select_table(&values[..2 * big_values]);
+            coding.table_select = [table, table, 0];
+            return coding;
+        }
         let mut start = 0;
         for (region, end) in coding.region_ends(bands).into_iter().enumerate() {
             coding.table_select[region] = select_table(&values[start..end]);
@@ -97,7 +126,8 @@ impl SpectrumCoding {
     }
 
     /// The line just past each of the three `big_values` regions. Region 0
-    /// holds `region0_count + 1` scalefactor bands and region 1 the next
+    /// holds `region0_count + 1` scalefactor bands, or in a mixed block ends
+    /// at [`mixed_region1`](Self::mixed_region1), and region 1 the next
     /// `region1_count + 1` (clause 2.4.2.7); all three end at `big_values`
     /// pairs at the latest.
     pub fn region_ends(&self, bands: &[Band]) -> [usize; 3] {
@@ -106,7 +136,8 @@ impl SpectrumCoding {
         let region1_bands = usize::from(self.region1_count) + 1;
         let boundary = |band: usize| bands.get(band).map_or(lines, |b| b.start.min(lines));
         [
-            boundary(region0_bands),
+            self.mixed_region1
+                .map_or(boundary(region0_bands), |start| start.min(lines)),
             boundary(region0_bands + region1_bands),
             lines,
         ]
@@ -301,8 +332,10 @@ mod tests {
     use crate::mp3::header::SamplingFrequency;
     use crate::mp3::scalefactor_bands::{coding_bands, long_bands};
 
+    const FS: SamplingFrequency = SamplingFrequency::Hz44100;
+
     fn bands() -> &'static [Band] {
-        long_bands(SamplingFrequency::Hz44100)
+        long_bands(FS)
     }
 
     fn spectrum(prefix: &[i32]) -> [i32; GRANULE_LINES] {
@@ -322,7 +355,7 @@ mod tests {
     #[test]
     fn silence_codes_to_nothing() {
         let values = [0; GRANULE_LINES];
-        let coding = SpectrumCoding::choose(&values, BlockType::Normal, bands());
+        let coding = SpectrumCoding::choose(&values, BlockType::Normal, bands(), FS);
         assert_eq!(coding.big_values, 0);
         assert_eq!(coding.count1, 0);
         assert_eq!(coding.table_select, [0; 3]);
@@ -334,7 +367,7 @@ mod tests {
     fn partitions_into_big_values_count1_and_zeros() {
         // Pairs: (5, 0) (0, 1); quadruples: (1, -1, 0, 0) (0, 0, 0, 1); then zeros.
         let values = spectrum(&[5, 0, 0, 1, 1, -1, 0, 0, 0, 0, 0, 1]);
-        let coding = SpectrumCoding::choose(&values, BlockType::Normal, bands());
+        let coding = SpectrumCoding::choose(&values, BlockType::Normal, bands(), FS);
         assert_eq!(coding.big_values, 2);
         assert_eq!(coding.count1, 2);
     }
@@ -343,7 +376,7 @@ mod tests {
     fn zeros_inside_the_top_nonzero_pair_stay_in_count1() {
         // Zero pairs are counted whole: line 9 is zero but line 8 is not.
         let values = spectrum(&[2, 0, 0, 0, 0, 0, 0, 0, 1, 0]);
-        let coding = SpectrumCoding::choose(&values, BlockType::Normal, bands());
+        let coding = SpectrumCoding::choose(&values, BlockType::Normal, bands(), FS);
         assert_eq!((coding.big_values, coding.count1), (1, 2));
     }
 
@@ -364,7 +397,7 @@ mod tests {
     #[test]
     fn region_ends_stop_at_big_values() {
         let values = spectrum(&[3; 40]);
-        let coding = SpectrumCoding::choose(&values, BlockType::Normal, bands());
+        let coding = SpectrumCoding::choose(&values, BlockType::Normal, bands(), FS);
         assert_eq!(coding.big_values, 20);
         // 40 lines span bands 0 to 8 (band 9 starts at 44): 3 / 4 / 2 bands.
         assert_eq!((coding.region0_count, coding.region1_count), (2, 3));
@@ -379,7 +412,7 @@ mod tests {
         let fs = SamplingFrequency::Hz44100;
         let values = spectrum(&[3; 200]);
         for block_type in [BlockType::Start, BlockType::Stop] {
-            let coding = SpectrumCoding::choose(&values, block_type, long_bands(fs));
+            let coding = SpectrumCoding::choose(&values, block_type, long_bands(fs), fs);
             assert_eq!(
                 coding.region_ends(long_bands(fs)),
                 [long_bands(fs)[8].start, 200, 200]
@@ -387,8 +420,31 @@ mod tests {
             assert_eq!(coding.table_select[2], 0);
         }
         let short = coding_bands(BlockType::Short, fs);
-        let coding = SpectrumCoding::choose(&values, BlockType::Short, &short);
+        let coding = SpectrumCoding::choose(&values, BlockType::Short, &short, fs);
         assert_eq!(coding.region_ends(&short), [36, 200, 200]);
+    }
+
+    /// Region 1 of a mixed block begins at line 36, where its short bands
+    /// begin, at the lower sampling frequencies too; at MPEG-2.5, where
+    /// decoders disagree on it, both regions have the same table.
+    #[test]
+    fn mixed_blocks_begin_region_1_below_the_short_bands() {
+        // Large values below line 36 and small ones above.
+        let mut values = spectrum(&[9; 36]);
+        values[36..200].fill(1);
+        values[198] = 2;
+        for fs in [
+            SamplingFrequency::Hz44100,
+            SamplingFrequency::Hz22050,
+            SamplingFrequency::Hz11025,
+        ] {
+            let mixed = coding_bands(BlockType::Mixed, fs);
+            let coding = SpectrumCoding::choose(&values, BlockType::Mixed, &mixed, fs);
+            assert_eq!((coding.region0_count, coding.region1_count), (7, 36));
+            assert_eq!(coding.region_ends(&mixed), [36, 200, 200], "{fs:?}");
+            let [region0, region1, _] = coding.table_select;
+            assert_eq!(region0 == region1, fs.mpeg25(), "{fs:?}");
+        }
     }
 
     #[test]
@@ -443,7 +499,7 @@ mod tests {
                 _ => 0,
             };
         }
-        let coding = SpectrumCoding::choose(&values, BlockType::Normal, bands());
+        let coding = SpectrumCoding::choose(&values, BlockType::Normal, bands(), FS);
         assert_eq!(
             written(&values, &coding).len(),
             coding.bit_count(&values, bands())
@@ -462,7 +518,7 @@ mod tests {
                 _ => 0,
             };
         }
-        let coding = SpectrumCoding::choose(&values, BlockType::Normal, bands());
+        let coding = SpectrumCoding::choose(&values, BlockType::Normal, bands(), FS);
         let below = |end| coding.bit_count_below(&values, bands(), end);
         let total = coding.bit_count(&values, bands());
         assert_eq!(below(0), 0);

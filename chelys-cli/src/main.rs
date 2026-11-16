@@ -25,8 +25,9 @@ const USAGE: &str = "\
 usage: chelys --sample-rate HZ --channels N
               [--bitrate KBPS [--free-format] | --vbr [--min-bitrate KBPS]
               [--max-bitrate KBPS] [--vbr-noise DB]] [--no-joint-stereo]
-              [--dual-channel] [--intensity-stereo] [--crc] [--copyright]
-              [--original] [--private-bit] < input.f32 > output.mp3
+              [--dual-channel] [--intensity-stereo] [--mixed-blocks] [--crc]
+              [--copyright] [--original] [--private-bit]
+              < input.f32 > output.mp3
 
 Reads interleaved 32-bit little-endian float PCM from stdin and writes MPEG-1
 Layer III to stdout, or MPEG-2 Layer III at 16, 22.05 and 24 kHz, or
@@ -65,6 +66,11 @@ MPEG-2.5 Layer III at 8, 11.025 and 12 kHz (experimental).
                      keeping only the level of each channel there and not
                      its fine structure; for low bitrates; with --vbr, only
                      at the highest bitrate (default: off)
+  --mixed-blocks     where an attack switches to short blocks, keep the
+                     normal block in the two lowest subbands (up to 1.4 kHz
+                     at 44.1 kHz), for their frequency resolution; frames
+                     with them are not coded in intensity stereo; not at
+                     8 kHz (default: off)
   --crc              protect each frame's header and side information with
                      a CRC-16 check word (default: off)
   --copyright        mark the stream as copyright protected (default: off)
@@ -93,6 +99,9 @@ struct Options {
     /// the stereo image above its bound for bits, a trade for low bitrates,
     /// which content that relies on the image may not want even there.
     intensity_stereo: bool,
+    /// Off unless asked for: neither standard says when to use mixed
+    /// blocks, and their effect on quality has not been judged.
+    mixed_blocks: bool,
     crc_protected: bool,
     flags: Flags,
 }
@@ -124,6 +133,7 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
     let mut flags = Flags::default();
     let (mut joint_stereo, mut dual_channel) = (true, false);
     let (mut intensity_stereo, mut crc_protected) = (false, false);
+    let mut mixed_blocks = false;
     let mut args = args.into_iter();
     while let Some(flag) = args.next() {
         let args = &mut args;
@@ -139,6 +149,7 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
             "--no-joint-stereo" => joint_stereo = false,
             "--dual-channel" => dual_channel = true,
             "--intensity-stereo" => intensity_stereo = true,
+            "--mixed-blocks" => mixed_blocks = true,
             "--crc" => crc_protected = true,
             "--copyright" => flags.copyright = true,
             "--original" => flags.original = true,
@@ -231,6 +242,9 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
     if dual_channel && intensity_stereo {
         return Err("--dual-channel and --intensity-stereo exclude each other".to_owned());
     }
+    if mixed_blocks && sampling_frequency == SamplingFrequency::Hz8000 {
+        return Err("--mixed-blocks: not at 8000 Hz".to_owned());
+    }
     Ok(Options {
         sampling_frequency,
         channels,
@@ -238,6 +252,7 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
         joint_stereo,
         dual_channel,
         intensity_stereo,
+        mixed_blocks,
         crc_protected,
         flags,
     })
@@ -276,7 +291,7 @@ fn main() -> ExitCode {
         crc_protected: options.crc_protected,
         flags: options.flags,
     };
-    match encode(config, options.channels) {
+    match encode(config, options.channels, options.mixed_blocks) {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
             eprintln!("chelys: {message}");
@@ -285,8 +300,9 @@ fn main() -> ExitCode {
     }
 }
 
-/// Encodes stdin to stdout as it arrives.
-fn encode(config: StreamConfig, channels: usize) -> Result<(), String> {
+/// Encodes stdin to stdout as it arrives, with mixed blocks if
+/// `mixed_blocks` is set.
+fn encode(config: StreamConfig, channels: usize, mixed_blocks: bool) -> Result<(), String> {
     let frame_bytes = 4 * channels;
     let mut stdin = std::io::stdin().lock();
     let file = seekable_stdout();
@@ -295,6 +311,9 @@ fn encode(config: StreamConfig, channels: usize) -> Result<(), String> {
         Some(_) => Encoder::with_info_tag(config),
         None => Encoder::new(config),
     };
+    if mixed_blocks {
+        encoder = encoder.with_mixed_blocks();
+    }
     let mut input = vec![0; 64 * 1024];
     // Bytes read but not yet decoded: the start of an incomplete sample frame.
     let mut held = 0;

@@ -11,7 +11,7 @@
 
 use std::ops::Range;
 
-use super::header::SamplingFrequency;
+use super::header::{SamplingFrequency, Version};
 use super::{BlockType, GRANULE_LINES};
 
 /// The frequency lines `start..start + width` of one scalefactor band. Short
@@ -77,25 +77,69 @@ pub fn short_bands(sampling_frequency: SamplingFrequency) -> &'static [Band; SHO
     }
 }
 
+/// The lines of the two lowest subbands, which a mixed block transforms
+/// with the normal window (clause 2.4.2.7).
+pub const MIXED_LONG_LINES: usize = 36;
+
+/// The first short scalefactor band of a mixed block (clause 2.4.2.7).
+pub const MIXED_SHORT_START: usize = 3;
+
+/// The long scalefactor bands a mixed block sends below its short ones:
+/// bands 0 to 7 (clause 2.4.1.7), or 0 to 5 at the lower sampling
+/// frequencies (clause 2.4.1.7 of ISO/IEC 13818-3). At every sampling
+/// frequency but MPEG-2.5's 8 kHz these are the lines of the two lowest
+/// subbands, as are short bands 0 to 2 in each window.
+///
+/// Spec gap: US 6,185,539 B1 does not mention mixed blocks. At 8 kHz its
+/// long bands 0 to 5, and its short bands 0 to 2 in each window, hold 72
+/// lines, the four lowest subbands, where the normal window covers two, so
+/// the patent leaves it open which window the two subbands above them have
+/// and how their lines are ordered. Mixed blocks are not used at 8 kHz.
+///
+/// # Panics
+///
+/// At 8 kHz.
+pub fn mixed_long_bands(sampling_frequency: SamplingFrequency) -> usize {
+    assert_ne!(
+        sampling_frequency,
+        SamplingFrequency::Hz8000,
+        "mixed blocks are not used at 8 kHz"
+    );
+    match sampling_frequency.version() {
+        Version::Mpeg1 => 8,
+        Version::Mpeg2 => 6,
+    }
+}
+
 /// The lines of each scalefactor of a granule of `block_type`, in the order
 /// in which both the scalefactors and the Huffman coded values are sent
 /// (clauses 2.4.1.7 and 2.4.2.7): the long bands for block types 0, 1 and 3,
 /// and for short blocks each short band three times, once per window, as
-/// `3 * sfb + window`, a band's windows following each other. Lines past the
-/// last range have no scalefactor.
+/// `3 * sfb + window`, a band's windows following each other. A mixed block
+/// sends its [`mixed_long_bands`] first, and then the short bands from
+/// [`MIXED_SHORT_START`] as a short block does. Lines past the last range
+/// have no scalefactor.
+///
+/// # Panics
+///
+/// For a mixed block at 8 kHz (see [`mixed_long_bands`]).
 pub fn coding_bands(block_type: BlockType, sampling_frequency: SamplingFrequency) -> Vec<Band> {
-    if block_type != BlockType::Short {
-        return long_bands(sampling_frequency).to_vec();
-    }
-    short_bands(sampling_frequency)
-        .iter()
-        .flat_map(|band| {
-            (0..SHORT_WINDOWS).map(move |window| Band {
-                start: SHORT_WINDOWS * band.start + window * band.width,
-                width: band.width,
-            })
+    let long = long_bands(sampling_frequency);
+    let short = short_bands(sampling_frequency).iter().flat_map(|band| {
+        (0..SHORT_WINDOWS).map(move |window| Band {
+            start: SHORT_WINDOWS * band.start + window * band.width,
+            width: band.width,
         })
-        .collect()
+    });
+    match block_type {
+        BlockType::Short => short.collect(),
+        BlockType::Mixed => long[..mixed_long_bands(sampling_frequency)]
+            .iter()
+            .copied()
+            .chain(short.skip(MIXED_SHORT_START * SHORT_WINDOWS))
+            .collect(),
+        _ => long.to_vec(),
+    }
 }
 
 /// The scalefactors, in the order of [`coding_bands`], that the encoder keeps
@@ -115,16 +159,18 @@ pub fn fixed_at_zero(block_type: BlockType, sampling_frequency: SamplingFrequenc
     }
     match block_type {
         BlockType::Short => 27..SHORT_BANDS * SHORT_WINDOWS,
+        BlockType::Mixed => unreachable!("mixed blocks are not used at 8 kHz"),
         _ => 16..LONG_BANDS,
     }
 }
 
-/// The windows of a granule of `block_type`: three for short blocks, and one
-/// for the others.
+/// The windows of a granule of `block_type`: three for short blocks, mixed
+/// or not, and one for the others.
 pub fn windows(block_type: BlockType) -> usize {
-    match block_type {
-        BlockType::Short => SHORT_WINDOWS,
-        _ => 1,
+    if block_type.short_windows() {
+        SHORT_WINDOWS
+    } else {
+        1
     }
 }
 
@@ -139,9 +185,10 @@ pub fn lines_above_bands(
 ) -> Range<usize> {
     let windows = windows(block_type);
     assert!(window < windows, "window {window} of {windows}");
-    let last = match block_type {
-        BlockType::Short => short_bands(sampling_frequency)[SHORT_BANDS - 1].end(),
-        _ => long_bands(sampling_frequency)[LONG_BANDS - 1].end(),
+    let last = if block_type.short_windows() {
+        short_bands(sampling_frequency)[SHORT_BANDS - 1].end()
+    } else {
+        long_bands(sampling_frequency)[LONG_BANDS - 1].end()
     };
     let width = GRANULE_LINES / windows - last;
     let start = windows * last + window * width;
@@ -186,6 +233,22 @@ pub fn short_coding_order(
             }
         }
     }
+    ordered
+}
+
+/// Reorders the lines of a mixed block from the order of the filterbank
+/// (see [`Filterbank::granule`](super::filterbank::Filterbank::granule))
+/// into the order of the bitstream: the lines of the two lowest subbands as
+/// they are, in the long bands, and the rest as [`short_coding_order`]
+/// orders them (clause 2.4.2.7).
+pub fn mixed_coding_order(
+    xr: &[f64; GRANULE_LINES],
+    sampling_frequency: SamplingFrequency,
+) -> [f64; GRANULE_LINES] {
+    // Short bands 0 to 2 of every window are the lines of the two lowest
+    // subbands, which short_coding_order sends first.
+    let mut ordered = short_coding_order(xr, sampling_frequency);
+    ordered[..MIXED_LONG_LINES].copy_from_slice(&xr[..MIXED_LONG_LINES]);
     ordered
 }
 
@@ -615,6 +678,50 @@ mod tests {
                 long_last..GRANULE_LINES
             );
         }
+    }
+
+    /// At every sampling frequency but 8 kHz, a mixed block's long bands
+    /// are the lines of the two lowest subbands, and short band 3 starts
+    /// above them in every window, so that its bands cover the granule as a
+    /// short block's do from there up. Reordering moves every line once and
+    /// leaves the lowest two subbands as they are.
+    #[test]
+    fn mixed_bands_put_the_two_lowest_subbands_in_long_bands() {
+        for fs in SamplingFrequency::ALL {
+            if fs == SamplingFrequency::Hz8000 {
+                continue;
+            }
+            let long = mixed_long_bands(fs);
+            assert_eq!(long_bands(fs)[long].start, MIXED_LONG_LINES, "{fs:?}");
+            assert_eq!(
+                SHORT_WINDOWS * short_bands(fs)[MIXED_SHORT_START].start,
+                MIXED_LONG_LINES,
+                "{fs:?}"
+            );
+            let mixed = coding_bands(BlockType::Mixed, fs);
+            let short = coding_bands(BlockType::Short, fs);
+            assert_eq!(mixed[..long], long_bands(fs)[..long], "{fs:?}");
+            assert_eq!(
+                mixed[long..],
+                short[MIXED_SHORT_START * SHORT_WINDOWS..],
+                "{fs:?}"
+            );
+
+            let xr: [f64; GRANULE_LINES] = std::array::from_fn(|i| i as f64);
+            let ordered = mixed_coding_order(&xr, fs);
+            assert_eq!(ordered[..MIXED_LONG_LINES], xr[..MIXED_LONG_LINES]);
+            assert_eq!(
+                ordered[MIXED_LONG_LINES..],
+                short_coding_order(&xr, fs)[MIXED_LONG_LINES..]
+            );
+            let mut seen = ordered.map(|x| x as usize);
+            seen.sort_unstable();
+            assert!(seen.iter().enumerate().all(|(i, &x)| i == x), "{fs:?}");
+        }
+        assert_eq!(mixed_long_bands(SamplingFrequency::Hz44100), 8);
+        assert_eq!(mixed_long_bands(SamplingFrequency::Hz22050), 6);
+        // At 8 kHz six long bands hold the four lowest subbands.
+        assert_eq!(long_bands(SamplingFrequency::Hz8000)[6].start, 72);
     }
 
     #[test]

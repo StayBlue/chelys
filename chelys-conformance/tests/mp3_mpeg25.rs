@@ -407,8 +407,12 @@ fn noise_to_mask(
     let mut nmr = Vec::new();
     for g in 0..granules - 1 {
         let masking = model.granule(&granule(input_at_judge, g + 1));
-        let xr = signal_bank.granule(&granule(input_at_judge, g), BlockType::Normal);
-        let er = error_bank.granule(&granule(&error, g), BlockType::Normal);
+        let xr = signal_bank.granule(
+            &granule(input_at_judge, g),
+            BlockType::Normal,
+            BlockType::Normal,
+        );
+        let er = error_bank.granule(&granule(&error, g), BlockType::Normal, BlockType::Normal);
         if g < 4 || g + 4 > granules {
             continue;
         }

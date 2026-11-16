@@ -59,7 +59,7 @@ impl GranuleSummary {
         let energy = |lines: &[f64]| lines.iter().map(|x| x * x).sum::<f64>();
         let mut en = [None; LONG_BANDS];
         let mut xm = [None; LONG_BANDS];
-        if block_type != BlockType::Short {
+        if !block_type.short_windows() {
             let bands = scalefactor_bands::long_bands(sampling_frequency);
             for (sb, band) in bands.iter().enumerate() {
                 en[sb] = int_log2(energy(&xr[band.start..band.end()]));
@@ -83,8 +83,8 @@ impl GranuleSummary {
 pub fn select(first: &GranuleSummary, second: &GranuleSummary) -> [bool; SCFSI_BANDS] {
     let general = first.en_tot.is_some()
         && second.en_tot.is_some()
-        && first.block_type != BlockType::Short
-        && second.block_type != BlockType::Short
+        && !first.block_type.short_windows()
+        && !second.block_type.short_windows()
         && difference(first.en_tot, second.en_tot) < EN_TOT_KRIT
         && sum_differences(&first.en, &second.en, 0..LONG_BANDS) < EN_DIF_KRIT;
     if !general {

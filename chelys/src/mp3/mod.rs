@@ -38,6 +38,12 @@ use side_info::{GranuleChannel, SideInfo, Window};
 /// Frequency lines in a granule (clause 2.1.70).
 pub const GRANULE_LINES: usize = 576;
 
+/// The PCM a [`FrameEncoder`] needs past a frame before coding it: two
+/// granules, as a granule's block type depends on whether the granule after
+/// it has an attack, and the filterbank needs the block type of the granule
+/// after the one it filters.
+const LOOK_AHEAD: usize = 2 * GRANULE_LINES;
+
 /// The samples by which a decoder's output lags the encoder's input: the
 /// delays of the analysis and synthesis polyphase filterbanks and of the
 /// overlapping blocks of the hybrid filterbank, together. An [`Encoder`]
@@ -52,13 +58,27 @@ pub const GRANULE_LINES: usize = 576;
 pub const DELAY: usize = 1057;
 
 /// The window and transform of a granule's block (clause C.1.5.3.3, figure
-/// C.7): `block_type` 0 to 3 of clause 2.4.2.7.
+/// C.7): `block_type` 0 to 3 of clause 2.4.2.7, and `block_type` 2 with
+/// `mixed_block_flag` set.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlockType {
     Normal,
     Start,
     Short,
+    /// A short block whose two lowest subbands are transformed with the
+    /// normal window, and sent with long scalefactor bands (clause 2.4.2.7):
+    /// `block_type` 2 with `mixed_block_flag` set. It takes the place of a
+    /// short block among the others.
+    Mixed,
     Stop,
+}
+
+impl BlockType {
+    /// Whether the granule is `block_type` 2, with short windows in all its
+    /// subbands or all but the two lowest.
+    pub fn short_windows(self) -> bool {
+        matches!(self, Self::Short | Self::Mixed)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -188,7 +208,7 @@ pub struct QuantizedGranule {
     pub scalefactors: Scalefactors,
     /// The quantised values in the order they are sent: by frequency, or for
     /// short blocks by scalefactor band, window and frequency (clause
-    /// 2.4.2.7).
+    /// 2.4.2.7), and for mixed blocks so above their two lowest subbands.
     pub values: [i32; GRANULE_LINES],
     pub coding: SpectrumCoding,
 }
@@ -218,7 +238,7 @@ impl QuantizedGranule {
         sampling_frequency: SamplingFrequency,
     ) -> Self {
         let bands = scalefactor_bands::coding_bands(block_type, sampling_frequency);
-        let coding = SpectrumCoding::choose(&values, block_type, &bands);
+        let coding = SpectrumCoding::choose(&values, block_type, &bands, sampling_frequency);
         Self {
             block_type,
             global_gain,
@@ -235,11 +255,6 @@ impl QuantizedGranule {
     /// sets a coarser step for one short window. It is always 0: the outer
     /// loop's scalefactors shape the noise of each window instead.
     ///
-    /// Spec gap: neither standard says when to set `mixed_block_flag`, which
-    /// codes the lower subbands of a short-block granule with long windows.
-    /// Annex C names it only as an input to the loops, and Annex D chooses
-    /// only the block type. It is always 0: a short-block granule is short
-    /// in every subband.
     fn window(&self) -> Window {
         let coding = &self.coding;
         let block_type = match self.block_type {
@@ -251,12 +266,12 @@ impl QuantizedGranule {
                 };
             }
             BlockType::Start => side_info::BlockType::Start,
-            BlockType::Short => side_info::BlockType::Short,
+            BlockType::Short | BlockType::Mixed => side_info::BlockType::Short,
             BlockType::Stop => side_info::BlockType::End,
         };
         Window::Switched {
             block_type,
-            mixed_block_flag: false,
+            mixed_block_flag: self.block_type == BlockType::Mixed,
             table_select: [coding.table_select[0], coding.table_select[1]],
             subblock_gain: [0; 3],
         }
@@ -623,6 +638,27 @@ impl Encoder {
         self
     }
 
+    /// Codes mixed blocks in place of short ones: the two lowest subbands of
+    /// a granule with an attack keep the frequency resolution of the normal
+    /// window (clause 2.4.2.7). See
+    /// [`BlockSwitching::with_mixed_blocks`].
+    ///
+    /// Frames with mixed blocks are not coded in intensity stereo (see
+    /// `intensity_frame`).
+    ///
+    /// # Panics
+    ///
+    /// At MPEG-2.5's 8 kHz, where mixed blocks are not used (see
+    /// [`scalefactor_bands::mixed_long_bands`]).
+    pub fn with_mixed_blocks(mut self) -> Self {
+        let fs = self.frames.config.sampling_frequency;
+        let models = std::mem::take(&mut self.frames.coding.models);
+        self.frames.coding.models = (models.into_iter())
+            .map(|model| model.with_mixed_blocks(fs))
+            .collect();
+        self
+    }
+
     /// Queues `bytes` of ancillary data for the frames coded from now on,
     /// as many bits a frame as [`with_ancillary`](Self::with_ancillary)
     /// allows, each byte's most significant bit first.
@@ -877,8 +913,9 @@ fn middle_side_frame(frame: &[Vec<Filtered<Analysis>>]) -> bool {
 }
 
 /// Whether a stereo frame may be coded in intensity stereo: if each of its
-/// granules has the same block type in both channels. Short blocks find
-/// the bound in each window (see [`stereo::IntensityPositions::mark`]).
+/// granules has the same block type in both channels, and none is a mixed
+/// block. Short blocks find the bound in each window (see
+/// [`stereo::IntensityPositions::mark`]).
 ///
 /// Spec gap: the standard asks for the same block type in both channels
 /// only for MS stereo (clause 2.4.3.4.9). As intensity stereo moves the left
@@ -886,10 +923,17 @@ fn middle_side_frame(frame: &[Vec<Filtered<Analysis>>]) -> bool {
 /// then be the same, and short blocks send their lines in another order
 /// (clause 2.4.2.7), frames are coded in it only if their channels have the
 /// same block types.
+///
+/// Spec gap: the bound of intensity stereo is found "individually for each
+/// window in the case of short blocks (block_type == '10')" (clause 2.4.3.2
+/// of ISO/IEC 13818-3), which mixed blocks are too, but neither standard
+/// says how a mixed block's long bands, which have one window, and its
+/// short bands share a bound. Frames with mixed blocks are not coded in
+/// intensity stereo.
 fn intensity_frame(frame: &[Vec<Filtered<Analysis>>]) -> bool {
-    frame
-        .iter()
-        .all(|granule| granule[0].block_type == granule[1].block_type)
+    frame.iter().all(|granule| {
+        granule[0].block_type == granule[1].block_type && granule[0].block_type != BlockType::Mixed
+    })
 }
 
 /// A try at coding a frame in intensity stereo: the positions of each of
@@ -1143,7 +1187,8 @@ pub fn encode_pcm_with_global_gain(
 
 /// Encodes PCM like [`encode_pcm_with_global_gain`], with the block type of
 /// each granule given by `block_type(channel, granule)`. The block types must
-/// follow each other as figure C.7 allows. If the mode allows MS stereo,
+/// follow each other as figure C.7 allows, with mixed blocks in place of
+/// short ones if any, and not at 8 kHz. If the mode allows MS stereo,
 /// every frame is coded in it, with no limitation of the side channel, and
 /// both channels must have the same block types.
 ///
@@ -1264,10 +1309,11 @@ trait Coding {
     /// What the analysis of a granule gives besides its block type.
     type Analysis;
 
-    /// Given each channel's PCM one granule ahead of the filterbank,
-    /// starting with the first granule before any is filtered, returns the
-    /// block type and analysis of the granule before the one it is given:
-    /// `None` only for the first.
+    /// Given each channel's PCM granule by granule, starting with the first,
+    /// returns the block type and analysis of the granule before the one it
+    /// is given: `None` only for the first. It is given each granule two
+    /// granules ahead of the filterbank, which needs the block types of the
+    /// granule it filters and of the one after.
     fn look_ahead(
         &mut self,
         channel: usize,
@@ -1337,7 +1383,7 @@ struct FrameAtBitrate {
 
 /// Runs each channel through its filterbank granule by granule as its PCM
 /// arrives, quantises each frame as `coding` does, and writes the frames.
-struct FrameEncoder<C> {
+struct FrameEncoder<C: Coding> {
     config: StreamConfig,
     coding: C,
     /// The reservoir between frames.
@@ -1355,6 +1401,9 @@ struct FrameEncoder<C> {
     /// The length of each frame written.
     frame_lens: Vec<usize>,
     ancillary: AncillaryQueue,
+    /// For each channel, the block type and analysis of the granule after
+    /// the next to be filtered.
+    ahead: Vec<Option<(BlockType, C::Analysis)>>,
 }
 
 /// What a [`FrameEncoder`] wrote, once it has finished.
@@ -1382,6 +1431,7 @@ impl<C: Coding> FrameEncoder<C> {
             samples: 0,
             frame_lens: Vec::new(),
             ancillary: AncillaryQueue::default(),
+            ahead: (0..channels).map(|_| None).collect(),
         }
     }
 
@@ -1400,7 +1450,7 @@ impl<C: Coding> FrameEncoder<C> {
         self.samples += len;
         let frame_samples = self.samples_per_frame();
         let mut start = 0;
-        while self.pcm[0].len() - start >= frame_samples + GRANULE_LINES {
+        while self.pcm[0].len() - start >= frame_samples + LOOK_AHEAD {
             self.encode_frame(start);
             start += frame_samples;
         }
@@ -1418,7 +1468,7 @@ impl<C: Coding> FrameEncoder<C> {
         let frames = (self.samples + DELAY).div_ceil(frame_samples);
         let remaining = frames - self.frame_lens.len();
         for pcm in &mut self.pcm {
-            pcm.resize(remaining * frame_samples + GRANULE_LINES, 0.0);
+            pcm.resize(remaining * frame_samples + LOOK_AHEAD, 0.0);
         }
         for frame in 0..remaining {
             self.encode_frame(frame * frame_samples);
@@ -1441,6 +1491,7 @@ impl<C: Coding> FrameEncoder<C> {
             coding,
             filterbanks,
             pcm,
+            ahead,
             ..
         } = self;
         let fs = config.sampling_frequency;
@@ -1451,12 +1502,13 @@ impl<C: Coding> FrameEncoder<C> {
                 .expect("a granule of PCM")
         };
         if self.frame_lens.is_empty() {
-            for channel in 0..pcm.len() {
+            for (channel, ahead) in ahead.iter_mut().enumerate() {
                 assert!(
                     coding
                         .look_ahead(channel, granule_pcm(channel, 0))
                         .is_none()
                 );
+                *ahead = coding.look_ahead(channel, granule_pcm(channel, 1));
             }
         }
         let granules = fs.version().granules();
@@ -1464,12 +1516,16 @@ impl<C: Coding> FrameEncoder<C> {
             .map(|gr| {
                 (filterbanks.iter_mut().enumerate())
                     .map(|(channel, filterbank)| {
-                        let (block_type, analysis) = coding
-                            .look_ahead(channel, granule_pcm(channel, gr + 1))
-                            .expect("the granule before has been analysed");
-                        let xr = filterbank.granule(granule_pcm(channel, gr), block_type);
+                        let next = coding.look_ahead(channel, granule_pcm(channel, gr + 2));
+                        let next_type = next.as_ref().map(|(block_type, _)| *block_type);
+                        let (block_type, analysis) = std::mem::replace(&mut ahead[channel], next)
+                            .expect("the granule has been analysed");
+                        let next_type = next_type.expect("the granule after has been analysed");
+                        let xr =
+                            filterbank.granule(granule_pcm(channel, gr), block_type, next_type);
                         let xr = match block_type {
                             BlockType::Short => scalefactor_bands::short_coding_order(&xr, fs),
+                            BlockType::Mixed => scalefactor_bands::mixed_coding_order(&xr, fs),
                             _ => xr,
                         };
                         Filtered {

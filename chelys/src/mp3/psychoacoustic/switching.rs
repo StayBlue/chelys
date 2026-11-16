@@ -6,6 +6,7 @@
 //! C.6.a).
 
 use super::super::header::SamplingFrequency;
+use super::super::scalefactor_bands::{self, MIXED_SHORT_START, SHORT_WINDOWS};
 use super::super::{BlockType, GRANULE_LINES};
 use super::{Masking, PsychoacousticModel, ShortMasking};
 
@@ -20,6 +21,9 @@ pub enum SwitchedMasking {
     Normal(Masking),
     Start(Masking),
     Short(ShortMasking),
+    /// A mixed block keeps the thresholds for long blocks, for its long
+    /// bands, and for short blocks, for its short ones.
+    Mixed(Masking, Box<ShortMasking>),
     Stop(Masking),
 }
 
@@ -29,6 +33,7 @@ impl SwitchedMasking {
             Self::Normal(_) => BlockType::Normal,
             Self::Start(_) => BlockType::Start,
             Self::Short(_) => BlockType::Short,
+            Self::Mixed(..) => BlockType::Mixed,
             Self::Stop(_) => BlockType::Stop,
         }
     }
@@ -39,6 +44,7 @@ impl SwitchedMasking {
                 masking.perceptual_entropy
             }
             Self::Short(masking) => masking.perceptual_entropy,
+            Self::Mixed(_, masking) => masking.perceptual_entropy,
         }
     }
 
@@ -47,11 +53,18 @@ impl SwitchedMasking {
         match self {
             Self::Normal(masking) | Self::Start(masking) | Self::Stop(masking) => &masking.spectrum,
             Self::Short(masking) => &masking.spectrum,
+            Self::Mixed(_, masking) => &masking.spectrum,
         }
     }
 
     /// The allowed distortion of each scalefactor of the granule, in the
     /// order they are sent, from its lines `xr` in the order they are sent.
+    ///
+    /// Spec gap: Annex D gives thresholds for long and for short blocks, and
+    /// not for mixed ones. A mixed block's long bands are allowed what the
+    /// threshold for long blocks allows them, and its short bands what the
+    /// threshold for short blocks allows them, as each band's lines are
+    /// transformed with the window of that threshold.
     pub fn allowed_distortion(
         &self,
         xr: &[f64; GRANULE_LINES],
@@ -62,6 +75,16 @@ impl SwitchedMasking {
                 masking.allowed_distortion(xr, sampling_frequency).to_vec()
             }
             Self::Short(masking) => masking.allowed_distortion(xr, sampling_frequency).to_vec(),
+            Self::Mixed(long, short) => {
+                let long_bands = scalefactor_bands::mixed_long_bands(sampling_frequency);
+                let long = long.allowed_distortion(xr, sampling_frequency);
+                let short = short.allowed_distortion(xr, sampling_frequency);
+                // The short bands lie where they would in a short block.
+                (long[..long_bands].iter())
+                    .chain(&short[MIXED_SHORT_START * SHORT_WINDOWS..])
+                    .copied()
+                    .collect()
+            }
         }
     }
 }
@@ -76,6 +99,8 @@ pub struct BlockSwitching {
     pending: Option<(Masking, ShortMasking)>,
     /// The block type of the granule before the pending one.
     last: BlockType,
+    /// Whether granules with short windows are mixed blocks.
+    mixed: bool,
 }
 
 impl BlockSwitching {
@@ -88,7 +113,26 @@ impl BlockSwitching {
             model: PsychoacousticModel::new(sampling_frequency),
             pending: None,
             last: BlockType::Normal,
+            mixed: false,
         }
+    }
+
+    /// Model switching to mixed blocks where it would switch to short ones.
+    ///
+    /// Spec gap: neither standard says when to set `mixed_block_flag`.
+    /// Annex C names it only among the inputs and outputs of the loops and
+    /// in the limits of their scalefactors (clause C.1.5.4.3.6), and Annex D
+    /// chooses only the block type. Mixed blocks are used, if asked for, in place of
+    /// every short block, as they take its place in figure C.7.
+    ///
+    /// # Panics
+    ///
+    /// At 8 kHz, where mixed blocks are not used (see
+    /// [`mixed_long_bands`](scalefactor_bands::mixed_long_bands)).
+    pub fn with_mixed_blocks(mut self, sampling_frequency: SamplingFrequency) -> Self {
+        scalefactor_bands::mixed_long_bands(sampling_frequency);
+        self.mixed = true;
+        self
     }
 
     /// Analyses the next granule of PCM, as
@@ -109,7 +153,8 @@ impl BlockSwitching {
         Some(match self.last {
             BlockType::Normal => SwitchedMasking::Normal(long),
             BlockType::Start => SwitchedMasking::Start(long),
-            BlockType::Short => SwitchedMasking::Short(short),
+            BlockType::Short if self.mixed => SwitchedMasking::Mixed(long, Box::new(short)),
+            BlockType::Short | BlockType::Mixed => SwitchedMasking::Short(short),
             BlockType::Stop => SwitchedMasking::Stop(long),
         })
     }

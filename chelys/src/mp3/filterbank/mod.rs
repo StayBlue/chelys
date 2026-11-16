@@ -4,8 +4,8 @@
 //! The analysis half of the Layer III hybrid filterbank: the polyphase
 //! subband filter (clause C.1.3, figure C.4) followed by the MDCT, with the
 //! window and transform of the normal, start, short or stop block type, and
-//! the encoder's aliasing butterflies (clause C.1.5.3.3). Mixed blocks are
-//! not used.
+//! the encoder's aliasing butterflies (clause C.1.5.3.3), and of mixed
+//! blocks, whose two lowest subbands have the normal window (clause 2.4.2.7).
 
 mod analysis_window;
 
@@ -19,6 +19,9 @@ const SUBBANDS: usize = 32;
 const SUBBAND_SAMPLES: usize = GRANULE_LINES / SUBBANDS;
 /// Samples in a long MDCT block: the subband samples of two granules.
 const LONG_BLOCK: usize = 2 * SUBBAND_SAMPLES;
+/// The subbands a mixed block transforms with the normal window (clause
+/// 2.4.2.7).
+const MIXED_LONG_SUBBANDS: usize = 2;
 /// Samples in each of the three short MDCT blocks of a short block, and the
 /// lines each gives.
 const SHORT_BLOCK: usize = 12;
@@ -70,6 +73,11 @@ pub struct Filterbank {
     /// The MDCT kernel for `n = 12`, indexed `[i][k]`, with the short window
     /// folded in.
     short_mdct: [[f64; SHORT_BLOCK]; SHORT_LINES],
+    /// The MDCT kernel for `n = 36` with no window, indexed `[i][k]`, for
+    /// the windows of [`low_window`](Self::low_window).
+    plain_mdct: Box<[[f64; LONG_BLOCK]; SUBBAND_SAMPLES]>,
+    /// The block type of the previous granule.
+    last: BlockType,
     /// The previous granule's subband samples, indexed `[subband][time]`.
     previous: [[f64; SUBBAND_SAMPLES]; SUBBANDS],
     /// `cs_i` and `ca_i` of Table B.9.
@@ -95,6 +103,7 @@ impl Filterbank {
                 .map(|block_type| mdct_kernel(|k| long_window(block_type, k))),
         );
         let short_mdct = mdct_kernel(short_window);
+        let plain_mdct = Box::new(mdct_kernel(|_| 1.0));
         let butterflies = ALIAS_COEFFICIENTS.map(|c| {
             let norm = (1.0 + c * c).sqrt();
             (1.0 / norm, c / norm)
@@ -104,25 +113,30 @@ impl Filterbank {
             matrix,
             long_mdct,
             short_mdct,
+            plain_mdct,
+            last: BlockType::Normal,
             previous: [[0.0; SUBBAND_SAMPLES]; SUBBANDS],
             butterflies,
         }
     }
 
     /// Filters the next 576 PCM samples, nominally in -1.0 to 1.0, into the
-    /// granule's frequency lines `xr`, transformed as `block_type` asks. The
-    /// lines describe the block formed with the previous granule, so they lag
-    /// the input by one granule.
+    /// granule's frequency lines `xr`, transformed as `block_type` asks,
+    /// given the block type of the granule after it, `next`. The lines
+    /// describe the block formed with the previous granule, so they lag the
+    /// input by one granule.
     ///
     /// Line `18 * subband + k` holds MDCT output `k` of `subband`. For short
     /// blocks, line `18 * subband + 6 * window + k` holds output `k` of short
     /// window `window`: the subband order the decoder reorders short blocks
     /// into before its IMDCT (clause 2.4.3.4.8), not the order of the
-    /// bitstream.
+    /// bitstream. Mixed blocks hold their two lowest subbands as long blocks
+    /// do and the rest as short blocks do.
     pub fn granule(
         &mut self,
         pcm: &[f64; GRANULE_LINES],
         block_type: BlockType,
+        next: BlockType,
     ) -> [f64; GRANULE_LINES] {
         let mut current = [[0.0; SUBBAND_SAMPLES]; SUBBANDS];
         for (time, samples) in pcm.chunks_exact(SUBBANDS).enumerate() {
@@ -143,26 +157,105 @@ impl Filterbank {
             }
         }
 
+        let low_window = self.low_window(block_type, next);
         let mut xr = [0.0; GRANULE_LINES];
         for (subband, lines) in xr.chunks_exact_mut(SUBBAND_SAMPLES).enumerate() {
             let mut block = [0.0; LONG_BLOCK];
             block[..SUBBAND_SAMPLES].copy_from_slice(&self.previous[subband]);
             block[SUBBAND_SAMPLES..].copy_from_slice(&current[subband]);
-            lines.copy_from_slice(&self.mdct(&block, block_type));
+            let mdct = match (&low_window, block_type) {
+                (Some(window), _) if subband < MIXED_LONG_SUBBANDS => {
+                    self.windowed_mdct(&block, window)
+                }
+                (_, BlockType::Mixed) => self.mdct(&block, BlockType::Short),
+                _ => self.mdct(&block, block_type),
+            };
+            lines.copy_from_slice(&mdct);
         }
         self.previous = current;
+        self.last = block_type;
         // The encoder's butterflies are those of the decoder (clause
         // C.1.5.3.3), which leaves them out for short blocks (clause
         // 2.4.3.4.10.1).
-        if block_type != BlockType::Short {
-            self.reduce_aliasing(&mut xr);
+        //
+        // Spec reading: clause 2.4.3.4.10.1 leaves the butterflies out for
+        // every granule of block type 2, which mixed blocks are too. A mixed
+        // block's two lowest subbands are long blocks, though, whose aliasing
+        // the butterfly between them reduces as in any long block, and it is
+        // applied there alone.
+        match block_type {
+            BlockType::Short => {}
+            BlockType::Mixed => self.reduce_aliasing_below(&mut xr, MIXED_LONG_SUBBANDS),
+            _ => self.reduce_aliasing(&mut xr),
         }
         xr
+    }
+
+    /// The analysis window of the two lowest subbands of a granule of
+    /// `block_type`, between the previous granule and `next`, if a mixed
+    /// block is among the three; otherwise those subbands have the window of
+    /// their block type, as all others do.
+    ///
+    /// The decoder windows the two lowest subbands of a mixed block with the
+    /// normal window (clause 2.4.2.7), and those of the start block before it
+    /// and the stop block after it with theirs. Those windows do not overlap
+    /// as the windows of figure C.7's sequences do: the start window's second
+    /// half and the normal window's first half, squared, do not add up to 1,
+    /// nor does the time aliasing of one cancel that of the other.
+    ///
+    /// Spec gap: Annex C gives the windows of the four block types but not
+    /// those of a mixed block. The windows here are chosen so that the
+    /// decoder's output is the input wherever two blocks overlap: given the
+    /// decoder's windows `p` of the second half of the earlier block and `q`
+    /// of the first half of the later one, `n` running over the 18 samples
+    /// of their overlap and `m = 17 - n`, the earlier block's analysis
+    /// window is `q(m) / d(n)` and the later block's `p(m) / d(n)`, where
+    /// `d(n) = p(n) q(m) + q(n) p(m)`. Where the windows do overlap as figure
+    /// C.7 has them, `d(n)` is 1 and these are the decoder's windows; at a
+    /// mixed block's transitions `d(n)` lies between 0.88 and 1. Next to a
+    /// short block, whose windows these are not, a half keeps the window of
+    /// its own block type.
+    fn low_window(&self, block_type: BlockType, next: BlockType) -> Option<[f64; LONG_BLOCK]> {
+        let mixed = [self.last, block_type, next].contains(&BlockType::Mixed);
+        if !mixed || block_type == BlockType::Short {
+            return None;
+        }
+        let own = low_synthesis(block_type).expect("a long window");
+        let (first, second) = own.split_at(SUBBAND_SAMPLES);
+        let mut window = own;
+        window[..SUBBAND_SAMPLES].copy_from_slice(&match low_synthesis(self.last) {
+            Some(last) => matched_halves(&last[SUBBAND_SAMPLES..], first).1,
+            None => first.try_into().unwrap(),
+        });
+        window[SUBBAND_SAMPLES..].copy_from_slice(&match low_synthesis(next) {
+            Some(next) => matched_halves(second, &next[..SUBBAND_SAMPLES]).0,
+            None => second.try_into().unwrap(),
+        });
+        Some(window)
+    }
+
+    /// The long MDCT of one subband's block of 36 samples with `window`.
+    fn windowed_mdct(
+        &self,
+        block: &[f64; LONG_BLOCK],
+        window: &[f64; LONG_BLOCK],
+    ) -> [f64; SUBBAND_SAMPLES] {
+        self.plain_mdct.map(|kernel| {
+            (kernel.iter().zip(window).zip(block))
+                .map(|((m, w), x)| m * w * x)
+                .sum::<f64>()
+                / LONG_BLOCK_GAIN
+        })
     }
 
     /// The windowed MDCT of one subband's block of 36 samples, with the
     /// lines of the three short windows one after the other for a short
     /// block.
+    ///
+    /// # Panics
+    ///
+    /// For a mixed block, whose subbands are transformed as long or short
+    /// ones.
     fn mdct(&self, block: &[f64; LONG_BLOCK], block_type: BlockType) -> [f64; SUBBAND_SAMPLES] {
         let transform = |kernel: &[f64], samples: &[f64], gain: f64| {
             kernel.iter().zip(samples).map(|(m, x)| m * x).sum::<f64>() / gain
@@ -171,6 +264,7 @@ impl Filterbank {
             BlockType::Normal => &self.long_mdct[0],
             BlockType::Start => &self.long_mdct[1],
             BlockType::Stop => &self.long_mdct[2],
+            BlockType::Mixed => unreachable!("mixed blocks have long and short subbands"),
             BlockType::Short => {
                 let mut lines = [0.0; SUBBAND_SAMPLES];
                 for (window, start) in SHORT_BLOCK_STARTS.into_iter().enumerate() {
@@ -208,7 +302,13 @@ impl Filterbank {
     /// adjacent subbands, applied to the eight lines on either side of the
     /// boundary as in figure A.5.
     fn reduce_aliasing(&self, xr: &mut [f64; GRANULE_LINES]) {
-        for subband in 1..SUBBANDS {
+        self.reduce_aliasing_below(xr, SUBBANDS);
+    }
+
+    /// The butterflies between each pair of adjacent subbands of the lowest
+    /// `subbands`.
+    fn reduce_aliasing_below(&self, xr: &mut [f64; GRANULE_LINES], subbands: usize) {
+        for subband in 1..subbands {
             let boundary = SUBBAND_SAMPLES * subband;
             for (i, &(cs, ca)) in self.butterflies.iter().enumerate() {
                 let (lower, upper) = (boundary - 1 - i, boundary + i);
@@ -231,8 +331,37 @@ fn long_window(block_type: BlockType, k: usize) -> f64 {
         (BlockType::Start, 24..30) => short_window(k - 18),
         (BlockType::Stop, 6..12) => short_window(k - 6),
         (BlockType::Start | BlockType::Stop, _) => 0.0,
-        (BlockType::Short, _) => unreachable!("short blocks have three short windows"),
+        (BlockType::Short | BlockType::Mixed, _) => {
+            unreachable!("short blocks have three short windows")
+        }
     }
+}
+
+/// The decoder's window of the two lowest subbands of a granule of
+/// `block_type`: the normal window for a mixed block (clause 2.4.2.7), the
+/// window of its block type for the other long blocks, and `None` for a
+/// short block, which has three short windows.
+fn low_synthesis(block_type: BlockType) -> Option<[f64; LONG_BLOCK]> {
+    let long = match block_type {
+        BlockType::Short => return None,
+        BlockType::Mixed => BlockType::Normal,
+        long => long,
+    };
+    Some(std::array::from_fn(|k| long_window(long, k)))
+}
+
+/// The analysis windows of two blocks where they overlap (see
+/// [`Filterbank::low_window`]), given the decoder's window `p` of the
+/// second half of the earlier block and `q` of the first half of the later
+/// one: the second half of the earlier block's analysis window, and the
+/// first half of the later one's.
+fn matched_halves(p: &[f64], q: &[f64]) -> ([f64; SUBBAND_SAMPLES], [f64; SUBBAND_SAMPLES]) {
+    let m = |n: usize| SUBBAND_SAMPLES - 1 - n;
+    let d = |n: usize| p[n] * q[m(n)] + q[n] * p[m(n)];
+    (
+        std::array::from_fn(|n| q[m(n)] / d(n)),
+        std::array::from_fn(|n| p[m(n)] / d(n)),
+    )
 }
 
 /// The window of a short block at sample `k` of 12 (clause C.1.5.3.3).
@@ -373,6 +502,72 @@ mod tests {
         }
     }
 
+    /// In the two lowest subbands, the decoder windows a mixed block with the
+    /// normal window and the start and stop blocks around it with theirs
+    /// (clause 2.4.2.7). With the analysis windows of
+    /// [`Filterbank::low_window`] its output is still the input, in every
+    /// sequence of block types that figure C.7 allows with mixed blocks in
+    /// place of short ones, and at the start of a stream that begins with a
+    /// mixed block. With the decoder's windows instead, it is not.
+    #[test]
+    fn mixed_blocks_invert_through_the_decoder_imdct() {
+        use BlockType::*;
+        let sequences: [&[BlockType]; 2] = [
+            &[
+                Normal, Normal, Start, Mixed, Mixed, Stop, Normal, Start, Mixed, Stop, Start,
+                Mixed, Stop, Normal,
+            ],
+            &[Mixed, Mixed, Stop, Start, Mixed, Mixed],
+        ];
+        for types in sequences {
+            let signal: Vec<f64> = (0..SUBBAND_SAMPLES * (types.len() + 1))
+                .map(|t| ((t * 7919) % 101) as f64 / 50.0 - 1.0)
+                .collect();
+            let mut worst_literal: f64 = 0.0;
+            for literal in [false, true] {
+                let mut filterbank = Filterbank::new();
+                let mut overlap = [0.0; SUBBAND_SAMPLES];
+                let mut previous = [0.0; SUBBAND_SAMPLES];
+                for (g, current) in signal.chunks_exact(SUBBAND_SAMPLES).enumerate() {
+                    let Some(&block_type) = types.get(g) else {
+                        break;
+                    };
+                    let next = types.get(g + 1).copied().unwrap_or(Normal);
+                    let mut block = [0.0; LONG_BLOCK];
+                    block[..SUBBAND_SAMPLES].copy_from_slice(&previous);
+                    block[SUBBAND_SAMPLES..].copy_from_slice(current);
+                    let window = match (literal, filterbank.low_window(block_type, next)) {
+                        (false, Some(window)) => window,
+                        _ => low_synthesis(block_type).unwrap(),
+                    };
+                    let lines = filterbank.windowed_mdct(&block, &window);
+                    let decoded_as = if block_type == Mixed {
+                        Normal
+                    } else {
+                        block_type
+                    };
+                    let out = decoder_imdct(&lines, decoded_as, &mut overlap);
+                    if g > 0 {
+                        let expected = &signal[SUBBAND_SAMPLES * (g - 1)..][..SUBBAND_SAMPLES];
+                        for (o, e) in out.iter().zip(expected) {
+                            if literal {
+                                worst_literal = worst_literal.max((o - e).abs());
+                            } else {
+                                assert!(
+                                    (o - e).abs() < 1e-12,
+                                    "{types:?}, granule {g} ({block_type:?}): {o} != {e}"
+                                );
+                            }
+                        }
+                    }
+                    filterbank.last = block_type;
+                    previous.copy_from_slice(current);
+                }
+            }
+            assert!(worst_literal > 0.1, "{types:?}: {worst_literal}");
+        }
+    }
+
     /// The three short windows follow each other in time, and their lines
     /// lie one window after the other: a click at subband sample 27 of the
     /// block lies only in the last short window (samples 18 to 29).
@@ -406,9 +601,9 @@ mod tests {
             BlockType::Stop,
         ] {
             let mut filterbank = Filterbank::new();
-            filterbank.granule(&pcm(0), BlockType::Normal);
+            filterbank.granule(&pcm(0), BlockType::Normal, BlockType::Normal);
             let previous = filterbank.previous;
-            let xr = filterbank.granule(&pcm(1), block_type);
+            let xr = filterbank.granule(&pcm(1), block_type, BlockType::Normal);
             let mut expected = [0.0; GRANULE_LINES];
             for (subband, lines) in expected.chunks_exact_mut(SUBBAND_SAMPLES).enumerate() {
                 let mut block = [0.0; LONG_BLOCK];
@@ -456,7 +651,7 @@ mod tests {
                 let pcm = std::array::from_fn(|t| {
                     (2.0 * PI * frequency * (GRANULE_LINES * g + t) as f64).sin() * 0.5
                 });
-                let xr = filterbank.granule(&pcm, BlockType::Normal);
+                let xr = filterbank.granule(&pcm, BlockType::Normal, BlockType::Normal);
                 if g >= 3 {
                     for (sb, lines) in xr.chunks_exact(SUBBAND_SAMPLES).enumerate() {
                         energy[sb] += lines.iter().map(|x| x * x).sum::<f64>();

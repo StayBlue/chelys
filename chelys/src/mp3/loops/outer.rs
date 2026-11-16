@@ -140,7 +140,7 @@ pub fn outer_loop(
     let mut scalefactors = Scalefactors::new(block_type, sampling_frequency.version());
     scalefactors.intensity = intensity.map(|_| ZeroPart::UNMARKED);
     if let Some(reuse) = reuse {
-        assert_ne!(block_type, BlockType::Short, "short blocks have no scfsi");
+        assert!(!block_type.short_windows(), "short blocks have no scfsi");
         scalefactors.preflag = reuse.first.preflag;
         scalefactors.scalefac_scale = reuse.first.scalefac_scale;
         scalefactors.scfsi = reuse.scfsi;

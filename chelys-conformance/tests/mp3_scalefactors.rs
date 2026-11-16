@@ -113,6 +113,7 @@ fn decode_with_scfsi(
     let block_type = match scalefactors.scalefac {
         Scalefac::Long(_) => BlockType::Normal,
         Scalefac::Short(_) => BlockType::Short,
+        Scalefac::Mixed { .. } => BlockType::Mixed,
     };
     let granules: Vec<_> = spectra
         .iter()

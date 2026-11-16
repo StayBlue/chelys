@@ -5,13 +5,12 @@
 //! (clause 2.4.3.4.7.1), their transmission with `scalefac_compress` (clause
 //! 2.4.2.7, and clause 2.4.3.2 of ISO/IEC 13818-3 for the lower sampling
 //! frequencies), with the intensity stereo positions the right channel sends
-//! in their place (clause 2.4.3.4.9.3), and preemphasis (Table B.6). Mixed
-//! blocks are not used.
+//! in their place (clause 2.4.3.4.9.3), and preemphasis (Table B.6).
 
 use crate::bitstream::BitWriter;
 use crate::mp3::BlockType;
 use crate::mp3::header::Version;
-use crate::mp3::scalefactor_bands::{LONG_BANDS, SHORT_BANDS, SHORT_WINDOWS};
+use crate::mp3::scalefactor_bands::{LONG_BANDS, MIXED_SHORT_START, SHORT_BANDS, SHORT_WINDOWS};
 use crate::mp3::side_info::SCFSI_BANDS;
 use crate::mp3::stereo::INTENSITY_SCALE;
 
@@ -28,10 +27,28 @@ pub fn scfsi_band(sb: usize) -> usize {
 }
 
 /// Long scalefactor bands 0 to 10 are sent with `slen1` bits, 11 to 20 with
-/// `slen2`; short bands 0 to 5 with `slen1`, 6 to 11 with `slen2` (clause
-/// 2.4.2.7).
+/// `slen2`; short bands 0 to 5 with `slen1`, 6 to 11 with `slen2`; and in a
+/// mixed block its long bands and short bands 3 to 5 with `slen1`, the rest
+/// with `slen2` (clause 2.4.2.7).
 const SLEN1_LONG: usize = 11;
 const SLEN1_SHORT: usize = 6 * SHORT_WINDOWS;
+const SLEN1_MIXED_SHORT: usize = (6 - MIXED_SHORT_START) * SHORT_WINDOWS;
+
+/// The scalefactors a mixed block sends at most: 8 long bands and short
+/// bands 3 to 11 in each window (clause 2.4.2.7).
+const MIXED_SCALEFACTORS: usize = 8 + (SHORT_BANDS - MIXED_SHORT_START) * SHORT_WINDOWS;
+
+/// The rows of the tables of clause 2.4.3.2 of ISO/IEC 13818-3, which give
+/// the number of scalefactors in each partition by block type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Rows {
+    /// Block types 0, 1 and 3.
+    Long,
+    /// Block type 2 without `mixed_block_flag`.
+    Short,
+    /// Block type 2 with `mixed_block_flag`.
+    Mixed,
+}
 
 /// `(slen1, slen2)` for each `scalefac_compress` (clause 2.4.2.7).
 const SCALEFAC_COMPRESS: [(u32, u32); 16] = [
@@ -70,25 +87,25 @@ struct LsfPartitions {
 
 impl LsfPartitions {
     /// Decodes `scalefac_compress` as clause 2.4.3.2 of ISO/IEC 13818-3
-    /// prints it for channels not coded in intensity stereo, with the rows
-    /// for block types 0, 1 and 3 or for block type 2 without mixed blocks.
-    fn decode(scalefac_compress: u16, short: bool) -> Self {
+    /// prints it for channels not coded in intensity stereo, with `rows`.
+    fn decode(scalefac_compress: u16, rows: Rows) -> Self {
         let sc = u32::from(scalefac_compress);
-        let (slen, preflag, long_sfb, short_sfb) = if sc < 400 {
+        let (slen, preflag, nr_of_sfb) = if sc < 400 {
             let slen = [(sc >> 4) / 5, (sc >> 4) % 5, (sc % 16) >> 2, sc % 4];
-            (slen, false, [6, 5, 5, 5], [9, 9, 9, 9])
+            (slen, false, [[6, 5, 5, 5], [9, 9, 9, 9], [6, 9, 9, 9]])
         } else if sc < 500 {
             let sc = sc - 400;
             let slen = [(sc >> 2) / 5, (sc >> 2) % 5, sc % 4, 0];
-            (slen, false, [6, 5, 7, 3], [9, 9, 12, 6])
+            (slen, false, [[6, 5, 7, 3], [9, 9, 12, 6], [6, 9, 12, 6]])
         } else {
             assert!(sc < 512, "scalefac_compress {sc} has more than 9 bits");
             let sc = sc - 500;
-            ([sc / 3, sc % 3, 0, 0], true, [11, 10, 0, 0], [18, 18, 0, 0])
+            let nr_of_sfb = [[11, 10, 0, 0], [18, 18, 0, 0], [15, 18, 0, 0]];
+            ([sc / 3, sc % 3, 0, 0], true, nr_of_sfb)
         };
         Self {
             slen,
-            nr_of_sfb: if short { short_sfb } else { long_sfb },
+            nr_of_sfb: nr_of_sfb[rows as usize],
             preflag,
         }
     }
@@ -96,27 +113,28 @@ impl LsfPartitions {
     /// Decodes `scalefac_compress` as clause 2.4.3.2 of ISO/IEC 13818-3
     /// prints it for the right channel of a frame coded in intensity stereo,
     /// `intensity_scale` in its lowest bit and `int_scalefac_compress` in the
-    /// rest, with the same rows as [`decode`](Self::decode).
-    fn decode_intensity(scalefac_compress: u16, short: bool) -> Self {
+    /// rest, with `rows`.
+    fn decode_intensity(scalefac_compress: u16, rows: Rows) -> Self {
         let isc = u32::from(scalefac_compress >> 1);
-        let (slen, long_sfb, short_sfb) = if isc < 180 {
+        let (slen, nr_of_sfb) = if isc < 180 {
             let slen = [isc / 36, (isc % 36) / 6, (isc % 36) % 6, 0];
-            (slen, [7, 7, 7, 0], [12, 12, 12, 0])
+            (slen, [[7, 7, 7, 0], [12, 12, 12, 0], [6, 15, 12, 0]])
         } else if isc < 244 {
             let isc = isc - 180;
             let slen = [(isc % 64) >> 4, (isc % 16) >> 2, isc % 4, 0];
-            (slen, [6, 6, 6, 3], [12, 9, 9, 6])
+            (slen, [[6, 6, 6, 3], [12, 9, 9, 6], [6, 12, 9, 6]])
         } else {
             assert!(
                 isc <= 255,
                 "scalefac_compress {scalefac_compress} has more than 9 bits"
             );
             let isc = isc - 244;
-            ([isc / 3, isc % 3, 0, 0], [8, 8, 5, 0], [15, 12, 9, 0])
+            let nr_of_sfb = [[8, 8, 5, 0], [15, 12, 9, 0], [6, 18, 9, 0]];
+            ([isc / 3, isc % 3, 0, 0], nr_of_sfb)
         };
         Self {
             slen,
-            nr_of_sfb: if short { short_sfb } else { long_sfb },
+            nr_of_sfb: nr_of_sfb[rows as usize],
             preflag: false,
         }
     }
@@ -146,6 +164,16 @@ pub enum Scalefac {
     Long([u8; LONG_BANDS]),
     /// `scalefac_s[sfb][window]`, for short blocks.
     Short([[u8; SHORT_WINDOWS]; SHORT_BANDS]),
+    /// For mixed blocks, the first `long` of `scalefac`: `scalefac_l[sfb]`
+    /// of the long bands, at `sfb`; and after them `scalefac_s[sfb][window]`
+    /// from short band 3 up, at `long + 3 * (sfb - 3) + window`. `long` is
+    /// 8, or 6 at the lower sampling frequencies (see
+    /// [`mixed_long_bands`](crate::mp3::scalefactor_bands::mixed_long_bands)),
+    /// and the scalefactors past those sent are unused.
+    Mixed {
+        long: usize,
+        scalefac: [u8; MIXED_SCALEFACTORS],
+    },
 }
 
 /// The scalefactors of one granule of one channel and the flags that go
@@ -155,7 +183,7 @@ pub struct Scalefactors {
     /// The version whose `scalefac_compress` sends them.
     pub version: Version,
     pub scalefac: Scalefac,
-    /// Never set for short blocks (clause 2.4.2.7).
+    /// Never set for short blocks, mixed or not (clause 2.4.2.7).
     pub preflag: bool,
     pub scalefac_scale: bool,
     /// The scfsi bands whose scalefactors the second granule of a frame takes
@@ -237,6 +265,13 @@ impl Scalefactors {
     pub fn new(block_type: BlockType, version: Version) -> Self {
         let scalefac = match block_type {
             BlockType::Short => Scalefac::Short([[0; SHORT_WINDOWS]; SHORT_BANDS]),
+            BlockType::Mixed => Scalefac::Mixed {
+                long: match version {
+                    Version::Mpeg1 => 8,
+                    Version::Mpeg2 => 6,
+                },
+                scalefac: [0; MIXED_SCALEFACTORS],
+            },
             _ => Scalefac::Long([0; LONG_BANDS]),
         };
         Self {
@@ -254,17 +289,19 @@ impl Scalefactors {
     pub fn sent(&self, index: usize) -> bool {
         match self.scalefac {
             Scalefac::Long(_) => !self.scfsi[scfsi_band(index)],
-            Scalefac::Short(_) => true,
+            Scalefac::Short(_) | Scalefac::Mixed { .. } => true,
         }
     }
 
     /// The scalefactors in the order they are sent: `scalefac_l[sfb]` at
     /// `sfb`, or `scalefac_s[sfb][window]` at `3 * sfb + window`, the order
-    /// of [`coding_bands`](crate::mp3::scalefactor_bands::coding_bands).
+    /// of [`coding_bands`](crate::mp3::scalefactor_bands::coding_bands), and
+    /// for mixed blocks as [`Scalefac::Mixed`] has them.
     pub fn values(&self) -> &[u8] {
         match &self.scalefac {
             Scalefac::Long(scalefac) => scalefac,
             Scalefac::Short(scalefac) => scalefac.as_flattened(),
+            Scalefac::Mixed { long, scalefac } => &scalefac[..mixed_len(*long)],
         }
     }
 
@@ -272,6 +309,7 @@ impl Scalefactors {
         match &mut self.scalefac {
             Scalefac::Long(scalefac) => scalefac,
             Scalefac::Short(scalefac) => scalefac.as_flattened_mut(),
+            Scalefac::Mixed { long, scalefac } => &mut scalefac[..mixed_len(*long)],
         }
     }
 
@@ -280,6 +318,16 @@ impl Scalefactors {
         match self.scalefac {
             Scalefac::Long(_) => SLEN1_LONG,
             Scalefac::Short(_) => SLEN1_SHORT,
+            Scalefac::Mixed { long, .. } => long + SLEN1_MIXED_SHORT,
+        }
+    }
+
+    /// The rows of clause 2.4.3.2 of ISO/IEC 13818-3 for these scalefactors.
+    fn rows(&self) -> Rows {
+        match self.scalefac {
+            Scalefac::Long(_) => Rows::Long,
+            Scalefac::Short(_) => Rows::Short,
+            Scalefac::Mixed { .. } => Rows::Mixed,
         }
     }
 
@@ -311,7 +359,7 @@ impl Scalefactors {
     /// and 31.
     pub fn limit(&self, index: usize) -> u8 {
         if self.version == Version::Mpeg2 && self.intensity.is_some() {
-            let first = LsfPartitions::decode_intensity(0, self.short()).nr_of_sfb[0];
+            let first = LsfPartitions::decode_intensity(0, self.rows()).nr_of_sfb[0];
             return if index < first { 15 } else { 31 };
         }
         let first = index < self.slen1_count();
@@ -323,25 +371,36 @@ impl Scalefactors {
         }
     }
 
-    /// Whether `preflag` can be sent: not for short blocks (clause 2.4.2.7),
-    /// nor for the right channel of a frame coded in intensity stereo at the
-    /// lower sampling frequencies, whose branch of `scalefac_compress` always
-    /// clears it (clause 2.4.3.2 of ISO/IEC 13818-3).
+    /// Whether `preflag` can be sent: not for short blocks, mixed or not
+    /// (clause 2.4.2.7), nor for the right channel of a frame coded in
+    /// intensity stereo at the lower sampling frequencies, whose branch of
+    /// `scalefac_compress` always clears it (clause 2.4.3.2 of ISO/IEC
+    /// 13818-3).
+    ///
+    /// Spec reading: "If block_type==2 (short blocks) preflag is never used"
+    /// (clause 2.4.2.7) is taken to cover mixed blocks, which are
+    /// `block_type` 2 too. Their long bands would gain nothing from it:
+    /// `pretab` is 0 in long bands 0 to 7.
     pub fn can_preemphasise(&self) -> bool {
         !self.short() && (self.version != Version::Mpeg2 || self.intensity.is_none())
     }
 
     fn short(&self) -> bool {
-        matches!(self.scalefac, Scalefac::Short(_))
+        self.rows() != Rows::Long
     }
 
     /// The scalefactor band and window of scalefactor `index` of
-    /// [`values`](Self::values).
+    /// [`values`](Self::values): the long bands of a mixed block are in
+    /// window 0.
     fn band_window(&self, index: usize) -> (usize, usize) {
-        if self.short() {
-            (index / SHORT_WINDOWS, index % SHORT_WINDOWS)
-        } else {
-            (index, 0)
+        match self.scalefac {
+            Scalefac::Long(_) => (index, 0),
+            Scalefac::Short(_) => (index / SHORT_WINDOWS, index % SHORT_WINDOWS),
+            Scalefac::Mixed { long, .. } if index < long => (index, 0),
+            Scalefac::Mixed { long, .. } => (
+                MIXED_SHORT_START + (index - long) / SHORT_WINDOWS,
+                (index - long) % SHORT_WINDOWS,
+            ),
         }
     }
 
@@ -431,8 +490,8 @@ impl Scalefactors {
             "the lower sampling frequencies have no scfsi"
         );
         match self.intensity {
-            Some(_) => LsfPartitions::decode_intensity(scalefac_compress, self.short()),
-            None => LsfPartitions::decode(scalefac_compress, self.short()),
+            Some(_) => LsfPartitions::decode_intensity(scalefac_compress, self.rows()),
+            None => LsfPartitions::decode(scalefac_compress, self.rows()),
         }
     }
 
@@ -479,8 +538,9 @@ impl Scalefactors {
     }
 
     /// `part2_length`: the sum of the widths of the scalefactors sent. Without
-    /// `scfsi` this is `11 * slen1 + 10 * slen2` for long blocks and
-    /// `18 * slen1 + 18 * slen2` for short ones (clause 2.4.2.7), and at the
+    /// `scfsi` this is `11 * slen1 + 10 * slen2` for long blocks,
+    /// `18 * slen1 + 18 * slen2` for short ones and `17 * slen1 + 18 * slen2`
+    /// for mixed ones (clause 2.4.3.4.5), and at the
     /// lower sampling frequencies the sum of `nr_of_sfb * slen` over the
     /// partitions (clause 2.4.3.2 of ISO/IEC 13818-3).
     pub fn part2_length(&self, scalefac_compress: u16) -> usize {
@@ -488,6 +548,11 @@ impl Scalefactors {
             .map(|slen| slen as usize)
             .sum()
     }
+}
+
+/// The scalefactors a mixed block with `long` long bands sends.
+fn mixed_len(long: usize) -> usize {
+    long + (SHORT_BANDS - MIXED_SHORT_START) * SHORT_WINDOWS
 }
 
 /// Whether `value` fits in `bits` bits.
@@ -540,6 +605,58 @@ mod tests {
         let bits: String = w.into_bytes().iter().map(|b| format!("{b:08b}")).collect();
         assert_eq!(&bits[..3], "101");
         assert_eq!(&bits[3 * 11 + 2 * 9..3 * 11 + 2 * 10], "11");
+    }
+
+    /// A mixed block sends 8 long and 27 short scalefactors, 17 of them with
+    /// `slen1` and 18 with `slen2` (clause 2.4.3.4.5), never with preflag,
+    /// and has the limits of clause C.1.5.4.3.6, 15 for the first 17.
+    #[test]
+    fn mixed_blocks_send_17_scalefactors_with_slen1() {
+        let mut scalefactors = Scalefactors::new(BlockType::Mixed, Version::Mpeg1);
+        assert_eq!(scalefactors.values().len(), 35);
+        assert!(!scalefactors.can_preemphasise());
+        assert_eq!((scalefactors.limit(16), scalefactors.limit(17)), (15, 7));
+        scalefactors.values_mut()[16] = 9;
+        scalefactors.values_mut()[34] = 5;
+        let compress = scalefactors.compress().unwrap();
+        assert_eq!(SCALEFAC_COMPRESS[usize::from(compress)], (4, 3));
+        assert_eq!(scalefactors.part2_length(compress), 17 * 4 + 18 * 3);
+        let mut w = BitWriter::new();
+        scalefactors.write(compress, &mut w);
+        assert_eq!(w.bit_len(), 17 * 4 + 18 * 3);
+        // Short band 3, window 1, follows the 8 long bands.
+        assert_eq!(scalefactors.band_window(9), (3, 1));
+        assert_eq!(scalefactors.band_window(34), (11, 2));
+    }
+
+    /// At the lower sampling frequencies a mixed block sends 6 long and 27
+    /// short scalefactors in the partitions of the mixed rows of clause
+    /// 2.4.3.2 of ISO/IEC 13818-3.
+    #[test]
+    fn lsf_mixed_blocks_use_the_mixed_rows() {
+        let cases = [
+            (0, [6, 9, 9, 9]),
+            (399, [6, 9, 9, 9]),
+            (400, [6, 9, 12, 6]),
+            (499, [6, 9, 12, 6]),
+            (500, [15, 18, 0, 0]),
+            (511, [15, 18, 0, 0]),
+        ];
+        for (sc, nr_of_sfb) in cases {
+            let partitions = LsfPartitions::decode(sc, Rows::Mixed);
+            assert_eq!(partitions.nr_of_sfb, nr_of_sfb, "{sc}");
+            assert_eq!(partitions.nr_of_sfb.iter().sum::<usize>(), 33);
+            // The other rows are unchanged.
+            assert_eq!(LsfPartitions::decode(sc, Rows::Short).slen, partitions.slen);
+        }
+        let mut scalefactors = Scalefactors::new(BlockType::Mixed, Version::Mpeg2);
+        assert_eq!(scalefactors.values().len(), 33);
+        scalefactors.values_mut()[5] = 15;
+        scalefactors.values_mut()[32] = 7;
+        let compress = scalefactors.compress().unwrap();
+        let partitions = LsfPartitions::decode(compress, Rows::Mixed);
+        assert_eq!(partitions.slen, [4, 0, 0, 3]);
+        assert_eq!(scalefactors.part2_length(compress), 6 * 4 + 9 * 3);
     }
 
     /// With `scalefac_scale` set each step is a factor of 2, otherwise of
@@ -605,16 +722,56 @@ mod tests {
     #[test]
     fn intensity_branch_decodes_int_scalefac_compress() {
         let cases = [
-            (0, [0, 0, 0, 0], [7, 7, 7, 0], [12, 12, 12, 0]),
-            (2 * 179 + 1, [4, 5, 5, 0], [7, 7, 7, 0], [12, 12, 12, 0]),
-            (2 * 180, [0, 0, 0, 0], [6, 6, 6, 3], [12, 9, 9, 6]),
-            (2 * 243, [3, 3, 3, 0], [6, 6, 6, 3], [12, 9, 9, 6]),
-            (2 * 244, [0, 0, 0, 0], [8, 8, 5, 0], [15, 12, 9, 0]),
-            (2 * 255 + 1, [3, 2, 0, 0], [8, 8, 5, 0], [15, 12, 9, 0]),
+            (
+                0,
+                [0, 0, 0, 0],
+                [7, 7, 7, 0],
+                [12, 12, 12, 0],
+                [6, 15, 12, 0],
+            ),
+            (
+                2 * 179 + 1,
+                [4, 5, 5, 0],
+                [7, 7, 7, 0],
+                [12, 12, 12, 0],
+                [6, 15, 12, 0],
+            ),
+            (
+                2 * 180,
+                [0, 0, 0, 0],
+                [6, 6, 6, 3],
+                [12, 9, 9, 6],
+                [6, 12, 9, 6],
+            ),
+            (
+                2 * 243,
+                [3, 3, 3, 0],
+                [6, 6, 6, 3],
+                [12, 9, 9, 6],
+                [6, 12, 9, 6],
+            ),
+            (
+                2 * 244,
+                [0, 0, 0, 0],
+                [8, 8, 5, 0],
+                [15, 12, 9, 0],
+                [6, 18, 9, 0],
+            ),
+            (
+                2 * 255 + 1,
+                [3, 2, 0, 0],
+                [8, 8, 5, 0],
+                [15, 12, 9, 0],
+                [6, 18, 9, 0],
+            ),
         ];
-        for (sc, slen, long, short) in cases {
-            for (is_short, nr_of_sfb) in [(false, long), (true, short)] {
-                let partitions = LsfPartitions::decode_intensity(sc, is_short);
+        for (sc, slen, long, short, mixed) in cases {
+            for (rows, nr_of_sfb) in [
+                (Rows::Long, long),
+                (Rows::Short, short),
+                (Rows::Mixed, mixed),
+            ] {
+                let partitions = LsfPartitions::decode_intensity(sc, rows);
                 assert_eq!(partitions.slen, slen, "{sc}");
                 assert_eq!(partitions.nr_of_sfb, nr_of_sfb, "{sc}");
                 assert!(!partitions.preflag);
@@ -638,7 +795,7 @@ mod tests {
         let compress = scalefactors.compress().unwrap();
         assert_eq!(compress % 2, 1);
         assert_eq!(
-            LsfPartitions::decode_intensity(compress, false).slen,
+            LsfPartitions::decode_intensity(compress, Rows::Long).slen,
             [4, 0, 5, 0]
         );
         scalefactors.preflag = true;
@@ -666,7 +823,7 @@ mod tests {
         // Positions 0: the marks need one bit, the positions none.
         let compress = scalefactors.compress().unwrap();
         assert_eq!(
-            LsfPartitions::decode_intensity(compress, false).slen,
+            LsfPartitions::decode_intensity(compress, Rows::Long).slen,
             [2, 1, 0, 0]
         );
         assert_eq!(scalefactors.part2_length(compress), 7 * 2 + 7);
@@ -678,7 +835,7 @@ mod tests {
         // Position 3 would be the mark of 2 bits, and so takes 3.
         scalefactors.values_mut()[20] = 3;
         let compress = scalefactors.compress().unwrap();
-        let slen = LsfPartitions::decode_intensity(compress, false).slen;
+        let slen = LsfPartitions::decode_intensity(compress, Rows::Long).slen;
         assert_eq!(slen[2], 3);
         let mut w = BitWriter::new();
         scalefactors.write(compress, &mut w);
