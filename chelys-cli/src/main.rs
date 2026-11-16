@@ -100,7 +100,14 @@ struct Options {
     /// which content that relies on the image may not want even there.
     intensity_stereo: bool,
     /// Off unless asked for: neither standard says when to use mixed
-    /// blocks, and their effect on quality has not been judged.
+    /// blocks, and PEAQ (GstPEAQ 0.6.1, black box) finds them no better.
+    /// Over 22 tracks of pop music at 44.1 kHz in stereo, where short
+    /// blocks code under 1% of the granules, the mean grade moved by at
+    /// most 0.004 at 96, 128 and 192 kbit/s and at `--vbr`. In the
+    /// 3 seconds with the most short blocks of each of those and of 13
+    /// tracks of rock, it moved by +0.017 at 128 kbit/s, -0.011 at 96,
+    /// -0.003 at 192 and +0.005 at `--vbr`, better in 24, 13, 12 and 21 of
+    /// the 35 windows.
     mixed_blocks: bool,
     crc_protected: bool,
     flags: Flags,
