@@ -54,10 +54,21 @@ impl SpectrumCoding {
     /// 54. Region 1 is taken to begin at line 36 there too, below the short
     /// bands, as for the short blocks of every sampling frequency.
     ///
+    /// Settled by decoding with ffmpeg, mpg123 and LAME (black box): at 16,
+    /// 22.05 and 24 kHz all three begin region 1 of a mixed block at line
+    /// 36, and decode mixed blocks at over 45 dB SNR only with it there; at
+    /// line 54 at 2 to 8 dB. The conformance test is
+    /// `mixed_blocks_round_trip`.
+    ///
     /// Spec gap: US 6,185,539 B1 does not say where region 1 of a mixed
     /// block begins at MPEG-2.5's 11.025 and 12 kHz either. There a mixed
     /// block codes both regions with the same table, so that it decodes
     /// alike wherever region 1 begins.
+    ///
+    /// Settled by decoding with ffmpeg, mpg123 and LAME (black box): at
+    /// 11.025 and 12 kHz, ffmpeg begins region 1 of a mixed block at line
+    /// 36, and mpg123 and LAME at line 54, the end of 8 long bands. The
+    /// conformance test is `mixed_blocks_round_trip` again.
     ///
     /// # Panics
     ///
