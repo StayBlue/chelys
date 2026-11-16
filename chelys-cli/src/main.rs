@@ -54,7 +54,7 @@ MPEG-2.5 Layer III at 8, 11.025 and 12 kHz (experimental).
                      the list above (default: the lowest)
   --max-bitrate KBPS with --vbr, the highest (default: the highest)
   --vbr-noise DB     with --vbr, allow each band this many dB more noise
-                     than the model does, or less if negative (default 4)
+                     than the model does, or less if negative (default 3)
   --no-joint-stereo  code two channels as left and right throughout
                      (default: code each frame in MS stereo where the
                      channels are alike)
@@ -110,13 +110,17 @@ struct Options {
 /// does, in dB, unless `--vbr-noise` says otherwise. The model's own
 /// allowance spends more bits than listeners need. Graded with PEAQ
 /// (GstPEAQ 0.6.1, black box), 22 tracks of pop music at 44.1 kHz in stereo
-/// averaged 238 kbit/s and a grade of -0.10 at 0 dB, 196 kbit/s and -0.26
-/// at 3 dB, and 184 kbit/s and -0.35 at 4 dB, -0.65 at worst. Above 4 dB,
-/// the worst track, sparse and tonal, fell quickly: -1.07 at 5 dB, and at
-/// 6 dB -1.76 at 117 kbit/s, below its grade at a constant 128 kbit/s. In
-/// a blind ABX test of that track's worst passage at 4 dB, a listener could
-/// not tell it from the input.
-const DEFAULT_VBR_NOISE_DB: f64 = 4.0;
+/// averaged 198 kbit/s and a grade of -0.15 at 0 dB, 182 kbit/s and -0.21
+/// at 1 dB, 167 kbit/s and -0.28 at 2 dB, 153 kbit/s and -0.37 at 3 dB
+/// (-0.51 at worst), and 140 kbit/s and -0.50 at 4 dB (-0.70 at worst).
+/// Above that the worst track, sparse and tonal, fell quickly: -1.20 at
+/// 5 dB, and -2.00 at 6 dB, at 116 kbit/s. At 3 dB the grade is that of a
+/// constant 160 kbit/s (-0.35, -0.48 at worst), with the mean close to
+/// and the worst track above their grades at 4 dB before granules within
+/// their allowance left their bits to the reservoir (184 kbit/s, -0.35,
+/// and -0.65 at worst); in a blind ABX test of that track's worst passage
+/// then, a listener could not tell it from the input.
+const DEFAULT_VBR_NOISE_DB: f64 = 3.0;
 
 /// The value after the flag `name`, parsed.
 fn value<T: FromStr>(args: &mut impl Iterator<Item = String>, name: &str) -> Result<T, String> {

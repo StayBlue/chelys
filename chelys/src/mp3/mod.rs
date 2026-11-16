@@ -574,7 +574,10 @@ impl Encoder {
             ms_allowed,
             intensity_allowed,
             noise_factor,
-            save_bits: !matches!(config.rate, Rate::Variable(_)),
+            saving_noise_db: match config.rate {
+                Rate::Variable(_) => 0.0,
+                _ => loops::SAVING_NOISE_DB,
+            },
             sampling_frequency: fs,
         };
         let shortest = config.rate.lowest().frame_len(fs, true);
@@ -743,10 +746,19 @@ struct ModelCoding {
     /// The factor the allowed distortion of every band is scaled by: 1 but
     /// at a variable bitrate (see [`rate::VariableRate`]).
     noise_factor: f64,
-    /// Whether a normal block within its allowance may leave bits to the
-    /// reservoir: but at a variable bitrate, where a frame is given the
-    /// lowest bitrate that keeps it within its allowance instead.
-    save_bits: bool,
+    /// How much more noise than its allowance, in dB, a normal block within
+    /// its allowance may be given to leave bits to the reservoir (see
+    /// [`loops::outer_loop`]): [`loops::SAVING_NOISE_DB`] but at a variable
+    /// bitrate, where it is 0. There the allowance is already raised by
+    /// [`noise_factor`](Self::noise_factor), and a frame is kept at a
+    /// bitrate only if its noise stays within it; a granule given more
+    /// noise than that would push its frame to the highest bitrate. Graded
+    /// with PEAQ (GstPEAQ 0.6.1, black box), 22 tracks of pop music at
+    /// 44.1 kHz in stereo, with `noise_offset_db` 4, averaged 184 kbit/s and
+    /// a grade of -0.35 without saving bits, 298 kbit/s and -0.06 saving
+    /// them with the noise raised 4 dB, and 140 kbit/s and -0.50 saving them
+    /// down to the allowance.
+    saving_noise_db: f64,
     sampling_frequency: SamplingFrequency,
 }
 
@@ -793,7 +805,7 @@ impl Coding for ModelCoding {
             frame,
             ms_stereo,
             mean_bits,
-            save_bits: self.save_bits,
+            saving_noise_db: self.saving_noise_db,
             sampling_frequency: fs,
         };
         let plain = quantize_frame(&to_quantize, None, reservoir, IfOutsideAllowance::Finish)
@@ -866,9 +878,10 @@ struct FrameToQuantize<'a> {
     frame: &'a [Vec<Filtered<Analysis>>],
     ms_stereo: bool,
     mean_bits: usize,
-    /// Whether a normal block within its allowance may leave bits to the
-    /// reservoir (see [`loops::outer_loop`]).
-    save_bits: bool,
+    /// How much more noise than its allowance, in dB, a normal block within
+    /// its allowance may be given to leave bits to the reservoir (see
+    /// [`loops::outer_loop`]).
+    saving_noise_db: f64,
     sampling_frequency: SamplingFrequency,
 }
 
@@ -1087,7 +1100,7 @@ fn quantize_frame(
         frame,
         ms_stereo,
         mean_bits,
-        save_bits,
+        saving_noise_db,
         sampling_frequency: fs,
     } = to_quantize;
     let mut reservoir = reservoir.clone();
@@ -1155,7 +1168,10 @@ fn quantize_frame(
             };
             let bits = loops::Bits {
                 available: available_bits,
-                least: save_bits.then(|| reservoir.least_use(mean_bits)),
+                saving: Some(loops::Saving {
+                    least: reservoir.least_use(mean_bits),
+                    noise_db: saving_noise_db,
+                }),
             };
             let outcome = loops::quantize_granule(xr, xmin, block_type, bits, fs, reuse, intensity);
             if gr == 0 {
