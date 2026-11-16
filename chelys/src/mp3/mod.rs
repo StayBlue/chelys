@@ -4,6 +4,7 @@
 //! MPEG-1 Audio Layer III, and its extension to lower sampling frequencies in
 //! ISO/IEC 13818-3.
 
+mod ancillary;
 mod crc;
 pub mod filterbank;
 pub mod header;
@@ -24,6 +25,7 @@ use std::collections::VecDeque;
 use std::ops::Range;
 
 use crate::bitstream::BitWriter;
+use ancillary::AncillaryQueue;
 use header::{Bitrate, Emphasis, Flags, Header, Mode, PaddingSchedule, SamplingFrequency, Version};
 use huffman::{QuadTable, SpectrumCoding};
 use loops::scfsi::{self, GranuleSummary};
@@ -343,10 +345,14 @@ fn main_data_bits(header: &Header) -> usize {
 /// `header` does not have intensity stereo on, or the other way round: the
 /// decoder would read its zero part, and at the lower sampling frequencies
 /// its `scalefac_compress`, otherwise than they were coded.
+///
+/// With `ancillary`, the main data ends with that many bits taken from the
+/// queue, as the frame's ancillary data.
 fn frame_contents(
     header: &Header,
     frame: &[Vec<QuantizedGranule>],
     main_data_begin: usize,
+    ancillary: Option<(&mut AncillaryQueue, usize)>,
 ) -> (SideInfo, Vec<u8>) {
     let sampling_frequency = header.sampling_frequency;
     let version = sampling_frequency.version();
@@ -414,6 +420,9 @@ fn frame_contents(
             };
         }
     }
+    if let Some((queue, bits)) = ancillary {
+        queue.write(bits, &mut main_data);
+    }
     (side_info, main_data.into_bytes())
 }
 
@@ -450,7 +459,7 @@ pub fn encode_granules(config: &StreamConfig, granules: &[Vec<QuantizedGranule>]
     for frame in granules.chunks_exact(per_frame) {
         let header =
             config.frame_header(bitrate, padding.next_padding(), ms_stereo, intensity_stereo);
-        let (side_info, main_data) = frame_contents(&header, frame, 0);
+        let (side_info, main_data) = frame_contents(&header, frame, 0, None);
         writer.write(&header, &side_info, &main_data);
     }
     writer.out
@@ -582,6 +591,51 @@ impl Encoder {
             }),
             ..Self::new(config)
         }
+    }
+
+    /// Gives each frame up to `bits_per_frame` bits of ancillary data, from
+    /// the bytes queued with [`push_ancillary`](Self::push_ancillary), after
+    /// its audio. Its audio then has as many bits fewer, as ancillary data
+    /// "will reduce the number of bits available for audio" (clause
+    /// C.1.5.3.6); a frame with less data queued keeps the rest for audio.
+    ///
+    /// The ancillary data of a frame are all its bits from the end of its
+    /// audio to where the next frame's main data begins (clause 2.4.2.8):
+    /// the queued bits come first, and any after them are zero. As the
+    /// standard leaves the bits "user definable", a reader cannot tell the
+    /// queued bits from those zeros by the stream alone, and the data needs
+    /// a framing of its own. Nor is it kept from imitating a syncword, which
+    /// "may hamper synchronization" (clause C.1.5.3.6).
+    ///
+    /// # Panics
+    ///
+    /// If `bits_per_frame` is more than the main data slot of the stream's
+    /// shortest frame holds.
+    pub fn with_ancillary(mut self, bits_per_frame: usize) -> Self {
+        let config = &self.frames.config;
+        let shortest = config.frame_header(config.rate.lowest(), false, false, false);
+        let slot = main_data_bits(&shortest);
+        assert!(
+            bits_per_frame <= slot,
+            "{bits_per_frame} bits of ancillary data exceed the {slot} of the shortest frame"
+        );
+        self.frames.ancillary.set_bits_per_frame(bits_per_frame);
+        self
+    }
+
+    /// Queues `bytes` of ancillary data for the frames coded from now on,
+    /// as many bits a frame as [`with_ancillary`](Self::with_ancillary)
+    /// allows, each byte's most significant bit first.
+    pub fn push_ancillary(&mut self, bytes: &[u8]) {
+        self.frames.ancillary.push(bytes);
+    }
+
+    /// The bits of ancillary data queued that no frame has carried yet. A
+    /// frame is coded once the granule after it has arrived;
+    /// [`finish`](Self::finish) drops what its last frames have no room
+    /// for.
+    pub fn ancillary_pending(&self) -> usize {
+        self.frames.ancillary.pending()
     }
 
     /// Encodes `channels`, one slice of samples (nominally -1.0 to 1.0) per
@@ -1275,7 +1329,8 @@ struct FrameAtBitrate {
     padding: bool,
     coded: CodedFrame,
     main_data_begin: usize,
-    /// The bits of the frame's main data slot beyond the granules' shares.
+    /// The bits of the frame's main data slot beyond the granules' shares
+    /// and its ancillary data.
     unshared_bits: usize,
     reservoir: Reservoir,
 }
@@ -1299,6 +1354,7 @@ struct FrameEncoder<C> {
     samples: usize,
     /// The length of each frame written.
     frame_lens: Vec<usize>,
+    ancillary: AncillaryQueue,
 }
 
 /// What a [`FrameEncoder`] wrote, once it has finished.
@@ -1325,6 +1381,7 @@ impl<C: Coding> FrameEncoder<C> {
             pcm: vec![Vec::new(); channels],
             samples: 0,
             frame_lens: Vec::new(),
+            ancillary: AncillaryQueue::default(),
         }
     }
 
@@ -1426,20 +1483,27 @@ impl<C: Coding> FrameEncoder<C> {
             .collect();
         coding.prepare(&mut filtered);
         let block_types: Vec<BlockType> = filtered.iter().flatten().map(|f| f.block_type).collect();
+        let ancillary_bits = self.ancillary.next_frame_bits();
         let kept = match &mut self.schedule {
             Schedule::Constant(bitrate, padding) => {
                 let (bitrate, padding) = (*bitrate, padding.next_padding());
-                self.quantize_at(&filtered, bitrate, padding, true)
+                self.quantize_at(&filtered, bitrate, padding, true, ancillary_bits)
             }
             Schedule::Mean(schedule) => {
                 let (bitrate, padding) = schedule.next_frame();
-                self.quantize_at(&filtered, bitrate, padding, true)
+                self.quantize_at(&filtered, bitrate, padding, true, ancillary_bits)
             }
             Schedule::Variable { bitrates, previous } => {
                 let (bitrates, start) = (bitrates.clone(), *previous);
                 let highest = bitrates.len() - 1;
                 let (index, kept) = rate::search_variable(bitrates.len(), start, |index| {
-                    let at = self.quantize_at(&filtered, bitrates[index], false, index == highest);
+                    let at = self.quantize_at(
+                        &filtered,
+                        bitrates[index],
+                        false,
+                        index == highest,
+                        ancillary_bits,
+                    );
                     let within = at.coded.excess <= 1.0;
                     (at, within)
                 });
@@ -1466,7 +1530,12 @@ impl<C: Coding> FrameEncoder<C> {
         let header =
             self.config
                 .frame_header(bitrate, padding, coded.ms_stereo, coded.intensity_stereo);
-        let (side_info, main_data) = frame_contents(&header, &coded.granules, main_data_begin);
+        let (side_info, main_data) = frame_contents(
+            &header,
+            &coded.granules,
+            main_data_begin,
+            Some((&mut self.ancillary, ancillary_bits)),
+        );
         self.writer.write(&header, &side_info, &main_data);
         self.reservoir = reservoir;
         self.reservoir_bytes = self.reservoir.end_frame(unshared_bits);
@@ -1476,19 +1545,23 @@ impl<C: Coding> FrameEncoder<C> {
 
     /// Quantises a frame at `bitrate`, with or without `padding`, from the
     /// reservoir as the frame finds it, trying intensity stereo if
-    /// `intensity` is set and the mode allows it.
+    /// `intensity` is set and the mode allows it, with `ancillary_bits` of
+    /// its main data slot kept for ancillary data.
     fn quantize_at(
         &mut self,
         frame: &[Vec<Filtered<C::Analysis>>],
         bitrate: Bitrate,
         padding: bool,
         intensity: bool,
+        ancillary_bits: usize,
     ) -> FrameAtBitrate {
         let fs = self.config.sampling_frequency;
         let mut reservoir = self.reservoir.for_frame(bitrate.frame_len(fs, true));
         let main_data_begin = reservoir.bytes();
         // mode_extension does not change the frame's length.
-        let slot_bits = main_data_bits(&self.config.frame_header(bitrate, padding, false, false));
+        let slot_bits = main_data_bits(&self.config.frame_header(bitrate, padding, false, false))
+            .checked_sub(ancillary_bits)
+            .expect("the ancillary data fits in the frame");
         let shares = frame.len() * self.pcm.len();
         let mean_bits = slot_bits / shares;
         let coded = self
@@ -1865,6 +1938,110 @@ mod tests {
             }
             assert!(dual == stereo, "{fs:?}");
         }
+    }
+
+    /// Each frame's ancillary data, from the end of its Huffman code bits to
+    /// where the next frame's main data begins (clause 2.4.2.8), starts with
+    /// the next of the queued bits, as many as it may carry, and is zero
+    /// after them, at constant, mean and variable bitrates, in both
+    /// versions, with a share of a whole number of bytes or not, and with
+    /// data that imitates headers. Once the queue runs dry the frames carry
+    /// none, and without ancillary data the bits there are all zero.
+    #[test]
+    fn frames_carry_the_queued_ancillary_data() {
+        use SamplingFrequency::*;
+        let at = |fs: SamplingFrequency, kbps| {
+            Rate::Constant(Bitrate::from_kbps(fs.version(), kbps).unwrap())
+        };
+        let mean = Rate::Mean(rate::MeanRate::new(Version::Mpeg1, 100_000).unwrap());
+        let cases = [
+            (Hz44100, at(Hz44100, 128), MS, false, 1000),
+            (Hz48000, mean, Mode::Stereo, true, 2000),
+            (
+                Hz32000,
+                variable(Hz32000, [32, 320], 0.0),
+                Mode::SingleChannel,
+                false,
+                300,
+            ),
+            (Hz22050, at(Hz22050, 64), Mode::Stereo, true, 77),
+            (Hz8000, at(Hz8000, 16), Mode::SingleChannel, false, 8),
+        ];
+        for (fs, rate, mode, crc_protected, per_frame) in cases {
+            let case = format!("{fs:?}, {per_frame} bits a frame");
+            let config = StreamConfig {
+                rate,
+                sampling_frequency: fs,
+                mode,
+                crc_protected,
+                flags: Flags::default(),
+            };
+            let pcm = varied(fs, 1.0);
+            let channels: [&[f64]; 2] = [&pcm[0], &pcm[1]];
+            let channels = &channels[..mode.channels()];
+            let frames = (pcm[0].len() + DELAY).div_ceil(fs.version().samples_per_frame());
+            // Enough for two thirds of the frames, headers among it.
+            let mut seed = 3;
+            let mut data: Vec<u8> = (0..frames * per_frame * 2 / 3 / 8)
+                .map(|_| (noise(&mut seed) * 128.0 + 128.0) as u8)
+                .collect();
+            data[..8].copy_from_slice(&[0xFF, 0xFB, 0x90, 0x64, 0xFF, 0xF3, 0x48, 0xC4]);
+            let bits: Vec<bool> = (0..8 * data.len())
+                .map(|i| data[i / 8] >> (7 - i % 8) & 1 == 1)
+                .collect();
+
+            let mut encoder = Encoder::new(config).with_ancillary(per_frame);
+            encoder.push_ancillary(&data);
+            let mut stream = Vec::new();
+            encoder.encode(channels, &mut stream);
+            assert!(encoder.ancillary_pending() < 8 * data.len(), "{case}");
+            encoder.finish(&mut stream);
+
+            let ancillary = stream_check::ancillary(&stream);
+            assert_eq!(ancillary.len(), frames, "{case}");
+            let mut sent = 0;
+            for (k, frame) in ancillary.iter().enumerate() {
+                let carried = per_frame.min(bits.len() - sent);
+                assert!(frame.len() >= carried, "{case}, frame {k}");
+                assert_eq!(
+                    frame[..carried],
+                    bits[sent..sent + carried],
+                    "{case}, frame {k}"
+                );
+                assert!(!frame[carried..].contains(&true), "{case}, frame {k}");
+                sent += carried;
+            }
+            assert_eq!(sent, bits.len(), "{case}");
+
+            let plain = stream_check::ancillary(&encode_pcm(&config, channels));
+            assert!(plain.iter().flatten().all(|&bit| !bit), "{case}");
+        }
+    }
+
+    /// Ancillary data that fills the shortest frame's main data slot is
+    /// allowed, and leaves its audio no bits of its own; any more is not.
+    #[test]
+    fn ancillary_data_fits_the_shortest_frame() {
+        let config = StreamConfig {
+            rate: Rate::Constant(Bitrate::from_kbps(Version::Mpeg1, 32).unwrap()),
+            sampling_frequency: SamplingFrequency::Hz48000,
+            mode: Mode::SingleChannel,
+            crc_protected: false,
+            flags: Flags::default(),
+        };
+        // 96 bytes, less the header and 17 of side information.
+        let slot = 8 * (96 - 4 - 17);
+        let pcm = &varied(SamplingFrequency::Hz48000, 0.5)[0];
+        let mut encoder = Encoder::new(config).with_ancillary(slot);
+        encoder.push_ancillary(&vec![0x55; 200 * slot / 8]);
+        let mut stream = Vec::new();
+        encoder.encode(&[pcm], &mut stream);
+        encoder.finish(&mut stream);
+        for frame in stream_check::ancillary(&stream) {
+            assert!(frame.len() >= slot);
+        }
+        let result = std::panic::catch_unwind(|| Encoder::new(config).with_ancillary(slot + 1));
+        assert!(result.is_err());
     }
 
     /// The flags mark every frame, the Xing/Info tag's too, and change

@@ -17,6 +17,12 @@ pub struct Frame {
     pub padding: bool,
     pub len: usize,
     pub main_data_begin: usize,
+    /// Where the frame's main data slot lies in the stream.
+    slot: (usize, usize),
+    /// Where the frame's main data begins among the bytes of all slots.
+    begin: usize,
+    /// The bits of its scalefactors and Huffman code.
+    audio_bits: usize,
 }
 
 /// The frames of `stream`, after checking that each frame's main data
@@ -141,9 +147,31 @@ fn walk(stream: &[u8], free: Option<Bitrate>) -> Vec<Frame> {
             padding,
             len,
             main_data_begin,
+            slot: (at + len - slot, at + len),
+            begin,
+            audio_bits: main_data_bits,
         });
         at += len;
     }
     assert_eq!(at, stream.len(), "the stream ends within a frame");
     frames
+}
+
+/// The ancillary bits of each frame of `stream`, after the checks of
+/// [`frames`]: from the end of its Huffman code bits to where the next
+/// frame's main data begins, or for the last frame to the end of the stream
+/// (clause 2.4.2.8).
+pub fn ancillary(stream: &[u8]) -> Vec<Vec<bool>> {
+    let frames = frames(stream);
+    let slots: Vec<u8> = frames
+        .iter()
+        .flat_map(|f| stream[f.slot.0..f.slot.1].iter().copied())
+        .collect();
+    let bit = |at: usize| slots[at / 8] >> (7 - at % 8) & 1 == 1;
+    let ends = frames.iter().skip(1).map(|f| 8 * f.begin);
+    frames
+        .iter()
+        .zip(ends.chain([8 * slots.len()]))
+        .map(|(f, end)| (8 * f.begin + f.audio_bits..end).map(bit).collect())
+        .collect()
 }
