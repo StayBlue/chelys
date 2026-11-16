@@ -231,6 +231,8 @@ pub enum Mode {
         intensity_stereo: bool,
         ms_stereo: bool,
     },
+    /// Two channels with independent programmes, such as two languages,
+    /// coded as in [`Stereo`](Self::Stereo) (clause 2.1.52).
     DualChannel,
     SingleChannel,
 }

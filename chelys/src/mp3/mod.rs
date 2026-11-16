@@ -1821,6 +1821,50 @@ mod tests {
         }
     }
 
+    /// A stream in dual channel is the stream in stereo but for the `mode`
+    /// of each header, and the `crc_check` that covers it: "the coding
+    /// process is the same as for the stereo mode" (clause 2.1.52).
+    #[test]
+    fn dual_channel_codes_as_stereo() {
+        use SamplingFrequency::*;
+        let mean = |fs: SamplingFrequency, kbps: u32| {
+            Rate::Mean(rate::MeanRate::new(fs.version(), kbps * 1000).unwrap())
+        };
+        let at = |fs: SamplingFrequency, kbps| {
+            Rate::Constant(Bitrate::from_kbps(fs.version(), kbps).unwrap())
+        };
+        let cases = [
+            (Hz44100, at(Hz44100, 128), false),
+            (Hz48000, mean(Hz48000, 100), true),
+            (Hz32000, variable(Hz32000, [32, 320], 0.0), false),
+            (Hz22050, at(Hz22050, 64), true),
+            (Hz11025, variable(Hz11025, [8, 64], 4.0), false),
+        ];
+        for (fs, rate, crc_protected) in cases {
+            let pcm = varied(fs, 1.0);
+            let config = |mode| StreamConfig {
+                rate,
+                sampling_frequency: fs,
+                mode,
+                crc_protected,
+            };
+            let stereo = encode(config(Mode::Stereo), &pcm);
+            let mut dual = encode(config(Mode::DualChannel), &pcm);
+            assert_eq!(dual.len(), stereo.len(), "{fs:?}");
+            let mut at = 0;
+            for frame in stream_check::frames(&stereo) {
+                assert_eq!(stereo[at + 3] >> 6, 0b00, "{fs:?}: stereo at {at}");
+                assert_eq!(dual[at + 3] >> 6, 0b10, "{fs:?}: dual channel at {at}");
+                dual[at + 3] &= 0b0011_1111;
+                if crc_protected {
+                    dual[at + 4..at + 6].copy_from_slice(&stereo[at + 4..at + 6]);
+                }
+                at += frame.len;
+            }
+            assert!(dual == stereo, "{fs:?}");
+        }
+    }
+
     /// At a variable bitrate, frames switch among the bitrates allowed,
     /// silence takes the lowest and loud passages more, no frame is padded, and every frame's main data keeps to the rules of the bit
     /// reservoir: where it may begin, and what the buffer leaves beside the

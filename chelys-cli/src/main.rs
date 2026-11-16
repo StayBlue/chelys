@@ -24,8 +24,8 @@ use chelys::mp3::{Encoder, StreamConfig};
 const USAGE: &str = "\
 usage: chelys --sample-rate HZ --channels N
               [--bitrate KBPS | --vbr [--min-bitrate KBPS] [--max-bitrate KBPS]
-              [--vbr-noise DB]] [--no-joint-stereo] [--intensity-stereo] [--crc]
-              < input.f32 > output.mp3
+              [--vbr-noise DB]] [--no-joint-stereo] [--dual-channel]
+              [--intensity-stereo] [--crc] < input.f32 > output.mp3
 
 Reads interleaved 32-bit little-endian float PCM from stdin and writes MPEG-1
 Layer III to stdout, or MPEG-2 Layer III at 16, 22.05 and 24 kHz, or
@@ -51,6 +51,9 @@ MPEG-2.5 Layer III at 8, 11.025 and 12 kHz (experimental).
   --no-joint-stereo  code two channels as left and right throughout
                      (default: code each frame in MS stereo where the
                      channels are alike)
+  --dual-channel     code two channels as two independent programmes, such
+                     as two languages: as left and right throughout, and
+                     marked as dual channel (default: off)
   --intensity-stereo code the upper bands of each frame of two channels in
                      intensity stereo where the frame is short of bits,
                      keeping only the level of each channel there and not
@@ -71,6 +74,7 @@ struct Options {
     /// encoder codes two channels in joint stereo by default, as observed
     /// from the frame headers of its output (ffmpeg n9.0.2).
     joint_stereo: bool,
+    dual_channel: bool,
     /// Off unless asked for, following ffmpeg's command line: its MP3
     /// encoder offers no switch for intensity stereo, and with its defaults
     /// it coded no frame in it, at 32 to 128 kbit/s, when observed from the
@@ -104,7 +108,8 @@ fn value<T: FromStr>(args: &mut impl Iterator<Item = String>, name: &str) -> Res
 fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
     let (mut sample_rate, mut channels, mut bitrate) = (None, None, None);
     let (mut vbr, mut min_bitrate, mut max_bitrate, mut vbr_noise) = (false, None, None, None);
-    let (mut joint_stereo, mut intensity_stereo, mut crc_protected) = (true, false, false);
+    let (mut joint_stereo, mut dual_channel) = (true, false);
+    let (mut intensity_stereo, mut crc_protected) = (false, false);
     let mut args = args.into_iter();
     while let Some(flag) = args.next() {
         let args = &mut args;
@@ -117,6 +122,7 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
             "--max-bitrate" => max_bitrate = Some(value::<u32>(args, &flag)?),
             "--vbr-noise" => vbr_noise = Some(value::<f64>(args, &flag)?),
             "--no-joint-stereo" => joint_stereo = false,
+            "--dual-channel" => dual_channel = true,
             "--intensity-stereo" => intensity_stereo = true,
             "--crc" => crc_protected = true,
             // An empty message asks for the usage text alone.
@@ -182,11 +188,18 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
     if intensity_stereo && channels != 2 {
         return Err("--intensity-stereo needs two channels".to_owned());
     }
+    if dual_channel && channels != 2 {
+        return Err("--dual-channel needs two channels".to_owned());
+    }
+    if dual_channel && intensity_stereo {
+        return Err("--dual-channel and --intensity-stereo exclude each other".to_owned());
+    }
     Ok(Options {
         sampling_frequency,
         channels,
         rate,
         joint_stereo,
+        dual_channel,
         intensity_stereo,
         crc_protected,
     })
@@ -210,12 +223,14 @@ fn main() -> ExitCode {
         sampling_frequency: options.sampling_frequency,
         mode: match (
             options.channels,
+            options.dual_channel,
             options.joint_stereo,
             options.intensity_stereo,
         ) {
-            (1, _, _) => Mode::SingleChannel,
-            (_, false, false) => Mode::Stereo,
-            (_, ms_stereo, intensity_stereo) => Mode::JointStereo {
+            (1, _, _, _) => Mode::SingleChannel,
+            (_, true, _, _) => Mode::DualChannel,
+            (_, _, false, false) => Mode::Stereo,
+            (_, _, ms_stereo, intensity_stereo) => Mode::JointStereo {
                 intensity_stereo,
                 ms_stereo,
             },

@@ -361,17 +361,28 @@ fn steady_tones_share_scalefactors_between_granules() {
     assert!(snr > 25.0, "{snr:.1} dB");
 }
 
-/// The `mode_extension` of each frame of a stream (clause 2.4.2.3).
-fn mode_extensions(stream: &[u8]) -> Vec<u8> {
+/// The fourth byte of each frame's header, which holds `mode` and
+/// `mode_extension` (clause 2.4.2.3).
+fn mode_bytes(stream: &[u8]) -> Vec<u8> {
     let mut frames = Vec::new();
     let mut at = 0;
     while at + 4 <= stream.len() {
         let header = &stream[at..];
         assert_eq!(header[0], 0xFF, "no syncword at {at}");
-        frames.push(header[3] >> 4 & 0b11);
+        frames.push(header[3]);
         at += frame_len(header);
     }
     frames
+}
+
+/// The `mode` of each frame of a stream.
+fn modes(stream: &[u8]) -> Vec<u8> {
+    mode_bytes(stream).iter().map(|b| b >> 6).collect()
+}
+
+/// The `mode_extension` of each frame of a stream.
+fn mode_extensions(stream: &[u8]) -> Vec<u8> {
+    mode_bytes(stream).iter().map(|b| b >> 4 & 0b11).collect()
 }
 
 /// Whether each frame of a stream is coded in MS stereo: bit 1 of its
@@ -510,6 +521,77 @@ fn amplitude(samples: &[f32], fs: f64, channel: usize, frequency: f64) -> f64 {
         (c + y * phase.cos(), s + y * phase.sin())
     });
     2.0 * cos.hypot(sin) / n
+}
+
+/// In dual channel, two programmes, each of four tones at frequencies of its
+/// own, are coded in their own channels (clause 2.1.52): every frame is
+/// marked as dual channel, and each of ffmpeg, mpg123 and LAME decodes each
+/// programme's tones at their level in its channel. With the other channel
+/// silent, that channel decodes to silence. In MPEG-1 at 44.1 kHz and
+/// 128 kbit/s, and at the lower sampling frequency of 22.05 kHz and
+/// 64 kbit/s, with the upper tones of both programmes below its 11 kHz.
+#[test]
+fn dual_channel_keeps_each_programme_in_its_channel() {
+    let programme = |fs: f64, frequencies: [f64; 4]| -> Vec<f64> {
+        (0..fs as usize)
+            .map(|t| {
+                (frequencies.iter())
+                    .map(|f| 0.15 * (TAU * f * t as f64 / fs).sin())
+                    .sum()
+            })
+            .collect()
+    };
+    let cases = [
+        (
+            SamplingFrequency::Hz44100,
+            128,
+            [
+                [220.0, 997.0, 3_100.0, 7_000.0],
+                [330.0, 1_500.0, 4_400.0, 9_000.0],
+            ],
+        ),
+        (
+            SamplingFrequency::Hz22050,
+            64,
+            [
+                [220.0, 997.0, 3_100.0, 7_000.0],
+                [330.0, 1_500.0, 4_400.0, 8_500.0],
+            ],
+        ),
+    ];
+    for (fs, kbps, frequencies) in cases {
+        let hz = f64::from(fs.hz());
+        let config = config(kbps, fs, Mode::DualChannel);
+        let [left, right] = frequencies.map(|f| programme(hz, f));
+        let silent = vec![0.0; left.len()];
+        let stream = encode_pcm(&config, &[&left, &right]);
+        assert!(modes(&stream).iter().all(|&mode| mode == 0b10), "{fs:?}");
+        let alone = [
+            encode_pcm(&config, &[&left, &silent]),
+            encode_pcm(&config, &[&silent, &right]),
+        ];
+        for Decoder { name, decode, .. } in DECODERS {
+            let decoded = decode(&stream);
+            assert_eq!(decoded.diagnostics, "", "{name}, {fs:?}");
+            for (channel, own) in frequencies.iter().enumerate() {
+                for &frequency in own {
+                    let level = amplitude(&decoded.samples, hz, channel, frequency);
+                    assert!(
+                        (level / 0.15 - 1.0).abs() < 0.05,
+                        "{name}, {fs:?}, channel {channel}, {frequency} Hz: {level:.4}"
+                    );
+                }
+                let decoded = decode(&alone[channel]);
+                assert_eq!(decoded.diagnostics, "", "{name}, {fs:?}");
+                let other = decoded.samples.iter().skip(1 - channel).step_by(2);
+                let loudest = other.fold(0f32, |m, s| m.max(s.abs()));
+                assert!(
+                    loudest == 0.0,
+                    "{name}, {fs:?}, channel {channel} alone: {loudest} in the other"
+                );
+            }
+        }
+    }
 }
 
 /// With intensity stereo allowed, frames short of bits code their upper
