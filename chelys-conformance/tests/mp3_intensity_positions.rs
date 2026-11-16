@@ -21,7 +21,7 @@
 //! stereo positions and the scalefactors mark as settled by decoding with
 //! ffmpeg, mpg123 and LAME.
 
-use chelys::mp3::header::{Bitrate, Mode, SamplingFrequency};
+use chelys::mp3::header::{Bitrate, Flags, Mode, SamplingFrequency};
 use chelys::mp3::rate::Rate;
 use chelys::mp3::scalefactor_bands::{self, LONG_BANDS, SHORT_WINDOWS};
 use chelys::mp3::scalefactors::ZeroPart;
@@ -79,6 +79,7 @@ fn stream(
         sampling_frequency: fs,
         mode,
         crc_protected: false,
+        flags: Flags::default(),
     };
     encode_granules(&config, &vec![vec![left, right]; FRAMES])
 }

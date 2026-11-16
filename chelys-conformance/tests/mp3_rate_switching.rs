@@ -7,7 +7,7 @@
 use std::f64::consts::TAU;
 use std::ops::Range;
 
-use chelys::mp3::header::{Bitrate, Mode, SamplingFrequency};
+use chelys::mp3::header::{Bitrate, Flags, Mode, SamplingFrequency};
 use chelys::mp3::rate::{MeanRate, Rate, VariableRate};
 use chelys::mp3::{StreamConfig, encode_pcm};
 use chelys_conformance::{DECODERS, Decoder};
@@ -101,6 +101,7 @@ fn every_decoder_follows_the_bitrate_from_frame_to_frame() {
                     sampling_frequency: fs,
                     mode,
                     crc_protected,
+                    flags: Flags::default(),
                 };
                 let input = input(fs, seconds);
                 let channels = mode.channels();

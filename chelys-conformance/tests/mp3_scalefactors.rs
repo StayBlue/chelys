@@ -13,7 +13,7 @@
 //! scalefactor sent with the wrong width, in the wrong band, or with the
 //! wrong multiplier or preemphasis decodes at least a factor of 2^(1/2) off.
 
-use chelys::mp3::header::{Bitrate, Mode, SamplingFrequency, Version};
+use chelys::mp3::header::{Bitrate, Flags, Mode, SamplingFrequency, Version};
 use chelys::mp3::rate::Rate;
 use chelys::mp3::scalefactor_bands::{self, LONG_BANDS};
 use chelys::mp3::scalefactors::{PRETAB, Scalefac, Scalefactors};
@@ -29,6 +29,7 @@ fn config(sampling_frequency: SamplingFrequency) -> StreamConfig {
         sampling_frequency,
         mode: Mode::SingleChannel,
         crc_protected: false,
+        flags: Flags::default(),
     }
 }
 

@@ -6,7 +6,7 @@
 
 use std::f64::consts::TAU;
 
-use chelys::mp3::header::{Bitrate, Mode, SamplingFrequency};
+use chelys::mp3::header::{Bitrate, Flags, Mode, SamplingFrequency};
 use chelys::mp3::rate::Rate;
 use chelys::mp3::{GRANULE_LINES, StreamConfig, encode_pcm, encode_silence};
 use chelys_conformance::{DECODERS, Decoder, ffmpeg};
@@ -17,6 +17,7 @@ fn config(kbps: u32, sampling_frequency: SamplingFrequency, mode: Mode) -> Strea
         sampling_frequency,
         mode,
         crc_protected: false,
+        flags: Flags::default(),
     }
 }
 
@@ -116,6 +117,7 @@ fn loud_noise_fits_at_the_lowest_bitrate() {
                 sampling_frequency: fs,
                 mode: Mode::Stereo,
                 crc_protected,
+                flags: Flags::default(),
             };
             let stream = encode_pcm(&config, &[&left, &right]);
             let decoded = ffmpeg::decode_mp3(&stream);

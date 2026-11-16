@@ -17,7 +17,7 @@ use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::process::ExitCode;
 use std::str::FromStr;
 
-use chelys::mp3::header::{Bitrate, Mode, SamplingFrequency};
+use chelys::mp3::header::{Bitrate, Flags, Mode, SamplingFrequency};
 use chelys::mp3::rate::{MeanRate, Rate, VariableRate};
 use chelys::mp3::{Encoder, StreamConfig};
 
@@ -25,8 +25,8 @@ const USAGE: &str = "\
 usage: chelys --sample-rate HZ --channels N
               [--bitrate KBPS [--free-format] | --vbr [--min-bitrate KBPS]
               [--max-bitrate KBPS] [--vbr-noise DB]] [--no-joint-stereo]
-              [--dual-channel] [--intensity-stereo] [--crc]
-              < input.f32 > output.mp3
+              [--dual-channel] [--intensity-stereo] [--crc] [--copyright]
+              [--original] [--private-bit] < input.f32 > output.mp3
 
 Reads interleaved 32-bit little-endian float PCM from stdin and writes MPEG-1
 Layer III to stdout, or MPEG-2 Layer III at 16, 22.05 and 24 kHz, or
@@ -67,6 +67,10 @@ MPEG-2.5 Layer III at 8, 11.025 and 12 kHz (experimental).
                      at the highest bitrate (default: off)
   --crc              protect each frame's header and side information with
                      a CRC-16 check word (default: off)
+  --copyright        mark the stream as copyright protected (default: off)
+  --original         mark the stream as an original (default: marked as a
+                     copy)
+  --private-bit      set each frame's bit for private use (default: off)
 
 Where stdout is a file, the stream starts with a Xing/Info tag: its length,
 a table to seek by, and the samples to trim at its start and end. Through a
@@ -90,6 +94,7 @@ struct Options {
     /// which content that relies on the image may not want even there.
     intensity_stereo: bool,
     crc_protected: bool,
+    flags: Flags,
 }
 
 /// The noise `--vbr` allows each band beyond what the psychoacoustic model
@@ -116,6 +121,7 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
     let (mut sample_rate, mut channels, mut bitrate) = (None, None, None);
     let (mut vbr, mut min_bitrate, mut max_bitrate, mut vbr_noise) = (false, None, None, None);
     let mut free_format = false;
+    let mut flags = Flags::default();
     let (mut joint_stereo, mut dual_channel) = (true, false);
     let (mut intensity_stereo, mut crc_protected) = (false, false);
     let mut args = args.into_iter();
@@ -134,6 +140,9 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
             "--dual-channel" => dual_channel = true,
             "--intensity-stereo" => intensity_stereo = true,
             "--crc" => crc_protected = true,
+            "--copyright" => flags.copyright = true,
+            "--original" => flags.original = true,
+            "--private-bit" => flags.private = true,
             // An empty message asks for the usage text alone.
             "-h" | "--help" => return Err(String::new()),
             other => return Err(format!("unknown argument: {other}")),
@@ -230,6 +239,7 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
         dual_channel,
         intensity_stereo,
         crc_protected,
+        flags,
     })
 }
 
@@ -264,6 +274,7 @@ fn main() -> ExitCode {
             },
         },
         crc_protected: options.crc_protected,
+        flags: options.flags,
     };
     match encode(config, options.channels) {
         Ok(()) => ExitCode::SUCCESS,

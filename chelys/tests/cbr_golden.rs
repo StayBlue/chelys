@@ -12,7 +12,7 @@
 
 use std::f64::consts::TAU;
 
-use chelys::mp3::header::{Bitrate, Mode, SamplingFrequency};
+use chelys::mp3::header::{Bitrate, Flags, Mode, SamplingFrequency};
 use chelys::mp3::rate::Rate;
 use chelys::mp3::{StreamConfig, encode_pcm};
 
@@ -150,6 +150,7 @@ fn constant_bitrate_streams_are_unchanged() {
                         sampling_frequency: fs,
                         mode,
                         crc_protected,
+                        flags: Flags::default(),
                     };
                     let [left, right] = input(fs);
                     let stream = match mode {

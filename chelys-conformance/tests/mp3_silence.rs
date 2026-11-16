@@ -1,7 +1,7 @@
 // Copyright (c) 2026 StayBlue
 // SPDX-License-Identifier: MIT
 
-use chelys::mp3::header::{Bitrate, Mode, SamplingFrequency, Version};
+use chelys::mp3::header::{Bitrate, Flags, Mode, SamplingFrequency, Version};
 use chelys::mp3::rate::Rate;
 use chelys::mp3::{StreamConfig, encode_silence};
 use chelys_conformance::ffmpeg::{self, StreamInfo};
@@ -27,6 +27,7 @@ fn ffmpeg_decodes_silence_in_every_configuration() {
                         sampling_frequency,
                         mode,
                         crc_protected,
+                        flags: Flags::default(),
                     };
                     let stream = encode_silence(&config, frames);
 
@@ -68,6 +69,7 @@ fn ffmpeg_reports_a_corrupted_crc() {
                 sampling_frequency,
                 mode,
                 crc_protected: true,
+                flags: Flags::default(),
             };
             let mut stream = encode_silence(&config, 5);
             stream[5] ^= 1; // low byte of the first frame's crc_check

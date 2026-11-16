@@ -7,7 +7,7 @@
 use std::f64::consts::TAU;
 use std::process::Command;
 
-use chelys::mp3::header::{Bitrate, Mode, SamplingFrequency};
+use chelys::mp3::header::{Bitrate, Flags, Mode, SamplingFrequency};
 use chelys::mp3::rate::Rate;
 use chelys::mp3::{DELAY, StreamConfig, encode_pcm, encode_pcm_with_info_tag, info_tag};
 use chelys_conformance::{Decoder, lame, mpg123};
@@ -93,6 +93,7 @@ fn mpg123_and_lame_decode_free_format() {
                     sampling_frequency: fs,
                     mode,
                     crc_protected,
+                    flags: Flags::default(),
                 };
                 let len = fs.hz() as usize * 3 / 5 + 123;
                 let input = chirp(fs, len);
@@ -157,6 +158,7 @@ fn ffmpeg_does_not_decode_free_format() {
             sampling_frequency: fs,
             mode: Mode::SingleChannel,
             crc_protected: false,
+            flags: Flags::default(),
         };
         let path = std::env::temp_dir().join(format!("chelys-free-{}.mp3", std::process::id()));
         std::fs::write(&path, encode_pcm(&config, &[&input])).unwrap();

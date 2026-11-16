@@ -5,7 +5,7 @@
 
 use std::f64::consts::TAU;
 
-use chelys::mp3::header::{Bitrate, Mode, SamplingFrequency, Version};
+use chelys::mp3::header::{Bitrate, Flags, Mode, SamplingFrequency, Version};
 use chelys::mp3::rate::Rate;
 use chelys::mp3::scalefactor_bands;
 use chelys::mp3::scalefactors::Scalefactors;
@@ -21,6 +21,7 @@ fn config(sampling_frequency: SamplingFrequency, mode: Mode, kbps: u32) -> Strea
         sampling_frequency,
         mode,
         crc_protected: false,
+        flags: Flags::default(),
     }
 }
 

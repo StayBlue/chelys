@@ -6,7 +6,7 @@
 
 use std::f64::consts::TAU;
 
-use chelys::mp3::header::{Bitrate, Mode, SamplingFrequency};
+use chelys::mp3::header::{Bitrate, Flags, Mode, SamplingFrequency};
 use chelys::mp3::rate::{MeanRate, Rate, VariableRate};
 use chelys::mp3::{DELAY, StreamConfig, encode_pcm_with_info_tag};
 use chelys_conformance::{Decoder, ffmpeg, lame, mpg123};
@@ -134,6 +134,7 @@ fn decoders_read_the_tag_at_every_sampling_frequency() {
                     sampling_frequency: fs,
                     mode,
                     crc_protected,
+                    flags: Flags::default(),
                 };
                 let len = fs.hz() as usize * 3 / 5 + 123;
                 let input = chirp(fs, len);
@@ -198,6 +199,7 @@ fn ffmpeg_seeks_by_the_table() {
         sampling_frequency: fs,
         mode: Mode::SingleChannel,
         crc_protected: false,
+        flags: Flags::default(),
     };
     let input: Vec<f64> = chirp(fs, 4 * 8000).iter().map(|x| x / 30.0).collect();
     let stream = encode_pcm_with_info_tag(&config, &[&input]);
@@ -238,6 +240,7 @@ fn ffmpeg_applies_the_delays_for_some_encoders_only() {
         sampling_frequency: fs,
         mode: Mode::SingleChannel,
         crc_protected: false,
+        flags: Flags::default(),
     };
     let len = 30_000;
     let input = chirp(fs, len);

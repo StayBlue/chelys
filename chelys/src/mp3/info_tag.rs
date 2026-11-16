@@ -54,7 +54,9 @@ const DECODER_DELAY: usize = 529;
 /// stream's own if it is constant, the one of the table nearest a mean rate,
 /// and otherwise, or where those do not hold it, the lowest that does. It
 /// has no `crc_check` word, no padding, and in joint stereo neither MS nor
-/// intensity stereo, and its side information is all zero: a decoder that
+/// intensity stereo, the stream's [`Flags`](super::header::Flags) (so that a stream marked as
+/// copyright protected has no frame unmarked), and its side information
+/// is all zero: a decoder that
 /// does not know the tag decodes it as a granule of silence in each
 /// channel.
 ///
@@ -107,10 +109,8 @@ pub fn header(config: &StreamConfig) -> Option<Header> {
         bitrate,
         sampling_frequency: fs,
         padding: false,
-        private: false,
         mode,
-        copyright: false,
-        original: false,
+        flags: config.flags,
         emphasis: Emphasis::None,
     })
 }
@@ -336,6 +336,7 @@ fn misc(config: &StreamConfig) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mp3::header::Flags;
     use crate::mp3::rate::VariableRate;
 
     fn config(fs: SamplingFrequency, rate: Rate, mode: Mode) -> StreamConfig {
@@ -344,6 +345,7 @@ mod tests {
             sampling_frequency: fs,
             mode,
             crc_protected: true,
+            flags: Flags::default(),
         }
     }
 

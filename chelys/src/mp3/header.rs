@@ -341,6 +341,19 @@ impl Emphasis {
     }
 }
 
+/// The bits of the header that describe the stream and leave its decoding
+/// alone (clause 2.4.2.3).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Flags {
+    /// `private_bit`, a "bit for private use".
+    pub private: bool,
+    /// `copyright`: whether the stream is copyright protected.
+    pub copyright: bool,
+    /// `original/copy`: whether the stream is an original rather than a
+    /// copy.
+    pub original: bool,
+}
+
 /// A Layer III frame header.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Header {
@@ -350,10 +363,8 @@ pub struct Header {
     pub bitrate: Bitrate,
     pub sampling_frequency: SamplingFrequency,
     pub padding: bool,
-    pub private: bool,
     pub mode: Mode,
-    pub copyright: bool,
-    pub original: bool,
+    pub flags: Flags,
     pub emphasis: Emphasis,
 }
 
@@ -378,11 +389,11 @@ impl Header {
         w.write(u32::from(self.bitrate.index), 4);
         w.write(self.sampling_frequency.code(), 2);
         w.write_bool(self.padding);
-        w.write_bool(self.private);
+        w.write_bool(self.flags.private);
         w.write(self.mode.code(), 2);
         w.write(self.mode.extension_code(), 2);
-        w.write_bool(self.copyright);
-        w.write_bool(self.original);
+        w.write_bool(self.flags.copyright);
+        w.write_bool(self.flags.original);
         w.write(self.emphasis.code(), 2);
     }
 
@@ -454,10 +465,8 @@ mod tests {
             bitrate: Bitrate::from_kbps(sampling_frequency.version(), kbps).unwrap(),
             sampling_frequency,
             padding: false,
-            private: false,
             mode,
-            copyright: false,
-            original: false,
+            flags: Flags::default(),
             emphasis: Emphasis::None,
         }
     }
@@ -496,9 +505,16 @@ mod tests {
         assert_eq!(header_bytes(&h), [0xFF, 0xFB, 0b1001_0000, 0b0110_0000]);
 
         h.padding = true;
-        h.original = true;
+        h.flags.original = true;
         h.emphasis = Emphasis::CcittJ17;
         assert_eq!(header_bytes(&h), [0xFF, 0xFB, 0b1001_0010, 0b0110_0111]);
+
+        h.flags = Flags {
+            private: true,
+            copyright: true,
+            original: false,
+        };
+        assert_eq!(header_bytes(&h), [0xFF, 0xFB, 0b1001_0011, 0b0110_1011]);
     }
 
     #[test]

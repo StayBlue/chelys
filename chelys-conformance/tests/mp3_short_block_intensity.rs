@@ -14,7 +14,7 @@
 //! of each channel, against that of the same line coded in left/right
 //! stereo, tells the two apart.
 
-use chelys::mp3::header::{Bitrate, Mode, SamplingFrequency, Version};
+use chelys::mp3::header::{Bitrate, Flags, Mode, SamplingFrequency, Version};
 use chelys::mp3::rate::Rate;
 use chelys::mp3::scalefactor_bands::{self, SHORT_BANDS, SHORT_WINDOWS};
 use chelys::mp3::scalefactors::ZeroPart;
@@ -120,6 +120,7 @@ fn stream(fs: SamplingFrequency, left_line: usize, right: Option<&QuantizedGranu
         sampling_frequency: fs,
         mode,
         crc_protected: false,
+        flags: Flags::default(),
     };
     let granules = FRAMES * fs.version().granules();
     let granule = vec![left, right.unwrap_or(&silent).clone()];

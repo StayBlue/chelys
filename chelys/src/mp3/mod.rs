@@ -24,7 +24,7 @@ use std::collections::VecDeque;
 use std::ops::Range;
 
 use crate::bitstream::BitWriter;
-use header::{Bitrate, Emphasis, Header, Mode, PaddingSchedule, SamplingFrequency, Version};
+use header::{Bitrate, Emphasis, Flags, Header, Mode, PaddingSchedule, SamplingFrequency, Version};
 use huffman::{QuadTable, SpectrumCoding};
 use loops::scfsi::{self, GranuleSummary};
 use psychoacoustic::switching::{BlockSwitching, SwitchedMasking};
@@ -65,6 +65,8 @@ pub struct StreamConfig {
     pub sampling_frequency: SamplingFrequency,
     pub mode: Mode,
     pub crc_protected: bool,
+    /// The `private_bit`, `copyright` and `original/copy` of every frame.
+    pub flags: Flags,
 }
 
 /// Appends one frame (clause 2.4.1.2): the header, the `crc_check` word if
@@ -315,10 +317,8 @@ impl StreamConfig {
             bitrate,
             sampling_frequency: self.sampling_frequency,
             padding,
-            private: false,
             mode,
-            copyright: false,
-            original: false,
+            flags: self.flags,
             emphasis: Emphasis::None,
         }
     }
@@ -1529,6 +1529,7 @@ mod tests {
             sampling_frequency: SamplingFrequency::Hz44100,
             mode: Mode::Stereo,
             crc_protected,
+            flags: Flags::default(),
         }
     }
 
@@ -1563,10 +1564,8 @@ mod tests {
             bitrate: Bitrate::from_kbps(Version::Mpeg1, 32).unwrap(),
             sampling_frequency: SamplingFrequency::Hz32000,
             padding: false,
-            private: false,
             mode: Mode::SingleChannel,
-            copyright: false,
-            original: false,
+            flags: Flags::default(),
             emphasis: Emphasis::None,
         }
     }
@@ -1619,10 +1618,8 @@ mod tests {
             bitrate: Bitrate::from_kbps(Version::Mpeg1, 32).unwrap(),
             sampling_frequency: SamplingFrequency::Hz32000,
             padding: false,
-            private: false,
             mode: Mode::SingleChannel,
-            copyright: false,
-            original: false,
+            flags: Flags::default(),
             emphasis: Emphasis::None,
         };
         // 144 slots minus the 4-byte header and 17 bytes of side information.
@@ -1709,6 +1706,7 @@ mod tests {
                 ms_stereo: true,
             },
             crc_protected: false,
+            flags: Flags::default(),
         };
         // Silence fills the reservoir to its limit, past which the rest is
         // stuffing, and the noise after it reaches back into it.
@@ -1850,6 +1848,7 @@ mod tests {
                 sampling_frequency: fs,
                 mode,
                 crc_protected,
+                flags: Flags::default(),
             };
             let stereo = encode(config(Mode::Stereo), &pcm);
             let mut dual = encode(config(Mode::DualChannel), &pcm);
@@ -1865,6 +1864,65 @@ mod tests {
                 at += frame.len;
             }
             assert!(dual == stereo, "{fs:?}");
+        }
+    }
+
+    /// The flags mark every frame, the Xing/Info tag's too, and change
+    /// nothing else but the `crc_check` that covers them: `private_bit` is
+    /// the last bit of the header's third byte, and `copyright` and
+    /// `original/copy` the fifth and sixth of its fourth (clause 2.4.1.3).
+    #[test]
+    fn flags_mark_every_frame_and_change_nothing_else() {
+        use SamplingFrequency::*;
+        let at = |fs: SamplingFrequency, kbps| {
+            Rate::Constant(Bitrate::from_kbps(fs.version(), kbps).unwrap())
+        };
+        let cases = [
+            (Hz44100, at(Hz44100, 128), MS, true),
+            (
+                Hz32000,
+                variable(Hz32000, [32, 320], 0.0),
+                Mode::SingleChannel,
+                false,
+            ),
+            (Hz22050, at(Hz22050, 64), Mode::Stereo, true),
+        ];
+        let flags = Flags {
+            private: true,
+            copyright: true,
+            original: true,
+        };
+        for (fs, rate, mode, crc_protected) in cases {
+            let pcm = varied(fs, 1.0);
+            let config = |flags| StreamConfig {
+                rate,
+                sampling_frequency: fs,
+                mode,
+                crc_protected,
+                flags,
+            };
+            let plain = encode(config(Flags::default()), &pcm);
+            let mut marked = encode(config(flags), &pcm);
+            assert_eq!(marked.len(), plain.len(), "{fs:?}");
+            let mut at = 0;
+            for frame in stream_check::frames(&plain) {
+                assert_eq!(plain[at + 2] & 1, 0, "{fs:?} at {at}");
+                assert_eq!(plain[at + 3] >> 2 & 0b11, 0b00, "{fs:?} at {at}");
+                assert_eq!(marked[at + 2] & 1, 1, "{fs:?} at {at}");
+                assert_eq!(marked[at + 3] >> 2 & 0b11, 0b11, "{fs:?} at {at}");
+                marked[at + 2] &= !1;
+                marked[at + 3] &= !0b1100;
+                if crc_protected {
+                    marked[at + 4..at + 6].copy_from_slice(&plain[at + 4..at + 6]);
+                }
+                at += frame.len;
+            }
+            assert!(marked == plain, "{fs:?}");
+
+            let channels: [&[f64]; 2] = [&pcm[0], &pcm[1]];
+            let tagged = encode_pcm_with_info_tag(&config(flags), &channels[..mode.channels()]);
+            assert_eq!(tagged[2] & 1, 1, "{fs:?}");
+            assert_eq!(tagged[3] >> 2 & 0b11, 0b11, "{fs:?}");
         }
     }
 
@@ -1900,6 +1958,7 @@ mod tests {
                         sampling_frequency: fs,
                         mode,
                         crc_protected,
+                        flags: Flags::default(),
                     };
                     let input = varied(fs, 1.0);
                     let frames = stream_check::frames(&encode(config, &input));
@@ -1954,6 +2013,7 @@ mod tests {
                         sampling_frequency: fs,
                         mode,
                         crc_protected,
+                        flags: Flags::default(),
                     };
                     let case = format!("{fs:?} at {bits_per_second} bit/s");
                     let input = varied(fs, 1.0);
@@ -2007,6 +2067,7 @@ mod tests {
                     sampling_frequency: fs,
                     mode: Mode::SingleChannel,
                     crc_protected: false,
+                    flags: Flags::default(),
                 };
                 encode(config, &input).len()
             })
@@ -2028,6 +2089,7 @@ mod tests {
                 sampling_frequency: fs,
                 mode: MS,
                 crc_protected: false,
+                flags: Flags::default(),
             };
             let frames = stream_check::frames(&encode(config, &varied(fs, 0.5)));
             let mut schedule = MeanRateSchedule::new(mean, fs);
@@ -2056,6 +2118,7 @@ mod tests {
             sampling_frequency: fs,
             mode: MS,
             crc_protected: false,
+            flags: Flags::default(),
         };
         let [left, right] = varied(fs, 0.5);
         let whole = encode_pcm(&config, &[&left, &right]);
