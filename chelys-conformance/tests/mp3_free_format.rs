@@ -26,10 +26,10 @@ fn chirp(fs: SamplingFrequency, len: usize) -> Vec<f64> {
 
 /// The SNR in dB of `output` against `input`, with `output` behind by
 /// `lag`, over the input away from its ends.
-fn snr(input: &[f64], output: &[f32], lag: usize) -> f64 {
+fn snr(input: &[f64], output: &[f32], lag: isize) -> f64 {
     let (signal, noise) = (2000..input.len() - 2000).fold((0.0, 0.0), |(s, n), t| {
         let x = input[t];
-        let y = f64::from(output[t + lag]);
+        let y = f64::from(output[(t as isize + lag) as usize]);
         (s + x * x, n + (x - y) * (x - y))
     });
     10.0 * (signal / noise).log10()
@@ -37,7 +37,7 @@ fn snr(input: &[f64], output: &[f32], lag: usize) -> f64 {
 
 /// Whether `output` lines up with `input` at `lag` and not at the lags
 /// beside it, which it could not do were a frame lost or misread.
-fn lines_up(input: &[f64], output: &[f32], lag: usize) -> Result<(), String> {
+fn lines_up(input: &[f64], output: &[f32], lag: isize) -> Result<(), String> {
     let [early, exact, late] = [lag - 1, lag, lag + 1].map(|lag| snr(input, output, lag));
     match exact > early + 3.0 && exact > late + 3.0 {
         true => Ok(()),
@@ -135,7 +135,7 @@ fn mpg123_and_lame_decode_free_format() {
                             untrimmed_lag
                         }
                     };
-                    if let Err(snrs) = lines_up(&input, &output, lag) {
+                    if let Err(snrs) = lines_up(&input, &output, lag as isize) {
                         panic!("{name}, {case}: {snrs}");
                     }
                 }
