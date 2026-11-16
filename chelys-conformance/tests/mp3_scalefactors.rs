@@ -299,6 +299,69 @@ fn short_scalefactors_divide_their_band_and_window() {
     }
 }
 
+/// Mixed blocks send `scalefac_l[sfb]` for long bands 0 to 7, or 0 to 5 at
+/// the lower sampling frequencies, and then `scalefac_s[sfb][window]` for
+/// short bands 3 to 11 (clause 2.4.2.7), with the widths of
+/// `scalefac_compress` that clause 2.4.3.2 of ISO/IEC 13818-3 gives mixed
+/// blocks there. Each must divide its own band, and window, which also
+/// needs the long lines to be sent by frequency and the short ones by band,
+/// window and frequency.
+#[test]
+fn mixed_scalefactors_divide_their_bands() {
+    for fs in SamplingFrequency::STANDARD {
+        let mut rng = Rng(0x313E_DB10);
+        let spectra = [
+            spectrum(&mut rng, BlockType::Mixed, fs),
+            spectrum(&mut rng, BlockType::Mixed, fs),
+        ];
+        let mixed = Scalefactors::new(BlockType::Mixed, fs.version());
+        let expected = decode(fs, &spectra, &mixed, 0);
+        // The scalefactors sent in fields of up to 4 bits: 17 with slen1,
+        // or at the lower sampling frequencies the 6 and 9 of the first two
+        // partitions of scalefac_compress below 400.
+        let wide = match fs.version() {
+            Version::Mpeg1 => 17,
+            Version::Mpeg2 => 15,
+        };
+
+        let mut variants = Vec::new();
+        for _ in 0..3 {
+            let mut scalefactors = mixed.clone();
+            for scalefac in &mut scalefactors.values_mut()[..wide] {
+                *scalefac = 8 * rng.next(2) as u8;
+            }
+            variants.push(("scalefac_scale 0", scalefactors, 0));
+        }
+        for _ in 0..3 {
+            let mut scalefactors = Scalefactors {
+                scalefac_scale: true,
+                ..mixed.clone()
+            };
+            for scalefac in scalefactors.values_mut() {
+                *scalefac = 4 * rng.next(2) as u8;
+            }
+            variants.push(("scalefac_scale 1", scalefactors, 0));
+        }
+        for (scalefac, scalefac_scale) in [(1, true), (2, false), (3, false)] {
+            let mut scalefactors = Scalefactors {
+                scalefac_scale,
+                ..mixed.clone()
+            };
+            scalefactors.values_mut().fill(scalefac);
+            let gain_steps = if scalefac_scale { 4 } else { 2 } * scalefac;
+            variants.push(("uniform", scalefactors, gain_steps));
+        }
+        for (label, scalefactors, gain_steps) in &variants {
+            let samples = decode(fs, &spectra, scalefactors, *gain_steps);
+            assert_close(
+                &format!("{fs:?} mixed {label} {scalefactors:?}"),
+                &samples,
+                &expected,
+            );
+        }
+    }
+}
+
 /// With `scfsi` set, the second granule of a frame does not send the
 /// scalefactors of that scfsi band but takes over the first granule's
 /// (clauses 2.4.1.7 and 2.4.2.7). Encoded either way, the same scalefactors

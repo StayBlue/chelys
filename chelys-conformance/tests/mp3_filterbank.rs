@@ -9,7 +9,7 @@ use std::f64::consts::TAU;
 use chelys::mp3::header::{Bitrate, Flags, Mode, SamplingFrequency};
 use chelys::mp3::rate::Rate;
 use chelys::mp3::{BlockType, StreamConfig, encode_pcm_with_global_gain, encode_with_block_types};
-use chelys_conformance::ffmpeg;
+use chelys_conformance::{DECODERS, ffmpeg};
 
 fn config(sampling_frequency: SamplingFrequency, mode: Mode) -> StreamConfig {
     StreamConfig {
@@ -68,7 +68,9 @@ fn align(input: &[f64], output: &[f32], channels: usize, channel: usize) -> (usi
     let snr = |lag: usize| {
         let (signal, noise) = span.clone().fold((0.0, 0.0), |(s, n), t| {
             let x = input[t];
-            let y = f64::from(output[(t + lag) * channels + channel]);
+            let y = output
+                .get((t + lag) * channels + channel)
+                .map_or(0.0, |&y| f64::from(y));
             (s + x * x, n + (x - y) * (x - y))
         });
         10.0 * (signal / noise).log10()
@@ -147,6 +149,70 @@ fn short_blocks_round_trip_at_every_sampling_frequency() {
     }
 }
 
+/// Mixed blocks round trip as well as short ones, through ffmpeg, mpg123
+/// and LAME, at every sampling frequency at which they are used: in a
+/// stream that changes block type as figure C.7 allows, with mixed blocks
+/// in place of short ones, and in a stream of mixed blocks only. The tones
+/// lie in the middle of subbands 0 and 1, which a mixed block transforms
+/// as long blocks, near the edge between them, where their aliasing
+/// butterfly works, and near the edge with subband 2, the first short one.
+///
+/// This is the evidence for three gaps in the standard that the encoder
+/// marks as settled by decoding with ffmpeg, mpg123 and LAME. Without the
+/// butterfly between subbands 0 and 1, every decoder decodes these streams
+/// at 12 to 17 dB. With the decoder's windows in place of the analysis
+/// windows matched to them, the stream that changes block type decodes at
+/// about 16 dB. With region 1 of a mixed block beginning at line 54, the
+/// end of 8 long bands, rather than at line 36, all three decode at 2 to 8
+/// dB at 16, 22.05 and 24 kHz; and at MPEG-2.5's 11.025 and 12 kHz, with
+/// different tables in the two regions, mpg123 and LAME decode at under 4
+/// dB with it at line 36, and ffmpeg at under 10 dB with it at line 54.
+#[test]
+fn mixed_blocks_round_trip() {
+    use BlockType::*;
+    const CYCLE: [BlockType; 13] = [
+        Normal, Normal, Start, Mixed, Mixed, Stop, Normal, Start, Mixed, Stop, Start, Mixed, Stop,
+    ];
+    for fs in SamplingFrequency::ALL {
+        if fs == SamplingFrequency::Hz8000 {
+            continue;
+        }
+        let rate = f64::from(fs.hz());
+        let band = rate / 64.0;
+        let input: Vec<f64> = tones(fs, 1.0, 0.0)
+            .iter()
+            .enumerate()
+            .map(|(t, x)| {
+                let t = t as f64 / rate;
+                x + [0.97, 1.03, 1.97]
+                    .iter()
+                    .map(|f| 0.08 * (TAU * f * band * t).sin())
+                    .sum::<f64>()
+            })
+            .collect();
+        let config = config(fs, Mode::SingleChannel);
+        for (label, pattern) in [
+            (
+                "every transition",
+                &(|_, g: usize| CYCLE[g % CYCLE.len()]) as &dyn Fn(usize, usize) -> BlockType,
+            ),
+            ("mixed only", &|_, _| Mixed),
+        ] {
+            let stream = encode_with_block_types(&config, 154, &[&input], pattern);
+            for decoder in DECODERS {
+                let decoded = (decoder.decode)(&stream);
+                assert_eq!(decoded.diagnostics, "", "{}", decoder.name);
+                let (lag, snr) = align(&input, &decoded.samples, 1, 0);
+                assert!(
+                    snr > 45.0,
+                    "{}, {fs:?} {label}: {snr:.1} dB at lag {lag}",
+                    decoder.name
+                );
+            }
+        }
+    }
+}
+
 /// A slightly coarser quantizer than the mono test, so that two channels fit
 /// in a frame without rate control or a bit reservoir.
 #[test]
@@ -165,7 +231,7 @@ fn stereo_channels_round_trip_separately() {
 
 /// In MS stereo the middle and side channels are sent in place of the left
 /// and right, and the decoder's matrix (clause 2.4.3.4.9.2) restores them:
-/// with long blocks, and with short ones in both channels.
+/// with long blocks, and with short or mixed ones in both channels.
 #[test]
 fn ms_stereo_round_trips() {
     let fs = SamplingFrequency::Hz32000;
@@ -176,14 +242,12 @@ fn ms_stereo_round_trips() {
         ms_stereo: true,
     };
     let config = config(fs, mode);
-    for (label, short) in [("long blocks", false), ("short blocks", true)] {
-        let stream = encode_with_block_types(&config, 160, &[&left, &right], |_, _| {
-            if short {
-                BlockType::Short
-            } else {
-                BlockType::Normal
-            }
-        });
+    for (label, block_type) in [
+        ("long blocks", BlockType::Normal),
+        ("short blocks", BlockType::Short),
+        ("mixed blocks", BlockType::Mixed),
+    ] {
+        let stream = encode_with_block_types(&config, 160, &[&left, &right], |_, _| block_type);
         let decoded = ffmpeg::decode_mp3(&stream);
         assert_eq!(decoded.diagnostics, "");
         for (channel, input) in [&left, &right].into_iter().enumerate() {

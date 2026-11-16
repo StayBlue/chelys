@@ -8,7 +8,7 @@ use std::f64::consts::TAU;
 
 use chelys::mp3::header::{Bitrate, Flags, Mode, SamplingFrequency};
 use chelys::mp3::rate::Rate;
-use chelys::mp3::{GRANULE_LINES, StreamConfig, encode_pcm, encode_silence};
+use chelys::mp3::{Encoder, GRANULE_LINES, StreamConfig, encode_pcm, encode_silence};
 use chelys_conformance::{DECODERS, Decoder, ffmpeg};
 
 fn config(kbps: u32, sampling_frequency: SamplingFrequency, mode: Mode) -> StreamConfig {
@@ -339,6 +339,110 @@ fn attacks_switch_to_short_blocks_and_shorten_pre_echo() {
                 );
             }
         }
+    }
+}
+
+/// The `block_type` of each granule of a single-channel stream, with
+/// whether `mixed_block_flag` is set, or 0 and `false` without
+/// `window_switching_flag` (clause 2.4.1.7, and clause 2.4.1.7 of ISO/IEC
+/// 13818-3 for the lower sampling frequencies).
+fn single_channel_windows(stream: &[u8]) -> Vec<(u32, bool)> {
+    side_infos(stream)
+        .iter()
+        .flat_map(|&(mpeg1, side_info)| {
+            // The bits before the first granule, those of each granule, and
+            // those before window_switching_flag.
+            let (start, granules, len, before) = if mpeg1 {
+                (18, 2, 59, 33)
+            } else {
+                (9, 1, 63, 38)
+            };
+            (0..granules).map(move |gr| {
+                let at = start + gr * len + before;
+                match bits(side_info, at, 1) {
+                    0 => (0, false),
+                    _ => (bits(side_info, at + 1, 2), bits(side_info, at + 3, 1) == 1),
+                }
+            })
+        })
+        .collect()
+}
+
+/// With mixed blocks, every granule that would be coded with short blocks
+/// is coded with mixed ones, and the others keep their block types. The
+/// stream decodes alike with ffmpeg, mpg123 and LAME, as well as the
+/// stream without mixed blocks, to within a few dB. A bass tone is
+/// interrupted by bursts of noise, at 44.1 kHz and 128 kbit/s, and at
+/// 22.05 kHz and 64 kbit/s.
+#[test]
+fn mixed_blocks_take_the_place_of_short_ones() {
+    for (sampling_frequency, kbps) in [
+        (SamplingFrequency::Hz44100, 128),
+        (SamplingFrequency::Hz22050, 64),
+    ] {
+        let fs = f64::from(sampling_frequency.hz());
+        let len = 2 * sampling_frequency.hz() as usize;
+        let attacks: Vec<usize> = (1..4).map(|i| i * len / 4 + 100 * i).collect();
+        let mut seed = 1u64;
+        let input: Vec<f64> = (0..len)
+            .map(|t| {
+                let tone = 0.2 * (TAU * 110.0 * t as f64 / fs).sin()
+                    + 0.1 * (TAU * 330.0 * t as f64 / fs).sin();
+                seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                let noise = (seed >> 11) as f64 / (1u64 << 52) as f64 - 1.0;
+                let burst: f64 = (attacks.iter().filter(|&&a| t >= a))
+                    .map(|&a| 0.4 * (-((t - a) as f64) / (0.02 * fs)).exp() * noise)
+                    .sum();
+                tone + burst
+            })
+            .collect();
+        let config = config(kbps, sampling_frequency, Mode::SingleChannel);
+        let encode = |mixed: bool| {
+            let mut encoder = Encoder::new(config);
+            if mixed {
+                encoder = encoder.with_mixed_blocks();
+            }
+            let mut stream = Vec::new();
+            encoder.encode(&[&input], &mut stream);
+            encoder.finish(&mut stream);
+            stream
+        };
+        let (plain, mixed) = (encode(false), encode(true));
+        let (plain_windows, mixed_windows) = (
+            single_channel_windows(&plain),
+            single_channel_windows(&mixed),
+        );
+        let short = plain_windows.iter().filter(|&&w| w == (2, false)).count();
+        assert!(short >= 3, "{sampling_frequency:?}: {plain_windows:?}");
+        assert!(plain_windows.iter().all(|&(_, mixed)| !mixed));
+        let expected: Vec<_> = (plain_windows.iter())
+            .map(|&(block_type, _)| (block_type, block_type == 2))
+            .collect();
+        assert_eq!(mixed_windows, expected, "{sampling_frequency:?}");
+
+        let plain_snr = snr(&input, &ffmpeg::decode_mp3(&plain).samples, 1, 0);
+        let outputs: Vec<Vec<f32>> = DECODERS
+            .iter()
+            .map(|decoder| {
+                let decoded = (decoder.decode)(&mixed);
+                assert_eq!(decoded.diagnostics, "", "{}", decoder.name);
+                decoded.samples
+            })
+            .collect();
+        // LAME's output starts 529 samples later than ffmpeg's and mpg123's.
+        let ffmpeg_snr = snr(&input, &outputs[0], 1, 0);
+        for (name, output, skip) in [("mpg123", &outputs[1], 0), ("LAME", &outputs[2], 529)] {
+            let same = (4096..len - 4096)
+                .all(|t| (outputs[0][t + 1057] - output[t + 1057 - skip]).abs() < 1e-4);
+            assert!(
+                same,
+                "{name} decodes {sampling_frequency:?} otherwise than ffmpeg"
+            );
+        }
+        assert!(
+            ffmpeg_snr > plain_snr - 5.0,
+            "{sampling_frequency:?}: {ffmpeg_snr:.1} dB with mixed blocks, {plain_snr:.1} without"
+        );
     }
 }
 
