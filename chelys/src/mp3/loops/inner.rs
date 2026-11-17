@@ -60,25 +60,21 @@ impl Lines {
         Self {
             xr: *xr,
             powered,
-            end: xr
-                .iter()
-                .rposition(|&x| x != 0.0)
-                .map_or(0, |last| last + 1),
+            end: end(xr),
         }
     }
 
-    /// The lines `xr`, taking the power of each line that is unchanged
-    /// from these lines, as most are from one iteration of the outer loop
-    /// to the next.
-    pub fn updated(&self, xr: &[f64; GRANULE_LINES]) -> Self {
-        let powered = std::array::from_fn(|i| {
-            if xr[i] == self.xr[i] {
-                self.powered[i]
-            } else {
-                power_three_quarters(xr[i])
+    /// Makes these lines `xr`, taking the power again only of the lines
+    /// that change, as few do from one iteration of the outer loop to the
+    /// next.
+    pub fn update(&mut self, xr: &[f64; GRANULE_LINES]) {
+        for ((line, powered), &x) in self.xr.iter_mut().zip(&mut self.powered).zip(xr) {
+            if *line != x {
+                *line = x;
+                *powered = power_three_quarters(x);
             }
-        });
-        Self::with_powers(xr, powered)
+        }
+        self.end = end(xr);
     }
 
     pub fn xr(&self) -> &[f64; GRANULE_LINES] {
@@ -102,6 +98,13 @@ impl Lines {
         }
         (largest <= MAX_MAGNITUDE as i32).then_some(ix)
     }
+}
+
+/// One past the last of the lines `xr` that is not zero.
+fn end(xr: &[f64; GRANULE_LINES]) -> usize {
+    xr.iter()
+        .rposition(|&x| x != 0.0)
+        .map_or(0, |last| last + 1)
 }
 
 /// `|x|^0.75`, as `(|x| * |x|^0.5)^0.5`: two square roots, which the

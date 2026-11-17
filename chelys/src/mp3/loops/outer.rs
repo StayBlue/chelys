@@ -235,16 +235,16 @@ pub fn outer_loop(
     let mut start_gain = None;
     // The lines of the last iteration, whose powers the next takes over.
     let mut lines: Option<Lines> = None;
-    let lines_for = |lines: &Option<Lines>, amplified: &[f64; GRANULE_LINES]| match lines {
-        Some(lines) => lines.updated(amplified),
-        None => Lines::new(amplified),
+    let update = |lines: &mut Option<Lines>, amplified: &[f64; GRANULE_LINES]| match lines {
+        Some(lines) => lines.update(amplified),
+        None => *lines = Some(Lines::new(amplified)),
     };
 
     loop {
         let amplified = amplify(xr, &scalefactors, &bands);
-        let current = lines_for(&lines, &amplified);
+        update(&mut lines, &amplified);
         let granule = fit(
-            &current,
+            lines.as_ref().expect("lines"),
             &scalefactors,
             block_type,
             available_bits,
@@ -252,7 +252,6 @@ pub fn outer_loop(
             start_gain,
             intensity,
         );
-        lines = Some(current);
         let Some(granule) = granule else {
             if best.is_none() && reuse.is_some() {
                 return outer_loop(
@@ -338,8 +337,9 @@ pub fn outer_loop(
     match saving {
         Some(saving) if within_allowance && block_type == BlockType::Normal => {
             let amplified = amplify(xr, &scalefactors, &bands);
+            update(&mut lines, &amplified);
             let to_save = ToSave {
-                lines: lines_for(&lines, &amplified),
+                lines: lines.expect("lines"),
                 xmin,
                 scalefactors: &scalefactors,
                 bands: &bands,
