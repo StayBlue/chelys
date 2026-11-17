@@ -385,14 +385,15 @@ impl ToSave<'_> {
             if let Some(intensity) = self.intensity {
                 intensity.fill_below_bound(&mut values, &amplified);
             }
-            let mut coarser = QuantizedGranule::new(global_gain, values, kept.block_type, fs);
-            coarser.scalefactors = self.scalefactors.clone();
-            let distortion = distortion(&amplified, &coarser, self.bands);
+            // The distortion first, as it needs no Huffman coding.
+            let distortion = quantisation_distortion(&amplified, &values, global_gain, self.bands);
             if (0..self.bands.len())
                 .any(|sb| !self.fixed.contains(&sb) && distortion[sb] > allowed[sb])
             {
                 break;
             }
+            let mut coarser = QuantizedGranule::new(global_gain, values, kept.block_type, fs);
+            coarser.scalefactors = self.scalefactors.clone();
             if let Some(intensity) = self.intensity {
                 intensity.mark(&mut coarser.scalefactors, &coarser.values);
                 if coarser.scalefactors.marks_any() && !kept.scalefactors.marks_any() {
@@ -522,13 +523,23 @@ fn distortion(
     granule: &QuantizedGranule,
     bands: &[Band],
 ) -> Vec<f64> {
-    let step = step_size(granule.global_gain);
+    quantisation_distortion(amplified, &granule.values, granule.global_gain, bands)
+}
+
+/// [`distortion`] for the quantised `values` at `global_gain`.
+fn quantisation_distortion(
+    amplified: &[f64; GRANULE_LINES],
+    values: &[i32; GRANULE_LINES],
+    global_gain: u8,
+    bands: &[Band],
+) -> Vec<f64> {
+    let step = step_size(global_gain);
     bands
         .iter()
         .map(|band| {
             let sum: f64 = (band.start..band.end())
                 .map(|i| {
-                    let requantised = power_four_thirds(granule.values[i].unsigned_abs()) * step;
+                    let requantised = power_four_thirds(values[i].unsigned_abs()) * step;
                     (amplified[i].abs() - requantised).powi(2)
                 })
                 .sum();
