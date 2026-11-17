@@ -253,7 +253,10 @@ impl Analysis {
         self.fft.transform(&mut x);
 
         let lines = size / 2 + 1;
-        let r: Vec<f64> = x[..lines].iter().map(|x| x.re.hypot(x.im)).collect();
+        let r: Vec<f64> = x[..lines]
+            .iter()
+            .map(|x| (x.re * x.re + x.im * x.im).sqrt())
+            .collect();
         let mut c = Vec::with_capacity(self.predicted);
         let mut current = Vec::with_capacity(self.predicted);
         for (w, x) in x[..self.predicted].iter().enumerate() {
@@ -264,8 +267,11 @@ impl Analysis {
             let (last, before_last) = (self.last[w], self.before_last[w]);
             let predicted_r = 2.0 * last.r - before_last.r;
             let predicted_f = 2.0 * last.f - before_last.f;
-            let distance = (x.re - predicted_r * predicted_f.cos())
-                .hypot(x.im - predicted_r * predicted_f.sin());
+            let (re, im) = (
+                x.re - predicted_r * predicted_f.cos(),
+                x.im - predicted_r * predicted_f.sin(),
+            );
+            let distance = (re * re + im * im).sqrt();
             let scale = polar.r + predicted_r.abs();
             // Spec gap: silence that was predicted to stay silent divides zero
             // by zero. The line has no energy, so its unpredictability carries
