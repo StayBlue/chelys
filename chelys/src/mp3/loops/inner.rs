@@ -115,15 +115,28 @@ fn power_three_quarters(x: f64) -> f64 {
 /// `nint(x)`, rounding halves away from zero as [`f64::round`] does, but
 /// zero for negative `x`, and at most [`BEYOND_MAGNITUDE`], beyond
 /// [`MAX_MAGNITUDE`]. Without SSE4.1, `f64::round` is a call to the C
-/// library; this takes a conversion to an integer, which truncates, and a
-/// comparison, and gives the same values.
+/// library, and a conversion to an integer is taken one line at a time;
+/// this takes only additions and comparisons, which the compiler can
+/// vectorise, and gives the same values.
 fn round_to_magnitude(x: f64) -> i32 {
     let x = x.clamp(0.0, f64::from(BEYOND_MAGNITUDE));
-    let truncated = x as i32;
+    // Exact: from 2^52 on, the integers are the doubles, so adding it
+    // rounds `x` to the nearest one, and subtracting it again gives that.
+    let nearest = (x + TWO_POW_52) - TWO_POW_52;
+    let truncated = if nearest > x { nearest - 1.0 } else { nearest };
     // Exact: `x` and its truncation lie within 1 of each other.
-    let fraction = x - f64::from(truncated);
-    truncated + i32::from(fraction >= 0.5)
+    let fraction = x - truncated;
+    let magnitude = if fraction >= 0.5 {
+        truncated + 1.0
+    } else {
+        truncated
+    };
+    // 2^52 plus the magnitude holds it in the low bits of its mantissa.
+    (magnitude + TWO_POW_52).to_bits() as i32
 }
+
+/// `2^52`, from which on the doubles are spaced 1 apart.
+const TWO_POW_52: f64 = 4_503_599_627_370_496.0;
 
 /// A magnitude that the Huffman tables cannot code.
 const BEYOND_MAGNITUDE: i32 = 2 * MAX_MAGNITUDE as i32;
