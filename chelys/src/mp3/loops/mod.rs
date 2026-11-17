@@ -9,8 +9,10 @@ mod inner;
 mod outer;
 pub mod scfsi;
 
-pub use inner::{inner_loop, quantize, step_size};
-pub use outer::{Bits, Outcome, Reuse, SAVING_NOISE_DB, Saving, excess, outer_loop};
+pub use inner::{StepEstimate, inner_loop, quantize, step_size};
+pub use outer::{
+    Bits, Outcome, Reuse, SAVING_NOISE_DB, Saving, excess, outer_loop, outer_loop_with,
+};
 
 use super::header::SamplingFrequency;
 use super::stereo::IntensityPositions;
@@ -23,13 +25,16 @@ use super::{BlockType, GRANULE_LINES, QuantizedGranule};
 /// [`coding_bands`](super::scalefactor_bands::coding_bands)). In a frame's
 /// second granule, `reuse` gives the scfsi bands that take over the first
 /// granule's scalefactors. The right channel of a frame coded in intensity
-/// stereo gives its positions in `intensity`.
+/// stereo gives its positions in `intensity`. `estimate` keeps the estimate
+/// of the inner loop's first step for these lines, for coding them again
+/// with other bits (see [`outer_loop_with`]).
 ///
 /// # Panics
 ///
 /// If the scalefactors that `intensity` marks do not fit in the
 /// [`available`](Bits::available) bits, which takes fewer than its
 /// [`silent_bits`](IntensityPositions::silent_bits).
+#[allow(clippy::too_many_arguments)]
 pub fn quantize_granule(
     xr: &[f64; GRANULE_LINES],
     xmin: &[f64],
@@ -38,6 +43,7 @@ pub fn quantize_granule(
     sampling_frequency: SamplingFrequency,
     reuse: Option<Reuse>,
     intensity: Option<&IntensityPositions>,
+    estimate: Option<&std::cell::OnceCell<StepEstimate>>,
 ) -> Outcome {
     if xr.iter().all(|&x| x == 0.0) {
         let mut granule =
@@ -55,7 +61,7 @@ pub fn quantize_granule(
             within_allowance: true,
         };
     }
-    outer_loop(
+    outer_loop_with(
         xr,
         xmin,
         block_type,
@@ -63,5 +69,6 @@ pub fn quantize_granule(
         sampling_frequency,
         reuse,
         intensity,
+        estimate,
     )
 }

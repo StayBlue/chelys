@@ -797,6 +797,9 @@ struct ModelCoding {
 struct PreparedGranule {
     lines: Vec<([f64; GRANULE_LINES], Vec<f64>)>,
     summaries: Vec<GranuleSummary>,
+    /// The estimate of the inner loop's first step for each channel's lines,
+    /// once the first try works it out (see [`loops::outer_loop_with`]).
+    estimates: Vec<std::cell::OnceCell<loops::StepEstimate>>,
 }
 
 impl PreparedGranule {
@@ -823,7 +826,12 @@ impl PreparedGranule {
         let summaries = (granule.iter().zip(&lines))
             .map(|(f, (xr, xmin))| GranuleSummary::new(xr, xmin, f.block_type, fs))
             .collect();
-        Self { lines, summaries }
+        let estimates = lines.iter().map(|_| std::cell::OnceCell::new()).collect();
+        Self {
+            lines,
+            summaries,
+            estimates,
+        }
     }
 }
 
@@ -1243,7 +1251,12 @@ fn quantize_frame(
                     noise_db: saving_noise_db,
                 }),
             };
-            let outcome = loops::quantize_granule(xr, xmin, block_type, bits, fs, reuse, intensity);
+            // Intensity stereo changes the lines from those prepared.
+            let estimate = positions
+                .is_none()
+                .then(|| &prepared[gr].estimates[channel]);
+            let outcome =
+                loops::quantize_granule(xr, xmin, block_type, bits, fs, reuse, intensity, estimate);
             if gr == 0 {
                 first[channel] = Some((summary, outcome.granule.scalefactors.clone()));
             }

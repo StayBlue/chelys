@@ -4,7 +4,7 @@
 //! The outer iteration loop, or distortion control loop (clause C.1.5.4.3,
 //! figure C.9.b).
 
-use super::inner::{Lines, Step, inner_loop_step, nonzero_end, step_size};
+use super::inner::{Lines, Step, StepEstimate, inner_loop_step, nonzero_end, step_size};
 use crate::mp3::header::SamplingFrequency;
 use crate::mp3::huffman::{Counted, MAX_MAGNITUDE, SpectrumCoding};
 use crate::mp3::scalefactor_bands::{self, Band, LONG_BANDS};
@@ -203,6 +203,33 @@ pub fn outer_loop(
     reuse: Option<Reuse>,
     intensity: Option<&IntensityPositions>,
 ) -> Outcome {
+    outer_loop_with(
+        xr,
+        xmin,
+        block_type,
+        bits,
+        sampling_frequency,
+        reuse,
+        intensity,
+        None,
+    )
+}
+
+/// [`outer_loop`], with the estimate of the inner loop's first step for
+/// `xr` as they are, kept in `estimate` once worked out, for lines coded
+/// again with other bits. It serves where the loop starts from `xr` as they
+/// are, that is without scalefactors taken over with scfsi.
+#[allow(clippy::too_many_arguments)]
+pub fn outer_loop_with(
+    xr: &[f64; GRANULE_LINES],
+    xmin: &[f64],
+    block_type: BlockType,
+    bits: Bits,
+    sampling_frequency: SamplingFrequency,
+    reuse: Option<Reuse>,
+    intensity: Option<&IntensityPositions>,
+    estimate: Option<&std::cell::OnceCell<StepEstimate>>,
+) -> Outcome {
     let Bits {
         available: available_bits,
         saving,
@@ -243,18 +270,24 @@ pub fn outer_loop(
     loop {
         let amplified = amplify(xr, &scalefactors, &bands);
         update(&mut lines, &amplified);
+        let current = lines.as_ref().expect("lines");
+        // Only the first fit starts from an estimate, and without scfsi it
+        // fits `xr` as they are.
+        let first = (estimate.filter(|_| start_gain.is_none() && reuse.is_none()))
+            .map(|estimate| estimate.get_or_init(|| StepEstimate::new(current)));
         let granule = fit(
-            lines.as_ref().expect("lines"),
+            current,
             &scalefactors,
             block_type,
             available_bits,
             sampling_frequency,
             start_gain,
+            first,
             intensity,
         );
         let Some(granule) = granule else {
             if best.is_none() && reuse.is_some() {
-                return outer_loop(
+                return outer_loop_with(
                     xr,
                     xmin,
                     block_type,
@@ -262,6 +295,7 @@ pub fn outer_loop(
                     sampling_frequency,
                     None,
                     intensity,
+                    estimate,
                 );
             }
             break;
@@ -613,7 +647,9 @@ fn part2_length(scalefactors: &Scalefactors) -> usize {
 
 /// The inner loop for the lines `amplified` by `scalefactors`, in at most
 /// `available_bits` with the scalefactors, marked for intensity stereo if
-/// `intensity` is given. `None` if they do not fit.
+/// `intensity` is given, starting as [`inner_loop_step`] does from
+/// `start_gain` or `estimate`. `None` if they do not fit.
+#[allow(clippy::too_many_arguments)]
 fn fit(
     lines: &Lines,
     scalefactors: &Scalefactors,
@@ -621,6 +657,7 @@ fn fit(
     available_bits: usize,
     sampling_frequency: SamplingFrequency,
     start_gain: Option<u8>,
+    estimate: Option<&StepEstimate>,
     intensity: Option<&IntensityPositions>,
 ) -> Option<Fitted> {
     let compress = scalefactors
@@ -635,6 +672,7 @@ fn fit(
             block_type,
             sampling_frequency,
             start_gain,
+            estimate,
         )?;
         let Some(intensity) = intensity else {
             return Some(Fitted::Step(step, scalefactors.clone()));

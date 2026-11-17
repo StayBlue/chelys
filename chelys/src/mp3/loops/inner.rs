@@ -218,18 +218,22 @@ pub fn inner_loop_lines(
         block_type,
         sampling_frequency,
         start_gain,
+        None,
     )
     .map(|step| step.granule(block_type, sampling_frequency))
 }
 
 /// [`inner_loop_lines`], giving the step it ends on, whose granule, with
-/// its Huffman coding, is made only if it is kept.
+/// its Huffman coding, is made only if it is kept. Without `start_gain`,
+/// the search starts from the step `estimate` gives, if it is that of
+/// `lines`, or from that of [`estimated_gain`].
 pub fn inner_loop_step(
     lines: &Lines,
     available_bits: usize,
     block_type: BlockType,
     sampling_frequency: SamplingFrequency,
     start_gain: Option<u8>,
+    estimate: Option<&StepEstimate>,
 ) -> Option<Step> {
     let bands = scalefactor_bands::coding_bands(block_type, sampling_frequency);
     if lines.xr.iter().all(|&x| x == 0.0) {
@@ -258,7 +262,10 @@ pub fn inner_loop_step(
     };
     // Each search keeps the step it ends on, so that no step is quantised
     // twice.
-    let start = start_gain.unwrap_or_else(|| estimated_gain(lines, available_bits));
+    let start = start_gain.unwrap_or_else(|| match estimate {
+        Some(estimate) => estimate.gain(available_bits),
+        None => estimated_gain(lines, available_bits),
+    });
     if let Some(mut step) = attempt(start) {
         // Finer steps while they fit.
         while let Some(finer) = step.global_gain.checked_sub(1).and_then(&attempt) {
@@ -338,35 +345,55 @@ const ESTIMATED_BITS_PER_MAGNITUDE_BIT: f64 = 1.12;
 /// then takes two or three steps instead of the ten or so of a bisection
 /// of the whole range of `global_gain`.
 fn estimated_gain(lines: &Lines, available_bits: usize) -> u8 {
-    // The values of a line are not zero up to the step `z` where
-    // `powered * 2^(-3/16 (z - 210)) - 0.0946 >= 0.5`. Lines that are zero
-    // at every step are left out, and those that are zero at none are
-    // counted as if they were from the step after the coarsest.
-    let mut steps = [0u16; 257];
-    let lowest_nonzero = (0.5f64 + 0.0946).log2();
-    for &powered in &lines.powered[..lines.end] {
-        if powered == 0.0 {
-            continue;
+    StepEstimate::new(lines).gain(available_bits)
+}
+
+/// What [`estimated_gain`] takes of a granule's lines, so that it can be
+/// worked out once for lines that are quantised again with other bits, as
+/// at each bitrate a frame is tried at.
+pub struct StepEstimate {
+    /// The lines whose values stop being zero at each step.
+    steps: [u16; 257],
+}
+
+impl StepEstimate {
+    pub fn new(lines: &Lines) -> Self {
+        // The values of a line are not zero up to the step `z` where
+        // `powered * 2^(-3/16 (z - 210)) - 0.0946 >= 0.5`. Lines that are zero
+        // at every step are left out, and those that are zero at none are
+        // counted as if they were from the step after the coarsest.
+        let mut steps = [0u16; 257];
+        let lowest_nonzero = (0.5f64 + 0.0946).log2();
+        for &powered in &lines.powered[..lines.end] {
+            if powered == 0.0 {
+                continue;
+            }
+            let z = f64::from(GLOBAL_GAIN_OFFSET)
+                + (approximate_log2(powered) - lowest_nonzero) * 16.0 / 3.0;
+            if z >= 0.0 {
+                steps[z.min(256.0) as usize] += 1;
+            }
         }
-        let z = f64::from(GLOBAL_GAIN_OFFSET)
-            + (approximate_log2(powered) - lowest_nonzero) * 16.0 / 3.0;
-        if z >= 0.0 {
-            steps[z.min(256.0) as usize] += 1;
-        }
+        Self { steps }
     }
-    // From the coarsest step down: the values not zero, and the bits of
-    // their magnitudes in steps of 3/16 of a bit.
-    let (mut values, mut magnitude_steps) = (u32::from(steps[256]), 0u32);
-    for global_gain in (0..=u8::MAX).rev() {
-        magnitude_steps += values;
-        values += u32::from(steps[usize::from(global_gain)]);
-        let bits = ESTIMATED_BITS_PER_VALUE * f64::from(values)
-            + ESTIMATED_BITS_PER_MAGNITUDE_BIT * 3.0 / 16.0 * f64::from(magnitude_steps);
-        if bits > available_bits as f64 {
-            return global_gain.saturating_add(1);
+
+    /// [`estimated_gain`] for the lines of this estimate.
+    pub fn gain(&self, available_bits: usize) -> u8 {
+        let steps = &self.steps;
+        // From the coarsest step down: the values not zero, and the bits of
+        // their magnitudes in steps of 3/16 of a bit.
+        let (mut values, mut magnitude_steps) = (u32::from(steps[256]), 0u32);
+        for global_gain in (0..=u8::MAX).rev() {
+            magnitude_steps += values;
+            values += u32::from(steps[usize::from(global_gain)]);
+            let bits = ESTIMATED_BITS_PER_VALUE * f64::from(values)
+                + ESTIMATED_BITS_PER_MAGNITUDE_BIT * 3.0 / 16.0 * f64::from(magnitude_steps);
+            if bits > available_bits as f64 {
+                return global_gain.saturating_add(1);
+            }
         }
+        0
     }
-    0
 }
 
 /// `log2(x)` for positive normal `x`, within 0.09: the bits of `x` taken as
