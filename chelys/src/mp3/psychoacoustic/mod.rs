@@ -431,12 +431,15 @@ impl PsychoacousticModel {
         };
 
         // Figure C.6.b: energy and unpredictability in each partition...
+        let weighted: Vec<f64> = (energy.iter().enumerate())
+            .map(|(w, &energy)| cw(w) * energy)
+            .collect();
         let (eb, cb): (Vec<f64>, Vec<f64>) = self
             .partitions
             .iter()
             .map(|p| {
-                (p.start..p.start + p.width)
-                    .map(|w| (energy[w], cw(w) * energy[w]))
+                let lines = p.start..p.start + p.width;
+                (energy[lines.clone()].iter().zip(&weighted[lines]))
                     .fold((0.0, 0.0), |(e, c), (de, dc)| (e + de, c + dc))
             })
             .unzip();
