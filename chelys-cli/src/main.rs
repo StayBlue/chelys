@@ -117,16 +117,17 @@ struct Options {
 /// does, in dB, unless `--vbr-noise` says otherwise. The model's own
 /// allowance spends more bits than listeners need. Graded with PEAQ
 /// (GstPEAQ 0.6.1, black box), 22 tracks of pop music at 44.1 kHz in stereo
-/// averaged 198 kbit/s and a grade of -0.15 at 0 dB, 182 kbit/s and -0.21
-/// at 1 dB, 167 kbit/s and -0.28 at 2 dB, 153 kbit/s and -0.37 at 3 dB
-/// (-0.51 at worst), and 140 kbit/s and -0.50 at 4 dB (-0.70 at worst).
-/// Above that the worst track, sparse and tonal, fell quickly: -1.20 at
-/// 5 dB, and -2.00 at 6 dB, at 116 kbit/s. At 3 dB the grade is that of a
-/// constant 160 kbit/s (-0.35, -0.48 at worst), with the mean close to
-/// and the worst track above their grades at 4 dB before granules within
-/// their allowance left their bits to the reservoir (184 kbit/s, -0.35,
-/// and -0.65 at worst); in a blind ABX test of that track's worst passage
-/// then, a listener could not tell it from the input.
+/// averaged 178 kbit/s and a grade of -0.19 at 3 dB (-0.26 at worst), above
+/// the -0.22 (-0.32) of a constant 178 kbit/s. Above 3 dB `--vbr` gained
+/// nothing over a constant bitrate of its mean: 162 kbit/s and -0.27 (-0.39)
+/// at 4 dB, against -0.27 (-0.39) at a constant 160 kbit/s; 148 kbit/s and
+/// -0.37 (-0.55) at 5 dB, against -0.38 (-0.47) at a constant 148 kbit/s;
+/// and 134 kbit/s and -0.50 (-0.78) at 6 dB, the worst track sparse and
+/// tonal. Before the threshold in quiet was taken as noise has it, 3 dB gave
+/// 153 kbit/s and -0.37 (-0.51 at worst); in a blind ABX test of that
+/// track's worst passage at 4 dB before granules within their allowance
+/// left their bits to the reservoir (184 kbit/s, -0.35, and -0.65 at worst),
+/// a listener could not tell it from the input.
 const DEFAULT_VBR_NOISE_DB: f64 = 3.0;
 
 /// The value after the flag `name`, parsed.
