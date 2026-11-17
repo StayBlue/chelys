@@ -498,6 +498,11 @@ struct BandBits {
 /// of the pairs.
 type Split = ((u8, u8), [u8; 3], usize);
 
+/// A split found by [`BandBits::splits_below`]: its bits,
+/// `(region0_count, region1_count)` and the bands at which its first two
+/// regions end.
+type SplitFound = (usize, (u8, u8), (usize, usize));
+
 impl BandBits {
     /// The bits of the pairs `values`, taking over the bands that `prefix`
     /// counted whole, if given, from pairs that `values` start with.
@@ -546,7 +551,7 @@ impl BandBits {
                 next[set] = previous[set] + bits;
             }
             escapes_below[band + 1] = escapes_below[band] + escapes;
-            let least = tables.cheapest(&codes, escapes, largest).1;
+            let least = tables.fewest_bits(&codes, escapes, largest);
             least_below[band + 1] = least_below[band] + least;
         }
         // A granule's pairs need too few bits for the sums to overflow.
@@ -575,23 +580,36 @@ impl BandBits {
         let count = self.count;
         let end0 = (count / 3).clamp(1.min(count), 16);
         let end1 = (count - count / 4).clamp(end0, end0 + 8).min(count);
-        self.region(0..end0).1 + self.region(end0..end1).1 + self.region(end1..count).1
+        [0..end0, end0..end1, end1..count]
+            .map(|range| {
+                let largest = self.max[range.clone()].iter().copied().max().unwrap_or(0);
+                self.region_bits(range, largest)
+            })
+            .iter()
+            .sum()
     }
 
     /// The table that codes the bands `range` in the fewest bits, and those
     /// bits.
     fn region(&self, range: std::ops::Range<usize>) -> (u8, usize) {
         let largest = self.max[range.clone()].iter().copied().max().unwrap_or(0);
-        self.region_with(range, largest)
+        let (bits, escapes) = self.region_counts(range);
+        PairTables::get().cheapest(&bits, escapes, largest)
     }
 
     /// [`region`](Self::region), given the largest magnitude of the bands.
-    fn region_with(&self, range: std::ops::Range<usize>, largest: u32) -> (u8, usize) {
-        let tables = PairTables::get();
+    fn region_bits(&self, range: std::ops::Range<usize>, largest: u32) -> usize {
+        let (bits, escapes) = self.region_counts(range);
+        PairTables::get().fewest_bits(&bits, escapes, largest)
+    }
+
+    /// The bits of the bands `range` with each set of code words, but for
+    /// escape fields, and their number of escapes.
+    fn region_counts(&self, range: std::ops::Range<usize>) -> ([u16; CODE_SETS], u16) {
         let (end, start) = (&self.below[range.end], &self.below[range.start]);
         let escapes = self.escapes_below[range.end] - self.escapes_below[range.start];
-        let bits: [u16; CODE_SETS] = std::array::from_fn(|set| end[set].wrapping_sub(start[set]));
-        tables.cheapest(&bits, escapes, largest)
+        let bits = std::array::from_fn(|set| end[set].wrapping_sub(start[set]));
+        (bits, escapes)
     }
 
     /// SUBDIVIDE (clause C.1.5.4.4.6) and the choice of tables (clause
@@ -620,9 +638,10 @@ impl BandBits {
     fn search_split(&self) -> Split {
         // The split of `upper` needs no fewer bits than the best, so those
         // bits plus one bound the search from the start.
-        let (bits, counts, tables) = self
+        let (bits, counts, (end0, end1)) = self
             .splits_below(self.upper() + 1, true)
             .expect("at least one split");
+        let tables = [0..end0, end0..end1, end1..self.count].map(|range| self.region(range).0);
         (counts, tables, bits)
     }
 
@@ -638,14 +657,15 @@ impl BandBits {
     /// The first split, in the order [`split`](Self::split) tries them,
     /// that needs fewer than `limit` bits, or with `fewest`, the first of
     /// those needing the fewest; with its bits, `(region0_count,
-    /// region1_count)` and the table of each region.
-    fn splits_below(&self, mut limit: usize, fewest: bool) -> Option<(usize, (u8, u8), [u8; 3])> {
+    /// region1_count)` and the bands at which its first two regions end. The
+    /// regions' tables are not chosen.
+    fn splits_below(&self, mut limit: usize, fewest: bool) -> Option<SplitFound> {
         let (count, least_below) = (self.count, &self.least_below);
         // The largest magnitudes of the regions are carried from one
         // region to the next that it grows into.
-        let region = |range, largest| self.region_with(range, largest);
-        // The last region, for each band it may start at.
-        let mut last = [(0u8, 0usize); LONG_BANDS + 1];
+        let region = |range, largest| self.region_bits(range, largest);
+        // The last region's bits, for each band it may start at.
+        let mut last = [0usize; LONG_BANDS + 1];
         let mut largest2 = 0;
         for start in (0..=count).rev() {
             if start < count {
@@ -664,7 +684,7 @@ impl BandBits {
             if end0 > 0 {
                 largest0 = largest0.max(self.max[end0 - 1]);
             }
-            let (table0, bits0) = region(0..end0, largest0);
+            let bits0 = region(0..end0, largest0);
             let (mut end, mut largest1) = (end0, 0);
             for region1 in 0..8u8 {
                 let end1 = (end0 + usize::from(region1) + 1).min(count);
@@ -672,7 +692,7 @@ impl BandBits {
                     largest1 = largest1.max(self.max[band]);
                 }
                 end = end1;
-                let (table2, bits2) = last[end1];
+                let bits2 = last[end1];
                 let at_least = bits0 + (least_below[end1] - least_below[end0]) + bits2;
                 if at_least >= limit {
                     if end1 == count {
@@ -680,10 +700,10 @@ impl BandBits {
                     }
                     continue;
                 }
-                let (table1, bits1) = region(end0..end1, largest1);
+                let bits1 = region(end0..end1, largest1);
                 let bits = bits0 + bits1 + bits2;
                 if bits < limit {
-                    best = Some((bits, (region0, region1), [table0, table1, table2]));
+                    best = Some((bits, (region0, region1), (end0, end1)));
                     if !fewest {
                         return best;
                     }
@@ -873,6 +893,25 @@ impl PairTables {
         // laid out so that the compiler can vectorise it; of the fewest,
         // the table first in order is kept.
         let choice = &self.choices[magnitude_class(largest)];
+        let lanes = Self::lanes(choice, bits, escapes);
+        let least = lanes.iter().copied().fold(i16::MAX, i16::min);
+        let set = lanes
+            .iter()
+            .position(|&bits| bits == least)
+            .expect("table 31 codes every allowed magnitude");
+        (choice.table_select[set], least as usize)
+    }
+
+    /// The bits of [`cheapest`](Self::cheapest), without its table.
+    fn fewest_bits(&self, bits: &[u16; CODE_SETS], escapes: u16, largest: u32) -> usize {
+        let choice = &self.choices[magnitude_class(largest)];
+        let lanes = Self::lanes(choice, bits, escapes);
+        lanes.iter().copied().fold(i16::MAX, i16::min) as usize
+    }
+
+    /// Each set's bits with its first table that can code the largest
+    /// magnitude of `choice`, or i16::MAX where none can.
+    fn lanes(choice: &Choice, bits: &[u16; CODE_SETS], escapes: u16) -> [i16; CODE_SETS] {
         let mut lanes = [0i16; CODE_SETS];
         for set in 0..CODE_SETS {
             lanes[set] = if choice.codes[set] {
@@ -881,12 +920,7 @@ impl PairTables {
                 i16::MAX
             };
         }
-        let least = lanes.iter().copied().fold(i16::MAX, i16::min);
-        let set = lanes
-            .iter()
-            .position(|&bits| bits == least)
-            .expect("table 31 codes every allowed magnitude");
-        (choice.table_select[set], least as usize)
+        lanes
     }
 }
 
