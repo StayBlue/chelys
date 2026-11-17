@@ -35,13 +35,24 @@ pub fn quantize(xr: &[f64; GRANULE_LINES], global_gain: u8) -> Option<[i32; GRAN
 pub struct Lines {
     xr: [f64; GRANULE_LINES],
     powered: [f64; GRANULE_LINES],
+    /// One past the last line that is not zero: those above quantise to
+    /// zero at every step.
+    end: usize,
 }
 
 impl Lines {
     pub fn new(xr: &[f64; GRANULE_LINES]) -> Self {
+        Self::with_powers(xr, xr.map(power_three_quarters))
+    }
+
+    fn with_powers(xr: &[f64; GRANULE_LINES], powered: [f64; GRANULE_LINES]) -> Self {
         Self {
             xr: *xr,
-            powered: xr.map(power_three_quarters),
+            powered,
+            end: xr
+                .iter()
+                .rposition(|&x| x != 0.0)
+                .map_or(0, |last| last + 1),
         }
     }
 
@@ -49,16 +60,14 @@ impl Lines {
     /// from these lines, as most are from one iteration of the outer loop
     /// to the next.
     pub fn updated(&self, xr: &[f64; GRANULE_LINES]) -> Self {
-        Self {
-            xr: *xr,
-            powered: std::array::from_fn(|i| {
-                if xr[i] == self.xr[i] {
-                    self.powered[i]
-                } else {
-                    power_three_quarters(xr[i])
-                }
-            }),
-        }
+        let powered = std::array::from_fn(|i| {
+            if xr[i] == self.xr[i] {
+                self.powered[i]
+            } else {
+                power_three_quarters(xr[i])
+            }
+        });
+        Self::with_powers(xr, powered)
     }
 
     pub fn xr(&self) -> &[f64; GRANULE_LINES] {
@@ -70,7 +79,8 @@ impl Lines {
         let scale = step_size(global_gain).powf(-0.75);
         let mut ix = [0; GRANULE_LINES];
         let mut largest = 0;
-        for ((ix, &powered), &xr) in ix.iter_mut().zip(&self.powered).zip(&self.xr) {
+        let end = self.end;
+        for ((ix, &powered), &xr) in ix[..end].iter_mut().zip(&self.powered).zip(&self.xr) {
             let magnitude = round_to_magnitude(powered * scale - 0.0946);
             largest = largest.max(magnitude);
             *ix = if xr.is_sign_negative() {
