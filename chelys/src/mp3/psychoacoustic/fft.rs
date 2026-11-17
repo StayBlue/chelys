@@ -30,7 +30,10 @@ impl Complex {
 }
 
 pub struct Fft {
-    /// `e^(-2 pi i k / N)` for `k < N / 2`.
+    /// The pairs of positions that the bit reversal swaps.
+    swaps: Vec<(u32, u32)>,
+    /// For each stage, from the butterflies of span 2 up, the twiddles
+    /// `e^(-2 pi i k / (2 h))` of its `h` butterflies, one after the other.
     twiddles: Vec<Complex>,
 }
 
@@ -43,16 +46,27 @@ impl Fft {
             size >= 2 && size.is_power_of_two(),
             "FFT size {size} is not a power of two of at least 2"
         );
-        let twiddles = (0..size / 2)
-            .map(|k| {
-                let angle = -2.0 * PI * k as f64 / size as f64;
-                Complex {
-                    re: angle.cos(),
-                    im: angle.sin(),
-                }
-            })
+        let twiddle = |k: usize| {
+            let angle = -2.0 * PI * k as f64 / size as f64;
+            Complex {
+                re: angle.cos(),
+                im: angle.sin(),
+            }
+        };
+        let bits = size.trailing_zeros();
+        let swaps = (0..size)
+            .map(|i| (i, i.reverse_bits() >> (usize::BITS - bits)))
+            .filter(|&(i, j)| i < j)
+            .map(|(i, j)| (i as u32, j as u32))
             .collect();
-        Self { twiddles }
+        let mut twiddles = Vec::with_capacity(size);
+        let mut half = 1;
+        while half < size {
+            let stride = size / (2 * half);
+            twiddles.extend((0..half).map(|k| twiddle(k * stride)));
+            half *= 2;
+        }
+        Self { swaps, twiddles }
     }
 
     /// Transforms `x` in place.
@@ -61,30 +75,27 @@ impl Fft {
     ///
     /// If `x` is not the size the transform was made for.
     pub fn transform(&self, x: &mut [Complex]) {
-        let n = 2 * self.twiddles.len();
+        let n = self.twiddles.len() + 1;
         assert_eq!(x.len(), n, "FFT input size");
-        let bits = n.trailing_zeros();
-        for i in 0..n {
-            let j = i.reverse_bits() >> (usize::BITS - bits);
-            if i < j {
-                x.swap(i, j);
-            }
+        for &(i, j) in &self.swaps {
+            x.swap(i as usize, j as usize);
         }
         let mut half = 1;
         while half < n {
-            let stride = n / (2 * half);
-            for start in (0..n).step_by(2 * half) {
-                for k in 0..half {
-                    let odd = x[start + half + k].mul(self.twiddles[k * stride]);
-                    let even = x[start + k];
-                    x[start + k] = Complex {
-                        re: even.re + odd.re,
-                        im: even.im + odd.im,
+            let twiddles = &self.twiddles[half - 1..][..half];
+            for block in x.chunks_exact_mut(2 * half) {
+                let (evens, odds) = block.split_at_mut(half);
+                for ((even, odd), twiddle) in evens.iter_mut().zip(odds).zip(twiddles) {
+                    let product = odd.mul(*twiddle);
+                    let sum = Complex {
+                        re: even.re + product.re,
+                        im: even.im + product.im,
                     };
-                    x[start + half + k] = Complex {
-                        re: even.re - odd.re,
-                        im: even.im - odd.im,
+                    *odd = Complex {
+                        re: even.re - product.re,
+                        im: even.im - product.im,
                     };
+                    *even = sum;
                 }
             }
             half *= 2;
