@@ -4,7 +4,7 @@
 //! The outer iteration loop, or distortion control loop (clause C.1.5.4.3,
 //! figure C.9.b).
 
-use super::inner::{Lines, inner_loop_lines, step_size};
+use super::inner::{Lines, Step, inner_loop_step, step_size};
 use crate::mp3::header::SamplingFrequency;
 use crate::mp3::huffman::{Counted, MAX_MAGNITUDE, SpectrumCoding};
 use crate::mp3::scalefactor_bands::{self, Band, LONG_BANDS};
@@ -228,9 +228,10 @@ pub fn outer_loop(
             }
         }
     }
-    // The least excess measured, and the result that had it, with its
-    // scalefactors before any intensity stereo marks.
-    let mut best: Option<(f64, Outcome, Scalefactors)> = None;
+    // The least excess measured, and the result that had it, whether it was
+    // within its allowance, and its scalefactors before any intensity
+    // stereo marks.
+    let mut best: Option<(f64, (Fitted, bool), Scalefactors)> = None;
     let mut start_gain = None;
     // The lines of the last iteration, whose powers the next takes over.
     let mut lines: Option<Lines> = None;
@@ -266,9 +267,10 @@ pub fn outer_loop(
             }
             break;
         };
-        start_gain = Some(granule.global_gain);
+        start_gain = Some(granule.global_gain());
 
-        let distortion = distortion(&amplified, &granule, &bands);
+        let distortion =
+            quantisation_distortion(&amplified, granule.values(), granule.global_gain(), &bands);
         let allowed_for = |scalefactors: &Scalefactors| -> Vec<f64> {
             (xmin.iter().enumerate())
                 .map(|(sb, xmin)| xmin * scalefactors.amplification(sb).powi(2))
@@ -282,11 +284,7 @@ pub fn outer_loop(
         let violated = excess > 0.0;
         let first = best.is_none();
         if best.as_ref().is_none_or(|(least, ..)| excess < *least) {
-            let outcome = Outcome {
-                granule,
-                within_allowance: !violated,
-            };
-            best = Some((excess, outcome, scalefactors.clone()));
+            best = Some((excess, (granule, !violated), scalefactors.clone()));
         }
 
         // C.1.5.4.3.4: preemphasis, which raises the allowed distortion of the
@@ -328,9 +326,10 @@ pub fn outer_loop(
             break;
         }
     }
-    let (_, outcome, scalefactors) = best.expect("lines without scalefactors always quantise");
+    let (_, (fitted, within_allowance), scalefactors) =
+        best.expect("lines without scalefactors always quantise");
     match saving {
-        Some(saving) if outcome.within_allowance && block_type == BlockType::Normal => {
+        Some(saving) if within_allowance && block_type == BlockType::Normal => {
             let amplified = amplify(xr, &scalefactors, &bands);
             let to_save = ToSave {
                 lines: lines_for(&lines, &amplified),
@@ -341,13 +340,67 @@ pub fn outer_loop(
                 sampling_frequency,
                 intensity,
             };
-            let granule = to_save.coarsest(outcome.granule, available_bits, saving);
+            let granule = to_save.coarsest(fitted, available_bits, saving);
             Outcome {
                 granule,
                 within_allowance: true,
             }
         }
-        _ => outcome,
+        _ => Outcome {
+            granule: fitted.granule(block_type, sampling_frequency),
+            within_allowance,
+        },
+    }
+}
+
+/// A granule that [`fit`] gives: the inner loop's step, whose Huffman
+/// coding is chosen only for the granule that the outer loop keeps, with
+/// its scalefactors, or with intensity stereo, whose bits are counted
+/// with the marks, the granule made at once.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "one is held per outer loop iteration, and boxing would allocate for each"
+)]
+enum Fitted {
+    Step(Step, Scalefactors),
+    Granule(QuantizedGranule),
+}
+
+impl Fitted {
+    fn global_gain(&self) -> u8 {
+        match self {
+            Self::Step(step, _) => step.global_gain,
+            Self::Granule(granule) => granule.global_gain,
+        }
+    }
+
+    fn values(&self) -> &[i32; GRANULE_LINES] {
+        match self {
+            Self::Step(step, _) => &step.values,
+            Self::Granule(granule) => &granule.values,
+        }
+    }
+
+    fn scalefactors(&self) -> &Scalefactors {
+        match self {
+            Self::Step(_, scalefactors) => scalefactors,
+            Self::Granule(granule) => &granule.scalefactors,
+        }
+    }
+
+    fn granule(
+        self,
+        block_type: BlockType,
+        sampling_frequency: SamplingFrequency,
+    ) -> QuantizedGranule {
+        match self {
+            Self::Step(step, scalefactors) => {
+                let mut granule = step.granule(block_type, sampling_frequency);
+                granule.scalefactors = scalefactors;
+                granule
+            }
+            Self::Granule(granule) => granule,
+        }
     }
 }
 
@@ -385,13 +438,9 @@ impl ToSave<'_> {
     /// it has none, as [`fit`] gives it. The search stops at the first step
     /// that fails, as distortion and bits follow the step only roughly; it
     /// counts the bits of a step only where it has to.
-    fn coarsest(
-        &self,
-        granule: QuantizedGranule,
-        available_bits: usize,
-        saving: Saving,
-    ) -> QuantizedGranule {
+    fn coarsest(&self, granule: Fitted, available_bits: usize, saving: Saving) -> QuantizedGranule {
         let fs = self.sampling_frequency;
+        let block_type = BlockType::Normal;
         let amplified = self.lines.xr();
         let raised = 10f64.powf(saving.noise_db / 10.0);
         let allowed: Vec<f64> = (self.xmin.iter().enumerate())
@@ -435,7 +484,7 @@ impl ToSave<'_> {
                 };
                 let most = available_bits.checked_sub(part2)?;
                 let least = saving.least.saturating_sub(part2);
-                let counted = SpectrumCoding::count(&values, granule.block_type, self.bands, fs);
+                let counted = SpectrumCoding::count(&values, block_type, self.bands, fs);
                 counted.bits_between(least, most).then_some(Kept {
                     global_gain,
                     values,
@@ -452,10 +501,10 @@ impl ToSave<'_> {
         // a step coarser than one whose bits fail. With intensity stereo,
         // the bits of the scalefactors change with the bands marked, which
         // need not follow the step, and the bits of every step are counted.
-        let mut marked = granule.scalefactors.marks_any();
+        let mut marked = granule.scalefactors().marks_any();
         let mut kept = None;
         let mut last = None;
-        for global_gain in granule.global_gain.saturating_add(1)..=u8::MAX {
+        for global_gain in granule.global_gain().saturating_add(1)..=u8::MAX {
             let Some(step) = quantised(global_gain, marked) else {
                 break;
             };
@@ -475,7 +524,7 @@ impl ToSave<'_> {
                 return Some(kept);
             }
             // Every step up to `coarsest` passed its distortion.
-            let (mut passed, mut failed, mut kept) = (granule.global_gain, coarsest, None);
+            let (mut passed, mut failed, mut kept) = (granule.global_gain(), coarsest, None);
             while failed - passed > 1 {
                 let middle = passed + (failed - passed) / 2;
                 let step = quantised(middle, marked).expect("the step passed");
@@ -496,11 +545,11 @@ impl ToSave<'_> {
             counted,
         }) = kept
         else {
-            return granule;
+            return granule.granule(block_type, fs);
         };
         let (coding, _) = counted.choose();
         let mut coarsest =
-            QuantizedGranule::with_coding(global_gain, values, granule.block_type, fs, coding);
+            QuantizedGranule::with_coding(global_gain, values, block_type, fs, coding);
         coarsest.scalefactors = scalefactors;
         debug_assert!((saving.least..=available_bits).contains(&coarsest.bit_len(fs)));
         coarsest
@@ -525,14 +574,14 @@ fn fit(
     sampling_frequency: SamplingFrequency,
     start_gain: Option<u8>,
     intensity: Option<&IntensityPositions>,
-) -> Option<QuantizedGranule> {
+) -> Option<Fitted> {
     let compress = scalefactors
         .compress()
         .expect("scalefactors are kept within their limits");
     let amplified = lines.xr();
     let mut huffman_bits = available_bits.checked_sub(scalefactors.part2_length(compress))?;
     loop {
-        let mut granule = inner_loop_lines(
+        let step = inner_loop_step(
             lines,
             huffman_bits,
             block_type,
@@ -540,9 +589,9 @@ fn fit(
             start_gain,
         )?;
         let Some(intensity) = intensity else {
-            granule.scalefactors = scalefactors.clone();
-            return Some(granule);
+            return Some(Fitted::Step(step, scalefactors.clone()));
         };
+        let mut granule = step.granule(block_type, sampling_frequency);
         let mut values = granule.values;
         if intensity.fill_below_bound(&mut values, amplified) {
             let mut filled =
@@ -552,7 +601,7 @@ fn fit(
             intensity.mark(&mut filled.scalefactors, &filled.values);
             let bits = filled.bit_len(sampling_frequency);
             if bits <= available_bits {
-                return Some(filled);
+                return Some(Fitted::Granule(filled));
             }
             // Fewer bits for the inner loop if that leaves room for the
             // value; failing that, the granule as it is, marked.
@@ -565,7 +614,7 @@ fn fit(
         intensity.mark(&mut granule.scalefactors, &granule.values);
         let bits = granule.bit_len(sampling_frequency);
         if bits <= available_bits {
-            return Some(granule);
+            return Some(Fitted::Granule(granule));
         }
         huffman_bits = huffman_bits.checked_sub(bits - available_bits)?;
     }

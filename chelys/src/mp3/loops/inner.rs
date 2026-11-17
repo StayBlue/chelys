@@ -193,15 +193,34 @@ pub fn inner_loop_lines(
     sampling_frequency: SamplingFrequency,
     start_gain: Option<u8>,
 ) -> Option<QuantizedGranule> {
-    if lines.xr.iter().all(|&x| x == 0.0) {
-        return Some(QuantizedGranule::new(
-            0,
-            [0; GRANULE_LINES],
-            block_type,
-            sampling_frequency,
-        ));
-    }
+    inner_loop_step(
+        lines,
+        available_bits,
+        block_type,
+        sampling_frequency,
+        start_gain,
+    )
+    .map(|step| step.granule(block_type, sampling_frequency))
+}
+
+/// [`inner_loop_lines`], giving the step it ends on, whose granule, with
+/// its Huffman coding, is made only if it is kept.
+pub fn inner_loop_step(
+    lines: &Lines,
+    available_bits: usize,
+    block_type: BlockType,
+    sampling_frequency: SamplingFrequency,
+    start_gain: Option<u8>,
+) -> Option<Step> {
     let bands = scalefactor_bands::coding_bands(block_type, sampling_frequency);
+    if lines.xr.iter().all(|&x| x == 0.0) {
+        let values = [0; GRANULE_LINES];
+        return Some(Step {
+            global_gain: 0,
+            values,
+            counted: SpectrumCoding::count(&values, block_type, &bands, sampling_frequency),
+        });
+    }
     // A step that fits, with its values; the granule is made only for the
     // step the search ends on.
     let attempt = |global_gain: u8| {
@@ -213,17 +232,6 @@ pub fn inner_loop_lines(
             counted,
         })
     };
-    let granule = |step: Step| {
-        let (coding, _) = step.counted.choose();
-        QuantizedGranule::with_coding(
-            step.global_gain,
-            step.values,
-            block_type,
-            sampling_frequency,
-            coding,
-        )
-    };
-
     // Each search keeps the step it ends on, so that no step is quantised
     // twice.
     let start = start_gain.unwrap_or_else(|| estimated_gain(lines, available_bits));
@@ -232,7 +240,7 @@ pub fn inner_loop_lines(
         while let Some(finer) = step.global_gain.checked_sub(1).and_then(&attempt) {
             step = finer;
         }
-        return Some(granule(step));
+        return Some(step);
     }
     // Coarser steps until one fits: doubling the distance, then bisecting.
     let (mut over, mut distance) = (start, 1u8);
@@ -247,16 +255,34 @@ pub fn inner_loop_lines(
         over = next;
         distance = distance.saturating_mul(2);
     };
-    Some(granule(bisect_between(&attempt, over, fits)))
+    Some(bisect_between(&attempt, over, fits))
 }
 
 /// A step size, the values quantised with it, and their counts.
-struct Step {
-    global_gain: u8,
-    values: [i32; GRANULE_LINES],
+pub struct Step {
+    pub global_gain: u8,
+    pub values: [i32; GRANULE_LINES],
     /// The values counted for their coding, which the step's granule is
     /// made with.
     counted: Counted,
+}
+
+impl Step {
+    /// The granule of the step, with all scalefactors zero.
+    pub fn granule(
+        self,
+        block_type: BlockType,
+        sampling_frequency: SamplingFrequency,
+    ) -> QuantizedGranule {
+        let (coding, _) = self.counted.choose();
+        QuantizedGranule::with_coding(
+            self.global_gain,
+            self.values,
+            block_type,
+            sampling_frequency,
+            coding,
+        )
+    }
 }
 
 /// The bits that the Huffman coding of a granule is estimated to need for
