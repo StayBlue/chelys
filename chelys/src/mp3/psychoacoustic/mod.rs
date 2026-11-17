@@ -211,30 +211,35 @@ struct Polar {
 struct Analysis {
     fft: Fft,
     window: Vec<f64>,
+    /// The lines whose unpredictability the model uses, from DC up; above
+    /// them it is not computed, and the phases not kept.
+    predicted: usize,
     last: Vec<Polar>,
     before_last: Vec<Polar>,
 }
 
 impl Analysis {
-    fn new(size: usize) -> Self {
+    fn new(size: usize, predicted: usize) -> Self {
         // Clause D.2.4 b): sw(i) = s(i) * (0.5 - 0.5 cos(2 pi (i - 0.5) / N))
         // for i = 1..N.
         let window = (0..size)
             .map(|n| 0.5 - 0.5 * (2.0 * PI * (n as f64 + 0.5) / size as f64).cos())
             .collect();
         // Clause D.2.1 asks for the stored spectra to start at zero.
-        let lines = size / 2 + 1;
+        assert!(predicted <= size / 2 + 1, "lines to predict");
         Self {
             fft: Fft::new(size),
             window,
-            last: vec![Polar::default(); lines],
-            before_last: vec![Polar::default(); lines],
+            predicted,
+            last: vec![Polar::default(); predicted],
+            before_last: vec![Polar::default(); predicted],
         }
     }
 
-    /// Transforms the windowed `samples` and returns the magnitudes and
-    /// unpredictabilities `c` of the lines from DC to Nyquist (clause D.2.4
-    /// b) to d)), remembering the spectrum for the next block.
+    /// Transforms the windowed `samples` and returns the magnitudes of the
+    /// lines from DC to Nyquist and the unpredictabilities `c` of the lines
+    /// predicted (clause D.2.4 b) to d)), remembering their spectrum for the
+    /// next block.
     fn next_block(&mut self, samples: &[f64]) -> (Vec<f64>, Vec<f64>) {
         let size = self.window.len();
         let mut x: Vec<Complex> = samples
@@ -248,12 +253,12 @@ impl Analysis {
         self.fft.transform(&mut x);
 
         let lines = size / 2 + 1;
-        let mut r = Vec::with_capacity(lines);
-        let mut c = Vec::with_capacity(lines);
-        let mut current = Vec::with_capacity(lines);
-        for (w, x) in x[..lines].iter().enumerate() {
+        let r: Vec<f64> = x[..lines].iter().map(|x| x.re.hypot(x.im)).collect();
+        let mut c = Vec::with_capacity(self.predicted);
+        let mut current = Vec::with_capacity(self.predicted);
+        for (w, x) in x[..self.predicted].iter().enumerate() {
             let polar = Polar {
-                r: x.re.hypot(x.im),
+                r: r[w],
                 f: x.im.atan2(x.re),
             };
             let (last, before_last) = (self.last[w], self.before_last[w]);
@@ -266,7 +271,6 @@ impl Analysis {
             // by zero. The line has no energy, so its unpredictability carries
             // no weight and any value does.
             c.push(if scale == 0.0 { 0.0 } else { distance / scale });
-            r.push(polar.r);
             current.push(polar);
         }
         self.before_last = std::mem::replace(&mut self.last, current);
@@ -332,8 +336,10 @@ impl PsychoacousticModel {
                 short_partitions.iter().map(|p| (p.qthr, p.width, p.bval)),
             ),
             history: [0.0; HISTORY],
-            long: Analysis::new(LONG_FFT),
-            short: Analysis::new(SHORT_FFT),
+            long: Analysis::new(LONG_FFT, LONG_CW_LINES),
+            // The lines of the short FFT that stand for the long FFT's
+            // below SHORT_CW_LINES (see `analyse`).
+            short: Analysis::new(SHORT_FFT, (SHORT_CW_LINES - 1 + 2) / 4 + 1),
             nb_last: vec![0.0; partitions.len()],
             nb_before_last: vec![0.0; partitions.len()],
         }
