@@ -48,16 +48,35 @@ impl<'a> Lines<'a> {
     fn quantize(&self, global_gain: u8) -> Option<[i32; GRANULE_LINES]> {
         let scale = step_size(global_gain).powf(-0.75);
         let mut ix = [0; GRANULE_LINES];
+        let mut largest = 0;
         for ((ix, &powered), &xr) in ix.iter_mut().zip(&self.powered).zip(self.xr) {
-            let magnitude = (powered * scale - 0.0946).round().max(0.0);
-            if magnitude > f64::from(MAX_MAGNITUDE) {
-                return None;
-            }
-            *ix = magnitude.copysign(xr) as i32;
+            let magnitude = round_to_magnitude(powered * scale - 0.0946);
+            largest = largest.max(magnitude);
+            *ix = if xr.is_sign_negative() {
+                -magnitude
+            } else {
+                magnitude
+            };
         }
-        Some(ix)
+        (largest <= MAX_MAGNITUDE as i32).then_some(ix)
     }
 }
+
+/// `nint(x)`, rounding halves away from zero as [`f64::round`] does, but
+/// zero for negative `x`, and at most [`BEYOND_MAGNITUDE`], beyond
+/// [`MAX_MAGNITUDE`]. Without SSE4.1, `f64::round` is a call to the C
+/// library; this takes a conversion to an integer, which truncates, and a
+/// comparison, and gives the same values.
+fn round_to_magnitude(x: f64) -> i32 {
+    let x = x.clamp(0.0, f64::from(BEYOND_MAGNITUDE));
+    let truncated = x as i32;
+    // Exact: `x` and its truncation lie within 1 of each other.
+    let fraction = x - f64::from(truncated);
+    truncated + i32::from(fraction >= 0.5)
+}
+
+/// A magnitude that the Huffman tables cannot code.
+const BEYOND_MAGNITUDE: i32 = 2 * MAX_MAGNITUDE as i32;
 
 /// The inner iteration loop (clause C.1.5.4.4, figure C.9.c): quantises
 /// `xr`, the lines of a granule of `block_type` in the order they are sent,
@@ -191,6 +210,36 @@ mod tests {
         xr[1] = -(0.6f64.powf(4.0 / 3.0));
         let ix = quantize(&xr, 210).unwrap();
         assert_eq!(ix[..2], [0, -1]);
+    }
+
+    #[test]
+    fn rounds_as_f64_round_does() {
+        let mut x = 0.0f64;
+        let mut cases = vec![
+            -1.5,
+            -0.5,
+            -0.0,
+            0.0,
+            0.5,
+            1.5,
+            2.5,
+            8191.5,
+            1e300,
+            f64::MAX,
+        ];
+        for _ in 0..200_000 {
+            x = (x * 1.618_033_988_7 + 0.123_456_789) % 9000.0;
+            cases.extend([
+                x,
+                x.floor() + 0.5,
+                (x.floor() + 0.5).next_down(),
+                x - 4500.0,
+            ]);
+        }
+        for x in cases {
+            let expected = x.round().clamp(0.0, f64::from(BEYOND_MAGNITUDE)) as i32;
+            assert_eq!(round_to_magnitude(x), expected, "{x}");
+        }
     }
 
     #[test]
