@@ -32,24 +32,45 @@ pub fn quantize(xr: &[f64; GRANULE_LINES], global_gain: u8) -> Option<[i32; GRAN
 /// A granule's lines with their magnitudes raised to the power 0.75 once, so
 /// that each step size tried costs one multiplication per line:
 /// `(|xr| / step)^0.75 = |xr|^0.75 * step^-0.75`.
-struct Lines<'a> {
-    xr: &'a [f64; GRANULE_LINES],
+pub struct Lines {
+    xr: [f64; GRANULE_LINES],
     powered: [f64; GRANULE_LINES],
 }
 
-impl<'a> Lines<'a> {
-    fn new(xr: &'a [f64; GRANULE_LINES]) -> Self {
+impl Lines {
+    pub fn new(xr: &[f64; GRANULE_LINES]) -> Self {
         Self {
-            xr,
-            powered: xr.map(|x| x.abs().powf(0.75)),
+            xr: *xr,
+            powered: xr.map(power_three_quarters),
         }
     }
 
-    fn quantize(&self, global_gain: u8) -> Option<[i32; GRANULE_LINES]> {
+    /// The lines `xr`, taking the power of each line that is unchanged
+    /// from these lines, as most are from one iteration of the outer loop
+    /// to the next.
+    pub fn updated(&self, xr: &[f64; GRANULE_LINES]) -> Self {
+        Self {
+            xr: *xr,
+            powered: std::array::from_fn(|i| {
+                if xr[i] == self.xr[i] {
+                    self.powered[i]
+                } else {
+                    power_three_quarters(xr[i])
+                }
+            }),
+        }
+    }
+
+    pub fn xr(&self) -> &[f64; GRANULE_LINES] {
+        &self.xr
+    }
+
+    /// [`quantize`] with these lines.
+    pub fn quantize(&self, global_gain: u8) -> Option<[i32; GRANULE_LINES]> {
         let scale = step_size(global_gain).powf(-0.75);
         let mut ix = [0; GRANULE_LINES];
         let mut largest = 0;
-        for ((ix, &powered), &xr) in ix.iter_mut().zip(&self.powered).zip(self.xr) {
+        for ((ix, &powered), &xr) in ix.iter_mut().zip(&self.powered).zip(&self.xr) {
             let magnitude = round_to_magnitude(powered * scale - 0.0946);
             largest = largest.max(magnitude);
             *ix = if xr.is_sign_negative() {
@@ -60,6 +81,12 @@ impl<'a> Lines<'a> {
         }
         (largest <= MAX_MAGNITUDE as i32).then_some(ix)
     }
+}
+
+/// `|x|^0.75`.
+fn power_three_quarters(x: f64) -> f64 {
+    // Zero, which many upper lines are, needs no power.
+    if x == 0.0 { 0.0 } else { x.abs().powf(0.75) }
 }
 
 /// `nint(x)`, rounding halves away from zero as [`f64::round`] does, but
@@ -104,7 +131,24 @@ pub fn inner_loop(
     sampling_frequency: SamplingFrequency,
     start_gain: Option<u8>,
 ) -> Option<QuantizedGranule> {
-    if xr.iter().all(|&x| x == 0.0) {
+    inner_loop_lines(
+        &Lines::new(xr),
+        available_bits,
+        block_type,
+        sampling_frequency,
+        start_gain,
+    )
+}
+
+/// [`inner_loop`] for the [`Lines`] `lines`.
+pub fn inner_loop_lines(
+    lines: &Lines,
+    available_bits: usize,
+    block_type: BlockType,
+    sampling_frequency: SamplingFrequency,
+    start_gain: Option<u8>,
+) -> Option<QuantizedGranule> {
+    if lines.xr.iter().all(|&x| x == 0.0) {
         return Some(QuantizedGranule::new(
             0,
             [0; GRANULE_LINES],
@@ -113,7 +157,6 @@ pub fn inner_loop(
         ));
     }
     let bands = scalefactor_bands::coding_bands(block_type, sampling_frequency);
-    let lines = Lines::new(xr);
     let attempt = |global_gain: u8| {
         let values = lines.quantize(global_gain)?;
         let granule = QuantizedGranule::new(global_gain, values, block_type, sampling_frequency);

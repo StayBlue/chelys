@@ -4,7 +4,7 @@
 //! The outer iteration loop, or distortion control loop (clause C.1.5.4.3,
 //! figure C.9.b).
 
-use super::inner::{inner_loop, quantize, step_size};
+use super::inner::{Lines, inner_loop_lines, step_size};
 use crate::mp3::header::SamplingFrequency;
 use crate::mp3::huffman::MAX_MAGNITUDE;
 use crate::mp3::scalefactor_bands::{self, Band, LONG_BANDS};
@@ -232,11 +232,18 @@ pub fn outer_loop(
     // scalefactors before any intensity stereo marks.
     let mut best: Option<(f64, Outcome, Scalefactors)> = None;
     let mut start_gain = None;
+    // The lines of the last iteration, whose powers the next takes over.
+    let mut lines: Option<Lines> = None;
+    let lines_for = |lines: &Option<Lines>, amplified: &[f64; GRANULE_LINES]| match lines {
+        Some(lines) => lines.updated(amplified),
+        None => Lines::new(amplified),
+    };
 
     loop {
         let amplified = amplify(xr, &scalefactors, &bands);
+        let current = lines_for(&lines, &amplified);
         let granule = fit(
-            &amplified,
+            &current,
             &scalefactors,
             block_type,
             available_bits,
@@ -244,6 +251,7 @@ pub fn outer_loop(
             start_gain,
             intensity,
         );
+        lines = Some(current);
         let Some(granule) = granule else {
             if best.is_none() && reuse.is_some() {
                 return outer_loop(
@@ -323,8 +331,9 @@ pub fn outer_loop(
     let (_, outcome, scalefactors) = best.expect("lines without scalefactors always quantise");
     match saving {
         Some(saving) if outcome.within_allowance && block_type == BlockType::Normal => {
+            let amplified = amplify(xr, &scalefactors, &bands);
             let to_save = ToSave {
-                xr,
+                lines: lines_for(&lines, &amplified),
                 xmin,
                 scalefactors: &scalefactors,
                 bands: &bands,
@@ -344,7 +353,8 @@ pub fn outer_loop(
 
 /// A granule that met its allowance, to quantise with a coarser step.
 struct ToSave<'a> {
-    xr: &'a [f64; GRANULE_LINES],
+    /// Its lines amplified by its scalefactors.
+    lines: Lines,
     xmin: &'a [f64],
     /// Its scalefactors before any intensity stereo marks.
     scalefactors: &'a Scalefactors,
@@ -372,21 +382,21 @@ impl ToSave<'_> {
         saving: Saving,
     ) -> QuantizedGranule {
         let fs = self.sampling_frequency;
-        let amplified = amplify(self.xr, self.scalefactors, self.bands);
+        let amplified = self.lines.xr();
         let raised = 10f64.powf(saving.noise_db / 10.0);
         let allowed: Vec<f64> = (self.xmin.iter().enumerate())
             .map(|(sb, xmin)| raised * xmin * self.scalefactors.amplification(sb).powi(2))
             .collect();
         let mut kept = granule;
         for global_gain in kept.global_gain.saturating_add(1)..=u8::MAX {
-            let Some(mut values) = quantize(&amplified, global_gain) else {
+            let Some(mut values) = self.lines.quantize(global_gain) else {
                 break;
             };
             if let Some(intensity) = self.intensity {
-                intensity.fill_below_bound(&mut values, &amplified);
+                intensity.fill_below_bound(&mut values, amplified);
             }
             // The distortion first, as it needs no Huffman coding.
-            let distortion = quantisation_distortion(&amplified, &values, global_gain, self.bands);
+            let distortion = quantisation_distortion(amplified, &values, global_gain, self.bands);
             if (0..self.bands.len())
                 .any(|sb| !self.fixed.contains(&sb) && distortion[sb] > allowed[sb])
             {
@@ -413,7 +423,7 @@ impl ToSave<'_> {
 /// `available_bits` with the scalefactors, marked for intensity stereo if
 /// `intensity` is given. `None` if they do not fit.
 fn fit(
-    amplified: &[f64; GRANULE_LINES],
+    lines: &Lines,
     scalefactors: &Scalefactors,
     block_type: BlockType,
     available_bits: usize,
@@ -424,10 +434,11 @@ fn fit(
     let compress = scalefactors
         .compress()
         .expect("scalefactors are kept within their limits");
+    let amplified = lines.xr();
     let mut huffman_bits = available_bits.checked_sub(scalefactors.part2_length(compress))?;
     loop {
-        let mut granule = inner_loop(
-            amplified,
+        let mut granule = inner_loop_lines(
+            lines,
             huffman_bits,
             block_type,
             sampling_frequency,
@@ -583,6 +594,7 @@ fn coarser(scalefactors: &Scalefactors) -> Scalefactors {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mp3::loops::{inner_loop, quantize};
 
     const FS: SamplingFrequency = SamplingFrequency::Hz44100;
 
