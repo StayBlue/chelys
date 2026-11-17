@@ -79,11 +79,51 @@ impl SpectrumCoding {
         bands: &[Band],
         sampling_frequency: SamplingFrequency,
     ) -> Self {
+        Self::choose_counted(values, block_type, bands, sampling_frequency).0
+    }
+
+    /// [`choose`](Self::choose), with the [`bit_count`](Self::bit_count) of
+    /// the coding chosen, which the choice works out anyway.
+    fn choose_counted(
+        values: &[i32; GRANULE_LINES],
+        block_type: BlockType,
+        bands: &[Band],
+        sampling_frequency: SamplingFrequency,
+    ) -> (Self, usize) {
+        let counted = Self::choose_and_count(values, block_type, bands, sampling_frequency);
+        debug_assert_eq!(counted.1, counted.0.bit_count(values, bands));
+        counted
+    }
+
+    fn choose_and_count(
+        values: &[i32; GRANULE_LINES],
+        block_type: BlockType,
+        bands: &[Band],
+        sampling_frequency: SamplingFrequency,
+    ) -> (Self, usize) {
         assert!(
             values.iter().all(|v| v.unsigned_abs() <= MAX_MAGNITUDE),
             "quantised magnitudes are limited to {MAX_MAGNITUDE}"
         );
+        let (start, end, zeros_end) = Self::partitions(values);
+        let run = Self::partitioned(values, start, end, block_type, bands, sampling_frequency);
+        let Some(zeros_end) = zeros_end else {
+            return run;
+        };
+        let shorter = Self::partitioned(
+            values,
+            zeros_end,
+            end,
+            block_type,
+            bands,
+            sampling_frequency,
+        );
+        if shorter.1 < run.1 { shorter } else { run }
+    }
 
+    /// The partitions to try: `count1` from the first line returned, or
+    /// from the third if given, to the second.
+    fn partitions(values: &[i32; GRANULE_LINES]) -> (usize, usize, Option<usize>) {
         // C.1.5.4.4.3: pairs of zeros at the top of the spectrum ("rzero").
         let mut end = GRANULE_LINES;
         while end >= 2 && values[end - 2..end] == [0, 0] {
@@ -98,7 +138,6 @@ impl SpectrumCoding {
         {
             start -= 4;
         }
-        let run = Self::partitioned(values, start, end, block_type, bands, sampling_frequency);
         // Spec reading: clause C.1.5.4.4.4 puts the whole run of such
         // quadruples in "count1", where each costs a bit at least, even one
         // of zeros. In `big_values` zeros can cost nothing, in a region coded
@@ -113,26 +152,14 @@ impl SpectrumCoding {
             .step_by(4)
             .filter(|&quad| values[quad..quad + 4] == [0; 4]);
         if zero_quads.clone().count() < 8 {
-            return run;
+            return (start, end, None);
         }
         let zeros_end = zero_quads.next_back().expect("quadruples of zeros") + 4;
-        let shorter = Self::partitioned(
-            values,
-            zeros_end,
-            end,
-            block_type,
-            bands,
-            sampling_frequency,
-        );
-        if shorter.bit_count(values, bands) < run.bit_count(values, bands) {
-            shorter
-        } else {
-            run
-        }
+        (start, end, Some(zeros_end))
     }
 
     /// The coding of `values` with the `big_values` partition below line
-    /// `start` and the `count1` partition from it to line `end`.
+    /// `start` and the `count1` partition from it to line `end`, and its bits.
     fn partitioned(
         values: &[i32; GRANULE_LINES],
         start: usize,
@@ -140,16 +167,20 @@ impl SpectrumCoding {
         block_type: BlockType,
         bands: &[Band],
         sampling_frequency: SamplingFrequency,
-    ) -> Self {
+    ) -> (Self, usize) {
         let (big_values, count1) = (start / 2, (end - start) / 4);
         let end = start;
 
         // C.1.5.4.4.5: whichever quadruple table needs fewer bits.
         let quads = &values[end..end + 4 * count1];
-        let count1_table = if quad_bits(QuadTable::B, quads) < quad_bits(QuadTable::A, quads) {
-            QuadTable::B
+        let (bits_a, bits_b) = (
+            quad_bits(QuadTable::A, quads),
+            quad_bits(QuadTable::B, quads),
+        );
+        let (count1_table, quad_bits) = if bits_b < bits_a {
+            (QuadTable::B, bits_b)
         } else {
-            QuadTable::A
+            (QuadTable::A, bits_a)
         };
 
         // With window_switching_flag set, region0_count and region1_count are
@@ -158,8 +189,8 @@ impl SpectrumCoding {
         // 2.4.2.7). A mixed block has the count of long blocks.
         let (region0_count, region1_count) = match block_type {
             BlockType::Normal => {
-                let (counts, table_select) = subdivide(&values[..end], bands);
-                return Self {
+                let (counts, table_select, pair_bits) = subdivide(&values[..end], bands);
+                let coding = Self {
                     big_values,
                     count1,
                     table_select,
@@ -168,6 +199,7 @@ impl SpectrumCoding {
                     mixed_region1: None,
                     count1_table,
                 };
+                return (coding, pair_bits + quad_bits);
             }
             BlockType::Start | BlockType::Stop | BlockType::Mixed => (7, 36),
             BlockType::Short => (8, 36),
@@ -182,16 +214,19 @@ impl SpectrumCoding {
             count1_table,
         };
         if block_type == BlockType::Mixed && sampling_frequency.mpeg25() {
-            let table = select_table(&values[..2 * big_values]);
+            let (table, pair_bits) = cheapest_table(&values[..2 * big_values]);
             coding.table_select = [table, table, 0];
-            return coding;
+            return (coding, pair_bits + quad_bits);
         }
         let mut start = 0;
+        let mut pair_bits = 0;
         for (region, end) in coding.region_ends(bands).into_iter().enumerate() {
-            coding.table_select[region] = select_table(&values[start..end]);
+            let (table, bits) = cheapest_table(&values[start..end]);
+            coding.table_select[region] = table;
+            pair_bits += bits;
             start = end;
         }
-        coding
+        (coding, pair_bits + quad_bits)
     }
 
     /// The line just past each of the three `big_values` regions. Region 0
@@ -274,13 +309,14 @@ impl SpectrumCoding {
 
 /// SUBDIVIDE (clause C.1.5.4.4.6) and the choice of tables (clause
 /// C.1.5.4.4.7) for the `big_values` pairs `values` of a normal block:
-/// returns `(region0_count, region1_count)` and the table of each region.
+/// returns `(region0_count, region1_count)`, the table of each region and
+/// the bits of the pairs.
 ///
 /// Spec gap: "The split strategy is up to the implementation" (clause
 /// C.1.5.4.4.6), which gives assigning a third of the bands to the first
 /// region and a quarter to the last only as "a very simple one for
 /// instance". Here every split the fields allow is tried, each region with
-/// the table that codes it in the fewest bits (see [`select_table`]), and
+/// the table that codes it in the fewest bits (see [`cheapest_table`]), and
 /// the split needing the fewest bits overall is kept. The bits it saves let
 /// the inner loop take a finer step. Graded with PEAQ (GstPEAQ 0.6.1, black
 /// box), 22 tracks of pop music at 44.1 kHz in stereo rose from a mean of
@@ -289,144 +325,286 @@ impl SpectrumCoding {
 /// 128 kbit/s (from -1.57 to -1.47 for the worst track) and from -0.22 to
 /// -0.21 at 192 kbit/s; at `--vbr` the streams came out 1 to 2% smaller at
 /// the same grade. Encoding takes about 1.4 times as long.
-fn subdivide(values: &[i32], bands: &[Band]) -> ((u8, u8), [u8; 3]) {
-    let lines = values.len();
-    let count = bands.len();
-    assert!(count <= LONG_BANDS, "a normal block has {LONG_BANDS} bands");
-    let tables = PairTables::get();
-    // For each table, its bits for the bands below each band, a band it
-    // cannot code counting nothing, as no region with it is given to it;
-    // and the largest magnitude of each band.
-    let mut below = [[0usize; LONG_BANDS + 1]; 32];
-    let mut max = [0u32; LONG_BANDS];
-    // How often each pair of magnitudes, capped at 15, occurs in a band, as
-    // `16 * x + y`, and the pairs that occur.
-    let mut pairs = [0u16; 256];
-    let mut occurring = [0u8; 256];
-    let boundary = |band: usize| bands.get(band).map_or(lines, |b| b.start.min(lines));
-    for band in 0..count {
-        let (mut signs, mut escapes, mut distinct) = (0, 0, 0);
-        for pair in values[boundary(band)..boundary(band + 1)].chunks_exact(2) {
-            let [x, y] = [pair[0], pair[1]].map(i32::unsigned_abs);
-            max[band] = max[band].max(x).max(y);
-            signs += usize::from(x != 0) + usize::from(y != 0);
-            escapes += usize::from(x >= 15) + usize::from(y >= 15);
-            let index = (16 * x.min(15) + y.min(15)) as u8;
-            if pairs[usize::from(index)] == 0 {
-                occurring[distinct] = index;
-                distinct += 1;
+fn subdivide(values: &[i32], bands: &[Band]) -> ((u8, u8), [u8; 3], usize) {
+    BandBits::new(values, bands).split()
+}
+
+/// The bits of the `big_values` pairs of a normal block, band by band, with
+/// every set of code words: what [`subdivide`] splits.
+struct BandBits {
+    /// The bands that hold pairs. A split that gives a region only bands
+    /// above them needs as many bits as one that ends the region where
+    /// they begin, which comes first and so is kept.
+    count: usize,
+    /// For each band, each set of code words' bits for the bands below it:
+    /// for a set of one table, its bits, a band it cannot code counting
+    /// nothing, as no region with it is given to it; for a set of tables
+    /// that differ only in `linbits`, the bits but for the escape fields,
+    /// whose number is counted apart, in `escapes_below`.
+    below: [[u16; CODE_SETS]; LONG_BANDS + 1],
+    escapes_below: [u16; LONG_BANDS + 1],
+    /// The largest magnitude of each band.
+    max: [u32; LONG_BANDS],
+}
+
+impl BandBits {
+    fn new(values: &[i32], bands: &[Band]) -> Self {
+        let lines = values.len();
+        assert!(
+            bands.len() <= LONG_BANDS,
+            "a normal block has {LONG_BANDS} bands"
+        );
+        let boundary = |band: usize| bands.get(band).map_or(lines, |b| b.start.min(lines));
+        let count = (0..bands.len())
+            .take_while(|&band| boundary(band) < lines)
+            .count();
+        let tables = PairTables::get();
+        let mut below = [[0u16; CODE_SETS]; LONG_BANDS + 1];
+        let mut escapes_below = [0u16; LONG_BANDS + 1];
+        let mut max = [0u32; LONG_BANDS];
+        for band in 0..count {
+            let PairCounts {
+                codes,
+                signs,
+                escapes,
+                largest,
+            } = PairCounts::new(&values[boundary(band)..boundary(band + 1)]);
+            max[band] = largest;
+            let [previous, next] = below
+                .get_disjoint_mut([band, band + 1])
+                .expect("distinct bands");
+            for set in 0..CODE_SETS {
+                let bits = if largest <= tables.largest[set] {
+                    codes[set] + signs
+                } else {
+                    0
+                };
+                next[set] = previous[set] + bits;
             }
-            pairs[usize::from(index)] += 1;
+            escapes_below[band + 1] = escapes_below[band] + escapes;
         }
-        let occurring = &occurring[..distinct];
-        // Tables that share their code words differ only in `linbits`, so
-        // their code words are counted once.
-        let mut code_bits = [None::<usize>; 32];
-        for entry in &tables.entries {
-            let t = usize::from(entry.table_select);
-            let mut bits = 0;
-            if max[band] <= entry.largest {
-                let table = entry.table;
-                let codes = *code_bits[entry.first].get_or_insert_with(|| {
-                    (occurring.iter())
-                        .map(|&index| {
-                            let (x, y) = (usize::from(index / 16), usize::from(index % 16));
-                            usize::from(pairs[usize::from(index)])
-                                * table.codes[x * table.size + y].len as usize
-                        })
-                        .sum()
-                });
-                bits = codes + signs + escapes * table.linbits as usize;
-            }
-            below[t][band + 1] = below[t][band] + bits;
-        }
-        for &index in occurring {
-            pairs[usize::from(index)] = 0;
+        // A granule's pairs need too few bits for the sums to overflow.
+        assert!(below[count].iter().all(|&bits| bits <= i16::MAX as u16 / 2));
+        Self {
+            count,
+            below,
+            escapes_below,
+            max,
         }
     }
-    // The table that codes the bands `range` in the fewest bits, and those
-    // bits.
-    let region = |range: std::ops::Range<usize>| -> (u8, usize) {
-        let largest = max[range.clone()].iter().copied().max().unwrap_or(0);
-        let mut best = (31, usize::MAX);
-        for entry in tables
-            .entries
-            .iter()
-            .filter(|entry| largest <= entry.largest)
-        {
-            let below = &below[usize::from(entry.table_select)];
-            let bits = below[range.end] - below[range.start];
-            if bits < best.1 {
-                best = (entry.table_select, bits);
-            }
-        }
-        best
-    };
-    // The last region, for each band it may start at.
-    let mut last = [(0u8, 0usize); LONG_BANDS + 1];
-    for (start, last) in last.iter_mut().enumerate().take(count + 1) {
-        *last = region(start..count);
+
+    /// The table that codes the bands `range` in the fewest bits, and those
+    /// bits.
+    fn region(&self, range: std::ops::Range<usize>) -> (u8, usize) {
+        let tables = PairTables::get();
+        let largest = self.max[range.clone()].iter().copied().max().unwrap_or(0);
+        let (end, start) = (&self.below[range.end], &self.below[range.start]);
+        let escapes = self.escapes_below[range.end] - self.escapes_below[range.start];
+        let bits: [u16; CODE_SETS] = std::array::from_fn(|set| end[set].wrapping_sub(start[set]));
+        tables.cheapest(&bits, escapes, largest)
     }
-    let mut best: Option<(usize, (u8, u8), [u8; 3])> = None;
-    // region0_count and region1_count are 4- and 3-bit fields.
-    for region0 in 0..16u8 {
-        let end0 = (usize::from(region0) + 1).min(count);
-        let (table0, bits0) = region(0..end0);
-        for region1 in 0..8u8 {
-            let end1 = (end0 + usize::from(region1) + 1).min(count);
-            let (table1, bits1) = region(end0..end1);
-            let (table2, bits2) = last[end1];
-            let bits = bits0 + bits1 + bits2;
-            if best.as_ref().is_none_or(|&(least, ..)| bits < least) {
-                best = Some((bits, (region0, region1), [table0, table1, table2]));
+
+    /// The split needing the fewest bits: `(region0_count, region1_count)`,
+    /// the table of each region and the bits of the pairs.
+    fn split(&self) -> ((u8, u8), [u8; 3], usize) {
+        let count = self.count;
+        let region = |range| self.region(range);
+        // The last region, for each band it may start at.
+        let mut last = [(0u8, 0usize); LONG_BANDS + 1];
+        for (start, last) in last.iter_mut().enumerate().take(count + 1) {
+            *last = region(start..count);
+        }
+        let mut best: Option<(usize, (u8, u8), [u8; 3])> = None;
+        // region0_count and region1_count are 4- and 3-bit fields.
+        for region0 in 0..16u8 {
+            let end0 = (usize::from(region0) + 1).min(count);
+            let (table0, bits0) = region(0..end0);
+            for region1 in 0..8u8 {
+                let end1 = (end0 + usize::from(region1) + 1).min(count);
+                let (table1, bits1) = region(end0..end1);
+                let (table2, bits2) = last[end1];
+                let bits = bits0 + bits1 + bits2;
+                if best.as_ref().is_none_or(|&(least, ..)| bits < least) {
+                    best = Some((bits, (region0, region1), [table0, table1, table2]));
+                }
+                if end1 == count {
+                    break;
+                }
             }
-            if end1 == count {
+            if end0 == count {
                 break;
             }
         }
-        if end0 == count {
-            break;
-        }
+        let (bits, counts, tables) = best.expect("at least one split");
+        (counts, tables, bits)
     }
-    let (_, counts, tables) = best.expect("at least one split");
-    (counts, tables)
 }
+
+/// What the bits of some pairs with each set of code words come to.
+struct PairCounts {
+    /// The bits of their code words in each set, with nothing for a pair
+    /// that a set has no code word for.
+    codes: [u16; CODE_SETS],
+    /// Their nonzero values, which each have a sign bit.
+    signs: u16,
+    /// Their values of 15 or more, which each have an escape field.
+    escapes: u16,
+    /// Their largest magnitude.
+    largest: u32,
+}
+
+impl PairCounts {
+    fn new(values: &[i32]) -> Self {
+        let tables = PairTables::get();
+        let mut counts = Self {
+            codes: [0; CODE_SETS],
+            signs: 0,
+            escapes: 0,
+            largest: 0,
+        };
+        for pair in values.chunks_exact(2) {
+            let [x, y] = [pair[0], pair[1]].map(i32::unsigned_abs);
+            counts.largest = counts.largest.max(x).max(y);
+            counts.signs += u16::from(x != 0) + u16::from(y != 0);
+            counts.escapes += u16::from(x >= 15) + u16::from(y >= 15);
+            let lens = &tables.lens[(16 * x.min(15) + y.min(15)) as usize];
+            for (codes, &len) in counts.codes.iter_mut().zip(lens) {
+                *codes += u16::from(len);
+            }
+        }
+        counts
+    }
+}
+
+/// The sets of code words that the pair tables use, in the order of their
+/// first table: each table but 16 to 23, which share one, and 24 to 31,
+/// which share another.
+const CODE_SETS: usize = 16;
+
+/// The sets of code words of more than one table: those of tables 16 to 23
+/// and 24 to 31, which differ only in `linbits`.
+const ESCAPE_SETS: [usize; 2] = [CODE_SETS - 2, CODE_SETS - 1];
 
 /// What [`subdivide`] needs of each table that is used, worked out once.
 struct PairTables {
-    entries: Vec<TableEntry>,
+    /// Each set of code words, with its first table.
+    sets: [TableEntry; CODE_SETS],
+    /// The largest magnitude each set of code words can code, in its own
+    /// array to be vectorised.
+    largest: [u32; CODE_SETS],
+    /// The tables of each of [`ESCAPE_SETS`], in order.
+    escape_tables: [Vec<TableEntry>; ESCAPE_SETS.len()],
+    /// For each pair of magnitudes, capped at 15, as `16 * x + y`, the length
+    /// of its code word in each set of code words; zero where a set has none.
+    lens: [[u8; CODE_SETS]; 256],
 }
 
+#[derive(Clone, Copy)]
 struct TableEntry {
     table_select: u8,
-    table: &'static PairTable,
-    /// The largest magnitude it can code.
+    /// The largest magnitude it can code, or for a set of code words, the
+    /// largest that any of its tables can.
     largest: u32,
-    /// The first table with the same code words.
-    first: usize,
+    linbits: u32,
 }
 
 impl PairTables {
     fn get() -> &'static Self {
         static TABLES: std::sync::OnceLock<PairTables> = std::sync::OnceLock::new();
         TABLES.get_or_init(|| {
-            let used = || (0..32u8).filter_map(|t| pair_table(t).map(|table| (t, table)));
-            let entries = used()
-                .map(|(table_select, table)| TableEntry {
+            let mut sets: Vec<(&'static PairTable, Vec<TableEntry>)> = Vec::new();
+            for (table_select, table) in
+                (0..32u8).filter_map(|t| pair_table(t).map(|table| (t, table)))
+            {
+                let entry = TableEntry {
                     table_select,
-                    table,
                     largest: if table.linbits == 0 {
                         table.size as u32 - 1
                     } else {
                         15 + (1 << table.linbits) - 1
                     },
-                    first: used()
-                        .find(|(_, other)| std::ptr::eq(other.codes, table.codes))
-                        .map_or(0, |(t, _)| usize::from(t)),
-                })
-                .collect();
-            Self { entries }
+                    linbits: table.linbits,
+                };
+                match sets
+                    .iter_mut()
+                    .find(|(set, _)| std::ptr::eq(set.codes, table.codes))
+                {
+                    Some((_, entries)) => entries.push(entry),
+                    None => sets.push((table, vec![entry])),
+                }
+            }
+            assert_eq!(sets.len(), CODE_SETS, "sets of code words");
+            let mut lens = [[0; CODE_SETS]; 256];
+            for (set, (table, entries)) in sets.iter().enumerate() {
+                assert_eq!(
+                    entries.len() > 1,
+                    ESCAPE_SETS.contains(&set),
+                    "set {set} of code words"
+                );
+                for x in 0..table.size {
+                    for y in 0..table.size {
+                        lens[16 * x + y][set] =
+                            u8::try_from(table.codeword(x, y).len).expect("code words are short");
+                    }
+                }
+            }
+            let largest_of = |entries: &[TableEntry]| entries.iter().map(|e| e.largest).max();
+            let firsts: [TableEntry; CODE_SETS] = std::array::from_fn(|set| TableEntry {
+                largest: largest_of(&sets[set].1).expect("a table per set"),
+                ..sets[set].1[0]
+            });
+            Self {
+                sets: firsts,
+                largest: firsts.map(|set| set.largest),
+                escape_tables: ESCAPE_SETS.map(|set| sets[set].1.clone()),
+                lens,
+            }
         })
+    }
+
+    /// Of the tables that can code `largest`, the first of those needing
+    /// the fewest bits, and its bits, given the bits but for escape fields
+    /// with each set of code words, `bits`, and the number of `escapes`.
+    fn cheapest(&self, bits: &[u16; CODE_SETS], escapes: u16, largest: u32) -> (u8, usize) {
+        // Each set's bits with its first table that can code `largest`,
+        // which of the set needs the fewest, or i16::MAX where none can,
+        // laid out so that the compiler can vectorise it; of the fewest,
+        // the table first in order is kept.
+        let mut lanes = [0i16; CODE_SETS];
+        for set in 0..CODE_SETS {
+            lanes[set] = if largest > self.largest[set] {
+                i16::MAX
+            } else {
+                bits[set] as i16
+            };
+        }
+        let escape_tables = ESCAPE_SETS.map(|set| self.first_that_codes(set, largest));
+        for (&set, table) in ESCAPE_SETS.iter().zip(&escape_tables) {
+            lanes[set] += escapes as i16 * table.linbits as i16;
+        }
+        let least = lanes.iter().copied().fold(i16::MAX, i16::min);
+        let set = lanes
+            .iter()
+            .position(|&bits| bits == least)
+            .expect("table 31 codes every allowed magnitude");
+        let table = match ESCAPE_SETS.iter().position(|&escape| escape == set) {
+            Some(index) => escape_tables[index].table_select,
+            None => self.sets[set].table_select,
+        };
+        (table, least as usize)
+    }
+
+    /// The first table of the escape set `set` that codes `largest`, which
+    /// needs the fewest bits of the set, its `linbits` being the fewest.
+    fn first_that_codes(&self, set: usize, largest: u32) -> TableEntry {
+        let index = ESCAPE_SETS
+            .iter()
+            .position(|&escape| escape == set)
+            .expect("an escape set");
+        *self.escape_tables[index]
+            .iter()
+            .find(|entry| largest <= entry.largest)
+            .expect("the last table codes every allowed magnitude")
     }
 }
 
@@ -436,14 +614,12 @@ impl PairTables {
 /// and "additional coding gain" from "trying all" the tables of the same
 /// size. Spec reading: tables of a larger size are tried too, as one can
 /// need fewer bits.
-fn select_table(values: &[i32]) -> u8 {
-    let max = values.iter().map(|v| v.unsigned_abs()).max().unwrap_or(0);
-    (0..32)
-        .filter_map(|t| pair_table(t).map(|table| (t, table)))
-        .filter(|(_, table)| can_code(table, max))
-        .min_by_key(|&(_, table)| pair_bits(table, values))
-        .expect("table 31 codes every allowed magnitude")
-        .0
+///
+/// Returns the table and the bits of `values` with it.
+fn cheapest_table(values: &[i32]) -> (u8, usize) {
+    let counts = PairCounts::new(values);
+    let bits = counts.codes.map(|codes| codes + counts.signs);
+    PairTables::get().cheapest(&bits, counts.escapes, counts.largest)
 }
 
 fn can_code(table: &PairTable, magnitude: u32) -> bool {
@@ -536,6 +712,10 @@ fn write_quad(table: QuadTable, quad: &[i32], w: &mut BitWriter) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn select_table(values: &[i32]) -> u8 {
+        cheapest_table(values).0
+    }
     use crate::mp3::header::SamplingFrequency;
     use crate::mp3::scalefactor_bands::{coding_bands, long_bands};
 
@@ -724,6 +904,43 @@ mod tests {
                     assert!(pair_bits(chosen, values) <= pair_bits(other, values));
                 }
             }
+        }
+    }
+
+    /// The table chosen is the first of those needing the fewest bits, as
+    /// trying every table in order finds, and its bits are theirs.
+    #[test]
+    fn chooses_the_first_table_needing_the_fewest_bits() {
+        let mut state = 12345u32;
+        let mut next = |bound: u32| {
+            state = state.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            (state >> 8) % bound
+        };
+        for case in 0..3000 {
+            let largest = [1, 2, 3, 5, 7, 15, 16, 40, 300, 8191][case % 10];
+            let len = 2 * (1 + next(40) as usize);
+            let values: Vec<i32> = (0..len)
+                .map(|_| {
+                    let magnitude = if next(4) == 0 {
+                        next(largest + 1)
+                    } else {
+                        next(largest.min(3) + 1)
+                    };
+                    if next(2) == 0 {
+                        magnitude as i32
+                    } else {
+                        -(magnitude as i32)
+                    }
+                })
+                .collect();
+            let max = values.iter().map(|v| v.unsigned_abs()).max().unwrap();
+            let expected = (0..32u8)
+                .filter_map(|t| pair_table(t).map(|table| (t, table)))
+                .filter(|(_, table)| can_code(table, max))
+                .map(|(t, table)| (t, pair_bits(table, &values)))
+                .min_by_key(|&(_, bits)| bits)
+                .unwrap();
+            assert_eq!(cheapest_table(&values), expected, "{values:?}");
         }
     }
 
