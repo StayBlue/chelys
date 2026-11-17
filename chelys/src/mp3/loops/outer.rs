@@ -6,6 +6,7 @@
 
 use super::inner::{inner_loop, quantize, step_size};
 use crate::mp3::header::SamplingFrequency;
+use crate::mp3::huffman::MAX_MAGNITUDE;
 use crate::mp3::scalefactor_bands::{self, Band, LONG_BANDS};
 use crate::mp3::scalefactors::{PRETAB, Scalefactors, ZeroPart};
 use crate::mp3::side_info::SCFSI_BANDS;
@@ -527,14 +528,25 @@ fn distortion(
         .map(|band| {
             let sum: f64 = (band.start..band.end())
                 .map(|i| {
-                    let requantised =
-                        f64::from(granule.values[i].unsigned_abs()).powf(4.0 / 3.0) * step;
+                    let requantised = power_four_thirds(granule.values[i].unsigned_abs()) * step;
                     (amplified[i].abs() - requantised).powi(2)
                 })
                 .sum();
             sum / band.width as f64
         })
         .collect()
+}
+
+/// `magnitude^(4/3)`, from a table of every magnitude the Huffman tables
+/// can code, as the distortion of each band takes it for every line.
+fn power_four_thirds(magnitude: u32) -> f64 {
+    static TABLE: std::sync::OnceLock<Vec<f64>> = std::sync::OnceLock::new();
+    let table = TABLE.get_or_init(|| {
+        (0..=MAX_MAGNITUDE)
+            .map(|magnitude| f64::from(magnitude).powf(4.0 / 3.0))
+            .collect()
+    });
+    table[magnitude as usize]
 }
 
 fn exceeds_limits(scalefactors: &Scalefactors) -> bool {
