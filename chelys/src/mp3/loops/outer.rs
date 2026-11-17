@@ -408,10 +408,11 @@ impl ToSave<'_> {
             if let Some(intensity) = self.intensity {
                 intensity.fill_below_bound(&mut values, amplified);
             }
-            // The distortion first, as it needs no Huffman coding.
-            let distortion = quantisation_distortion(amplified, &values, global_gain, self.bands);
-            if (0..self.bands.len())
-                .any(|sb| !self.fixed.contains(&sb) && distortion[sb] > allowed[sb])
+            // The distortion first, as it needs no Huffman coding, band by
+            // band until one exceeds its allowance.
+            let distortion = band_distortion(amplified, &values, global_gain);
+            if (self.bands.iter().enumerate())
+                .any(|(sb, band)| !self.fixed.contains(&sb) && distortion(band) > allowed[sb])
             {
                 return None;
             }
@@ -638,31 +639,41 @@ fn quantisation_distortion(
     global_gain: u8,
     bands: &[Band],
 ) -> Vec<f64> {
-    let step = step_size(global_gain);
     bands
         .iter()
-        .map(|band| {
-            let sum: f64 = (band.start..band.end())
-                .map(|i| {
-                    let requantised = power_four_thirds(values[i].unsigned_abs()) * step;
-                    (amplified[i].abs() - requantised).powi(2)
-                })
-                .sum();
-            sum / band.width as f64
-        })
+        .map(band_distortion(amplified, values, global_gain))
         .collect()
 }
 
-/// `magnitude^(4/3)`, from a table of every magnitude the Huffman tables
-/// can code, as the distortion of each band takes it for every line.
-fn power_four_thirds(magnitude: u32) -> f64 {
+/// [`quantisation_distortion`] of one band at a time.
+fn band_distortion<'a>(
+    amplified: &'a [f64; GRANULE_LINES],
+    values: &'a [i32; GRANULE_LINES],
+    global_gain: u8,
+) -> impl Fn(&Band) -> f64 + 'a {
+    let step = step_size(global_gain);
+    let powers = four_thirds_powers();
+    move |band| {
+        let lines = band.start..band.end();
+        let sum: f64 = (amplified[lines.clone()].iter().zip(&values[lines]))
+            .map(|(x, value)| {
+                let requantised = powers[value.unsigned_abs() as usize] * step;
+                (x.abs() - requantised).powi(2)
+            })
+            .sum();
+        sum / band.width as f64
+    }
+}
+
+/// `magnitude^(4/3)` for every magnitude the Huffman tables can code, as
+/// the distortion of each band takes it for every line.
+fn four_thirds_powers() -> &'static [f64] {
     static TABLE: std::sync::OnceLock<Vec<f64>> = std::sync::OnceLock::new();
-    let table = TABLE.get_or_init(|| {
+    TABLE.get_or_init(|| {
         (0..=MAX_MAGNITUDE)
             .map(|magnitude| f64::from(magnitude).powf(4.0 / 3.0))
             .collect()
-    });
-    table[magnitude as usize]
+    })
 }
 
 fn exceeds_limits(scalefactors: &Scalefactors) -> bool {
