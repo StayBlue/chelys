@@ -440,6 +440,15 @@ impl Scalefactors {
     /// sets `preflag` as the scalefactors have it, and in the right channel
     /// of a frame coded in intensity stereo [`INTENSITY_SCALE`].
     pub fn compress(&self) -> Option<u16> {
+        if self.version == Version::Mpeg1 && self.intensity.is_none() {
+            return self.long_compress();
+        }
+        self.tried_compress()
+    }
+
+    /// [`compress`](Self::compress) by trying every field width for every
+    /// scalefactor sent.
+    fn tried_compress(&self) -> Option<u16> {
         let (count, step, offset) = match (self.version, self.intensity) {
             (Version::Mpeg1, _) => (SCALEFAC_COMPRESS.len() as u16, 1, 0),
             (Version::Mpeg2, None) => (LSF_SCALEFAC_COMPRESS, 1, 0),
@@ -459,6 +468,33 @@ impl Scalefactors {
             .map(|c| c * step + offset)
             .filter(|&c| fits(c))
             .min_by_key(|&c| self.part2_length(c))
+    }
+
+    /// [`compress`](Self::compress) in ISO/IEC 11172-3 without intensity
+    /// stereo, where a field holds a scalefactor if it holds the largest sent
+    /// with its width, and the outer loop asks for it in each iteration.
+    fn long_compress(&self) -> Option<u16> {
+        let slen1_count = self.slen1_count();
+        // The largest scalefactor sent with `slen1` and with `slen2`, and
+        // how many are.
+        let (mut largest, mut sent) = ([0u8; 2], [0usize; 2]);
+        for (index, &value) in self.values().iter().enumerate() {
+            if self.sent(index) {
+                let part = usize::from(index >= slen1_count);
+                largest[part] = largest[part].max(value);
+                sent[part] += 1;
+            }
+        }
+        (0..SCALEFAC_COMPRESS.len())
+            .filter(|&c| {
+                let (slen1, slen2) = SCALEFAC_COMPRESS[c];
+                fits_in(largest[0], slen1) && fits_in(largest[1], slen2)
+            })
+            .min_by_key(|&c| {
+                let (slen1, slen2) = SCALEFAC_COMPRESS[c];
+                sent[0] * slen1 as usize + sent[1] * slen2 as usize
+            })
+            .map(|c| c as u16)
     }
 
     /// The value sent for scalefactor `index` of [`values`](Self::values) in
@@ -575,6 +611,33 @@ mod tests {
         for (i, &(slen1, slen2)) in SCALEFAC_COMPRESS.iter().enumerate() {
             assert!(slen1 <= 4 && slen2 <= 3, "{i}");
             assert!(!SCALEFAC_COMPRESS[..i].contains(&(slen1, slen2)), "{i}");
+        }
+    }
+
+    /// For every block type, `compress` without intensity stereo chooses as
+    /// trying every width for every scalefactor does.
+    #[test]
+    fn long_compress_chooses_as_trying_every_width_does() {
+        let mut state = 7u32;
+        let mut next = |bound: u32| {
+            state = state.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            ((state >> 8) % bound) as u8
+        };
+        for case in 0..20_000 {
+            let block_type = [BlockType::Normal, BlockType::Short, BlockType::Mixed][case % 3];
+            let mut scalefactors = Scalefactors::new(block_type, Version::Mpeg1);
+            let largest = [1, 2, 4, 8, 16, 20][case % 6];
+            for value in scalefactors.values_mut() {
+                *value = next(largest);
+            }
+            if block_type == BlockType::Normal {
+                scalefactors.scfsi = std::array::from_fn(|_| next(3) == 0);
+            }
+            assert_eq!(
+                scalefactors.long_compress(),
+                scalefactors.tried_compress(),
+                "{scalefactors:?}"
+            );
         }
     }
 
