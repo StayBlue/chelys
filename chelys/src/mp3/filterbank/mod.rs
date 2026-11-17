@@ -77,11 +77,13 @@ pub struct Filterbank {
     start: usize,
     /// The rows `k` of `M_ik` of clause C.1.3 that
     /// [`subband_samples`](Self::subband_samples) multiplies, 0 to 16 and 33
-    /// to 48, numbered `row`, `k` up to 16 and `k - 16` above, for the first
-    /// half of the outputs `i`: the even rows, then the odd, indexed
-    /// `[row / 2][i]`. These and the kernels below are indexed by input
-    /// sample first, as [`transform`] takes them.
-    even_rows: Box<[[f64; SUBBANDS / 2]; FOLDED_ROWS / 2 + 1]>,
+    /// to 48, numbered `row`, `k` up to 16 and `k - 16` above: the rows
+    /// whose number is a multiple of 4 and those 2 more, for the first
+    /// quarter of the outputs `i`, indexed `[row / 4][i]`, and the odd rows,
+    /// for the first half, indexed `[row / 2][i]`. These and the kernels
+    /// below are indexed by input sample first, as [`transform`] takes them.
+    rows_0_mod_4: Box<[[f64; SUBBANDS / 4]; FOLDED_ROWS / 4 + 1]>,
+    rows_2_mod_4: Box<[[f64; SUBBANDS / 4]; FOLDED_ROWS / 4]>,
     odd_rows: Box<[[f64; SUBBANDS / 2]; FOLDED_ROWS / 2]>,
     /// The MDCT kernel of clause C.1.5.3.3 for `n = 36`, indexed `[k][i]`,
     /// with the window of the normal, start and stop block types folded in,
@@ -109,11 +111,12 @@ impl Default for Filterbank {
 
 impl Filterbank {
     pub fn new() -> Self {
-        let matrix_row = |row: usize| -> [f64; SUBBANDS / 2] {
+        fn matrix_row<const I: usize>(row: usize) -> [f64; I] {
             let k = if row <= 16 { row } else { row + 16 };
             std::array::from_fn(|i| ((2 * i + 1) as f64 * (k as f64 - 16.0) * PI / 64.0).cos())
-        };
-        let even_rows = Box::new(std::array::from_fn(|half| matrix_row(2 * half)));
+        }
+        let rows_0_mod_4 = Box::new(std::array::from_fn(|q| matrix_row(4 * q)));
+        let rows_2_mod_4 = Box::new(std::array::from_fn(|q| matrix_row(4 * q + 2)));
         let odd_rows = Box::new(std::array::from_fn(|half| matrix_row(2 * half + 1)));
         let long_mdct = Box::new(
             [BlockType::Normal, BlockType::Start, BlockType::Stop]
@@ -128,7 +131,8 @@ impl Filterbank {
         Self {
             history: Box::new([0.0; HISTORY]),
             start: HISTORY - 512,
-            even_rows,
+            rows_0_mod_4,
+            rows_2_mod_4,
             odd_rows,
             long_mdct,
             short_mdct,
@@ -333,15 +337,24 @@ impl Filterbank {
         // row is entry `i` times `(-1)^(k - 16)`, so the even and the odd
         // `k - 16` are summed apart for the first 16 outputs, and their sum
         // and difference give output `i` and output `31 - i`, which halves
-        // the multiplications again. The sums are the same but for
-        // rounding.
+        // the multiplications again. For even `k - 16`, entry `15 - i` is
+        // entry `i` times `(-1)^((k - 16) / 2)`, and the even rows are split
+        // again by that sign: they are summed apart for 8 of their 16
+        // entries, whose sum and difference give all 16. The row number has
+        // the parity of `k - 16`, and is 2 more than a multiple of 4 where
+        // `(k - 16) / 2` is odd. The sums are the same but for rounding.
         let folded: [f64; FOLDED_ROWS] = std::array::from_fn(|row| match row {
             0..16 => y[row] + y[32 - row],
             16 => y[16],
             17..32 => y[row + 16] - y[80 - row],
             _ => y[48],
         });
-        let even = transform(&self.even_rows, |m, half| m * folded[2 * half]);
+        let even_0 = transform(&self.rows_0_mod_4, |m, q| m * folded[4 * q]);
+        let even_2 = transform(&self.rows_2_mod_4, |m, q| m * folded[4 * q + 2]);
+        let even: [f64; SUBBANDS / 2] = std::array::from_fn(|i| match i < SUBBANDS / 4 {
+            true => even_0[i] + even_2[i],
+            false => even_0[SUBBANDS / 2 - 1 - i] - even_2[SUBBANDS / 2 - 1 - i],
+        });
         let odd = transform(&self.odd_rows, |m, half| m * folded[2 * half + 1]);
         std::array::from_fn(|i| match i < SUBBANDS / 2 {
             true => even[i] + odd[i],
