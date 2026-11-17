@@ -199,6 +199,15 @@ impl ShortMasking {
     }
 }
 
+/// What [`PsychoacousticModel::analyse`] keeps of a granule for its
+/// threshold for short blocks: the magnitudes of the three short blocks'
+/// FFTs, and the rest of [`ShortMasking`].
+struct ShortSpectra {
+    r: [Vec<f64>; SHORT_WINDOWS],
+    perceptual_entropy: f64,
+    spectrum: Vec<f64>,
+}
+
 /// The magnitude `r` and phase `f` of one FFT line (clause D.2.4 b)).
 #[derive(Clone, Copy, Debug, Default)]
 struct Polar {
@@ -363,8 +372,9 @@ impl PsychoacousticModel {
     }
 
     /// Analyses the next granule like [`Self::granule`], giving the
-    /// threshold for both long and short blocks.
-    fn analyse(&mut self, pcm: &[f64; GRANULE_LINES]) -> (Masking, ShortMasking) {
+    /// threshold for long blocks, and the spectra that
+    /// [`Self::short_masking`] takes the threshold for short blocks from.
+    fn analyse(&mut self, pcm: &[f64; GRANULE_LINES]) -> (Masking, ShortSpectra) {
         self.history.copy_within(GRANULE_LINES.., 0);
         self.history[HISTORY - GRANULE_LINES..].copy_from_slice(pcm);
 
@@ -488,12 +498,23 @@ impl PsychoacousticModel {
             spectrum: spectrum.clone(),
             threshold: thr,
         };
-        let short = ShortMasking {
-            ratio: r_short.map(|r| self.short_ratio(&r)),
+        let short = ShortSpectra {
+            r: r_short,
             perceptual_entropy,
             spectrum,
         };
         (long, short)
+    }
+
+    /// The threshold for short blocks of a granule, from its `spectra`, which
+    /// [`Self::analyse`] gives; it depends on nothing else, so it is worked
+    /// out only for the granules that need it.
+    fn short_masking(&self, spectra: ShortSpectra) -> ShortMasking {
+        ShortMasking {
+            ratio: spectra.r.map(|r| self.short_ratio(&r)),
+            perceptual_entropy: spectra.perceptual_entropy,
+            spectrum: spectra.spectrum,
+        }
     }
 
     /// Figure C.6.d: the ratio of each short scalefactor band in one short
@@ -858,7 +879,8 @@ mod tests {
             let mut seed = 1;
             let mut short = None;
             for _ in 0..6 {
-                short = Some(model.analyse(&noise(&mut seed, 0.5)).1);
+                let spectra = model.analyse(&noise(&mut seed, 0.5)).1;
+                short = Some(model.short_masking(spectra));
             }
             let short = short.unwrap();
             let partitions = partitions::short_partitions(fs);
@@ -894,7 +916,8 @@ mod tests {
         let mut pcm = [0.0; GRANULE_LINES];
         pcm[click] = 0.5;
         model.analyse(&pcm);
-        let (_, short) = model.analyse(&[0.0; GRANULE_LINES]);
+        let (_, spectra) = model.analyse(&[0.0; GRANULE_LINES]);
+        let short = model.short_masking(spectra);
         assert!(short.ratio[0].iter().all(|r| r.is_infinite()));
         assert!(short.ratio[1].iter().all(|r| r.is_infinite()));
         assert!(

@@ -8,7 +8,7 @@
 use super::super::header::SamplingFrequency;
 use super::super::scalefactor_bands::{self, MIXED_SHORT_START, SHORT_WINDOWS};
 use super::super::{BlockType, GRANULE_LINES};
-use super::{Masking, PsychoacousticModel, ShortMasking};
+use super::{Masking, PsychoacousticModel, ShortMasking, ShortSpectra};
 
 /// A granule has an attack, and is coded with short blocks, when its
 /// perceptual entropy exceeds this (clause C.1.5.3.2, `switch_pe` in figure
@@ -94,9 +94,10 @@ impl SwitchedMasking {
 /// whether the next one has an attack.
 pub struct BlockSwitching {
     model: PsychoacousticModel,
-    /// The threshold of the granule analysed last, for long and for short
-    /// blocks, until its block type is known.
-    pending: Option<(Masking, ShortMasking)>,
+    /// The threshold of the granule analysed last for long blocks, and the
+    /// spectra of its threshold for short blocks, until its block type is
+    /// known.
+    pending: Option<(Masking, ShortSpectra)>,
     /// The block type of the granule before the pending one.
     last: BlockType,
     /// Whether granules with short windows are mixed blocks.
@@ -141,9 +142,10 @@ impl BlockSwitching {
     ///
     /// Spec reading: figure C.6.a computes the threshold for short blocks
     /// only for a granule whose entropy exceeds `switch_pe`. This model
-    /// computes it for every granule, and the one for long blocks too, and
-    /// keeps the one its block type needs: a granule without an attack is
-    /// coded with short blocks as well when it falls between two that are.
+    /// computes the short blocks' spectra for every granule, and the
+    /// threshold for long blocks too, and gives the threshold its block type
+    /// needs: a granule without an attack is coded with short blocks as well
+    /// when it falls between two that are.
     pub fn granule(&mut self, pcm: &[f64; GRANULE_LINES]) -> Option<SwitchedMasking> {
         let next = self.model.analyse(pcm);
         let attack_next = next.0.perceptual_entropy > SWITCH_PE;
@@ -153,8 +155,12 @@ impl BlockSwitching {
         Some(match self.last {
             BlockType::Normal => SwitchedMasking::Normal(long),
             BlockType::Start => SwitchedMasking::Start(long),
-            BlockType::Short if self.mixed => SwitchedMasking::Mixed(long, Box::new(short)),
-            BlockType::Short | BlockType::Mixed => SwitchedMasking::Short(short),
+            BlockType::Short if self.mixed => {
+                SwitchedMasking::Mixed(long, Box::new(self.model.short_masking(short)))
+            }
+            BlockType::Short | BlockType::Mixed => {
+                SwitchedMasking::Short(self.model.short_masking(short))
+            }
             BlockType::Stop => SwitchedMasking::Stop(long),
         })
     }
