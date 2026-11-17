@@ -22,6 +22,16 @@ pub fn step_size(global_gain: u8) -> f64 {
     (f64::from(i32::from(global_gain) - GLOBAL_GAIN_OFFSET) / 4.0).exp2()
 }
 
+/// `step_size(global_gain)^-0.75`, by which [`Lines::quantize`] multiplies
+/// the lines' powers, from a table of every `global_gain`.
+fn scale(global_gain: u8) -> f64 {
+    static TABLE: std::sync::OnceLock<[f64; 256]> = std::sync::OnceLock::new();
+    let table = TABLE.get_or_init(|| {
+        std::array::from_fn(|global_gain| step_size(global_gain as u8).powf(-0.75))
+    });
+    table[usize::from(global_gain)]
+}
+
 /// Quantises `xr` with step size `global_gain`:
 /// `ix(i) = nint((|xr(i)| / 2^((global_gain - 210) / 4))^0.75 - 0.0946)`,
 /// carrying the sign of `xr(i)`. Returns `None` if a magnitude would exceed
@@ -77,7 +87,7 @@ impl Lines {
 
     /// [`quantize`] with these lines.
     pub fn quantize(&self, global_gain: u8) -> Option<[i32; GRANULE_LINES]> {
-        let scale = step_size(global_gain).powf(-0.75);
+        let scale = scale(global_gain);
         let mut ix = [0; GRANULE_LINES];
         let mut largest = 0;
         let end = self.end;
