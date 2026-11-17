@@ -126,6 +126,12 @@ const BEYOND_MAGNITUDE: i32 = 2 * MAX_MAGNITUDE as i32;
 /// and their bits fit. Spec reading: the decision in figure C.9.c has its "y"
 /// and "n" swapped relative to that text, which is followed.
 ///
+/// Spec reading: figure C.9.c counts the bits of every step it tries. Here,
+/// whether they fit is often settled by bounds on them instead (see
+/// [`Counted::bits_between`]), without searching every split of the
+/// `big_values` regions, for speed. The answer is always the one the count
+/// gives, so the loop tries the same steps and keeps the same one.
+///
 /// Spec gap: clause C.1.5.4.2.1 leaves the starting step, `quantanf`, to the
 /// implementation, asking only that the first iteration need more bits than
 /// are available and suggesting it be chosen to save iterations. Here the
