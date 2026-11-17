@@ -200,10 +200,10 @@ impl ShortMasking {
 }
 
 /// What [`PsychoacousticModel::analyse`] keeps of a granule for its
-/// threshold for short blocks: the magnitudes of the three short blocks'
-/// FFTs, and the rest of [`ShortMasking`].
+/// threshold for short blocks: the energies of the lines of the three short
+/// blocks' FFTs, and the rest of [`ShortMasking`].
 struct ShortSpectra {
-    r: [Vec<f64>; SHORT_WINDOWS],
+    energy: [Vec<f64>; SHORT_WINDOWS],
     perceptual_entropy: f64,
     spectrum: Vec<f64>,
 }
@@ -261,7 +261,7 @@ impl Analysis {
         }
     }
 
-    /// Transforms the windowed `samples` and returns the magnitudes of the
+    /// Transforms the windowed `samples` and returns the energies of the
     /// lines from DC to Nyquist and the unpredictabilities `c` of the lines
     /// predicted (clause D.2.4 b) to d)), remembering their spectrum for the
     /// next block.
@@ -275,10 +275,13 @@ impl Analysis {
         );
         let x = self.fft.transform(&self.windowed);
 
-        let r: Vec<f64> = x
-            .iter()
-            .map(|x| (x.re * x.re + x.im * x.im).sqrt())
-            .collect();
+        // Spec reading: clause D.2.4 b) takes the magnitude `r` of every
+        // line, of which clause D.2.4 e) and figures C.6.b and C.6.d take
+        // only the square, the energy; it is taken as the sum of the squares
+        // of the real and imaginary parts, without the square root, for
+        // speed. Only the predicted lines need it (clause D.2.4 c) and d)).
+        // The energies are the same but for rounding.
+        let energy: Vec<f64> = x.iter().map(|x| x.re * x.re + x.im * x.im).collect();
         let mut c = Vec::with_capacity(self.predicted);
         for (w, x) in x[..self.predicted].iter().enumerate() {
             // Spec reading: clause D.2.4 c) predicts the phase as
@@ -291,7 +294,7 @@ impl Analysis {
             // same but for rounding. A line without magnitude is taken to
             // have the phase 0, as `atan2(0, 0)` gives and the stored spectra
             // start with.
-            let polar = match r[w] {
+            let polar = match energy[w].sqrt() {
                 0.0 => Polar::default(),
                 r => Polar {
                     r,
@@ -325,7 +328,7 @@ impl Analysis {
             self.before_last[w] = polar;
         }
         std::mem::swap(&mut self.last, &mut self.before_last);
-        (r, c)
+        (energy, c)
     }
 }
 
@@ -416,9 +419,9 @@ impl PsychoacousticModel {
         self.history.copy_within(GRANULE_LINES.., 0);
         self.history[HISTORY - GRANULE_LINES..].copy_from_slice(pcm);
 
-        let (r_short, cw_short) = self.short_blocks();
+        let (energy_short, cw_short) = self.short_blocks();
         let long_start = BLOCK_CENTRE - LONG_FFT / 2;
-        let (r, cw_long) = self
+        let (energy, cw_long) = self
             .long
             .next_block(&self.history[long_start..][..LONG_FFT]);
         let cw = |w: usize| match w {
@@ -433,7 +436,7 @@ impl PsychoacousticModel {
             .iter()
             .map(|p| {
                 (p.start..p.start + p.width)
-                    .map(|w| (r[w] * r[w], cw(w) * r[w] * r[w]))
+                    .map(|w| (energy[w], cw(w) * energy[w]))
                     .fold((0.0, 0.0), |(e, c), (de, dc)| (e + de, c + dc))
             })
             .unzip();
@@ -455,8 +458,9 @@ impl PsychoacousticModel {
             let snr = f64::max(p.minval, TMN * tb + NMT * (1.0 - tb));
             // Spec reading: figure C.6.b prints the exponent as SNR(b)/10;
             // clause D.2.4 i) has the sign that puts the threshold below the
-            // energy.
-            nb.push(ecb * p.norm * 10f64.powf(-snr / 10.0));
+            // energy. The power of ten, 10^(-SNR(b)/10), is taken as
+            // e^(-SNR(b)/10 ln 10), for speed: the same but for rounding.
+            nb.push(ecb * p.norm * (-snr / 10.0 * std::f64::consts::LN_10).exp());
         }
 
         // ...with pre-echo control: the threshold may rise at most by RPELEV
@@ -529,7 +533,7 @@ impl PsychoacousticModel {
             .sum::<f64>();
 
         // Figure C.6.c: the partitions converted to scalefactor bands.
-        let spectrum: Vec<f64> = r[..stereo::CRITERION_LINES].iter().map(|r| r * r).collect();
+        let spectrum: Vec<f64> = energy[..stereo::CRITERION_LINES].to_vec();
         let long = Masking {
             ratio: band_ratio(self.band_weights, &allowed, &eb),
             perceptual_entropy,
@@ -537,7 +541,7 @@ impl PsychoacousticModel {
             threshold: thr,
         };
         let short = ShortSpectra {
-            r: r_short,
+            energy: energy_short,
             perceptual_entropy,
             spectrum,
         };
@@ -549,14 +553,14 @@ impl PsychoacousticModel {
     /// out only for the granules that need it.
     fn short_masking(&self, spectra: ShortSpectra) -> ShortMasking {
         ShortMasking {
-            ratio: spectra.r.map(|r| self.short_ratio(&r)),
+            ratio: spectra.energy.map(|energy| self.short_ratio(&energy)),
             perceptual_entropy: spectra.perceptual_entropy,
             spectrum: spectra.spectrum,
         }
     }
 
     /// Figure C.6.d: the ratio of each short scalefactor band in one short
-    /// block, from the magnitudes `r` of its FFT.
+    /// block, from the energies of the lines of its FFT.
     ///
     /// Spec reading: the figure says to compare the threshold with the last
     /// one as well as the threshold in quiet, but its formula,
@@ -567,11 +571,11 @@ impl PsychoacousticModel {
     /// tables' SNR is negative, so, unlike the long blocks' (figure C.6.b),
     /// it puts the threshold below the spread energy. With a fixed SNR, the unpredictability that the
     /// figure convolves alongside the energy has no use, and is left out.
-    fn short_ratio(&self, r: &[f64]) -> [f64; SHORT_BANDS] {
+    fn short_ratio(&self, energy: &[f64]) -> [f64; SHORT_BANDS] {
         let eb: Vec<f64> = self
             .short_partitions
             .iter()
-            .map(|p| r[p.start..p.start + p.width].iter().map(|r| r * r).sum())
+            .map(|p| energy[p.start..p.start + p.width].iter().sum())
             .collect();
         let thr: Vec<f64> = self
             .short_partitions
@@ -588,7 +592,7 @@ impl PsychoacousticModel {
         band_ratio(self.short_band_weights, &thr, &eb)
     }
 
-    /// The magnitudes of the granule's three short blocks, and the
+    /// The energies of the lines of the granule's three short blocks, and the
     /// unpredictability of the lines of the second (clause C.1.5.3.2.1). The
     /// short blocks are 192 samples apart and centred on the long block, as
     /// the three short windows are in the filterbank's block (clause
@@ -599,11 +603,11 @@ impl PsychoacousticModel {
         let r = std::array::from_fn(|block| {
             let centre = BLOCK_CENTRE + block * SHORT_SHIFT - SHORT_SHIFT;
             let samples = &self.history[centre - SHORT_FFT / 2..][..SHORT_FFT];
-            let (r, c) = self.short.next_block(samples);
+            let (energy, c) = self.short.next_block(samples);
             if block == 1 {
                 middle = c;
             }
-            r
+            energy
         });
         (r, middle)
     }
