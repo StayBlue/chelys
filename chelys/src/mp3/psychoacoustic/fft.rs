@@ -103,10 +103,48 @@ impl Fft {
                 im: even.im - odd.im,
             };
         }
-        // Two stages at a time, of spans `2 h` and `4 h`, each value loaded
-        // and stored once for both: the same butterflies as one stage after
-        // the other.
+        // Three stages at a time, of spans `2 h`, `4 h` and `8 h`, then two,
+        // each value loaded and stored once for them: the same butterflies as
+        // one stage after the other.
+        let butterfly = |even: Complex, odd: Complex, twiddle: Complex| {
+            let product = odd.mul(twiddle);
+            let sum = Complex {
+                re: even.re + product.re,
+                im: even.im + product.im,
+            };
+            let difference = Complex {
+                re: even.re - product.re,
+                im: even.im - product.im,
+            };
+            (sum, difference)
+        };
         let mut half = 2;
+        while 8 * half <= n {
+            let first = &self.twiddles[half - 1..][..half];
+            let second = &self.twiddles[2 * half - 1..][..2 * half];
+            let third = &self.twiddles[4 * half - 1..][..4 * half];
+            for block in x.chunks_exact_mut(8 * half) {
+                for k in 0..half {
+                    let e: [Complex; 8] = std::array::from_fn(|j| block[k + j * half]);
+                    let (e0, e1) = butterfly(e[0], e[1], first[k]);
+                    let (e2, e3) = butterfly(e[2], e[3], first[k]);
+                    let (e4, e5) = butterfly(e[4], e[5], first[k]);
+                    let (e6, e7) = butterfly(e[6], e[7], first[k]);
+                    let (e0, e2) = butterfly(e0, e2, second[k]);
+                    let (e1, e3) = butterfly(e1, e3, second[half + k]);
+                    let (e4, e6) = butterfly(e4, e6, second[k]);
+                    let (e5, e7) = butterfly(e5, e7, second[half + k]);
+                    let (e0, e4) = butterfly(e0, e4, third[k]);
+                    let (e1, e5) = butterfly(e1, e5, third[half + k]);
+                    let (e2, e6) = butterfly(e2, e6, third[2 * half + k]);
+                    let (e3, e7) = butterfly(e3, e7, third[3 * half + k]);
+                    for (j, value) in [e0, e1, e2, e3, e4, e5, e6, e7].into_iter().enumerate() {
+                        block[k + j * half] = value;
+                    }
+                }
+            }
+            half *= 8;
+        }
         while 4 * half <= n {
             let first = &self.twiddles[half - 1..][..half];
             let second = &self.twiddles[2 * half - 1..][..2 * half];
@@ -115,18 +153,6 @@ impl Fft {
                 let (a, b) = low.split_at_mut(half);
                 let (c, d) = high.split_at_mut(half);
                 for k in 0..half {
-                    let butterfly = |even: Complex, odd: Complex, twiddle: Complex| {
-                        let product = odd.mul(twiddle);
-                        let sum = Complex {
-                            re: even.re + product.re,
-                            im: even.im + product.im,
-                        };
-                        let difference = Complex {
-                            re: even.re - product.re,
-                            im: even.im - product.im,
-                        };
-                        (sum, difference)
-                    };
                     let (a1, b1) = butterfly(a[k], b[k], first[k]);
                     let (c1, d1) = butterfly(c[k], d[k], first[k]);
                     (a[k], c[k]) = butterfly(a1, c1, second[k]);
