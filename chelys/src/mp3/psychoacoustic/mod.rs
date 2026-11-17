@@ -287,6 +287,10 @@ pub struct PsychoacousticModel {
     short_spreading: Vec<Vec<f64>>,
     /// The normalising constant of each short partition.
     short_norm: Vec<f64>,
+    /// The threshold in quiet that each partition allows noise, and each
+    /// short partition: see [`noise_in_quiet`].
+    noise_in_quiet: Vec<f64>,
+    short_noise_in_quiet: Vec<f64>,
     history: [f64; HISTORY],
     long: Analysis,
     short: Analysis,
@@ -323,6 +327,10 @@ impl PsychoacousticModel {
             short_band_weights: partitions::short_band_weights(sampling_frequency),
             short_spreading,
             short_norm,
+            noise_in_quiet: noise_in_quiet(partitions.iter().map(|p| (p.qthr, p.width, p.bval))),
+            short_noise_in_quiet: noise_in_quiet(
+                short_partitions.iter().map(|p| (p.qthr, p.width, p.bval)),
+            ),
             history: [0.0; HISTORY],
             long: Analysis::new(LONG_FFT),
             short: Analysis::new(SHORT_FFT),
@@ -412,18 +420,24 @@ impl PsychoacousticModel {
         // +6, -6 or -20 dB. The printed maximum misses up to all of them.
         // Neither exceeds 1800 on steady tones, noise, a crescendo or a
         // tremolo.
-        let thr: Vec<f64> = self
-            .partitions
-            .iter()
-            .enumerate()
-            .map(|(b, p)| {
-                let limited = nb[b]
+        let limited: Vec<f64> = (0..nb.len())
+            .map(|b| {
+                nb[b]
                     .min(RPELEV * self.nb_last[b])
-                    .min(RPELEV2 * self.nb_before_last[b]);
-                p.qthr.max(limited)
+                    .min(RPELEV2 * self.nb_before_last[b])
             })
             .collect();
         self.nb_before_last = std::mem::replace(&mut self.nb_last, nb);
+        let thr: Vec<f64> = (self.partitions.iter().zip(&limited))
+            .map(|(p, limited)| p.qthr.max(*limited))
+            .collect();
+        // The allowed distortion takes the threshold in quiet as noise has
+        // it (see `noise_in_quiet`); the perceptual entropy keeps the printed
+        // one, against which the window switching threshold of 1800 (clause
+        // C.1.5.3.2) and the entropy of silence above are set.
+        let allowed: Vec<f64> = (self.noise_in_quiet.iter().zip(&limited))
+            .map(|(quiet, limited)| quiet.max(*limited))
+            .collect();
 
         // Spec gap: clause C.1.5.3.2.1 does not give the base of `log`. The
         // natural logarithm matches the tonality conversion beside it, and the
@@ -453,7 +467,7 @@ impl PsychoacousticModel {
         // Figure C.6.c: the partitions converted to scalefactor bands.
         let spectrum: Vec<f64> = r[..stereo::CRITERION_LINES].iter().map(|r| r * r).collect();
         let long = Masking {
-            ratio: band_ratio(self.band_weights, &thr, &eb),
+            ratio: band_ratio(self.band_weights, &allowed, &eb),
             perceptual_entropy,
             spectrum: spectrum.clone(),
             threshold: thr,
@@ -472,10 +486,11 @@ impl PsychoacousticModel {
     /// Spec reading: the figure says to compare the threshold with the last
     /// one as well as the threshold in quiet, but its formula,
     /// `thr(b) = maximum(qthr(b), nbb(b))`, has no last threshold, and none
-    /// of the pre-echo constants. The formula is taken as printed. So is
-    /// the exponent `SNR(b)/10`: the short tables' SNR is negative, so,
-    /// unlike the long blocks' (figure C.6.b), it puts the threshold below
-    /// the spread energy. With a fixed SNR, the unpredictability that the
+    /// of the pre-echo constants. The formula is taken as printed, with
+    /// `qthr` taken as noise has it, as for long blocks (see
+    /// [`noise_in_quiet`]). So is the exponent `SNR(b)/10`: the short
+    /// tables' SNR is negative, so, unlike the long blocks' (figure C.6.b),
+    /// it puts the threshold below the spread energy. With a fixed SNR, the unpredictability that the
     /// figure convolves alongside the energy has no use, and is left out.
     fn short_ratio(&self, r: &[f64]) -> [f64; SHORT_BANDS] {
         let eb: Vec<f64> = self
@@ -492,7 +507,7 @@ impl PsychoacousticModel {
                     .map(|(spreading, eb)| eb * spreading[b])
                     .sum();
                 let nbb = ecb * self.short_norm[b] * p.snr.ratio();
-                p.qthr.max(nbb)
+                self.short_noise_in_quiet[b].max(nbb)
             })
             .collect();
         band_ratio(self.short_band_weights, &thr, &eb)
@@ -517,6 +532,53 @@ impl PsychoacousticModel {
         });
         (r, middle)
     }
+}
+
+/// The threshold in quiet that each partition allows noise, from the
+/// `(qthr, width, bval)` of the partitions in order: the share of a tone's
+/// threshold in quiet that falls into the partition, `qthr / width` times
+/// its width in Bark. A partition's width in Bark is taken as half the
+/// distance between the `bval` of its neighbours, or the distance to its one
+/// neighbour at either end.
+///
+/// Spec reading: this deliberately departs from figures C.6.b and C.6.d for
+/// the allowed distortion. Clause D.2.4 l) applies the threshold in quiet to
+/// each FFT line, with the values of Table D.4 relative to the level that a
+/// sine wave of +-1/2 LSB has in the FFT, and the `qthr` columns of Table
+/// C.7, and of Table D.3 of ISO/IEC 13818-3, are such a level per line times
+/// the partition's width (see the test
+/// `qthr_is_a_per_line_level_times_the_width` in [`partitions`]). Taken as
+/// printed, a band of noise at the threshold in every line is allowed as
+/// many times a tone's energy at threshold as it has lines. Yet within a
+/// critical band, noise is heard at about the energy a tone is, a property
+/// of hearing that the standard does not state: over a Bark, the printed
+/// threshold allows noise 2.3 times a tone's energy at the lowest
+/// frequencies and 81 times at 12 to 14.5 kHz, at 44.1 kHz in the long FFT.
+/// Music has little energy above 12 kHz, and from there to 16 kHz the
+/// threshold in quiet set the threshold of 25 to 37% of the granules in
+/// three tracks of pop music, and of 80 to 84% in two tracks of rock, where
+/// it allowed noise 7 to 8 dB above their energy (median); PEAQ found the
+/// largest share of chelys's coding noise there. Taken as noise has it,
+/// graded with PEAQ (GstPEAQ 0.6.1, black box), 22 tracks of pop music at
+/// 44.1 kHz in stereo rose from a mean of -1.79 to -1.70 at 96 kbit/s, from
+/// -0.66 to -0.59 at 128, from -0.17 to -0.13 at 192, and from 0.03 to 0.04
+/// at 320, and 14 tracks of rock from -0.82 to -0.76 at 128 kbit/s, with the
+/// total noise-to-mask ratio 0.6 to 0.7 dB lower at 128 and 192 kbit/s.
+/// Lowering every `qthr` by 10 or 20 dB instead graded lower at both.
+fn noise_in_quiet(partitions: impl Iterator<Item = (f64, usize, f64)>) -> Vec<f64> {
+    let partitions: Vec<(f64, usize, f64)> = partitions.collect();
+    let bval = |b: usize| partitions[b].2;
+    let last = partitions.len() - 1;
+    (partitions.iter().enumerate())
+        .map(|(b, &(qthr, width, _))| {
+            let bark = match b {
+                0 => bval(1) - bval(0),
+                _ if b == last => bval(last) - bval(last - 1),
+                _ => (bval(b + 1) - bval(b - 1)) / 2.0,
+            };
+            qthr / width as f64 * bark
+        })
+        .collect()
 }
 
 /// `sprdngf(bval(bb), bval(b))` between all partitions, indexed `[bb][b]`.
@@ -672,6 +734,41 @@ mod tests {
         assert!((masking.perceptual_entropy - expected).abs() < 1e-9);
         let xmin = masking.allowed_distortion(&[0.0; GRANULE_LINES], FS);
         assert_eq!(xmin, [0.0; LONG_BANDS]);
+    }
+
+    /// Noise allowed by the threshold in quiet totals a tone's threshold over
+    /// a Bark (see [`noise_in_quiet`]): white noise at the threshold in quiet
+    /// in every line around 14 kHz is allowed coding noise only as far below
+    /// it as its spread energy asks (9 dB), where the printed `qthr` would
+    /// allow coding noise 9 dB louder than the signal. Noise 30 dB below
+    /// that level needs no bits.
+    #[test]
+    fn noise_at_the_threshold_in_quiet_per_line_is_audible() {
+        let partitions = partitions::partitions(FS);
+        let line = (14_000.0 / FS.hz() as f64 * LONG_FFT as f64) as usize;
+        let p = partitions
+            .iter()
+            .find(|p| (p.start..p.start + p.width).contains(&line))
+            .unwrap();
+        let per_line = |masking: &Masking| {
+            masking.spectrum[p.start..p.start + p.width]
+                .iter()
+                .sum::<f64>()
+                / p.width as f64
+        };
+        let ratio_db = |below_db: f64| {
+            let mut seed = 5;
+            let measured = per_line(&steady_state(|_| noise(&mut seed, 0.01)));
+            let target = p.qthr / p.width as f64 * 10f64.powf(-below_db / 10.0);
+            let amplitude = 0.01 * (target / measured).sqrt();
+            let mut seed = 5;
+            let masking = steady_state(|_| noise(&mut seed, amplitude));
+            10.0 * masking.ratio[band_of(14_500.0)].log10()
+        };
+        let at_threshold = ratio_db(0.0);
+        assert!(at_threshold < -5.0, "{at_threshold} dB");
+        let below = ratio_db(30.0);
+        assert!(below > 0.0, "{below} dB");
     }
 
     /// Louder and noisier signals have more perceptual entropy.
