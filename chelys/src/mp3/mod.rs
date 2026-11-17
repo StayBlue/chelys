@@ -547,7 +547,8 @@ pub fn encode_pcm_with_info_tag(config: &StreamConfig, channels: &[&[f64]]) -> V
 /// stereo if the mode allows that (Annex G.2).
 ///
 /// At a [`Rate::Variable`] each frame is coded at bitrates from the one
-/// before it, as [`rate::search_variable`] tries them, and kept at the
+/// below that of the frame before it, as [`rate::search_variable`] tries
+/// them, and kept at the
 /// lowest of those at which every band's noise stays within its allowance
 /// (see [`loops::excess`]). Frames are not padded. Intensity stereo, which
 /// gives up the stereo image above its bound for bits, is tried only at the
@@ -1670,7 +1671,10 @@ impl<C: Coding> FrameEncoder<C> {
                     .expect("a frame coded in full")
             }
             Schedule::Variable { bitrates, previous } => {
-                let (bitrates, start) = (bitrates.clone(), *previous);
+                // From the bitrate below the last frame's, at which most
+                // frames within their allowance at the last frame's are
+                // within it too (see `rate::search_variable`).
+                let (bitrates, start) = (bitrates.clone(), previous.saturating_sub(1));
                 let highest = bitrates.len() - 1;
                 // The search keeps a frame that is not within its allowance
                 // only at the highest bitrate, so below it, coding stops once
