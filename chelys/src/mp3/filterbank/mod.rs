@@ -15,6 +15,10 @@ use crate::mp3::{BlockType, GRANULE_LINES};
 use analysis_window::ANALYSIS_WINDOW;
 
 const SUBBANDS: usize = 32;
+/// The rows of the polyphase filter's matrixing that remain once those
+/// equal to another, or to its negative, are folded together (see
+/// [`Filterbank::subband_samples`]).
+const FOLDED_ROWS: usize = 33;
 /// The buffer that holds the filter's 512 input samples: room for 16
 /// passes of 32 samples before they must be moved.
 const HISTORY: usize = 1024;
@@ -71,9 +75,12 @@ pub struct Filterbank {
     /// once `start` reaches its beginning.
     history: Box<[f64; HISTORY]>,
     start: usize,
-    /// `M_ik` of clause C.1.3, indexed `[k][i]`. This and the kernels below
-    /// are indexed by input sample first, as [`transform`] takes them.
-    matrix: Box<[[f64; SUBBANDS]; 64]>,
+    /// The rows `k` of `M_ik` of clause C.1.3 that
+    /// [`subband_samples`](Self::subband_samples) multiplies, 0 to 16 and 33
+    /// to 48, indexed `[row][i]`, where `row` is `k` up to 16 and `k - 16`
+    /// above. This and the kernels below are indexed by input sample first,
+    /// as [`transform`] takes them.
+    matrix: Box<[[f64; SUBBANDS]; FOLDED_ROWS]>,
     /// The MDCT kernel of clause C.1.5.3.3 for `n = 36`, indexed `[k][i]`,
     /// with the window of the normal, start and stop block types folded in,
     /// in that order.
@@ -100,8 +107,9 @@ impl Default for Filterbank {
 
 impl Filterbank {
     pub fn new() -> Self {
-        let mut matrix = Box::new([[0.0; SUBBANDS]; 64]);
-        for (k, column) in matrix.iter_mut().enumerate() {
+        let mut matrix = Box::new([[0.0; SUBBANDS]; FOLDED_ROWS]);
+        for (row, column) in matrix.iter_mut().enumerate() {
+            let k = if row <= 16 { row } else { row + 16 };
             for (i, m) in column.iter_mut().enumerate() {
                 *m = ((2 * i + 1) as f64 * (k as f64 - 16.0) * PI / 64.0).cos();
             }
@@ -313,7 +321,21 @@ impl Filterbank {
                 .map(|j| ANALYSIS_WINDOW[i + 64 * j] * history[i + 64 * j])
                 .sum();
         }
-        transform(&self.matrix, |m, k| m * y[k])
+        // Spec reading: figure C.4 sums `M_ik * Y_k` over all 64 `k`. As
+        // `M_ik = cos((2i + 1)(k - 16) pi / 64)` (clause C.1.3), row `32 - k`
+        // of the matrix equals row `k`, and row `96 - k` is its negative. So
+        // `Y_k` and `Y_(32 - k)` are added, for `k` from 0 to 15, and
+        // `Y_(96 - k)` subtracted from `Y_k`, for `k` from 33 to 47, before
+        // multiplying by the row, and rows 16 and 48 multiply `Y_k` alone,
+        // which halves the multiplications, for speed. The sums are the
+        // same but for rounding.
+        let folded: [f64; FOLDED_ROWS] = std::array::from_fn(|row| match row {
+            0..16 => y[row] + y[32 - row],
+            16 => y[16],
+            17..32 => y[row + 16] - y[80 - row],
+            _ => y[48],
+        });
+        transform(&self.matrix, |m, k| m * folded[k])
     }
 
     /// The encoder's aliasing butterflies (figure C.8) between each pair of
