@@ -620,8 +620,10 @@ impl BandBits {
 
     /// [`split`](Self::split), searched.
     fn search_split(&self) -> Split {
+        // The split of `upper` needs no fewer bits than the best, so those
+        // bits plus one bound the search from the start.
         let (bits, counts, tables) = self
-            .splits_below(usize::MAX, true)
+            .splits_below(self.upper() + 1, true)
             .expect("at least one split");
         (counts, tables, bits)
     }
