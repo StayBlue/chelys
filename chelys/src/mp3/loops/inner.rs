@@ -43,6 +43,7 @@ pub fn quantize(xr: &[f64; GRANULE_LINES], global_gain: u8) -> Option<[i32; GRAN
 /// A granule's lines with their magnitudes raised to the power 0.75 once, so
 /// that each step size tried costs one multiplication per line:
 /// `(|xr| / step)^0.75 = |xr|^0.75 * step^-0.75`.
+#[derive(Clone)]
 pub struct Lines {
     xr: [f64; GRANULE_LINES],
     powered: [f64; GRANULE_LINES],
@@ -348,9 +349,24 @@ fn estimated_gain(lines: &Lines, available_bits: usize) -> u8 {
     StepEstimate::new(lines).gain(available_bits)
 }
 
-/// What [`estimated_gain`] takes of a granule's lines, so that it can be
-/// worked out once for lines that are quantised again with other bits, as
-/// at each bitrate a frame is tried at.
+/// A granule's lines as they are, without scalefactors, and the estimate
+/// of the inner loop's first step for them, worked out once for lines that
+/// are quantised again with other bits, as at each bitrate a frame is tried
+/// at.
+pub struct Unscaled {
+    pub lines: Lines,
+    pub estimate: StepEstimate,
+}
+
+impl Unscaled {
+    pub fn new(xr: &[f64; GRANULE_LINES]) -> Self {
+        let lines = Lines::new(xr);
+        let estimate = StepEstimate::new(&lines);
+        Self { lines, estimate }
+    }
+}
+
+/// What [`estimated_gain`] takes of a granule's lines.
 pub struct StepEstimate {
     /// The lines whose values stop being zero at each step.
     steps: [u16; 257],

@@ -797,9 +797,9 @@ struct ModelCoding {
 struct PreparedGranule {
     lines: Vec<([f64; GRANULE_LINES], Vec<f64>)>,
     summaries: Vec<GranuleSummary>,
-    /// The estimate of the inner loop's first step for each channel's lines,
-    /// once the first try works it out (see [`loops::outer_loop_with`]).
-    estimates: Vec<std::cell::OnceCell<loops::StepEstimate>>,
+    /// Each channel's lines as the outer loop starts from them, once the
+    /// first try works them out (see [`loops::outer_loop_with`]).
+    unscaled: Vec<std::cell::OnceCell<loops::Unscaled>>,
 }
 
 impl PreparedGranule {
@@ -826,11 +826,11 @@ impl PreparedGranule {
         let summaries = (granule.iter().zip(&lines))
             .map(|(f, (xr, xmin))| GranuleSummary::new(xr, xmin, f.block_type, fs))
             .collect();
-        let estimates = lines.iter().map(|_| std::cell::OnceCell::new()).collect();
+        let unscaled = lines.iter().map(|_| std::cell::OnceCell::new()).collect();
         Self {
             lines,
             summaries,
-            estimates,
+            unscaled,
         }
     }
 }
@@ -1252,11 +1252,9 @@ fn quantize_frame(
                 }),
             };
             // Intensity stereo changes the lines from those prepared.
-            let estimate = positions
-                .is_none()
-                .then(|| &prepared[gr].estimates[channel]);
+            let unscaled = positions.is_none().then(|| &prepared[gr].unscaled[channel]);
             let outcome =
-                loops::quantize_granule(xr, xmin, block_type, bits, fs, reuse, intensity, estimate);
+                loops::quantize_granule(xr, xmin, block_type, bits, fs, reuse, intensity, unscaled);
             if gr == 0 {
                 first[channel] = Some((summary, outcome.granule.scalefactors.clone()));
             }

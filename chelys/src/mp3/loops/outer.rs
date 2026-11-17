@@ -4,7 +4,7 @@
 //! The outer iteration loop, or distortion control loop (clause C.1.5.4.3,
 //! figure C.9.b).
 
-use super::inner::{Lines, Step, StepEstimate, inner_loop_step, nonzero_end, step_size};
+use super::inner::{Lines, Step, StepEstimate, Unscaled, inner_loop_step, nonzero_end, step_size};
 use crate::mp3::header::SamplingFrequency;
 use crate::mp3::huffman::{Counted, MAX_MAGNITUDE, SpectrumCoding};
 use crate::mp3::scalefactor_bands::{self, Band, LONG_BANDS};
@@ -215,10 +215,10 @@ pub fn outer_loop(
     )
 }
 
-/// [`outer_loop`], with the estimate of the inner loop's first step for
-/// `xr` as they are, kept in `estimate` once worked out, for lines coded
-/// again with other bits. It serves where the loop starts from `xr` as they
-/// are, that is without scalefactors taken over with scfsi.
+/// [`outer_loop`], with `xr` as they are and the estimate of the inner
+/// loop's first step for them kept in `unscaled` once worked out, for lines
+/// coded again with other bits. They serve where the loop starts from `xr`
+/// as they are, that is without scalefactors taken over with scfsi.
 #[allow(clippy::too_many_arguments)]
 pub fn outer_loop_with(
     xr: &[f64; GRANULE_LINES],
@@ -228,7 +228,7 @@ pub fn outer_loop_with(
     sampling_frequency: SamplingFrequency,
     reuse: Option<Reuse>,
     intensity: Option<&IntensityPositions>,
-    estimate: Option<&std::cell::OnceCell<StepEstimate>>,
+    unscaled: Option<&std::cell::OnceCell<Unscaled>>,
 ) -> Outcome {
     let Bits {
         available: available_bits,
@@ -260,8 +260,13 @@ pub fn outer_loop_with(
     // stereo marks.
     let mut best: Option<(f64, (Fitted, bool), Scalefactors)> = None;
     let mut start_gain = None;
-    // The lines of the last iteration, whose powers the next takes over.
-    let mut lines: Option<Lines> = None;
+    // The lines of the last iteration, whose powers the next takes over,
+    // starting from `xr` as they are, which `unscaled` may have already.
+    let unscaled_cell = unscaled;
+    let unscaled = unscaled
+        .filter(|_| reuse.is_none())
+        .map(|unscaled| unscaled.get_or_init(|| Unscaled::new(xr)));
+    let mut lines: Option<Lines> = unscaled.map(|unscaled| unscaled.lines.clone());
     let update = |lines: &mut Option<Lines>, amplified: &[f64; GRANULE_LINES]| match lines {
         Some(lines) => lines.update(amplified),
         None => *lines = Some(Lines::new(amplified)),
@@ -271,10 +276,8 @@ pub fn outer_loop_with(
         let amplified = amplify(xr, &scalefactors, &bands);
         update(&mut lines, &amplified);
         let current = lines.as_ref().expect("lines");
-        // Only the first fit starts from an estimate, and without scfsi it
-        // fits `xr` as they are.
-        let first = (estimate.filter(|_| start_gain.is_none() && reuse.is_none()))
-            .map(|estimate| estimate.get_or_init(|| StepEstimate::new(current)));
+        // Only the first fit starts from an estimate.
+        let first = (unscaled.filter(|_| start_gain.is_none())).map(|unscaled| &unscaled.estimate);
         let granule = fit(
             current,
             &scalefactors,
@@ -295,7 +298,7 @@ pub fn outer_loop_with(
                     sampling_frequency,
                     None,
                     intensity,
-                    estimate,
+                    unscaled_cell,
                 );
             }
             break;
