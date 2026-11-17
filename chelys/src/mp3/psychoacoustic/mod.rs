@@ -283,14 +283,19 @@ impl Analysis {
 pub struct PsychoacousticModel {
     partitions: &'static [Partition],
     band_weights: &'static [BandWeights; LONG_BANDS],
-    /// `sprdngf(bval(bb), bval(b))`, indexed `[bb][b]`.
-    spreading: Vec<Vec<f64>>,
+    /// For each partition `b`, the partitions `bb` that spread into it, with
+    /// `sprdngf(bval(bb), bval(b))`, in order: those with a spread of zero
+    /// are left out, as adding nothing to the sums they are in changes none.
+    spread_into: Vec<Vec<(usize, f64)>>,
     short_partitions: &'static [ShortPartition],
     short_band_weights: &'static [BandWeights; SHORT_BANDS],
-    /// As `spreading`, between the short partitions.
-    short_spreading: Vec<Vec<f64>>,
+    /// As `spread_into`, between the short partitions.
+    short_spread_into: Vec<Vec<(usize, f64)>>,
     /// The normalising constant of each short partition.
     short_norm: Vec<f64>,
+    /// The ratio of the threshold to the spread energy of each short
+    /// partition.
+    short_snr: Vec<f64>,
     /// The threshold in quiet that each partition allows noise, and each
     /// short partition: see [`noise_in_quiet`].
     noise_in_quiet: Vec<f64>,
@@ -326,11 +331,12 @@ impl PsychoacousticModel {
         Self {
             partitions,
             band_weights: partitions::band_weights(sampling_frequency),
-            spreading: spreading_matrix(partitions.iter().map(|p| p.bval)),
+            spread_into: spread_into(&spreading_matrix(partitions.iter().map(|p| p.bval))),
             short_partitions,
             short_band_weights: partitions::short_band_weights(sampling_frequency),
-            short_spreading,
+            short_spread_into: spread_into(&short_spreading),
             short_norm,
+            short_snr: short_partitions.iter().map(|p| p.snr.ratio()).collect(),
             noise_in_quiet: noise_in_quiet(partitions.iter().map(|p| (p.qthr, p.width, p.bval))),
             short_noise_in_quiet: noise_in_quiet(
                 short_partitions.iter().map(|p| (p.qthr, p.width, p.bval)),
@@ -385,9 +391,9 @@ impl PsychoacousticModel {
         let mut nb = Vec::with_capacity(self.partitions.len());
         for (b, p) in self.partitions.iter().enumerate() {
             let (mut ecb, mut ct) = (0.0, 0.0);
-            for (bb, spreading) in self.spreading.iter().enumerate() {
-                ecb += eb[bb] * spreading[b];
-                ct += cb[bb] * spreading[b];
+            for &(bb, spreading) in &self.spread_into[b] {
+                ecb += eb[bb] * spreading;
+                ct += cb[bb] * spreading;
             }
             // Spec gap: with no energy `ct / ecb` is undefined. Taking it as 0
             // makes ln(0) give a fully tonal partition, whose threshold is
@@ -508,11 +514,11 @@ impl PsychoacousticModel {
             .short_partitions
             .iter()
             .enumerate()
-            .map(|(b, p)| {
-                let ecb: f64 = (self.short_spreading.iter().zip(&eb))
-                    .map(|(spreading, eb)| eb * spreading[b])
+            .map(|(b, _)| {
+                let ecb: f64 = (self.short_spread_into[b].iter())
+                    .map(|&(bb, spreading)| eb[bb] * spreading)
                     .sum();
-                let nbb = ecb * self.short_norm[b] * p.snr.ratio();
+                let nbb = ecb * self.short_norm[b] * self.short_snr[b];
                 self.short_noise_in_quiet[b].max(nbb)
             })
             .collect();
@@ -588,6 +594,19 @@ fn noise_in_quiet(partitions: impl Iterator<Item = (f64, usize, f64)>) -> Vec<f6
 }
 
 /// `sprdngf(bval(bb), bval(b))` between all partitions, indexed `[bb][b]`.
+/// For each partition `b`, the partitions `bb` with a spread
+/// `spreading[bb][b]` other than zero, and their spread, in order.
+fn spread_into(spreading: &[Vec<f64>]) -> Vec<Vec<(usize, f64)>> {
+    (0..spreading.len())
+        .map(|b| {
+            (spreading.iter().enumerate())
+                .map(|(bb, from)| (bb, from[b]))
+                .filter(|&(_, spread)| spread != 0.0)
+                .collect()
+        })
+        .collect()
+}
+
 fn spreading_matrix(bval: impl Iterator<Item = f64> + Clone) -> Vec<Vec<f64>> {
     bval.clone()
         .map(|from| {
@@ -840,7 +859,7 @@ mod tests {
             let short = short.unwrap();
             let partitions = partitions::short_partitions(fs);
             let offset = |b: usize| {
-                let spread: f64 = model.short_spreading.iter().map(|from| from[b]).sum();
+                let spread: f64 = model.short_spread_into[b].iter().map(|&(_, s)| s).sum();
                 10.0 * (model.short_norm[b] * spread).log10()
             };
             for (w, ratio) in short.ratio.iter().enumerate() {
