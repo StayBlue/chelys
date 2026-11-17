@@ -404,7 +404,9 @@ impl StepEstimate {
             let z = f64::from(GLOBAL_GAIN_OFFSET)
                 + (approximate_log2(powered) - lowest_nonzero) * 16.0 / 3.0;
             if z >= 0.0 {
-                steps[z.min(256.0) as usize] += 1;
+                // Converted as an `i32`, which takes fewer instructions than
+                // a `usize`, the same in this range.
+                steps[z.min(256.0) as i32 as usize] += 1;
             }
         }
         Self { steps }
