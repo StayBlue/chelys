@@ -232,6 +232,9 @@ impl Default for Polar {
 struct Analysis {
     fft: RealFft,
     window: Vec<f64>,
+    /// The windowed samples, kept from one block to the next for their
+    /// memory.
+    windowed: Vec<f64>,
     /// The lines whose unpredictability the model uses, from DC up; above
     /// them it is not computed, and the phases not kept.
     predicted: usize,
@@ -250,6 +253,7 @@ impl Analysis {
         assert!(predicted <= size / 2 + 1, "lines to predict");
         Self {
             fft: RealFft::new(size),
+            windowed: Vec::with_capacity(size),
             window,
             predicted,
             last: vec![Polar::default(); predicted],
@@ -265,19 +269,17 @@ impl Analysis {
         // Exact: the size is a power of two, so multiplying by its
         // reciprocal divides by it, without a division for each sample.
         let reciprocal = 1.0 / self.window.len() as f64;
-        let windowed: Vec<f64> = samples
-            .iter()
-            .zip(&self.window)
-            .map(|(s, w)| s * PCM_SCALE * w * reciprocal)
-            .collect();
-        let x = self.fft.transform(&windowed);
+        self.windowed.clear();
+        self.windowed.extend(
+            (samples.iter().zip(&self.window)).map(|(s, w)| s * PCM_SCALE * w * reciprocal),
+        );
+        let x = self.fft.transform(&self.windowed);
 
         let r: Vec<f64> = x
             .iter()
             .map(|x| (x.re * x.re + x.im * x.im).sqrt())
             .collect();
         let mut c = Vec::with_capacity(self.predicted);
-        let mut current = Vec::with_capacity(self.predicted);
         for (w, x) in x[..self.predicted].iter().enumerate() {
             // Spec reading: clause D.2.4 c) predicts the phase as
             // `2 f(t-1) - f(t-2)`, of which clause D.2.4 d) takes only the
@@ -318,9 +320,11 @@ impl Analysis {
             // by zero. The line has no energy, so its unpredictability carries
             // no weight and any value does.
             c.push(if scale == 0.0 { 0.0 } else { distance / scale });
-            current.push(polar);
+            // The spectrum before last is not needed again, and takes this
+            // block's, line by line, to become the last.
+            self.before_last[w] = polar;
         }
-        self.before_last = std::mem::replace(&mut self.last, current);
+        std::mem::swap(&mut self.last, &mut self.before_last);
         (r, c)
     }
 }

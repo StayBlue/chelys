@@ -127,6 +127,10 @@ pub struct RealFft {
     half: Fft,
     /// `e^(-2 pi i k / N)` for `k <= N / 2`.
     twiddles: Vec<Complex>,
+    /// The complex values of the half-size transform, and the lines given,
+    /// kept from one transform to the next for their memory.
+    z: Vec<Complex>,
+    lines: Vec<Complex>,
 }
 
 impl RealFft {
@@ -150,6 +154,8 @@ impl RealFft {
         Self {
             half: Fft::new(size / 2),
             twiddles,
+            z: Vec::with_capacity(size / 2),
+            lines: Vec::with_capacity(size / 2 + 1),
         }
     }
 
@@ -159,17 +165,17 @@ impl RealFft {
     /// # Panics
     ///
     /// If `x` is not the size the transform was made for.
-    pub fn transform(&self, x: &[f64]) -> Vec<Complex> {
+    pub fn transform(&mut self, x: &[f64]) -> &[Complex] {
         let half = self.twiddles.len() - 1;
         assert_eq!(x.len(), 2 * half, "FFT input size");
-        let mut z: Vec<Complex> = x
-            .chunks_exact(2)
-            .map(|pair| Complex {
-                re: pair[0],
-                im: pair[1],
-            })
-            .collect();
-        self.half.transform(&mut z);
+        let z = &mut self.z;
+        z.clear();
+        z.extend(x.chunks_exact(2).map(|pair| Complex {
+            re: pair[0],
+            im: pair[1],
+        }));
+        self.half.transform(z);
+        let twiddles = &self.twiddles;
         let line = |k: usize, zk: Complex, mirrored: Complex| {
             let mirrored = mirrored.conj();
             let even = Complex {
@@ -181,14 +187,15 @@ impl RealFft {
                 re: (zk.im - mirrored.im) / 2.0,
                 im: -(zk.re - mirrored.re) / 2.0,
             };
-            let odd = odd.mul(self.twiddles[k]);
+            let odd = odd.mul(twiddles[k]);
             Complex {
                 re: even.re + odd.re,
                 im: even.im + odd.im,
             }
         };
         // Z(N/2) = Z(0), so the first and last lines take Z(0) twice.
-        let mut x = Vec::with_capacity(half + 1);
+        let x = &mut self.lines;
+        x.clear();
         x.push(line(0, z[0], z[0]));
         x.extend((1..half).map(|k| line(k, z[k], z[half - k])));
         x.push(line(half, z[0], z[0]));
@@ -235,7 +242,8 @@ mod tests {
             let mut complex: Vec<Complex> =
                 (input.iter()).map(|&re| Complex { re, im: 0.0 }).collect();
             Fft::new(n).transform(&mut complex);
-            let real = RealFft::new(n).transform(&input);
+            let mut fft = RealFft::new(n);
+            let real = fft.transform(&input);
             assert_eq!(real.len(), n / 2 + 1);
             for (k, (real, complex)) in real.iter().zip(&complex).enumerate() {
                 assert!((real.re - complex.re).abs() < 1e-9, "n {n}, k {k}");
