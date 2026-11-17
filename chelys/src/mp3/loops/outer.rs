@@ -391,6 +391,9 @@ impl ToSave<'_> {
         // its granule is made only once the search ends.
         let mut kept: Option<(u8, [i32; GRANULE_LINES], Scalefactors)> = None;
         let mut marked = granule.scalefactors.marks_any();
+        // The scalefactors, and so their bits, change only where intensity
+        // stereo marks them.
+        let unmarked_part2 = part2_length(self.scalefactors);
         for global_gain in granule.global_gain.saturating_add(1)..=u8::MAX {
             let Some(mut values) = self.lines.quantize(global_gain) else {
                 break;
@@ -412,7 +415,10 @@ impl ToSave<'_> {
                     break;
                 }
             }
-            let part2 = part2_length(&scalefactors);
+            let part2 = match self.intensity {
+                Some(_) => part2_length(&scalefactors),
+                None => unmarked_part2,
+            };
             let Some(most) = available_bits.checked_sub(part2) else {
                 break;
             };
