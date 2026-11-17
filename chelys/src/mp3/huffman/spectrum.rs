@@ -661,16 +661,40 @@ const ESCAPE_SETS: [usize; 2] = [CODE_SETS - 2, CODE_SETS - 1];
 
 /// What [`BandBits`] needs of each table that is used, worked out once.
 struct PairTables {
-    /// Each set of code words, with its first table.
-    sets: [TableEntry; CODE_SETS],
     /// The largest magnitude each set of code words can code, in its own
     /// array to be vectorised.
     largest: [u32; CODE_SETS],
-    /// The tables of each of [`ESCAPE_SETS`], in order.
-    escape_tables: [Vec<TableEntry>; ESCAPE_SETS.len()],
+    /// What [`cheapest`](Self::cheapest) takes from each set of code words
+    /// for each class of largest magnitude, indexed by [`magnitude_class`].
+    choices: [Choice; MAGNITUDE_CLASSES],
     /// For each pair of magnitudes, capped at 15, as `16 * x + y`, the length
     /// of its code word in each set of code words; zero where a set has none.
     lens: [[u8; CODE_SETS]; 256],
+}
+
+/// For a largest magnitude, each set of code words' first table that can
+/// code it, which of the set needs the fewest bits.
+#[derive(Clone, Copy, Default)]
+struct Choice {
+    /// Whether the set has such a table.
+    codes: [bool; CODE_SETS],
+    /// Its `linbits`, the bits of each escape field.
+    linbits: [i16; CODE_SETS],
+    table_select: [u8; CODE_SETS],
+}
+
+/// The classes of largest magnitude for which [`Choice`] differs: each up to
+/// 15, and above it each width of the escape field that it needs.
+const MAGNITUDE_CLASSES: usize = 16 + MAX_MAGNITUDE.ilog2() as usize + 1;
+
+/// The class of `largest` among the [`MAGNITUDE_CLASSES`]: the magnitude up
+/// to 15, and above it 15 plus the bits of `largest - 15`, which are the
+/// fewest `linbits` that code it, as an escape field codes `largest - 15`.
+fn magnitude_class(largest: u32) -> usize {
+    match largest.checked_sub(15) {
+        None | Some(0) => largest as usize,
+        Some(escaped) => 15 + escaped.ilog2() as usize + 1,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -722,15 +746,33 @@ impl PairTables {
                     }
                 }
             }
-            let largest_of = |entries: &[TableEntry]| entries.iter().map(|e| e.largest).max();
-            let firsts: [TableEntry; CODE_SETS] = std::array::from_fn(|set| TableEntry {
-                largest: largest_of(&sets[set].1).expect("a table per set"),
-                ..sets[set].1[0]
+            let largest: [u32; CODE_SETS] = std::array::from_fn(|set| {
+                (sets[set].1.iter().map(|e| e.largest).max()).expect("a table per set")
             });
+            let mut choices = [Choice::default(); MAGNITUDE_CLASSES];
+            for magnitude in 0..=MAX_MAGNITUDE {
+                let mut choice = Choice::default();
+                for (set, (_, entries)) in sets.iter().enumerate() {
+                    if let Some(first) = entries.iter().find(|entry| magnitude <= entry.largest) {
+                        choice.codes[set] = true;
+                        choice.linbits[set] = i16::try_from(first.linbits).expect("linbits");
+                        choice.table_select[set] = first.table_select;
+                    }
+                }
+                let class = &mut choices[magnitude_class(magnitude)];
+                if magnitude == 0 || magnitude_class(magnitude) != magnitude_class(magnitude - 1) {
+                    *class = choice;
+                }
+                assert!(
+                    class.codes == choice.codes
+                        && class.linbits == choice.linbits
+                        && class.table_select == choice.table_select,
+                    "magnitude {magnitude} chooses as its class does"
+                );
+            }
             Self {
-                sets: firsts,
-                largest: firsts.map(|set| set.largest),
-                escape_tables: ESCAPE_SETS.map(|set| sets[set].1.clone()),
+                largest,
+                choices,
                 lens,
             }
         })
@@ -744,41 +786,21 @@ impl PairTables {
         // which of the set needs the fewest, or i16::MAX where none can,
         // laid out so that the compiler can vectorise it; of the fewest,
         // the table first in order is kept.
+        let choice = &self.choices[magnitude_class(largest)];
         let mut lanes = [0i16; CODE_SETS];
         for set in 0..CODE_SETS {
-            lanes[set] = if largest > self.largest[set] {
-                i16::MAX
+            lanes[set] = if choice.codes[set] {
+                bits[set] as i16 + escapes as i16 * choice.linbits[set]
             } else {
-                bits[set] as i16
+                i16::MAX
             };
-        }
-        let escape_tables = ESCAPE_SETS.map(|set| self.first_that_codes(set, largest));
-        for (&set, table) in ESCAPE_SETS.iter().zip(&escape_tables) {
-            lanes[set] += escapes as i16 * table.linbits as i16;
         }
         let least = lanes.iter().copied().fold(i16::MAX, i16::min);
         let set = lanes
             .iter()
             .position(|&bits| bits == least)
             .expect("table 31 codes every allowed magnitude");
-        let table = match ESCAPE_SETS.iter().position(|&escape| escape == set) {
-            Some(index) => escape_tables[index].table_select,
-            None => self.sets[set].table_select,
-        };
-        (table, least as usize)
-    }
-
-    /// The first table of the escape set `set` that codes `largest`, which
-    /// needs the fewest bits of the set, its `linbits` being the fewest.
-    fn first_that_codes(&self, set: usize, largest: u32) -> TableEntry {
-        let index = ESCAPE_SETS
-            .iter()
-            .position(|&escape| escape == set)
-            .expect("an escape set");
-        *self.escape_tables[index]
-            .iter()
-            .find(|entry| largest <= entry.largest)
-            .expect("the last table codes every allowed magnitude")
+        (choice.table_select[set], least as usize)
     }
 }
 
