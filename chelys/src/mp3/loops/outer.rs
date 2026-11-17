@@ -515,11 +515,14 @@ impl ToSave<'_> {
                 };
                 kept = Some(step);
             } else {
-                last = Some((global_gain, step));
+                // Only the step is kept; its values are quantised again
+                // if their bits are counted.
+                last = Some(global_gain);
             }
         }
         let kept = kept.or_else(|| {
-            let (coarsest, step) = last?;
+            let coarsest = last?;
+            let step = quantised(coarsest, marked).expect("the step passed");
             if let Some(kept) = counted(coarsest, step) {
                 return Some(kept);
             }
