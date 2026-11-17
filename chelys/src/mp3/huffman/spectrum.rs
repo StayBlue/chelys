@@ -473,7 +473,14 @@ struct BandBits {
     least_below: [usize; LONG_BANDS + 1],
     /// The largest magnitude of each band.
     max: [u32; LONG_BANDS],
+    /// The split, once searched: both whether a step's bits fit and the
+    /// coding of the step kept can need it.
+    split: std::cell::OnceCell<Split>,
 }
+
+/// `(region0_count, region1_count)`, the table of each region and the bits
+/// of the pairs.
+type Split = ((u8, u8), [u8; 3], usize);
 
 impl BandBits {
     fn new(values: &[i32], bands: &[Band]) -> Self {
@@ -523,6 +530,7 @@ impl BandBits {
             escapes_below,
             least_below,
             max,
+            split: std::cell::OnceCell::new(),
         }
     }
 
@@ -568,7 +576,12 @@ impl BandBits {
     /// 128 kbit/s (from -1.57 to -1.47 for the worst track) and from -0.22 to
     /// -0.21 at 192 kbit/s; at `--vbr` the streams came out 1 to 2% smaller at
     /// the same grade. Encoding takes about 1.4 times as long.
-    fn split(&self) -> ((u8, u8), [u8; 3], usize) {
+    fn split(&self) -> Split {
+        *self.split.get_or_init(|| self.search_split())
+    }
+
+    /// [`split`](Self::split), searched.
+    fn search_split(&self) -> Split {
         let (count, least_below) = (self.count, &self.least_below);
         let region = |range| self.region(range);
         // The last region, for each band it may start at.
