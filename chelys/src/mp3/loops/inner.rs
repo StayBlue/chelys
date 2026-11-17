@@ -6,6 +6,7 @@
 
 use crate::mp3::header::SamplingFrequency;
 use crate::mp3::huffman::MAX_MAGNITUDE;
+use crate::mp3::huffman::SpectrumCoding;
 use crate::mp3::{BlockType, GRANULE_LINES, QuantizedGranule, scalefactor_bands};
 
 /// Spec gap: clause C.1.5.4.1 sets `global_gain = qquant + system_constant`
@@ -167,27 +168,51 @@ pub fn inner_loop_lines(
         ));
     }
     let bands = scalefactor_bands::coding_bands(block_type, sampling_frequency);
+    // A step that fits, with its values; the granule is made only for the
+    // step the search ends on.
     let attempt = |global_gain: u8| {
         let values = lines.quantize(global_gain)?;
-        let granule = QuantizedGranule::new(global_gain, values, block_type, sampling_frequency);
-        let fits = granule.coding.bit_count(&granule.values, &bands) <= available_bits;
-        fits.then_some(granule)
+        let fits = SpectrumCoding::bits_between(
+            &values,
+            block_type,
+            &bands,
+            sampling_frequency,
+            0,
+            available_bits,
+        );
+        fits.then_some(Step {
+            global_gain,
+            values,
+        })
+    };
+    let granule = |step: Step| {
+        QuantizedGranule::new(
+            step.global_gain,
+            step.values,
+            block_type,
+            sampling_frequency,
+        )
     };
 
-    let start = start_gain.unwrap_or_else(|| bisect(&attempt));
-    if let Some(mut granule) = attempt(start) {
+    // Each search keeps the step it ends on, so that no step is quantised
+    // twice.
+    let (start, first) = match start_gain {
+        Some(start) => (start, attempt(start)),
+        None => bisect(&attempt),
+    };
+    if let Some(mut step) = first {
         // Finer steps while they fit.
-        while let Some(finer) = granule.global_gain.checked_sub(1).and_then(&attempt) {
-            granule = finer;
+        while let Some(finer) = step.global_gain.checked_sub(1).and_then(&attempt) {
+            step = finer;
         }
-        return Some(granule);
+        return Some(granule(step));
     }
     // Coarser steps until one fits: doubling the distance, then bisecting.
     let (mut over, mut distance) = (start, 1u8);
     let fits = loop {
         let next = over.saturating_add(distance);
-        if attempt(next).is_some() {
-            break next;
+        if let Some(step) = attempt(next) {
+            break step;
         }
         if next == u8::MAX {
             return None;
@@ -195,37 +220,39 @@ pub fn inner_loop_lines(
         over = next;
         distance = distance.saturating_mul(2);
     };
-    let fits = bisect_between(&attempt, over, fits);
-    attempt(fits)
+    Some(granule(bisect_between(&attempt, over, fits)))
 }
 
-/// A step size near the finest that fits, by bisection over the whole range.
-/// Spec gap: this assumes that larger steps never need more bits, which the
-/// Huffman tables do not quite guarantee; the search in [`inner_loop`] then
-/// ends on a step whose next finer step does not fit.
-fn bisect(attempt: &impl Fn(u8) -> Option<QuantizedGranule>) -> u8 {
-    if attempt(0).is_some() {
-        return 0;
-    }
-    if attempt(u8::MAX).is_none() {
-        return u8::MAX;
-    }
-    bisect_between(attempt, 0, u8::MAX)
+/// A step size and the values quantised with it.
+struct Step {
+    global_gain: u8,
+    values: [i32; GRANULE_LINES],
 }
 
-/// Narrows `over`, which does not fit, and `fits`, which does, to adjacent
-/// steps and returns the one that fits.
-fn bisect_between(
-    attempt: &impl Fn(u8) -> Option<QuantizedGranule>,
-    mut over: u8,
-    mut fits: u8,
-) -> u8 {
-    while fits - over > 1 {
-        let middle = over + (fits - over) / 2;
-        if attempt(middle).is_some() {
-            fits = middle;
-        } else {
-            over = middle;
+/// A step size near the finest that fits, by bisection over the whole range,
+/// and its values if it fits. Spec gap: this assumes that larger steps
+/// never need more bits, which the Huffman tables do not quite guarantee;
+/// the search in [`inner_loop`] then ends on a step whose next finer step
+/// does not fit.
+fn bisect(attempt: &impl Fn(u8) -> Option<Step>) -> (u8, Option<Step>) {
+    if let Some(step) = attempt(0) {
+        return (0, Some(step));
+    }
+    let Some(coarsest) = attempt(u8::MAX) else {
+        return (u8::MAX, None);
+    };
+    let step = bisect_between(attempt, 0, coarsest);
+    (step.global_gain, Some(step))
+}
+
+/// Narrows `over`, which does not fit, and the step of `fits`, which does,
+/// to adjacent steps and returns the one that fits.
+fn bisect_between(attempt: &impl Fn(u8) -> Option<Step>, mut over: u8, mut fits: Step) -> Step {
+    while fits.global_gain - over > 1 {
+        let middle = over + (fits.global_gain - over) / 2;
+        match attempt(middle) {
+            Some(step) => fits = step,
+            None => over = middle,
         }
     }
     fits

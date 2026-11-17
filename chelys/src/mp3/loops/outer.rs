@@ -6,7 +6,7 @@
 
 use super::inner::{Lines, inner_loop_lines, step_size};
 use crate::mp3::header::SamplingFrequency;
-use crate::mp3::huffman::MAX_MAGNITUDE;
+use crate::mp3::huffman::{MAX_MAGNITUDE, SpectrumCoding};
 use crate::mp3::scalefactor_bands::{self, Band, LONG_BANDS};
 use crate::mp3::scalefactors::{PRETAB, Scalefactors, ZeroPart};
 use crate::mp3::side_info::SCFSI_BANDS;
@@ -387,8 +387,11 @@ impl ToSave<'_> {
         let allowed: Vec<f64> = (self.xmin.iter().enumerate())
             .map(|(sb, xmin)| raised * xmin * self.scalefactors.amplification(sb).powi(2))
             .collect();
-        let mut kept = granule;
-        for global_gain in kept.global_gain.saturating_add(1)..=u8::MAX {
+        // The coarsest step that passes, with its values and scalefactors;
+        // its granule is made only once the search ends.
+        let mut kept: Option<(u8, [i32; GRANULE_LINES], Scalefactors)> = None;
+        let mut marked = granule.scalefactors.marks_any();
+        for global_gain in granule.global_gain.saturating_add(1)..=u8::MAX {
             let Some(mut values) = self.lines.quantize(global_gain) else {
                 break;
             };
@@ -402,21 +405,46 @@ impl ToSave<'_> {
             {
                 break;
             }
-            let mut coarser = QuantizedGranule::new(global_gain, values, kept.block_type, fs);
-            coarser.scalefactors = self.scalefactors.clone();
+            let mut scalefactors = self.scalefactors.clone();
             if let Some(intensity) = self.intensity {
-                intensity.mark(&mut coarser.scalefactors, &coarser.values);
-                if coarser.scalefactors.marks_any() && !kept.scalefactors.marks_any() {
+                intensity.mark(&mut scalefactors, &values);
+                if scalefactors.marks_any() && !marked {
                     break;
                 }
             }
-            if !(saving.least..=available_bits).contains(&coarser.bit_len(fs)) {
+            let part2 = part2_length(&scalefactors);
+            let Some(most) = available_bits.checked_sub(part2) else {
+                break;
+            };
+            let least = saving.least.saturating_sub(part2);
+            if !SpectrumCoding::bits_between(
+                &values,
+                granule.block_type,
+                self.bands,
+                fs,
+                least,
+                most,
+            ) {
                 break;
             }
-            kept = coarser;
+            marked = scalefactors.marks_any();
+            kept = Some((global_gain, values, scalefactors));
         }
-        kept
+        let Some((global_gain, values, scalefactors)) = kept else {
+            return granule;
+        };
+        let mut coarsest = QuantizedGranule::new(global_gain, values, granule.block_type, fs);
+        coarsest.scalefactors = scalefactors;
+        debug_assert!((saving.least..=available_bits).contains(&coarsest.bit_len(fs)));
+        coarsest
     }
+}
+
+/// The bits of `scalefactors`, `part2_length`, with the `scalefac_compress`
+/// that sends them in the fewest.
+fn part2_length(scalefactors: &Scalefactors) -> usize {
+    let compress = (scalefactors.compress()).expect("scalefactors are kept within their limits");
+    scalefactors.part2_length(compress)
 }
 
 /// The inner loop for the lines `amplified` by `scalefactors`, in at most

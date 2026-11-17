@@ -121,6 +121,74 @@ impl SpectrumCoding {
         if shorter.1 < run.1 { shorter } else { run }
     }
 
+    /// Whether the coding that [`choose`](Self::choose) gives `values`
+    /// needs between `least` and `most` bits. The answer is the same, but
+    /// where bounds on the bits of each split settle it, without searching
+    /// the splits.
+    pub fn bits_between(
+        values: &[i32; GRANULE_LINES],
+        block_type: BlockType,
+        bands: &[Band],
+        sampling_frequency: SamplingFrequency,
+        least: usize,
+        most: usize,
+    ) -> bool {
+        let exact = || {
+            let bits = Self::choose_counted(values, block_type, bands, sampling_frequency).1;
+            (least..=most).contains(&bits)
+        };
+        if block_type != BlockType::Normal {
+            return exact();
+        }
+        let between = Self::bounded_bits_between(values, bands, least, most);
+        debug_assert_eq!(between, exact());
+        between
+    }
+
+    /// [`bits_between`](Self::bits_between) for a normal block.
+    fn bounded_bits_between(
+        values: &[i32; GRANULE_LINES],
+        bands: &[Band],
+        least: usize,
+        most: usize,
+    ) -> bool {
+        let (start, end, zeros_end) = Self::partitions(values);
+        // For each partition, its quadruples' bits and its pairs' bits by
+        // band.
+        let partitions = [Some(start), zeros_end].map(|start| {
+            start.map(|start| {
+                let quads = &values[start..end];
+                let quad_bits = quad_bits(QuadTable::A, quads).min(quad_bits(QuadTable::B, quads));
+                (quad_bits, BandBits::new(&values[..start], bands))
+            })
+        });
+        let partitions = partitions.iter().flatten();
+        // The bits lie between the fewest any partition can need and the
+        // fewest that a split of each needs.
+        let lower = (partitions.clone())
+            .map(|(quad_bits, pairs)| quad_bits + pairs.least())
+            .min()
+            .expect("a partition");
+        if lower > most {
+            return false;
+        }
+        let upper = (partitions.clone())
+            .map(|(quad_bits, pairs)| quad_bits + pairs.upper())
+            .min()
+            .expect("a partition");
+        if upper < least {
+            return false;
+        }
+        if least <= lower && upper <= most {
+            return true;
+        }
+        let bits = (partitions.clone())
+            .map(|(quad_bits, pairs)| quad_bits + pairs.split().2)
+            .min()
+            .expect("a partition");
+        (least..=most).contains(&bits)
+    }
+
     /// The partitions to try: `count1` from the first line returned, or
     /// from the third if given, to the second.
     fn partitions(values: &[i32; GRANULE_LINES]) -> (usize, usize, Option<usize>) {
@@ -399,6 +467,19 @@ impl BandBits {
             least_below,
             max,
         }
+    }
+
+    /// No split needs fewer bits than this.
+    fn least(&self) -> usize {
+        self.least_below[self.count]
+    }
+
+    /// The bits of one split, which the best needs no more than.
+    fn upper(&self) -> usize {
+        let count = self.count;
+        let end0 = (count / 3).clamp(1.min(count), 16);
+        let end1 = (count - count / 4).clamp(end0, end0 + 8).min(count);
+        self.region(0..end0).1 + self.region(end0..end1).1 + self.region(end1..count).1
     }
 
     /// The table that codes the bands `range` in the fewest bits, and those
