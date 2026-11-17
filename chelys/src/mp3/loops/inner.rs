@@ -218,7 +218,12 @@ pub fn inner_loop_step(
         return Some(Step {
             global_gain: 0,
             values,
-            counted: SpectrumCoding::count(&values, block_type, &bands, sampling_frequency),
+            counted: Box::new(SpectrumCoding::count(
+                &values,
+                block_type,
+                &bands,
+                sampling_frequency,
+            )),
         });
     }
     // A step that fits, with its values; the granule is made only for the
@@ -226,10 +231,10 @@ pub fn inner_loop_step(
     let attempt = |global_gain: u8| {
         let values = lines.quantize(global_gain)?;
         let counted = SpectrumCoding::count(&values, block_type, &bands, sampling_frequency);
-        counted.bits_between(0, available_bits).then_some(Step {
+        counted.bits_between(0, available_bits).then(|| Step {
             global_gain,
             values,
-            counted,
+            counted: Box::new(counted),
         })
     };
     // Each search keeps the step it ends on, so that no step is quantised
@@ -264,7 +269,7 @@ pub struct Step {
     pub values: [i32; GRANULE_LINES],
     /// The values counted for their coding, which the step's granule is
     /// made with.
-    counted: Counted,
+    counted: Box<Counted>,
 }
 
 impl Step {

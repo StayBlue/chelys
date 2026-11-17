@@ -364,10 +364,6 @@ pub fn outer_loop(
 /// coding is chosen only for the granule that the outer loop keeps, with
 /// its scalefactors, or with intensity stereo, whose bits are counted
 /// with the marks, the granule made at once.
-#[allow(
-    clippy::large_enum_variant,
-    reason = "one is held per outer loop iteration, and boxing would allocate for each"
-)]
 enum Fitted {
     Step(Step, Scalefactors),
     Granule(QuantizedGranule),
