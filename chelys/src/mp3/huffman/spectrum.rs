@@ -530,7 +530,6 @@ impl BandBits {
         for band in first..count {
             let PairCounts {
                 codes,
-                signs,
                 escapes,
                 largest,
             } = PairCounts::new(&values[boundary(band)..boundary(band + 1)]);
@@ -540,15 +539,14 @@ impl BandBits {
                 .expect("distinct bands");
             for set in 0..CODE_SETS {
                 let bits = if largest <= tables.largest[set] {
-                    codes[set] + signs
+                    codes[set]
                 } else {
                     0
                 };
                 next[set] = previous[set] + bits;
             }
             escapes_below[band + 1] = escapes_below[band] + escapes;
-            let bits = codes.map(|codes| codes + signs);
-            let least = tables.cheapest(&bits, escapes, largest).1;
+            let least = tables.cheapest(&codes, escapes, largest).1;
             least_below[band + 1] = least_below[band] + least;
         }
         // A granule's pairs need too few bits for the sums to overflow.
@@ -705,11 +703,10 @@ impl BandBits {
 
 /// What the bits of some pairs with each set of code words come to.
 struct PairCounts {
-    /// The bits of their code words in each set, with nothing for a pair
-    /// that a set has no code word for.
+    /// The bits of their code words in each set, with a sign bit for each
+    /// nonzero value, and nothing for a pair that a set has no code word
+    /// for.
     codes: [u16; CODE_SETS],
-    /// Their nonzero values, which each have a sign bit.
-    signs: u16,
     /// Their values of 15 or more, which each have an escape field.
     escapes: u16,
     /// Their largest magnitude.
@@ -721,14 +718,12 @@ impl PairCounts {
         let tables = PairTables::get();
         let mut counts = Self {
             codes: [0; CODE_SETS],
-            signs: 0,
             escapes: 0,
             largest: 0,
         };
         for pair in values.chunks_exact(2) {
             let [x, y] = [pair[0], pair[1]].map(i32::unsigned_abs);
             counts.largest = counts.largest.max(x).max(y);
-            counts.signs += u16::from(x != 0) + u16::from(y != 0);
             counts.escapes += u16::from(x >= 15) + u16::from(y >= 15);
             let lens = &tables.lens[(16 * x.min(15) + y.min(15)) as usize];
             for (codes, &len) in counts.codes.iter_mut().zip(lens) {
@@ -757,7 +752,8 @@ struct PairTables {
     /// for each class of largest magnitude, indexed by [`magnitude_class`].
     choices: [Choice; MAGNITUDE_CLASSES],
     /// For each pair of magnitudes, capped at 15, as `16 * x + y`, the length
-    /// of its code word in each set of code words; zero where a set has none.
+    /// of its code word in each set of code words with its sign bits; zero
+    /// where a set has none.
     lens: [[u8; CODE_SETS]; 256],
 }
 
@@ -830,8 +826,9 @@ impl PairTables {
                 );
                 for x in 0..table.size {
                     for y in 0..table.size {
-                        lens[16 * x + y][set] =
-                            u8::try_from(table.codeword(x, y).len).expect("code words are short");
+                        let signs = u32::from(x != 0) + u32::from(y != 0);
+                        lens[16 * x + y][set] = u8::try_from(table.codeword(x, y).len + signs)
+                            .expect("code words are short");
                     }
                 }
             }
@@ -903,8 +900,7 @@ impl PairTables {
 /// Returns the table and the bits of `values` with it.
 fn cheapest_table(values: &[i32]) -> (u8, usize) {
     let counts = PairCounts::new(values);
-    let bits = counts.codes.map(|codes| codes + counts.signs);
-    PairTables::get().cheapest(&bits, counts.escapes, counts.largest)
+    PairTables::get().cheapest(&counts.codes, counts.escapes, counts.largest)
 }
 
 fn can_code(table: &PairTable, magnitude: u32) -> bool {
