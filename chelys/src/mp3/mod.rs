@@ -1070,14 +1070,12 @@ impl IntensityTry {
 /// as illegal and the others as positions, and mpg123 and LAME read only 7
 /// as illegal and the others as positions; a marked band is then decoded in
 /// intensity stereo. The conformance test is
-/// `marks_are_read_as_illegal_in_different_fields`. In MS stereo at 22.05
-/// kHz, with the side channel all but zero below every bound, frames are
-/// coded in intensity stereo mostly from the highest bound, below which the
-/// side channel codes what is left of the tones above it, and all three
-/// decode every tone at its level; the conformance test is
+/// `marks_are_read_as_illegal_in_different_fields`. In MS stereo at 16,
+/// 22.05 and 24 kHz, with the side channel all but zero below every bound,
+/// frames are coded in intensity stereo with the side channel given a value
+/// in the band just below the bound, and all three decode every tone at its
+/// level; the conformance test is
 /// `intensity_stereo_keeps_the_level_of_each_channel_at_the_lower_sampling_frequencies`.
-/// At 16 and 24 kHz the tones of that test leave nothing there, and nearly
-/// every frame is coded in MS stereo alone.
 ///
 /// The perceptual entropy each channel's bits are reckoned from stays that
 /// of the left and right channels; in intensity stereo the two then share
