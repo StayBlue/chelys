@@ -600,6 +600,8 @@ impl Encoder {
                 _ => loops::SAVING_NOISE_DB,
             },
             sampling_frequency: fs,
+            ms_stereo: false,
+            prepared: Vec::new(),
         };
         let shortest = config.rate.lowest().frame_len(fs, true);
         let reservoir = Reservoir::new(shortest, fs.version());
@@ -781,6 +783,48 @@ struct ModelCoding {
     /// down to the allowance.
     saving_noise_db: f64,
     sampling_frequency: SamplingFrequency,
+    /// Whether the frame being coded is coded in MS stereo, and its
+    /// granules as every try at coding it starts from, both worked out
+    /// once by [`Coding::prepare`].
+    ms_stereo: bool,
+    prepared: Vec<PreparedGranule>,
+}
+
+/// A granule of a frame as every try at coding the frame starts from: each
+/// channel's lines and allowed distortion, in MS stereo if the frame is
+/// coded in it, and what scfsi takes of them, unless intensity stereo
+/// changes the lines.
+struct PreparedGranule {
+    lines: Vec<([f64; GRANULE_LINES], Vec<f64>)>,
+    summaries: Vec<GranuleSummary>,
+}
+
+impl PreparedGranule {
+    fn new(
+        granule: &[Filtered<Analysis>],
+        ms_stereo: bool,
+        sampling_frequency: SamplingFrequency,
+    ) -> Self {
+        let fs = sampling_frequency;
+        let mut lines: Vec<_> = granule
+            .iter()
+            .map(|f| (f.xr, f.analysis.1.clone()))
+            .collect();
+        if ms_stereo {
+            let [(left, left_xmin), (right, right_xmin)] = &mut lines[..] else {
+                unreachable!("joint stereo has two channels")
+            };
+            (*left, *right) = stereo::middle_side(left, right);
+            stereo::limit_side(right, granule[0].block_type, fs);
+            let joint = stereo::middle_side_distortion(left_xmin, right_xmin);
+            left_xmin.clone_from(&joint);
+            *right_xmin = joint;
+        }
+        let summaries = (granule.iter().zip(&lines))
+            .map(|(f, (xr, xmin))| GranuleSummary::new(xr, xmin, f.block_type, fs))
+            .collect();
+        Self { lines, summaries }
+    }
 }
 
 impl Coding for ModelCoding {
@@ -806,6 +850,10 @@ impl Coding for ModelCoding {
                 }
             }
         }
+        self.ms_stereo = self.ms_allowed && middle_side_frame(frame);
+        self.prepared = (frame.iter())
+            .map(|granule| PreparedGranule::new(granule, self.ms_stereo, fs))
+            .collect();
     }
 
     fn quantize(
@@ -817,7 +865,7 @@ impl Coding for ModelCoding {
         only_within: bool,
     ) -> Option<CodedFrame> {
         let fs = self.sampling_frequency;
-        let ms_stereo = self.ms_allowed && middle_side_frame(frame);
+        let ms_stereo = self.ms_stereo;
         let steps = if intensity && self.intensity_allowed && intensity_frame(frame) {
             0..stereo::INTENSITY_STEPS
         } else {
@@ -825,7 +873,7 @@ impl Coding for ModelCoding {
         };
         let to_quantize = FrameToQuantize {
             frame,
-            ms_stereo,
+            prepared: &self.prepared,
             mean_bits,
             saving_noise_db: self.saving_noise_db,
             sampling_frequency: fs,
@@ -901,7 +949,8 @@ fn search_intensity<Try, Frame>(
 /// data of each granule of each channel.
 struct FrameToQuantize<'a> {
     frame: &'a [Vec<Filtered<Analysis>>],
-    ms_stereo: bool,
+    /// Its granules as [`Coding::prepare`] readied them.
+    prepared: &'a [PreparedGranule],
     mean_bits: usize,
     /// How much more noise than its allowance, in dB, a normal block within
     /// its allowance may be given to leave bits to the reservoir (see
@@ -1072,8 +1121,9 @@ impl IntensityTry {
     }
 }
 
-/// Quantises a frame's granules, in MS stereo if `ms_stereo` is set and in
-/// intensity stereo as `intensity` gives, accounting for their bits in a
+/// Quantises a frame's granules, from them as [`Coding::prepare`] readied
+/// them, in MS stereo if it chose that, and in intensity stereo as
+/// `intensity` gives, accounting for their bits in a
 /// copy of the reservoir, so that a try leaves the encoder's state as it
 /// was. `None` if `if_outside` gives up on a granule outside its allowed
 /// distortion, or if the reservoir gives the right channel of a granule
@@ -1127,7 +1177,7 @@ fn quantize_frame(
 ) -> Option<FrameTry> {
     let &FrameToQuantize {
         frame,
-        ms_stereo,
+        prepared,
         mean_bits,
         saving_noise_db,
         sampling_frequency: fs,
@@ -1139,29 +1189,17 @@ fn quantize_frame(
     let mut excess: f64 = 0.0;
     let mut granules = Vec::with_capacity(frame.len());
     for (gr, granule) in frame.iter().enumerate() {
-        let mut lines: Vec<_> = granule
-            .iter()
-            .map(|f| (f.xr, f.analysis.1.clone()))
-            .collect();
+        let mut lines = prepared[gr].lines.clone();
         let positions = intensity.map(|intensity| &intensity.positions[gr]);
-        if ms_stereo || positions.is_some() {
-            let [(left, left_xmin), (right, right_xmin)] = &mut lines[..] else {
+        if let Some(positions) = positions {
+            let [(left, left_xmin), (right, _)] = &mut lines[..] else {
                 unreachable!("joint stereo has two channels")
             };
-            if ms_stereo {
-                (*left, *right) = stereo::middle_side(left, right);
-                stereo::limit_side(right, granule[0].block_type, fs);
-                let joint = stereo::middle_side_distortion(left_xmin, right_xmin);
-                left_xmin.clone_from(&joint);
-                *right_xmin = joint;
-            }
-            if let Some(positions) = positions {
-                positions.code(&granule[0].xr, &granule[1].xr, [left, right]);
-                let (left_alone, right_alone) = (&granule[0].analysis.1, &granule[1].analysis.1);
-                let coded = positions.first_scalefactor();
-                for (index, xmin) in left_xmin.iter_mut().enumerate().skip(coded) {
-                    *xmin = positions.sum_distortion(index, left_alone[index], right_alone[index]);
-                }
+            positions.code(&granule[0].xr, &granule[1].xr, [left, right]);
+            let (left_alone, right_alone) = (&granule[0].analysis.1, &granule[1].analysis.1);
+            let coded = positions.first_scalefactor();
+            for (index, xmin) in left_xmin.iter_mut().enumerate().skip(coded) {
+                *xmin = positions.sum_distortion(index, left_alone[index], right_alone[index]);
             }
         }
         // The right channel's bits are reckoned before the left channel takes
@@ -1185,7 +1223,10 @@ fn quantize_frame(
             if intensity.is_some_and(|positions| available_bits < positions.silent_bits()) {
                 return None;
             }
-            let summary = GranuleSummary::new(xr, xmin, block_type, fs);
+            let summary = match positions {
+                None => prepared[gr].summaries[channel].clone(),
+                Some(_) => GranuleSummary::new(xr, xmin, block_type, fs),
+            };
             let reuse = match (gr, &first[channel]) {
                 (1, Some((first_summary, first_scalefactors))) if intensity.is_none() => {
                     Some(loops::Reuse {
