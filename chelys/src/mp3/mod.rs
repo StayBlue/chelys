@@ -1058,10 +1058,12 @@ impl IntensityTry {
 /// position that marks a band of the right channel's zero part as not coded
 /// in intensity stereo is the largest value of its field (clause 2.4.3.2 of
 /// ISO/IEC 13818-3), but decoders do not agree on it, and no mark is read as
-/// one by all of them. So the encoder sends no marks there: a frame whose
-/// right channel would need one, with no nonzero value in the band just
-/// below the bound, in any window of a short block, is coded from another
-/// bound (see [`search_intensity`]) or without intensity stereo.
+/// one by all of them. So the encoder sends no marks there: the right
+/// channel is given a value in the band just below the bound where it has
+/// none, in any window of a short block (see
+/// [`stereo::IntensityPositions::fill_below_bound`]), and a frame whose
+/// right channel would still need a mark is coded from another bound (see
+/// [`search_intensity`]) or without intensity stereo.
 ///
 /// Settled by decoding with ffmpeg, mpg123 and LAME (black box): of the
 /// marks of fields of 1 to 5 bits, 1, 3, 7, 15 and 31, ffmpeg reads only 31

@@ -111,7 +111,7 @@ const STREAMS: [(SamplingFrequency, u32, Mode, bool, usize, u64); 8] = [
         MS_IS,
         false,
         6269,
-        0xB8A7_F074_A631_E9E4,
+        0x2EEF_A221_0FF9_F171,
     ),
     (
         SamplingFrequency::Hz16000,

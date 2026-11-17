@@ -582,6 +582,65 @@ impl IntensityPositions {
         });
     }
 
+    /// At the lower sampling frequencies, gives the right channel's
+    /// quantised `values` a value of 1, with the sign of the line, at the
+    /// largest of the `amplified` lines of the band just below the bound,
+    /// in each window where that band has no nonzero value. Returns whether
+    /// it gave any.
+    ///
+    /// Spec reading: the encoder sends no marks there (see
+    /// `quantize_frame`), and a right channel whose last nonzero value lies
+    /// below that band would need every band from above it to the bound
+    /// marked, so that the frame could not be coded in intensity stereo
+    /// from this bound. With a value in the band just below the bound, the
+    /// zero part begins at the bound and the bands below are sent as zeros.
+    /// The value adds the line's quantisation noise to the band, which the
+    /// iteration loops judge against its allowed distortion as any other.
+    /// The bands below with no nonzero value decode as zeros whatever their
+    /// scalefactors, so those are sent as 0, as [`mark`](Self::mark) sends
+    /// those of the bands it marks.
+    pub fn fill_below_bound(
+        &self,
+        values: &mut [i32; GRANULE_LINES],
+        amplified: &[f64; GRANULE_LINES],
+    ) -> bool {
+        if self.sampling_frequency.version() != Version::Mpeg2 || self.bound == 0 {
+            return false;
+        }
+        let bands = scalefactor_bands::coding_bands(self.block_type, self.sampling_frequency);
+        let windows = scalefactor_bands::windows(self.block_type);
+        let mut filled = false;
+        for window in 0..windows {
+            let band = &bands[(self.bound - 1) * windows + window];
+            let lines = band.start..band.end();
+            if values[lines.clone()].iter().any(|&v| v != 0) {
+                continue;
+            }
+            let strongest = lines
+                .max_by(|&a, &b| amplified[a].abs().total_cmp(&amplified[b].abs()))
+                .expect("a band has lines");
+            values[strongest] = if amplified[strongest] < 0.0 { -1 } else { 1 };
+            filled = true;
+        }
+        filled
+    }
+
+    /// Sets to 0 the scalefactors of the bands below the bound that have no
+    /// nonzero value in `values` (see [`fill_below_bound`](Self::fill_below_bound)).
+    pub fn clear_empty_bands(
+        &self,
+        scalefactors: &mut Scalefactors,
+        values: &[i32; GRANULE_LINES],
+    ) {
+        let bands = scalefactor_bands::coding_bands(self.block_type, self.sampling_frequency);
+        let first = self.first_scalefactor();
+        for (band, scalefactor) in bands[..first].iter().zip(scalefactors.values_mut()) {
+            if values[band.start..band.end()].iter().all(|&v| v == 0) {
+                *scalefactor = 0;
+            }
+        }
+    }
+
     /// The bits the right channel takes with all its lines quantised to
     /// zero, every band below the bound marked and every band from it
     /// sending its position: the bits the iteration loops can always fit it

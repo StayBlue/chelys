@@ -130,7 +130,12 @@ pub const SAVING_NOISE_DB: f64 = 4.0;
 /// lines quantise to zero whatever their scalefactors, so the loop works
 /// with scalefactors as usual, and each result is marked before its bits are
 /// counted. If the marks take more bits than the scalefactors they replace,
-/// the inner loop runs again with that many fewer bits.
+/// the inner loop runs again with that many fewer bits. At the lower
+/// sampling frequencies, where no marks are sent, a result with nothing in
+/// the band just below the bound is first given a value there (see
+/// [`IntensityPositions::fill_below_bound`]); if that takes more bits than
+/// there are, the inner loop runs again with that many fewer, and failing
+/// that the result is kept marked, which the frame cannot use.
 ///
 /// `scalefac_scale` starts at 0. Clause C.1.5.4.3 switches it to 1 when the
 /// scalefactors would otherwise pass their limits (figure C.9.b leaves this
@@ -351,12 +356,13 @@ struct ToSave<'a> {
 impl ToSave<'_> {
     /// The granule with the coarsest step, from that of `granule` up, at
     /// which no band's distortion exceeds its allowance raised as `saving`
-    /// says, and which takes between its least bits and `available_bits`. Every band counts, those taken over with scfsi
+    /// says, and which takes between its least bits and `available_bits`.
+    /// Every band counts, those taken over with scfsi
     /// too, but for those fixed at zero. In the right channel of a frame
-    /// coded in intensity stereo, a step that would leave a band below the
-    /// bound with nothing in it, and so marked, fails too: at the lower
-    /// sampling frequencies the frame could not then be coded in intensity
-    /// stereo (see `quantize_frame`). The search stops at the first step
+    /// coded in intensity stereo, a step that would mark a band where the
+    /// granule had none fails too; at the lower sampling frequencies each
+    /// step is first given a value in the band just below the bound where
+    /// it has none, as [`fit`] gives it. The search stops at the first step
     /// that fails, as distortion and bits follow the step only roughly.
     fn coarsest(
         &self,
@@ -372,9 +378,12 @@ impl ToSave<'_> {
             .collect();
         let mut kept = granule;
         for global_gain in kept.global_gain.saturating_add(1)..=u8::MAX {
-            let Some(values) = quantize(&amplified, global_gain) else {
+            let Some(mut values) = quantize(&amplified, global_gain) else {
                 break;
             };
+            if let Some(intensity) = self.intensity {
+                intensity.fill_below_bound(&mut values, &amplified);
+            }
             let mut coarser = QuantizedGranule::new(global_gain, values, kept.block_type, fs);
             coarser.scalefactors = self.scalefactors.clone();
             let distortion = distortion(&amplified, &coarser, self.bands);
@@ -422,10 +431,29 @@ fn fit(
             sampling_frequency,
             start_gain,
         )?;
-        granule.scalefactors = scalefactors.clone();
         let Some(intensity) = intensity else {
+            granule.scalefactors = scalefactors.clone();
             return Some(granule);
         };
+        let mut values = granule.values;
+        if intensity.fill_below_bound(&mut values, amplified) {
+            let mut filled =
+                QuantizedGranule::new(granule.global_gain, values, block_type, sampling_frequency);
+            filled.scalefactors = scalefactors.clone();
+            intensity.clear_empty_bands(&mut filled.scalefactors, &filled.values);
+            intensity.mark(&mut filled.scalefactors, &filled.values);
+            let bits = filled.bit_len(sampling_frequency);
+            if bits <= available_bits {
+                return Some(filled);
+            }
+            // Fewer bits for the inner loop if that leaves room for the
+            // value; failing that, the granule as it is, marked.
+            if let Some(fewer) = huffman_bits.checked_sub(bits - available_bits) {
+                huffman_bits = fewer;
+                continue;
+            }
+        }
+        granule.scalefactors = scalefactors.clone();
         intensity.mark(&mut granule.scalefactors, &granule.values);
         let bits = granule.bit_len(sampling_frequency);
         if bits <= available_bits {
