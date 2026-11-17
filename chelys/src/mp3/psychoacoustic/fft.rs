@@ -3,7 +3,7 @@
 
 //! The "standard forward FFT" of clause D.2.4 b): an iterative radix-2
 //! decimation-in-time transform, `X(k) = sum x(n) e^(-2 pi i k n / N)`, without
-//! normalisation.
+//! normalisation, and its form for real input, [`RealFft`].
 
 use std::f64::consts::PI;
 
@@ -18,6 +18,13 @@ impl Complex {
         Self {
             re: self.re * other.re - self.im * other.im,
             im: self.re * other.im + self.im * other.re,
+        }
+    }
+
+    fn conj(self) -> Self {
+        Self {
+            re: self.re,
+            im: -self.im,
         }
     }
 }
@@ -85,6 +92,83 @@ impl Fft {
     }
 }
 
+/// The FFT of real input of `N` samples, through the FFT of `N / 2`
+/// complex ones: the even samples as their real parts and the odd ones as
+/// their imaginary parts, giving `Z(k) = E(k) + i O(k)`, where `E` and `O`
+/// are the transforms of the even and odd samples. Since those samples are
+/// real, `E(k) = (Z(k) + conj(Z(N/2 - k))) / 2` and
+/// `O(k) = (Z(k) - conj(Z(N/2 - k))) / 2i`, and
+/// `X(k) = E(k) + e^(-2 pi i k / N) O(k)`, with `Z(N/2) = Z(0)`.
+pub struct RealFft {
+    half: Fft,
+    /// `e^(-2 pi i k / N)` for `k <= N / 2`.
+    twiddles: Vec<Complex>,
+}
+
+impl RealFft {
+    /// # Panics
+    ///
+    /// If `size` is not a power of two of at least 4.
+    pub fn new(size: usize) -> Self {
+        assert!(
+            size >= 4 && size.is_power_of_two(),
+            "FFT size {size} is not a power of two of at least 4"
+        );
+        let twiddles = (0..=size / 2)
+            .map(|k| {
+                let angle = -2.0 * PI * k as f64 / size as f64;
+                Complex {
+                    re: angle.cos(),
+                    im: angle.sin(),
+                }
+            })
+            .collect();
+        Self {
+            half: Fft::new(size / 2),
+            twiddles,
+        }
+    }
+
+    /// The lines `X(0)` to `X(N / 2)` of the transform of `x`; the rest are
+    /// their conjugates.
+    ///
+    /// # Panics
+    ///
+    /// If `x` is not the size the transform was made for.
+    pub fn transform(&self, x: &[f64]) -> Vec<Complex> {
+        let half = self.twiddles.len() - 1;
+        assert_eq!(x.len(), 2 * half, "FFT input size");
+        let mut z: Vec<Complex> = x
+            .chunks_exact(2)
+            .map(|pair| Complex {
+                re: pair[0],
+                im: pair[1],
+            })
+            .collect();
+        self.half.transform(&mut z);
+        (0..=half)
+            .map(|k| {
+                let zk = z[k % half];
+                let mirrored = z[(half - k) % half].conj();
+                let even = Complex {
+                    re: (zk.re + mirrored.re) / 2.0,
+                    im: (zk.im + mirrored.im) / 2.0,
+                };
+                // (zk - mirrored) / 2i
+                let odd = Complex {
+                    re: (zk.im - mirrored.im) / 2.0,
+                    im: -(zk.re - mirrored.re) / 2.0,
+                };
+                let odd = odd.mul(self.twiddles[k]);
+                Complex {
+                    re: even.re + odd.re,
+                    im: even.im + odd.im,
+                }
+            })
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -113,6 +197,22 @@ mod tests {
                 }
                 assert!((fast.re - direct.re).abs() < 1e-9, "n {n}, k {k}");
                 assert!((fast.im - direct.im).abs() < 1e-9, "n {n}, k {k}");
+            }
+        }
+    }
+
+    #[test]
+    fn real_input_matches_the_complex_transform() {
+        for n in [4, 8, 256, 1024] {
+            let input: Vec<f64> = (0..n).map(|t| ((t * 7919) % 31) as f64 - 15.0).collect();
+            let mut complex: Vec<Complex> =
+                (input.iter()).map(|&re| Complex { re, im: 0.0 }).collect();
+            Fft::new(n).transform(&mut complex);
+            let real = RealFft::new(n).transform(&input);
+            assert_eq!(real.len(), n / 2 + 1);
+            for (k, (real, complex)) in real.iter().zip(&complex).enumerate() {
+                assert!((real.re - complex.re).abs() < 1e-9, "n {n}, k {k}");
+                assert!((real.im - complex.im).abs() < 1e-9, "n {n}, k {k}");
             }
         }
     }

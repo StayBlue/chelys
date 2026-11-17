@@ -21,7 +21,7 @@ use super::GRANULE_LINES;
 use super::header::{SamplingFrequency, Version};
 use super::scalefactor_bands::{self, LONG_BANDS, SHORT_BANDS, SHORT_WINDOWS};
 use super::{BlockType, stereo};
-use fft::{Complex, Fft};
+use fft::RealFft;
 use partitions::{BandWeights, Partition, ShortPartition};
 
 const LONG_FFT: usize = 1024;
@@ -209,7 +209,7 @@ struct Polar {
 /// One FFT of the model with its Hann window, and the spectra of the two
 /// blocks before, from which it predicts the next (clause D.2.4 c)).
 struct Analysis {
-    fft: Fft,
+    fft: RealFft,
     window: Vec<f64>,
     /// The lines whose unpredictability the model uses, from DC up; above
     /// them it is not computed, and the phases not kept.
@@ -228,7 +228,7 @@ impl Analysis {
         // Clause D.2.1 asks for the stored spectra to start at zero.
         assert!(predicted <= size / 2 + 1, "lines to predict");
         Self {
-            fft: Fft::new(size),
+            fft: RealFft::new(size),
             window,
             predicted,
             last: vec![Polar::default(); predicted],
@@ -242,18 +242,14 @@ impl Analysis {
     /// next block.
     fn next_block(&mut self, samples: &[f64]) -> (Vec<f64>, Vec<f64>) {
         let size = self.window.len();
-        let mut x: Vec<Complex> = samples
+        let windowed: Vec<f64> = samples
             .iter()
             .zip(&self.window)
-            .map(|(s, w)| Complex {
-                re: s * PCM_SCALE * w / size as f64,
-                im: 0.0,
-            })
+            .map(|(s, w)| s * PCM_SCALE * w / size as f64)
             .collect();
-        self.fft.transform(&mut x);
+        let x = self.fft.transform(&windowed);
 
-        let lines = size / 2 + 1;
-        let r: Vec<f64> = x[..lines]
+        let r: Vec<f64> = x
             .iter()
             .map(|x| (x.re * x.re + x.im * x.im).sqrt())
             .collect();
