@@ -115,10 +115,12 @@ struct Options {
 
 /// The noise `--vbr` allows each band beyond what the psychoacoustic model
 /// does, in dB, unless `--vbr-noise` says otherwise. The model's own
-/// allowance spends more bits than listeners need. Graded with PEAQ
-/// (GstPEAQ 0.6.1, black box), 22 tracks of pop music at 44.1 kHz in stereo
-/// averaged 178 kbit/s and a grade of -0.19 at 3 dB (-0.26 at worst), above
-/// the -0.22 (-0.32) of a constant 178 kbit/s. Above 3 dB `--vbr` gained
+/// allowance spends more bits than listeners need. 3 dB was chosen while
+/// every frame's bitrate was searched by coding the frame at each bitrate
+/// tried. Graded with PEAQ (GstPEAQ 0.6.1, black box), 22 tracks of pop
+/// music at 44.1 kHz in stereo then averaged 178 kbit/s and a grade of
+/// -0.19 at 3 dB (-0.26 at worst), above the -0.22 (-0.32) of a constant
+/// 178 kbit/s. Above 3 dB `--vbr` gained
 /// nothing over a constant bitrate of its mean: 162 kbit/s and -0.27 (-0.39)
 /// at 4 dB, against -0.27 (-0.39) at a constant 160 kbit/s; 148 kbit/s and
 /// -0.37 (-0.55) at 5 dB, against -0.38 (-0.47) at a constant 148 kbit/s;
@@ -128,6 +130,18 @@ struct Options {
 /// track's worst passage at 4 dB before granules within their allowance
 /// left their bits to the reservoir (184 kbit/s, -0.35, and -0.65 at worst),
 /// a listener could not tell it from the input.
+///
+/// Since frames of normal blocks are quantised once instead, their noise
+/// unshaped (see `chelys::mp3::Encoder`), `--vbr` gains over a constant
+/// bitrate of its mean above 3 dB too: the pop music averages 180 kbit/s
+/// and -0.15 (-0.21) at 3 dB, against -0.21 (-0.32) at a constant
+/// 180 kbit/s, and 161 kbit/s and -0.25 (-0.39) at 4.5 dB, against -0.27
+/// (-0.38) at a constant 162 kbit/s. The offset is not raised to win back
+/// the 2-3% more bits the single coding spends: it keeps the allowance of
+/// the frames still searched, and of the lower sampling frequencies, where
+/// nothing changed, and the gain is taken as quality, most of it on the
+/// worst tracks. A size matched to the search's would be particular to the
+/// tracks it was matched on.
 const DEFAULT_VBR_NOISE_DB: f64 = 3.0;
 
 /// The value after the flag `name`, parsed.

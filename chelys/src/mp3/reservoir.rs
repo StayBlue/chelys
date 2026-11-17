@@ -84,6 +84,17 @@ impl Reservoir {
         }
     }
 
+    /// A reservoir with room for whatever a granule leaves and nothing to
+    /// lend: a granule given it is limited only by its own share, and need
+    /// use none of it.
+    pub fn unbounded() -> Self {
+        Self {
+            bits: 0,
+            stream_max_bytes: usize::MAX / 16,
+            max_bytes: usize::MAX / 16,
+        }
+    }
+
     /// What the buffer leaves of its 7680 bits beside a frame of
     /// `frame_bytes`, in whole bytes.
     fn buffer_bytes(frame_bytes: usize) -> usize {

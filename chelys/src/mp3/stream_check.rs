@@ -22,7 +22,10 @@ pub struct Frame {
     /// Where the frame's main data begins among the bytes of all slots.
     begin: usize,
     /// The bits of its scalefactors and Huffman code.
-    audio_bits: usize,
+    pub audio_bits: usize,
+    /// The bytes of earlier main data slots after the main data before it,
+    /// where its main data could have begun.
+    pub free_before: usize,
 }
 
 /// The frames of `stream`, after checking that each frame's main data
@@ -57,7 +60,7 @@ fn walk(stream: &[u8], free: Option<Bitrate>) -> Vec<Frame> {
     let mut at = 0;
     // Main data slot bytes before the frame, and the bits of main data
     // that end the main data before it.
-    let (mut slots, mut used_bits) = (0, 0);
+    let (mut slots, mut used_bits) = (0, 0usize);
     while at < stream.len() {
         let header = &stream[at..at + 4];
         assert!(
@@ -123,6 +126,7 @@ fn walk(stream: &[u8], free: Option<Bitrate>) -> Vec<Frame> {
             "frame {}: main data begins before the stream",
             frames.len()
         );
+        let free_before = slots - used_bits.div_ceil(8);
         let begin = slots - main_data_begin;
         assert!(
             8 * begin >= used_bits,
@@ -150,6 +154,7 @@ fn walk(stream: &[u8], free: Option<Bitrate>) -> Vec<Frame> {
             slot: (at + len - slot, at + len),
             begin,
             audio_bits: main_data_bits,
+            free_before,
         });
         at += len;
     }

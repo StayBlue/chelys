@@ -546,13 +546,17 @@ pub fn encode_pcm_with_info_tag(config: &StreamConfig, channels: &[&[f64]]) -> V
 /// if the mode allows it, and frames short of bits are coded in intensity
 /// stereo if the mode allows that (Annex G.2).
 ///
-/// At a [`Rate::Variable`] each frame is coded at bitrates from the one
-/// below that of the frame before it, as [`rate::search_variable`] tries
-/// them, and kept at the
-/// lowest of those at which every band's noise stays within its allowance
-/// (see [`loops::excess`]). Frames are not padded. Intensity stereo, which
-/// gives up the stereo image above its bound for bits, is tried only at the
-/// highest bitrate, where a larger frame is no longer to be had.
+/// At a [`Rate::Variable`] each frame is kept at a bitrate at which every
+/// band's noise stays within its allowance (see [`loops::excess`]). In
+/// MPEG-1, a frame of normal blocks is quantised once, each granule left as
+/// coarse as its allowance lets it, and kept at the lowest bitrate whose
+/// frame, with the bit reservoir, holds it. Other frames, and those that
+/// no frame holds, are coded at bitrates from the one below that of the
+/// frame before it, as [`rate::search_variable`] tries them, and kept at
+/// the lowest of those at which their noise stays within its allowance.
+/// Frames are not padded. Intensity stereo, which gives up the stereo image
+/// above its bound for bits, is tried only at the highest bitrate, where a
+/// larger frame is no longer to be had.
 ///
 /// Spec reading: a padded frame is one slot longer to keep a mean bitrate
 /// (clause 2.4.2.3: "the frame contains an additional slot to adjust the
@@ -1675,26 +1679,35 @@ impl<C: Coding> FrameEncoder<C> {
                 // frames within their allowance at the last frame's are
                 // within it too (see `rate::search_variable`).
                 let (bitrates, start) = (bitrates.clone(), previous.saturating_sub(1));
-                let highest = bitrates.len() - 1;
-                // The search keeps a frame that is not within its allowance
-                // only at the highest bitrate, so below it, coding stops once
-                // a frame is known not to be.
-                let (index, kept) = rate::search_variable(bitrates.len(), start, |index| {
-                    let at = self.quantize_at(
-                        &filtered,
-                        bitrates[index],
-                        false,
-                        index == highest,
-                        ancillary_bits,
-                        index != highest,
-                    );
-                    let within = at.as_ref().is_some_and(|at| at.coded.excess <= 1.0);
-                    (at, within)
+                let once = (self.config.sampling_frequency.version() == Version::Mpeg1
+                    && block_types.iter().all(|&b| b == BlockType::Normal))
+                .then(|| self.quantize_within(&filtered, &bitrates, ancillary_bits))
+                .flatten();
+                let (index, kept) = once.unwrap_or_else(|| {
+                    let highest = bitrates.len() - 1;
+                    // The search keeps a frame that is not within its
+                    // allowance only at the highest bitrate, so below it,
+                    // coding stops once a frame is known not to be.
+                    let (index, kept) = rate::search_variable(bitrates.len(), start, |index| {
+                        let at = self.quantize_at(
+                            &filtered,
+                            bitrates[index],
+                            false,
+                            index == highest,
+                            ancillary_bits,
+                            index != highest,
+                        );
+                        let within = at.as_ref().is_some_and(|at| at.coded.excess <= 1.0);
+                        (at, within)
+                    });
+                    let kept =
+                        kept.expect("a frame within its allowance or at the highest bitrate");
+                    (index, kept)
                 });
                 if let Schedule::Variable { previous, .. } = &mut self.schedule {
                     *previous = index;
                 }
-                kept.expect("a frame within its allowance or at the highest bitrate")
+                kept
             }
         };
         let FrameAtBitrate {
@@ -1725,6 +1738,81 @@ impl<C: Coding> FrameEncoder<C> {
         self.reservoir_bytes = self.reservoir.end_frame(unshared_bits);
         self.writer.keep_unused(self.reservoir_bytes);
         self.frame_lens.push(header.frame_len());
+    }
+
+    /// Quantises a frame once, each granule given all the bits it may have
+    /// and free to leave any of them, and keeps it at the lowest of
+    /// `bitrates` whose frame, with the bit reservoir, holds what it uses;
+    /// with the index of that bitrate. `None` if the frame's noise is not
+    /// within its allowance (see [`loops::excess`]), or no frame holds it.
+    ///
+    /// Spec gap: neither standard says how to choose a frame's bitrate (see
+    /// [`rate::search_variable`]). Coding a frame at each bitrate the search
+    /// tries took about 3.3 codings of it, two thirds of them discarded.
+    /// Given more bits than it needs, a granule's outer loop amplifies no
+    /// band, and the saving search leaves it at the coarsest step at which
+    /// every band is within its allowance (see [`loops::outer_loop`]): one
+    /// band's noise is at its allowance and the rest below theirs, where a
+    /// tight budget would have the loop shape the noise up to the allowance
+    /// of more bands for fewer bits. Graded with PEAQ (GstPEAQ 0.6.1, black
+    /// box) against the search, 22 tracks of pop music and 14 of rock, in
+    /// stereo, came out 2.6% and 2.9% larger at 44.1 kHz and graded 0.048
+    /// and 0.045 higher (their worst tracks 0.059 and 0.099), and 1.7% and
+    /// 2.7% larger at 48 kHz for 0.045 and 0.046 (0.056 and 0.086); matched
+    /// in size at 44.1 kHz, they graded 0.027 and 0.020 higher (0.024 and
+    /// 0.069). Encoding took 37% less time. The bits a frame leaves beyond
+    /// the reservoir's room are stuffing, under 0.05% of a stream's.
+    ///
+    /// Spec gap: frames with short, start or stop blocks, which spend all
+    /// the bits they are given, keep the search, as do the lower sampling
+    /// frequencies. There a frame has one granule and the highest bitrate
+    /// is 160 kbit/s; coded once, streams came out 22% larger at 22.05 kHz
+    /// and 39% at 11.025 kHz, and half the frames were not held at any
+    /// bitrate.
+    fn quantize_within(
+        &mut self,
+        frame: &[Vec<Filtered<C::Analysis>>],
+        bitrates: &[Bitrate],
+        ancillary_bits: usize,
+    ) -> Option<(usize, FrameAtBitrate)> {
+        let fs = self.config.sampling_frequency;
+        let coded = self.coding.quantize(
+            frame,
+            MAX_PART2_3_LENGTH,
+            &mut Reservoir::unbounded(),
+            false,
+            true,
+        )?;
+        let used: usize = (coded.granules.iter().flatten())
+            .map(|granule| granule.bit_len(fs))
+            .sum();
+        let slot_bits = |bitrate: Bitrate| {
+            main_data_bits(&self.config.frame_header(bitrate, false, false, false))
+                .checked_sub(ancillary_bits)
+                .expect("the ancillary data fits in the frame")
+        };
+        let reservoir = |bitrate: Bitrate| self.reservoir.for_frame(bitrate.frame_len(fs, true));
+        let index = (bitrates.iter())
+            .position(|&bitrate| used <= 8 * reservoir(bitrate).bytes() + slot_bits(bitrate))?;
+        let bitrate = bitrates[index];
+        let (mut reservoir, slot_bits) = (reservoir(bitrate), slot_bits(bitrate));
+        let main_data_begin = reservoir.bytes();
+        let shares = frame.len() * self.pcm.len();
+        let mean_bits = slot_bits / shares;
+        for granule in coded.granules.iter().flatten() {
+            reservoir.granule_done(mean_bits, granule.bit_len(fs));
+        }
+        Some((
+            index,
+            FrameAtBitrate {
+                bitrate,
+                padding: false,
+                coded,
+                main_data_begin,
+                unshared_bits: slot_bits - shares * mean_bits,
+                reservoir,
+            },
+        ))
     }
 
     /// Quantises a frame at `bitrate`, with or without `padding`, from the
@@ -2347,6 +2435,68 @@ mod tests {
                 });
             }
         });
+    }
+
+    /// In MPEG-1 at a variable bitrate, a frame of normal blocks is kept at
+    /// the lowest bitrate whose frame, with the reservoir it finds, holds
+    /// its main data: at the bitrate below, its slot and what the reservoir
+    /// could give a frame of that length fall short of it.
+    #[test]
+    fn frames_of_normal_blocks_take_the_lowest_bitrate_that_holds_them() {
+        use std::f64::consts::TAU;
+        let fs = SamplingFrequency::Hz44100;
+        let config = StreamConfig {
+            rate: variable(fs, [32, 320], 0.0),
+            sampling_frequency: fs,
+            mode: MS,
+            crc_protected: false,
+            flags: Flags::default(),
+        };
+        // Noise that swells and fades slowly over a quiet tone, with no
+        // attack to switch to short blocks.
+        let hz = f64::from(fs.hz());
+        let mut state = 0x9E37_79B9u32;
+        let mut noise = move || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            f64::from(state) / f64::from(u32::MAX) * 2.0 - 1.0
+        };
+        let (left, right): (Vec<f64>, Vec<f64>) = (0..(2.0 * hz) as usize)
+            .map(|t| {
+                let s = t as f64 / hz;
+                let swell = 0.25 * (1.0 - (TAU * s / 2.0).cos());
+                let tone = 0.05 * (TAU * 440.0 * s).sin();
+                (tone + swell * noise(), tone + swell * noise())
+            })
+            .unzip();
+        let frames = stream_check::frames(&encode(config, &[left, right]));
+        let bitrates: Vec<Bitrate> = Bitrate::all(fs.version()).collect();
+        let reservoir = |bitrate: Bitrate| {
+            Reservoir::new(bitrate.frame_len(fs, true), fs.version()).max_bytes()
+        };
+        // What the reservoir keeps between frames.
+        let kept = reservoir(bitrates[0]);
+        let mut above_lowest = 0;
+        for (k, frame) in frames.iter().enumerate() {
+            let index = bitrates.iter().position(|&b| b == frame.bitrate).unwrap();
+            let Some(below) = index.checked_sub(1).map(|index| bitrates[index]) else {
+                continue;
+            };
+            let held = frame.free_before.min(kept).min(reservoir(below));
+            let slot = main_data_bits(&config.frame_header(below, false, false, false));
+            assert!(
+                frame.audio_bits > 8 * held + slot,
+                "frame {k} at {:?} fits at {below:?}",
+                frame.bitrate
+            );
+            above_lowest += 1;
+        }
+        assert!(
+            above_lowest > frames.len() / 2,
+            "{above_lowest} of {}",
+            frames.len()
+        );
     }
 
     /// In free format every frame has `bitrate_index` 0 and `N` or `N + 1`
