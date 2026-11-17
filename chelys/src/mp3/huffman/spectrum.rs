@@ -382,11 +382,15 @@ impl Counted {
         if least <= lower && upper <= most {
             return true;
         }
-        let bits = (partitions.clone())
-            .map(|partition| partition.quad_bits().1 + partition.pairs.split().2)
-            .min()
-            .expect("a partition");
-        (least..=most).contains(&bits)
+        // The fewest bits are at most `most` if some partition has a split
+        // within them, and at least `least` if none has one with fewer.
+        let within = |bits: usize| {
+            (partitions.clone()).any(|partition| {
+                (bits.checked_sub(partition.quad_bits().1))
+                    .is_some_and(|pair_bits| partition.pairs.split_within(pair_bits))
+            })
+        };
+        (upper <= most || within(most)) && (least <= lower || !within(least - 1))
     }
 
     /// The coding [`SpectrumCoding::choose`] gives the values, and its bits.
@@ -582,6 +586,26 @@ impl BandBits {
 
     /// [`split`](Self::split), searched.
     fn search_split(&self) -> Split {
+        let (bits, counts, tables) = self
+            .splits_below(usize::MAX, true)
+            .expect("at least one split");
+        (counts, tables, bits)
+    }
+
+    /// Whether some split needs at most `most` bits, searching only until
+    /// one is found where the split is not yet known.
+    fn split_within(&self, most: usize) -> bool {
+        match self.split.get() {
+            Some(&(_, _, bits)) => bits <= most,
+            None => self.splits_below(most + 1, false).is_some(),
+        }
+    }
+
+    /// The first split, in the order [`split`](Self::split) tries them,
+    /// that needs fewer than `limit` bits, or with `fewest`, the first of
+    /// those needing the fewest; with its bits, `(region0_count,
+    /// region1_count)` and the table of each region.
+    fn splits_below(&self, mut limit: usize, fewest: bool) -> Option<(usize, (u8, u8), [u8; 3])> {
         let (count, least_below) = (self.count, &self.least_below);
         let region = |range| self.region(range);
         // The last region, for each band it may start at.
@@ -589,13 +613,11 @@ impl BandBits {
         for (start, last) in last.iter_mut().enumerate().take(count + 1) {
             *last = region(start..count);
         }
-        let mut best: Option<(usize, (u8, u8), [u8; 3])> = None;
+        let mut best = None;
         // region0_count and region1_count are 4- and 3-bit fields.
-        // Splits that cannot need fewer bits than the best so far are skipped:
-        // only one needing fewer would be kept.
-        let beaten = |best: &Option<(usize, _, _)>, bits: usize| {
-            best.as_ref().is_some_and(|&(least, ..)| bits >= least)
-        };
+        // Splits that cannot need fewer bits than the limit, which is that
+        // of the best so far, are skipped: only one needing fewer would be
+        // kept.
         for region0 in 0..16u8 {
             let end0 = (usize::from(region0) + 1).min(count);
             let (table0, bits0) = region(0..end0);
@@ -603,7 +625,7 @@ impl BandBits {
                 let end1 = (end0 + usize::from(region1) + 1).min(count);
                 let (table2, bits2) = last[end1];
                 let at_least = bits0 + (least_below[end1] - least_below[end0]) + bits2;
-                if beaten(&best, at_least) {
+                if at_least >= limit {
                     if end1 == count {
                         break;
                     }
@@ -611,8 +633,12 @@ impl BandBits {
                 }
                 let (table1, bits1) = region(end0..end1);
                 let bits = bits0 + bits1 + bits2;
-                if best.as_ref().is_none_or(|&(least, ..)| bits < least) {
+                if bits < limit {
                     best = Some((bits, (region0, region1), [table0, table1, table2]));
+                    if !fewest {
+                        return best;
+                    }
+                    limit = bits;
                 }
                 if end1 == count {
                     break;
@@ -622,8 +648,7 @@ impl BandBits {
                 break;
             }
         }
-        let (bits, counts, tables) = best.expect("at least one split");
-        (counts, tables, bits)
+        best
     }
 }
 
