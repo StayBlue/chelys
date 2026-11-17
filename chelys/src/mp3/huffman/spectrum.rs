@@ -433,7 +433,7 @@ impl PartitionCounts {
         Self {
             big_values: start / 2,
             count1: (end - start) / 4,
-            quad_bits: [QuadTable::A, QuadTable::B].map(|table| quad_bits(table, quads)),
+            quad_bits: quad_bits_with_both(quads),
             pairs: BandBits::new(&values[..start], bands, prefix),
         }
     }
@@ -938,6 +938,27 @@ fn quad_bits(table: QuadTable, values: &[i32]) -> usize {
             table.codeword(vwxy(quad)).len as usize + signs
         })
         .sum()
+}
+
+/// [`quad_bits`] with tables A and B, in that order, indexing each
+/// quadruple once.
+fn quad_bits_with_both(values: &[i32]) -> [usize; 2] {
+    static LENS: std::sync::OnceLock<[[u8; 2]; 16]> = std::sync::OnceLock::new();
+    // For each index, the length of its code word in each table with its
+    // sign bits.
+    let lens = LENS.get_or_init(|| {
+        std::array::from_fn(|vwxy| {
+            let vwxy = vwxy as u8;
+            [QuadTable::A, QuadTable::B].map(|table| {
+                u8::try_from(table.codeword(vwxy).len + vwxy.count_ones())
+                    .expect("code words are short")
+            })
+        })
+    });
+    values.chunks_exact(4).fold([0, 0], |[a, b], quad| {
+        let [len_a, len_b] = lens[usize::from(vwxy(quad))];
+        [a + usize::from(len_a), b + usize::from(len_b)]
+    })
 }
 
 /// The table index of a quadruple. The normative syntax indexes
