@@ -64,18 +64,19 @@ const ALIAS_COEFFICIENTS: [f64; 8] = [
 pub struct Filterbank {
     /// The input sample vector `X` of figure C.4, most recent sample first.
     history: [f64; 512],
-    /// `M_ik` of clause C.1.3, indexed `[i][k]`.
-    matrix: Box<[[f64; 64]; SUBBANDS]>,
-    /// The MDCT kernel of clause C.1.5.3.3 for `n = 36`, indexed `[i][k]`,
+    /// `M_ik` of clause C.1.3, indexed `[k][i]`. This and the kernels below
+    /// are indexed by input sample first, as [`transform`] takes them.
+    matrix: Box<[[f64; SUBBANDS]; 64]>,
+    /// The MDCT kernel of clause C.1.5.3.3 for `n = 36`, indexed `[k][i]`,
     /// with the window of the normal, start and stop block types folded in,
     /// in that order.
-    long_mdct: Box<[[[f64; LONG_BLOCK]; SUBBAND_SAMPLES]; 3]>,
-    /// The MDCT kernel for `n = 12`, indexed `[i][k]`, with the short window
+    long_mdct: Box<[[[f64; SUBBAND_SAMPLES]; LONG_BLOCK]; 3]>,
+    /// The MDCT kernel for `n = 12`, indexed `[k][i]`, with the short window
     /// folded in.
-    short_mdct: [[f64; SHORT_BLOCK]; SHORT_LINES],
-    /// The MDCT kernel for `n = 36` with no window, indexed `[i][k]`, for
+    short_mdct: [[f64; SHORT_LINES]; SHORT_BLOCK],
+    /// The MDCT kernel for `n = 36` with no window, indexed `[k][i]`, for
     /// the windows of [`low_window`](Self::low_window).
-    plain_mdct: Box<[[f64; LONG_BLOCK]; SUBBAND_SAMPLES]>,
+    plain_mdct: Box<[[f64; SUBBAND_SAMPLES]; LONG_BLOCK]>,
     /// The block type of the previous granule.
     last: BlockType,
     /// The previous granule's subband samples, indexed `[subband][time]`.
@@ -92,9 +93,9 @@ impl Default for Filterbank {
 
 impl Filterbank {
     pub fn new() -> Self {
-        let mut matrix = Box::new([[0.0; 64]; SUBBANDS]);
-        for (i, row) in matrix.iter_mut().enumerate() {
-            for (k, m) in row.iter_mut().enumerate() {
+        let mut matrix = Box::new([[0.0; SUBBANDS]; 64]);
+        for (k, column) in matrix.iter_mut().enumerate() {
+            for (i, m) in column.iter_mut().enumerate() {
                 *m = ((2 * i + 1) as f64 * (k as f64 - 16.0) * PI / 64.0).cos();
             }
         }
@@ -249,12 +250,8 @@ impl Filterbank {
         block: &[f64; LONG_BLOCK],
         window: &[f64; LONG_BLOCK],
     ) -> [f64; SUBBAND_SAMPLES] {
-        self.plain_mdct.map(|kernel| {
-            (kernel.iter().zip(window).zip(block))
-                .map(|((m, w), x)| m * w * x)
-                .sum::<f64>()
-                / LONG_BLOCK_GAIN
-        })
+        transform(&self.plain_mdct, |m, k| m * window[k] * block[k])
+            .map(|sum| sum / LONG_BLOCK_GAIN)
     }
 
     /// The windowed MDCT of one subband's block of 36 samples, with the
@@ -266,9 +263,6 @@ impl Filterbank {
     /// For a mixed block, whose subbands are transformed as long or short
     /// ones.
     fn mdct(&self, block: &[f64; LONG_BLOCK], block_type: BlockType) -> [f64; SUBBAND_SAMPLES] {
-        let transform = |kernel: &[f64], samples: &[f64], gain: f64| {
-            kernel.iter().zip(samples).map(|(m, x)| m * x).sum::<f64>() / gain
-        };
         let long = match block_type {
             BlockType::Normal => &self.long_mdct[0],
             BlockType::Start => &self.long_mdct[1],
@@ -278,15 +272,15 @@ impl Filterbank {
                 let mut lines = [0.0; SUBBAND_SAMPLES];
                 for (window, start) in SHORT_BLOCK_STARTS.into_iter().enumerate() {
                     let samples = &block[start..start + SHORT_BLOCK];
-                    for (k, kernel) in self.short_mdct.iter().enumerate() {
-                        lines[SHORT_LINES * window + k] =
-                            transform(kernel, samples, SHORT_BLOCK_GAIN);
+                    let window_lines = transform(&self.short_mdct, |m, k| m * samples[k]);
+                    for (line, sum) in lines[SHORT_LINES * window..].iter_mut().zip(window_lines) {
+                        *line = sum / SHORT_BLOCK_GAIN;
                     }
                 }
                 return lines;
             }
         };
-        long.map(|kernel| transform(&kernel, block, LONG_BLOCK_GAIN))
+        transform(long, |m, k| m * block[k]).map(|sum| sum / LONG_BLOCK_GAIN)
     }
 
     /// One pass of figure C.4: shifts in 32 samples, oldest first, and returns
@@ -303,8 +297,7 @@ impl Filterbank {
                 .map(|j| ANALYSIS_WINDOW[i + 64 * j] * self.history[i + 64 * j])
                 .sum();
         }
-        self.matrix
-            .map(|row| row.iter().zip(&y).map(|(m, y)| m * y).sum())
+        transform(&self.matrix, |m, k| m * y[k])
     }
 
     /// The encoder's aliasing butterflies (figure C.8) between each pair of
@@ -378,14 +371,33 @@ fn short_window(k: usize) -> f64 {
     (PI / 12.0 * (k as f64 + 0.5)).sin()
 }
 
+/// For each output `i` of a matrix indexed `[k][i]`, the sum over `k` of
+/// `term(m, k)`, where `m` is its element `[k][i]`. Each sum is taken in
+/// order from -0.0, as [`Iterator::sum`] does, so the sums are the same to
+/// the bit; but all of them at once, one input `k` at a time, so that their
+/// additions, which do not depend on each other, overlap, and the compiler
+/// can vectorise them.
+fn transform<const K: usize, const I: usize>(
+    matrix: &[[f64; I]; K],
+    term: impl Fn(f64, usize) -> f64,
+) -> [f64; I] {
+    let mut sums = [-0.0; I];
+    for (k, column) in matrix.iter().enumerate() {
+        for (sum, &m) in sums.iter_mut().zip(column) {
+            *sum += term(m, k);
+        }
+    }
+    sums
+}
+
 /// The MDCT of clause C.1.5.3.3 for `n` windowed samples, as a matrix
-/// indexed `[i][k]` with `window(k)` folded in.
+/// indexed `[k][i]` with `window(k)` folded in.
 fn mdct_kernel<const N: usize, const LINES: usize>(
     window: impl Fn(usize) -> f64,
-) -> [[f64; N]; LINES] {
+) -> [[f64; LINES]; N] {
     let n = N as f64;
-    std::array::from_fn(|i| {
-        std::array::from_fn(|k| {
+    std::array::from_fn(|k| {
+        std::array::from_fn(|i| {
             let kernel =
                 (PI / (2.0 * n) * (2.0 * k as f64 + 1.0 + n / 2.0) * (2.0 * i as f64 + 1.0)).cos();
             window(k) * kernel
