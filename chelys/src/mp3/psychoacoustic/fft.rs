@@ -93,7 +93,38 @@ impl Fft {
                 im: even.im - odd.im,
             };
         }
+        // Two stages at a time, of spans `2 h` and `4 h`, each value loaded
+        // and stored once for both: the same butterflies as one stage after
+        // the other.
         let mut half = 2;
+        while 4 * half <= n {
+            let first = &self.twiddles[half - 1..][..half];
+            let second = &self.twiddles[2 * half - 1..][..2 * half];
+            for block in x.chunks_exact_mut(4 * half) {
+                let (low, high) = block.split_at_mut(2 * half);
+                let (a, b) = low.split_at_mut(half);
+                let (c, d) = high.split_at_mut(half);
+                for k in 0..half {
+                    let butterfly = |even: Complex, odd: Complex, twiddle: Complex| {
+                        let product = odd.mul(twiddle);
+                        let sum = Complex {
+                            re: even.re + product.re,
+                            im: even.im + product.im,
+                        };
+                        let difference = Complex {
+                            re: even.re - product.re,
+                            im: even.im - product.im,
+                        };
+                        (sum, difference)
+                    };
+                    let (a1, b1) = butterfly(a[k], b[k], first[k]);
+                    let (c1, d1) = butterfly(c[k], d[k], first[k]);
+                    (a[k], c[k]) = butterfly(a1, c1, second[k]);
+                    (b[k], d[k]) = butterfly(b1, d1, second[half + k]);
+                }
+            }
+            half *= 4;
+        }
         while half < n {
             let twiddles = &self.twiddles[half - 1..][..half];
             for block in x.chunks_exact_mut(2 * half) {
