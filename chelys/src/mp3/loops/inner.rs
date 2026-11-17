@@ -377,7 +377,10 @@ fn estimated_gain(lines: &Lines, available_bits: usize) -> u8 {
 fn approximate_log2(x: f64) -> f64 {
     const MANTISSA_BITS: u32 = 52;
     const EXPONENT_BIAS: f64 = 1023.0;
-    x.to_bits() as f64 / (1u64 << MANTISSA_BITS) as f64 - EXPONENT_BIAS
+    // The bits of a positive `x` are below 2^63, so they convert as an `i64`
+    // to the same value as they would as a `u64`, which takes more
+    // instructions.
+    (x.to_bits() as i64) as f64 / (1u64 << MANTISSA_BITS) as f64 - EXPONENT_BIAS
 }
 
 /// Narrows `over`, which does not fit, and the step of `fits`, which does,
