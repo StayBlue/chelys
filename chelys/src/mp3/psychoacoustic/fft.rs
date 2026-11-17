@@ -157,28 +157,29 @@ impl RealFft {
             })
             .collect();
         self.half.transform(&mut z);
-        (0..=half)
-            .map(|k| {
-                // Z(N/2) = Z(0), without the division that `k % half` takes.
-                let wrapped = |k: usize| if k == half { 0 } else { k };
-                let zk = z[wrapped(k)];
-                let mirrored = z[wrapped(half - k)].conj();
-                let even = Complex {
-                    re: (zk.re + mirrored.re) / 2.0,
-                    im: (zk.im + mirrored.im) / 2.0,
-                };
-                // (zk - mirrored) / 2i
-                let odd = Complex {
-                    re: (zk.im - mirrored.im) / 2.0,
-                    im: -(zk.re - mirrored.re) / 2.0,
-                };
-                let odd = odd.mul(self.twiddles[k]);
-                Complex {
-                    re: even.re + odd.re,
-                    im: even.im + odd.im,
-                }
-            })
-            .collect()
+        let line = |k: usize, zk: Complex, mirrored: Complex| {
+            let mirrored = mirrored.conj();
+            let even = Complex {
+                re: (zk.re + mirrored.re) / 2.0,
+                im: (zk.im + mirrored.im) / 2.0,
+            };
+            // (zk - mirrored) / 2i
+            let odd = Complex {
+                re: (zk.im - mirrored.im) / 2.0,
+                im: -(zk.re - mirrored.re) / 2.0,
+            };
+            let odd = odd.mul(self.twiddles[k]);
+            Complex {
+                re: even.re + odd.re,
+                im: even.im + odd.im,
+            }
+        };
+        // Z(N/2) = Z(0), so the first and last lines take Z(0) twice.
+        let mut x = Vec::with_capacity(half + 1);
+        x.push(line(0, z[0], z[0]));
+        x.extend((1..half).map(|k| line(k, z[k], z[half - k])));
+        x.push(line(half, z[0], z[0]));
+        x
     }
 }
 
