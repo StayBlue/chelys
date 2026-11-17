@@ -83,10 +83,18 @@ impl Lines {
 
     /// [`quantize`] with these lines.
     pub fn quantize(&self, global_gain: u8) -> Option<[i32; GRANULE_LINES]> {
+        self.quantize_below(global_gain, GRANULE_LINES)
+    }
+
+    /// [`quantize`](Self::quantize), given that the lines from `nonzero`
+    /// up quantise to zero, as they do at any step at which they did at a
+    /// finer one (see [`nonzero_end`]): the step's scale, and so each line's
+    /// value, only falls as the step grows.
+    pub fn quantize_below(&self, global_gain: u8, nonzero: usize) -> Option<[i32; GRANULE_LINES]> {
         let scale = scale(global_gain);
         let mut ix = [0; GRANULE_LINES];
         let mut largest = 0;
-        let end = self.end;
+        let end = self.end.min(nonzero);
         for ((ix, &powered), &xr) in ix[..end].iter_mut().zip(&self.powered).zip(&self.xr) {
             let magnitude = round_to_magnitude(powered * scale - 0.0946);
             largest = largest.max(magnitude);
@@ -98,6 +106,14 @@ impl Lines {
         }
         (largest <= MAX_MAGNITUDE as i32).then_some(ix)
     }
+}
+
+/// One past the last of the quantised `values` that is not zero.
+pub fn nonzero_end(values: &[i32; GRANULE_LINES]) -> usize {
+    values
+        .iter()
+        .rposition(|&v| v != 0)
+        .map_or(0, |last| last + 1)
 }
 
 /// One past the last of the lines `xr` that is not zero.

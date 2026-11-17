@@ -4,7 +4,7 @@
 //! The outer iteration loop, or distortion control loop (clause C.1.5.4.3,
 //! figure C.9.b).
 
-use super::inner::{Lines, Step, inner_loop_step, step_size};
+use super::inner::{Lines, Step, inner_loop_step, nonzero_end, step_size};
 use crate::mp3::header::SamplingFrequency;
 use crate::mp3::huffman::{Counted, MAX_MAGNITUDE, SpectrumCoding};
 use crate::mp3::scalefactor_bands::{self, Band, LONG_BANDS};
@@ -470,8 +470,12 @@ impl ToSave<'_> {
         // A step's values and scalefactors, marked for intensity stereo, if
         // no band's distortion exceeds its allowance and it marks a band
         // only if `marked`, that is if the last step that passed did.
+        // Every step tried is coarser than the granule's, so the lines that
+        // quantise to zero at it do at all of them. Intensity stereo may give
+        // the granule a value below its bound, which only moves this up.
+        let nonzero = nonzero_end(granule.values());
         let quantised = |global_gain: u8, marked: bool| {
-            let mut values = self.lines.quantize(global_gain)?;
+            let mut values = self.lines.quantize_below(global_gain, nonzero)?;
             if let Some(intensity) = self.intensity {
                 intensity.fill_below_bound(&mut values, amplified);
             }
