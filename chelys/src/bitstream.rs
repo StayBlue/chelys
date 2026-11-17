@@ -22,15 +22,20 @@ impl BitWriter {
             bits == 32 || value >> bits == 0,
             "value {value} does not fit in {bits} bits"
         );
-        for shift in (0..bits).rev() {
-            if self.bit_len.is_multiple_of(8) {
+        // As many of the bits left as the last byte has room for at a time.
+        let mut left = bits;
+        while left > 0 {
+            let used = (self.bit_len % 8) as u32;
+            if used == 0 {
                 self.bytes.push(0);
             }
-            if (value >> shift) & 1 == 1 {
-                let last = self.bytes.len() - 1;
-                self.bytes[last] |= 0x80 >> (self.bit_len % 8);
-            }
-            self.bit_len += 1;
+            let room = 8 - used;
+            let taken = room.min(left);
+            let chunk = (u64::from(value) >> (left - taken)) & ((1 << taken) - 1);
+            let last = self.bytes.len() - 1;
+            self.bytes[last] |= (chunk << (room - taken)) as u8;
+            self.bit_len += taken as usize;
+            left -= taken;
         }
     }
 
