@@ -6,6 +6,7 @@
 use std::f64::consts::TAU;
 
 use chelys::mp3::header::{Bitrate, Flags, Mode, SamplingFrequency, Version};
+use chelys::mp3::huffman::QuadTable;
 use chelys::mp3::rate::Rate;
 use chelys::mp3::scalefactor_bands;
 use chelys::mp3::scalefactors::Scalefactors;
@@ -64,7 +65,15 @@ fn probe_stream(fs: SamplingFrequency, block_type: BlockType, scaled: bool) -> V
         let mut values = [0; GRANULE_LINES];
         values[line] = 1;
         let mut probe = QuantizedGranule::new(200, values, block_type, fs);
-        assert!(probe.coding.big_values <= 1, "line {line}");
+        // The partition of clause C.1.5.4.4.4, which the encoder may not
+        // keep: the line and the zeros below it as quadruples, but for the
+        // pair of lines 0 and 1 where the quadruples leave it.
+        let end = (line / 2 + 1) * 2;
+        let start = end % 4;
+        probe.coding.big_values = start / 2;
+        probe.coding.count1 = (end - start) / 4;
+        probe.coding.table_select = [u8::from(line < 2), 0, 0];
+        probe.coding.count1_table = QuadTable::A;
         let mut scalefactors = Scalefactors::new(block_type, Version::Mpeg2);
         if scaled {
             for (index, s) in scalefactors.values_mut().iter_mut().enumerate() {

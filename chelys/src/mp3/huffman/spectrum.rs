@@ -90,12 +90,59 @@ impl SpectrumCoding {
             end -= 2;
         }
         // C.1.5.4.4.4: quadruples of magnitudes up to 1 below them ("count1").
-        let mut count1 = 0;
-        while end >= 4 && values[end - 4..end].iter().all(|v| v.unsigned_abs() <= 1) {
-            end -= 4;
-            count1 += 1;
+        let mut start = end;
+        while start >= 4
+            && values[start - 4..start]
+                .iter()
+                .all(|v| v.unsigned_abs() <= 1)
+        {
+            start -= 4;
         }
-        let big_values = end / 2;
+        let run = Self::partitioned(values, start, end, block_type, bands, sampling_frequency);
+        // Spec reading: clause C.1.5.4.4.4 puts the whole run of such
+        // quadruples in "count1", where each costs a bit at least, even one
+        // of zeros. In `big_values` zeros can cost nothing, in a region coded
+        // with table 0. So `count1` is also tried from above the run's last
+        // quadruple of zeros, and the partition needing fewer bits is kept.
+        // Where little is left in a sparse spectrum, as in the right
+        // channel of a frame in intensity stereo, that saves most of the
+        // bits. It is tried only where the run holds at least 8 quadruples
+        // of zeros, as it seldom saves bits with fewer and takes a second
+        // count.
+        let mut zero_quads = (start..end)
+            .step_by(4)
+            .filter(|&quad| values[quad..quad + 4] == [0; 4]);
+        if zero_quads.clone().count() < 8 {
+            return run;
+        }
+        let zeros_end = zero_quads.next_back().expect("quadruples of zeros") + 4;
+        let shorter = Self::partitioned(
+            values,
+            zeros_end,
+            end,
+            block_type,
+            bands,
+            sampling_frequency,
+        );
+        if shorter.bit_count(values, bands) < run.bit_count(values, bands) {
+            shorter
+        } else {
+            run
+        }
+    }
+
+    /// The coding of `values` with the `big_values` partition below line
+    /// `start` and the `count1` partition from it to line `end`.
+    fn partitioned(
+        values: &[i32; GRANULE_LINES],
+        start: usize,
+        end: usize,
+        block_type: BlockType,
+        bands: &[Band],
+        sampling_frequency: SamplingFrequency,
+    ) -> Self {
+        let (big_values, count1) = (start / 2, (end - start) / 4);
+        let end = start;
 
         // C.1.5.4.4.5: whichever quadruple table needs fewer bits.
         let quads = &values[end..end + 4 * count1];
@@ -403,6 +450,25 @@ mod tests {
         assert_eq!(subdivide(1, bands()), (0, 0));
         // All 21 bands: 7 / 9 / 5, with region 1 clamped to its 3-bit maximum.
         assert_eq!(subdivide(288, bands()), (6, 7));
+    }
+
+    /// A lone value of 1 above many zeros: the zeros go to `big_values`,
+    /// where table 0 codes them in no bits, rather than to `count1` as the
+    /// run of clause C.1.5.4.4.4 would have them.
+    #[test]
+    fn zeros_below_a_lone_value_go_to_big_values() {
+        let mut values = [0; GRANULE_LINES];
+        values[201] = 1;
+        let coding = SpectrumCoding::choose(&values, BlockType::Normal, bands(), FS);
+        // Line 201 lies in the quadruple of lines 198 to 201.
+        assert_eq!((coding.big_values, coding.count1), (99, 1));
+        // The run: from line 2, as lines 0 and 1 are left a pair.
+        let run = SpectrumCoding {
+            big_values: 1,
+            count1: 50,
+            ..coding.clone()
+        };
+        assert!(coding.bit_count(&values, bands()) < run.bit_count(&values, bands()));
     }
 
     #[test]
