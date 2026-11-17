@@ -121,18 +121,15 @@ fn power_three_quarters(x: f64) -> f64 {
 fn round_to_magnitude(x: f64) -> i32 {
     let x = x.clamp(0.0, f64::from(BEYOND_MAGNITUDE));
     // Exact: from 2^52 on, the integers are the doubles, so adding it
-    // rounds `x` to the nearest one, and subtracting it again gives that.
-    let nearest = (x + TWO_POW_52) - TWO_POW_52;
-    let truncated = if nearest > x { nearest - 1.0 } else { nearest };
-    // Exact: `x` and its truncation lie within 1 of each other.
-    let fraction = x - truncated;
-    let magnitude = if fraction >= 0.5 {
-        truncated + 1.0
-    } else {
-        truncated
-    };
-    // 2^52 plus the magnitude holds it in the low bits of its mantissa.
-    (magnitude + TWO_POW_52).to_bits() as i32
+    // rounds `x` to the nearest one, halves to the even one, and
+    // subtracting it again gives that.
+    let shifted = x + TWO_POW_52;
+    let nearest = shifted - TWO_POW_52;
+    // Exact, as `x` and the nearest integer lie within 1/2 of each other: a
+    // half rounded down to the even integer is rounded up instead.
+    let half_down = i32::from(x - nearest == 0.5);
+    // 2^52 plus an integer holds it in the low bits of its mantissa.
+    shifted.to_bits() as i32 + half_down
 }
 
 /// `2^52`, from which on the doubles are spaced 1 apart.
