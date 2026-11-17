@@ -94,10 +94,12 @@ impl Lines {
     }
 }
 
-/// `|x|^0.75`.
+/// `|x|^0.75`, as `(|x| * |x|^0.5)^0.5`: two square roots, which the
+/// processor computes, rather than a call to the C library's `pow`. It
+/// differs from `pow` by about the last bit.
 fn power_three_quarters(x: f64) -> f64 {
-    // Zero, which many upper lines are, needs no power.
-    if x == 0.0 { 0.0 } else { x.abs().powf(0.75) }
+    let x = x.abs();
+    (x * x.sqrt()).sqrt()
 }
 
 /// `nint(x)`, rounding halves away from zero as [`f64::round`] does, but
