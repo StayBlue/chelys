@@ -814,7 +814,8 @@ impl Coding for ModelCoding {
         mean_bits: usize,
         reservoir: &mut Reservoir,
         intensity: bool,
-    ) -> CodedFrame {
+        only_within: bool,
+    ) -> Option<CodedFrame> {
         let fs = self.sampling_frequency;
         let ms_stereo = self.ms_allowed && middle_side_frame(frame);
         let steps = if intensity && self.intensity_allowed && intensity_frame(frame) {
@@ -829,8 +830,11 @@ impl Coding for ModelCoding {
             saving_noise_db: self.saving_noise_db,
             sampling_frequency: fs,
         };
-        let plain = quantize_frame(&to_quantize, None, reservoir, IfOutsideAllowance::Finish)
-            .expect("a finished frame");
+        let if_outside = match only_within {
+            true => IfOutsideAllowance::GiveUpBeyond,
+            false => IfOutsideAllowance::Finish,
+        };
+        let plain = quantize_frame(&to_quantize, None, reservoir, if_outside)?;
         let tries: Vec<_> = if plain.within_allowance {
             Vec::new()
         } else {
@@ -849,12 +853,12 @@ impl Coding for ModelCoding {
             ..
         } = kept.unwrap_or(plain);
         *reservoir = kept_reservoir;
-        CodedFrame {
+        Some(CodedFrame {
             granules,
             ms_stereo,
             intensity_stereo,
             excess,
-        }
+        })
     }
 }
 
@@ -914,6 +918,10 @@ enum IfOutsideAllowance {
     Finish,
     /// Stop, and return no frame.
     GiveUp,
+    /// Stop, and return no frame, once a granule's noise exceeds its
+    /// allowance as [`loops::excess`] measures it, which the frame's
+    /// [`CodedFrame::excess`] then does too.
+    GiveUpBeyond,
 }
 
 /// A frame quantised one way, and the bit reservoir after it, which is taken
@@ -1207,6 +1215,9 @@ fn quantize_frame(
             }
             within_allowance &= outcome.within_allowance;
             excess = excess.max(loops::excess(xr, xmin, &outcome.granule, fs));
+            if excess > 1.0 && if_outside == IfOutsideAllowance::GiveUpBeyond {
+                return None;
+            }
             quantized.push(outcome.granule);
         }
         granules.push(quantized);
@@ -1297,7 +1308,8 @@ impl<F: FnMut(usize, usize) -> BlockType> Coding for FixedGainCoding<F> {
         mean_bits: usize,
         reservoir: &mut Reservoir,
         _intensity: bool,
-    ) -> CodedFrame {
+        _only_within: bool,
+    ) -> Option<CodedFrame> {
         let (global_gain, fs) = (self.global_gain, self.sampling_frequency);
         let mut granules = Vec::with_capacity(frame.len());
         for granule in frame {
@@ -1326,12 +1338,12 @@ impl<F: FnMut(usize, usize) -> BlockType> Coding for FixedGainCoding<F> {
                 .collect();
             granules.push(quantized);
         }
-        CodedFrame {
+        Some(CodedFrame {
             granules,
             ms_stereo: self.ms_stereo,
             intensity_stereo: false,
             excess: 0.0,
-        }
+        })
     }
 }
 
@@ -1377,14 +1389,18 @@ trait Coding {
     /// Quantises a frame's granules, indexed `[gr][ch]`, given the share of
     /// the frame's main data of each granule of each channel, accounting in
     /// the reservoir for the bits each uses. Intensity stereo is tried only
-    /// if `intensity` is set and the mode allows it.
+    /// if `intensity` is set and the mode allows it. If `only_within` is
+    /// set, the frame is wanted only if its noise is within its allowance
+    /// ([`CodedFrame::excess`] at most 1), and `None` may be returned as
+    /// soon as it is known not to be.
     fn quantize(
         &mut self,
         frame: &[Vec<Filtered<Self::Analysis>>],
         mean_bits: usize,
         reservoir: &mut Reservoir,
         intensity: bool,
-    ) -> CodedFrame;
+        only_within: bool,
+    ) -> Option<CodedFrame>;
 }
 
 /// How [`FrameEncoder`] chooses the bitrate of each frame.
@@ -1593,15 +1609,20 @@ impl<C: Coding> FrameEncoder<C> {
         let kept = match &mut self.schedule {
             Schedule::Constant(bitrate, padding) => {
                 let (bitrate, padding) = (*bitrate, padding.next_padding());
-                self.quantize_at(&filtered, bitrate, padding, true, ancillary_bits)
+                self.quantize_at(&filtered, bitrate, padding, true, ancillary_bits, false)
+                    .expect("a frame coded in full")
             }
             Schedule::Mean(schedule) => {
                 let (bitrate, padding) = schedule.next_frame();
-                self.quantize_at(&filtered, bitrate, padding, true, ancillary_bits)
+                self.quantize_at(&filtered, bitrate, padding, true, ancillary_bits, false)
+                    .expect("a frame coded in full")
             }
             Schedule::Variable { bitrates, previous } => {
                 let (bitrates, start) = (bitrates.clone(), *previous);
                 let highest = bitrates.len() - 1;
+                // The search keeps a frame that is not within its allowance
+                // only at the highest bitrate, so below it, coding stops once
+                // a frame is known not to be.
                 let (index, kept) = rate::search_variable(bitrates.len(), start, |index| {
                     let at = self.quantize_at(
                         &filtered,
@@ -1609,14 +1630,15 @@ impl<C: Coding> FrameEncoder<C> {
                         false,
                         index == highest,
                         ancillary_bits,
+                        index != highest,
                     );
-                    let within = at.coded.excess <= 1.0;
+                    let within = at.as_ref().is_some_and(|at| at.coded.excess <= 1.0);
                     (at, within)
                 });
                 if let Schedule::Variable { previous, .. } = &mut self.schedule {
                     *previous = index;
                 }
-                kept
+                kept.expect("a frame within its allowance or at the highest bitrate")
             }
         };
         let FrameAtBitrate {
@@ -1652,7 +1674,9 @@ impl<C: Coding> FrameEncoder<C> {
     /// Quantises a frame at `bitrate`, with or without `padding`, from the
     /// reservoir as the frame finds it, trying intensity stereo if
     /// `intensity` is set and the mode allows it, with `ancillary_bits` of
-    /// its main data slot kept for ancillary data.
+    /// its main data slot kept for ancillary data; or `None` if `only_within`
+    /// is set and the frame's noise is not within its allowance (see
+    /// [`Coding::quantize`]).
     fn quantize_at(
         &mut self,
         frame: &[Vec<Filtered<C::Analysis>>],
@@ -1660,7 +1684,8 @@ impl<C: Coding> FrameEncoder<C> {
         padding: bool,
         intensity: bool,
         ancillary_bits: usize,
-    ) -> FrameAtBitrate {
+        only_within: bool,
+    ) -> Option<FrameAtBitrate> {
         let fs = self.config.sampling_frequency;
         let mut reservoir = self.reservoir.for_frame(bitrate.frame_len(fs, true));
         let main_data_begin = reservoir.bytes();
@@ -1670,17 +1695,17 @@ impl<C: Coding> FrameEncoder<C> {
             .expect("the ancillary data fits in the frame");
         let shares = frame.len() * self.pcm.len();
         let mean_bits = slot_bits / shares;
-        let coded = self
-            .coding
-            .quantize(frame, mean_bits, &mut reservoir, intensity);
-        FrameAtBitrate {
+        let coded =
+            self.coding
+                .quantize(frame, mean_bits, &mut reservoir, intensity, only_within)?;
+        Some(FrameAtBitrate {
             bitrate,
             padding,
             coded,
             main_data_begin,
             unshared_bits: slot_bits - shares * mean_bits,
             reservoir,
-        }
+        })
     }
 }
 
