@@ -80,7 +80,20 @@ impl Fft {
         for &(i, j) in &self.swaps {
             x.swap(i as usize, j as usize);
         }
-        let mut half = 1;
+        // The butterflies of span 2 have the twiddle 1, by which multiplying
+        // changes nothing but at most the sign of a zero, and is left out.
+        for pair in x.chunks_exact_mut(2) {
+            let (even, odd) = (pair[0], pair[1]);
+            pair[0] = Complex {
+                re: even.re + odd.re,
+                im: even.im + odd.im,
+            };
+            pair[1] = Complex {
+                re: even.re - odd.re,
+                im: even.im - odd.im,
+            };
+        }
+        let mut half = 2;
         while half < n {
             let twiddles = &self.twiddles[half - 1..][..half];
             for block in x.chunks_exact_mut(2 * half) {
