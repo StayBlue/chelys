@@ -208,11 +208,23 @@ struct ShortSpectra {
     spectrum: Vec<f64>,
 }
 
-/// The magnitude `r` and phase `f` of one FFT line (clause D.2.4 b)).
-#[derive(Clone, Copy, Debug, Default)]
+/// The magnitude `r` and phase `f` of one FFT line (clause D.2.4 b)), the
+/// phase kept as its cosine and sine (see [`Analysis::next_block`]).
+#[derive(Clone, Copy, Debug)]
 struct Polar {
     r: f64,
-    f: f64,
+    cos: f64,
+    sin: f64,
+}
+
+impl Default for Polar {
+    fn default() -> Self {
+        Self {
+            r: 0.0,
+            cos: 1.0,
+            sin: 0.0,
+        }
+    }
 }
 
 /// One FFT of the model with its Hann window, and the spectra of the two
@@ -267,16 +279,38 @@ impl Analysis {
         let mut c = Vec::with_capacity(self.predicted);
         let mut current = Vec::with_capacity(self.predicted);
         for (w, x) in x[..self.predicted].iter().enumerate() {
-            let polar = Polar {
-                r: r[w],
-                f: x.im.atan2(x.re),
+            // Spec reading: clause D.2.4 c) predicts the phase as
+            // `2 f(t-1) - f(t-2)`, of which clause D.2.4 d) takes only the
+            // cosine and sine. Those are had here from the cosines and sines
+            // of the two phases, by the formulas for a double angle and a
+            // difference of angles, and those of a line's phase from its real
+            // and imaginary parts divided by its magnitude, rather than
+            // through the angles themselves, for speed. The values are the
+            // same but for rounding. A line without magnitude is taken to
+            // have the phase 0, as `atan2(0, 0)` gives and the stored spectra
+            // start with.
+            let polar = match r[w] {
+                0.0 => Polar::default(),
+                r => Polar {
+                    r,
+                    cos: x.re / r,
+                    sin: x.im / r,
+                },
             };
             let (last, before_last) = (self.last[w], self.before_last[w]);
             let predicted_r = 2.0 * last.r - before_last.r;
-            let predicted_f = 2.0 * last.f - before_last.f;
+            // cos and sin of 2 f(t-1), then of 2 f(t-1) - f(t-2).
+            let (cos_double, sin_double) = (
+                last.cos * last.cos - last.sin * last.sin,
+                2.0 * last.cos * last.sin,
+            );
+            let (predicted_cos, predicted_sin) = (
+                cos_double * before_last.cos + sin_double * before_last.sin,
+                sin_double * before_last.cos - cos_double * before_last.sin,
+            );
             let (re, im) = (
-                x.re - predicted_r * predicted_f.cos(),
-                x.im - predicted_r * predicted_f.sin(),
+                x.re - predicted_r * predicted_cos,
+                x.im - predicted_r * predicted_sin,
             );
             let distance = (re * re + im * im).sqrt();
             let scale = polar.r + predicted_r.abs();
