@@ -343,6 +343,9 @@ struct BandBits {
     /// whose number is counted apart, in `escapes_below`.
     below: [[u16; CODE_SETS]; LONG_BANDS + 1],
     escapes_below: [u16; LONG_BANDS + 1],
+    /// The fewest bits that the bands below each band need, each band with
+    /// the table that codes it alone in the fewest: no split needs fewer.
+    least_below: [usize; LONG_BANDS + 1],
     /// The largest magnitude of each band.
     max: [u32; LONG_BANDS],
 }
@@ -361,6 +364,7 @@ impl BandBits {
         let tables = PairTables::get();
         let mut below = [[0u16; CODE_SETS]; LONG_BANDS + 1];
         let mut escapes_below = [0u16; LONG_BANDS + 1];
+        let mut least_below = [0usize; LONG_BANDS + 1];
         let mut max = [0u32; LONG_BANDS];
         for band in 0..count {
             let PairCounts {
@@ -382,6 +386,9 @@ impl BandBits {
                 next[set] = previous[set] + bits;
             }
             escapes_below[band + 1] = escapes_below[band] + escapes;
+            let bits = codes.map(|codes| codes + signs);
+            let least = tables.cheapest(&bits, escapes, largest).1;
+            least_below[band + 1] = least_below[band] + least;
         }
         // A granule's pairs need too few bits for the sums to overflow.
         assert!(below[count].iter().all(|&bits| bits <= i16::MAX as u16 / 2));
@@ -389,6 +396,7 @@ impl BandBits {
             count,
             below,
             escapes_below,
+            least_below,
             max,
         }
     }
@@ -407,7 +415,7 @@ impl BandBits {
     /// The split needing the fewest bits: `(region0_count, region1_count)`,
     /// the table of each region and the bits of the pairs.
     fn split(&self) -> ((u8, u8), [u8; 3], usize) {
-        let count = self.count;
+        let (count, least_below) = (self.count, &self.least_below);
         let region = |range| self.region(range);
         // The last region, for each band it may start at.
         let mut last = [(0u8, 0usize); LONG_BANDS + 1];
@@ -416,13 +424,25 @@ impl BandBits {
         }
         let mut best: Option<(usize, (u8, u8), [u8; 3])> = None;
         // region0_count and region1_count are 4- and 3-bit fields.
+        // Splits that cannot need fewer bits than the best so far are skipped:
+        // only one needing fewer would be kept.
+        let beaten = |best: &Option<(usize, _, _)>, bits: usize| {
+            best.as_ref().is_some_and(|&(least, ..)| bits >= least)
+        };
         for region0 in 0..16u8 {
             let end0 = (usize::from(region0) + 1).min(count);
             let (table0, bits0) = region(0..end0);
             for region1 in 0..8u8 {
                 let end1 = (end0 + usize::from(region1) + 1).min(count);
-                let (table1, bits1) = region(end0..end1);
                 let (table2, bits2) = last[end1];
+                let at_least = bits0 + (least_below[end1] - least_below[end0]) + bits2;
+                if beaten(&best, at_least) {
+                    if end1 == count {
+                        break;
+                    }
+                    continue;
+                }
+                let (table1, bits1) = region(end0..end1);
                 let bits = bits0 + bits1 + bits2;
                 if best.as_ref().is_none_or(|&(least, ..)| bits < least) {
                     best = Some((bits, (region0, region1), [table0, table1, table2]));
