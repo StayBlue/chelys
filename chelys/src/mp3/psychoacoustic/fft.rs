@@ -30,8 +30,10 @@ impl Complex {
 }
 
 pub struct Fft {
-    /// The pairs of positions that the bit reversal swaps.
-    swaps: Vec<(u32, u32)>,
+    /// For each butterfly of span 2, the position whose value the bit
+    /// reversal brings to its first input, `rev(2m)`; that of its second is
+    /// `rev(2m + 1) = rev(2m) + N/2`.
+    firsts: Vec<u32>,
     /// For each stage, from the butterflies of span 2 up, the twiddles
     /// `e^(-2 pi i k / (2 h))` of its `h` butterflies, one after the other.
     twiddles: Vec<Complex>,
@@ -54,10 +56,8 @@ impl Fft {
             }
         };
         let bits = size.trailing_zeros();
-        let swaps = (0..size)
-            .map(|i| (i, i.reverse_bits() >> (usize::BITS - bits)))
-            .filter(|&(i, j)| i < j)
-            .map(|(i, j)| (i as u32, j as u32))
+        let firsts = (0..size / 2)
+            .map(|m| ((2 * m).reverse_bits() >> (usize::BITS - bits)) as u32)
             .collect();
         let mut twiddles = Vec::with_capacity(size);
         let mut half = 1;
@@ -66,7 +66,7 @@ impl Fft {
             twiddles.extend((0..half).map(|k| twiddle(k * stride)));
             half *= 2;
         }
-        Self { swaps, twiddles }
+        Self { firsts, twiddles }
     }
 
     /// Transforms `x` in place.
@@ -74,16 +74,26 @@ impl Fft {
     /// # Panics
     ///
     /// If `x` is not the size the transform was made for.
+    #[cfg(test)]
     pub fn transform(&self, x: &mut [Complex]) {
+        let input = x.to_vec();
+        self.transform_from(|i| input[i], x);
+    }
+
+    /// The transform of the values `input(i)` into `x`.
+    ///
+    /// # Panics
+    ///
+    /// If `x` is not the size the transform was made for.
+    pub fn transform_from(&self, input: impl Fn(usize) -> Complex, x: &mut [Complex]) {
         let n = self.twiddles.len() + 1;
         assert_eq!(x.len(), n, "FFT input size");
-        for &(i, j) in &self.swaps {
-            x.swap(i as usize, j as usize);
-        }
-        // The butterflies of span 2 have the twiddle 1, by which multiplying
+        // The bit reversal, with the butterflies of span 2 taken as their
+        // inputs are gathered. Their twiddle is 1, by which multiplying
         // changes nothing but at most the sign of a zero, and is left out.
-        for pair in x.chunks_exact_mut(2) {
-            let (even, odd) = (pair[0], pair[1]);
+        for (pair, &first) in x.chunks_exact_mut(2).zip(&self.firsts) {
+            let first = first as usize;
+            let (even, odd) = (input(first), input(first + n / 2));
             pair[0] = Complex {
                 re: even.re + odd.re,
                 im: even.im + odd.im,
@@ -200,12 +210,14 @@ impl RealFft {
         let half = self.twiddles.len() - 1;
         assert_eq!(x.len(), 2 * half, "FFT input size");
         let z = &mut self.z;
-        z.clear();
-        z.extend(x.chunks_exact(2).map(|pair| Complex {
-            re: pair[0],
-            im: pair[1],
-        }));
-        self.half.transform(z);
+        z.resize(half, Complex::default());
+        self.half.transform_from(
+            |i| Complex {
+                re: x[2 * i],
+                im: x[2 * i + 1],
+            },
+            z,
+        );
         let twiddles = &self.twiddles;
         let line = |k: usize, zk: Complex, mirrored: Complex| {
             let mirrored = mirrored.conj();
