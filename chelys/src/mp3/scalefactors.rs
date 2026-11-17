@@ -414,11 +414,6 @@ impl Scalefactors {
         })
     }
 
-    /// `scalefac_multiplier` (clause 2.4.2.7).
-    fn multiplier(&self) -> f64 {
-        if self.scalefac_scale { 1.0 } else { 0.5 }
-    }
-
     /// The factor by which the decoder divides the lines of scalefactor
     /// `index` of [`values`](Self::values),
     /// `2^(scalefac_multiplier * (scalefac_l + preflag * pretab))` for long
@@ -430,8 +425,14 @@ impl Scalefactors {
             Scalefac::Long(_) if self.preflag => PRETAB[index],
             _ => 0,
         };
-        let steps = f64::from(self.values()[index] + pretab);
-        (self.multiplier() * steps).exp2()
+        let steps = usize::from(self.values()[index] + pretab);
+        // `scalefac_multiplier * steps`, in halves.
+        let halves = if self.scalefac_scale {
+            2 * steps
+        } else {
+            steps
+        };
+        half_power(halves)
     }
 
     /// The `scalefac_compress` whose field widths hold the scalefactors sent
@@ -598,6 +599,16 @@ fn mixed_len(long: usize) -> usize {
 /// Whether `value` fits in `bits` bits.
 fn fits_in(value: u8, bits: u32) -> bool {
     u32::from(value) >> bits == 0
+}
+
+/// `2^(halves / 2)`, from a table of every power that a scalefactor with its
+/// preemphasis, which fit in a byte, can give, as the outer loop takes the
+/// amplification of every band in each iteration.
+fn half_power(halves: usize) -> f64 {
+    const TABLE_HALVES: usize = 2 * (u8::MAX as usize + 1);
+    static TABLE: std::sync::OnceLock<[f64; TABLE_HALVES]> = std::sync::OnceLock::new();
+    let table = TABLE.get_or_init(|| std::array::from_fn(|halves| (0.5 * halves as f64).exp2()));
+    table[halves]
 }
 
 #[cfg(test)]
