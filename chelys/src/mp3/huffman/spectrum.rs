@@ -583,8 +583,13 @@ impl BandBits {
     /// The table that codes the bands `range` in the fewest bits, and those
     /// bits.
     fn region(&self, range: std::ops::Range<usize>) -> (u8, usize) {
-        let tables = PairTables::get();
         let largest = self.max[range.clone()].iter().copied().max().unwrap_or(0);
+        self.region_with(range, largest)
+    }
+
+    /// [`region`](Self::region), given the largest magnitude of the bands.
+    fn region_with(&self, range: std::ops::Range<usize>, largest: u32) -> (u8, usize) {
+        let tables = PairTables::get();
         let (end, start) = (&self.below[range.end], &self.below[range.start]);
         let escapes = self.escapes_below[range.end] - self.escapes_below[range.start];
         let bits: [u16; CODE_SETS] = std::array::from_fn(|set| end[set].wrapping_sub(start[set]));
@@ -636,12 +641,19 @@ impl BandBits {
     /// region1_count)` and the table of each region.
     fn splits_below(&self, mut limit: usize, fewest: bool) -> Option<(usize, (u8, u8), [u8; 3])> {
         let (count, least_below) = (self.count, &self.least_below);
-        let region = |range| self.region(range);
+        // The largest magnitudes of the regions are carried from one
+        // region to the next that it grows into.
+        let region = |range, largest| self.region_with(range, largest);
         // The last region, for each band it may start at.
         let mut last = [(0u8, 0usize); LONG_BANDS + 1];
-        for (start, last) in last.iter_mut().enumerate().take(count + 1) {
-            *last = region(start..count);
+        let mut largest2 = 0;
+        for start in (0..=count).rev() {
+            if start < count {
+                largest2 = largest2.max(self.max[start]);
+            }
+            last[start] = region(start..count, largest2);
         }
+        let mut largest0 = 0;
         let mut best = None;
         // region0_count and region1_count are 4- and 3-bit fields.
         // Splits that cannot need fewer bits than the limit, which is that
@@ -649,9 +661,17 @@ impl BandBits {
         // kept.
         for region0 in 0..16u8 {
             let end0 = (usize::from(region0) + 1).min(count);
-            let (table0, bits0) = region(0..end0);
+            if end0 > 0 {
+                largest0 = largest0.max(self.max[end0 - 1]);
+            }
+            let (table0, bits0) = region(0..end0, largest0);
+            let (mut end, mut largest1) = (end0, 0);
             for region1 in 0..8u8 {
                 let end1 = (end0 + usize::from(region1) + 1).min(count);
+                for band in end..end1 {
+                    largest1 = largest1.max(self.max[band]);
+                }
+                end = end1;
                 let (table2, bits2) = last[end1];
                 let at_least = bits0 + (least_below[end1] - least_below[end0]) + bits2;
                 if at_least >= limit {
@@ -660,7 +680,7 @@ impl BandBits {
                     }
                     continue;
                 }
-                let (table1, bits1) = region(end0..end1);
+                let (table1, bits1) = region(end0..end1, largest1);
                 let bits = bits0 + bits1 + bits2;
                 if bits < limit {
                     best = Some((bits, (region0, region1), [table0, table1, table2]));
