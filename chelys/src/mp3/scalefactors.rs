@@ -451,7 +451,7 @@ impl Scalefactors {
                 Version::Mpeg2 => self.lsf_partitions(c).preflag == self.preflag,
             };
             preflag_sent
-                && (self.widths(c).into_iter().enumerate()).all(|(index, slen)| {
+                && self.widths(c).enumerate().all(|(index, slen)| {
                     slen.is_none_or(|slen| self.sent_value(index, slen).is_some())
                 })
         };
@@ -497,27 +497,31 @@ impl Scalefactors {
 
     /// The width of each scalefactor of [`values`](Self::values) sent with
     /// `scalefac_compress`, or `None` for those not sent.
-    fn widths(&self, scalefac_compress: u16) -> Vec<Option<u32>> {
-        match self.version {
+    fn widths(&self, scalefac_compress: u16) -> impl Iterator<Item = Option<u32>> + '_ {
+        // One of the two, without collecting them, as `compress` asks for
+        // the widths of every `scalefac_compress` in the inner loop.
+        let (mpeg1, mpeg2) = match self.version {
             Version::Mpeg1 => {
                 let (slen1, slen2) = SCALEFAC_COMPRESS[usize::from(scalefac_compress)];
-                (0..self.values().len())
-                    .map(|index| {
-                        let slen = if index < self.slen1_count() {
-                            slen1
-                        } else {
-                            slen2
-                        };
-                        self.sent(index).then_some(slen)
-                    })
-                    .collect()
+                let slen1_count = self.slen1_count();
+                let widths = (0..self.values().len()).map(move |index| {
+                    let slen = if index < slen1_count { slen1 } else { slen2 };
+                    self.sent(index).then_some(slen)
+                });
+                (Some(widths), None)
             }
-            Version::Mpeg2 => self
-                .lsf_partitions(scalefac_compress)
-                .widths(self.values().len())
-                .map(Some)
-                .collect(),
-        }
+            Version::Mpeg2 => {
+                let widths = self
+                    .lsf_partitions(scalefac_compress)
+                    .widths(self.values().len())
+                    .map(Some);
+                (None, Some(widths))
+            }
+        };
+        mpeg1
+            .into_iter()
+            .flatten()
+            .chain(mpeg2.into_iter().flatten())
     }
 
     /// Writes the scalefactors sent (clause 2.4.1.7) with the field widths of
@@ -528,7 +532,7 @@ impl Scalefactors {
     /// If a scalefactor sent does not fit its field.
     pub fn write(&self, scalefac_compress: u16, w: &mut BitWriter) {
         let widths = self.widths(scalefac_compress);
-        for (index, slen) in widths.into_iter().enumerate() {
+        for (index, slen) in widths.enumerate() {
             let Some(slen) = slen else { continue };
             let value = self
                 .sent_value(index, slen)
@@ -544,7 +548,7 @@ impl Scalefactors {
     /// lower sampling frequencies the sum of `nr_of_sfb * slen` over the
     /// partitions (clause 2.4.3.2 of ISO/IEC 13818-3).
     pub fn part2_length(&self, scalefac_compress: u16) -> usize {
-        (self.widths(scalefac_compress).into_iter().flatten())
+        (self.widths(scalefac_compress).flatten())
             .map(|slen| slen as usize)
             .sum()
     }
