@@ -15,6 +15,9 @@ use crate::mp3::{BlockType, GRANULE_LINES};
 use analysis_window::ANALYSIS_WINDOW;
 
 const SUBBANDS: usize = 32;
+/// The buffer that holds the filter's 512 input samples: room for 16
+/// passes of 32 samples before they must be moved.
+const HISTORY: usize = 1024;
 /// Subband samples per granule, and MDCT lines per subband.
 const SUBBAND_SAMPLES: usize = GRANULE_LINES / SUBBANDS;
 /// Samples in a long MDCT block: the subband samples of two granules.
@@ -62,8 +65,12 @@ const ALIAS_COEFFICIENTS: [f64; 8] = [
 
 /// Filters one channel of PCM into granules of 576 frequency lines.
 pub struct Filterbank {
-    /// The input sample vector `X` of figure C.4, most recent sample first.
-    history: [f64; 512],
+    /// The input sample vector `X` of figure C.4, most recent sample first,
+    /// at `history[start..][..512]`: each pass moves `start` down rather
+    /// than shifting `X`, which is moved back to the end of the buffer only
+    /// once `start` reaches its beginning.
+    history: Box<[f64; HISTORY]>,
+    start: usize,
     /// `M_ik` of clause C.1.3, indexed `[k][i]`. This and the kernels below
     /// are indexed by input sample first, as [`transform`] takes them.
     matrix: Box<[[f64; SUBBANDS]; 64]>,
@@ -110,7 +117,8 @@ impl Filterbank {
             (1.0 / norm, c / norm)
         });
         Self {
-            history: [0.0; 512],
+            history: Box::new([0.0; HISTORY]),
+            start: HISTORY - 512,
             matrix,
             long_mdct,
             short_mdct,
@@ -286,15 +294,23 @@ impl Filterbank {
     /// One pass of figure C.4: shifts in 32 samples, oldest first, and returns
     /// the 32 subband samples.
     fn subband_samples(&mut self, samples: &[f64; SUBBANDS]) -> [f64; SUBBANDS] {
-        self.history.copy_within(0..512 - SUBBANDS, SUBBANDS);
+        if self.start < SUBBANDS {
+            self.history.copy_within(
+                self.start..self.start + 512 - SUBBANDS,
+                HISTORY - 512 + SUBBANDS,
+            );
+            self.start = HISTORY - 512 + SUBBANDS;
+        }
+        self.start -= SUBBANDS;
+        let history: &mut [f64; 512] = (&mut self.history[self.start..][..512]).try_into().unwrap();
         for (i, &sample) in samples.iter().enumerate() {
             // "for i=31 down to 0 do X[i]=next_input_audio_sample"
-            self.history[SUBBANDS - 1 - i] = sample;
+            history[SUBBANDS - 1 - i] = sample;
         }
         let mut y = [0.0; 64];
         for (i, y) in y.iter_mut().enumerate() {
             *y = (0..8)
-                .map(|j| ANALYSIS_WINDOW[i + 64 * j] * self.history[i + 64 * j])
+                .map(|j| ANALYSIS_WINDOW[i + 64 * j] * history[i + 64 * j])
                 .sum();
         }
         transform(&self.matrix, |m, k| m * y[k])
