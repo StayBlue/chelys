@@ -351,6 +351,15 @@ pub fn outer_loop(
     }
 }
 
+/// A step of the saving search that passes, with its values, its
+/// scalefactors marked for intensity stereo, and their counts.
+struct Kept {
+    global_gain: u8,
+    values: [i32; GRANULE_LINES],
+    scalefactors: Scalefactors,
+    counted: Counted,
+}
+
 /// A granule that met its allowance, to quantise with a coarser step.
 struct ToSave<'a> {
     /// Its lines amplified by its scalefactors.
@@ -374,7 +383,8 @@ impl ToSave<'_> {
     /// granule had none fails too; at the lower sampling frequencies each
     /// step is first given a value in the band just below the bound where
     /// it has none, as [`fit`] gives it. The search stops at the first step
-    /// that fails, as distortion and bits follow the step only roughly.
+    /// that fails, as distortion and bits follow the step only roughly; it
+    /// counts the bits of a step only where it has to.
     fn coarsest(
         &self,
         granule: QuantizedGranule,
@@ -387,17 +397,14 @@ impl ToSave<'_> {
         let allowed: Vec<f64> = (self.xmin.iter().enumerate())
             .map(|(sb, xmin)| raised * xmin * self.scalefactors.amplification(sb).powi(2))
             .collect();
-        // The coarsest step that passes, with its values and scalefactors;
-        // its granule is made only once the search ends.
-        let mut kept: Option<(u8, [i32; GRANULE_LINES], Scalefactors, Counted)> = None;
-        let mut marked = granule.scalefactors.marks_any();
         // The scalefactors, and so their bits, change only where intensity
         // stereo marks them.
         let unmarked_part2 = part2_length(self.scalefactors);
-        for global_gain in granule.global_gain.saturating_add(1)..=u8::MAX {
-            let Some(mut values) = self.lines.quantize(global_gain) else {
-                break;
-            };
+        // A step's values and scalefactors, marked for intensity stereo, if
+        // no band's distortion exceeds its allowance and it marks a band
+        // only if `marked`, that is if the last step that passed did.
+        let quantised = |global_gain: u8, marked: bool| {
+            let mut values = self.lines.quantize(global_gain)?;
             if let Some(intensity) = self.intensity {
                 intensity.fill_below_bound(&mut values, amplified);
             }
@@ -406,31 +413,88 @@ impl ToSave<'_> {
             if (0..self.bands.len())
                 .any(|sb| !self.fixed.contains(&sb) && distortion[sb] > allowed[sb])
             {
-                break;
+                return None;
             }
             let mut scalefactors = self.scalefactors.clone();
             if let Some(intensity) = self.intensity {
                 intensity.mark(&mut scalefactors, &values);
                 if scalefactors.marks_any() && !marked {
-                    break;
+                    return None;
                 }
             }
-            let part2 = match self.intensity {
-                Some(_) => part2_length(&scalefactors),
-                None => unmarked_part2,
+            Some((values, scalefactors))
+        };
+        // The step with those values, if their bits are between the least
+        // and the available bits.
+        let counted =
+            |global_gain: u8, (values, scalefactors): ([i32; GRANULE_LINES], Scalefactors)| {
+                let part2 = match self.intensity {
+                    Some(_) => part2_length(&scalefactors),
+                    None => unmarked_part2,
+                };
+                let most = available_bits.checked_sub(part2)?;
+                let least = saving.least.saturating_sub(part2);
+                let counted = SpectrumCoding::count(&values, granule.block_type, self.bands, fs);
+                counted.bits_between(least, most).then_some(Kept {
+                    global_gain,
+                    values,
+                    scalefactors,
+                    counted,
+                })
             };
-            let Some(most) = available_bits.checked_sub(part2) else {
+        // The coarser steps one at a time while their distortion and marks
+        // pass, then the bits of the last, and if they fail, a bisection
+        // between it and the granule's step for the last whose bits pass,
+        // rather than counting the bits of every step, for speed. This
+        // assumes that coarser steps never need more bits, which the Huffman
+        // tables do not quite guarantee; where they do, the search may keep
+        // a step coarser than one whose bits fail. With intensity stereo,
+        // the bits of the scalefactors change with the bands marked, which
+        // need not follow the step, and the bits of every step are counted.
+        let mut marked = granule.scalefactors.marks_any();
+        let mut kept = None;
+        let mut last = None;
+        for global_gain in granule.global_gain.saturating_add(1)..=u8::MAX {
+            let Some(step) = quantised(global_gain, marked) else {
                 break;
             };
-            let least = saving.least.saturating_sub(part2);
-            let counted = SpectrumCoding::count(&values, granule.block_type, self.bands, fs);
-            if !counted.bits_between(least, most) {
-                break;
+            marked = step.1.marks_any();
+            if self.intensity.is_some() {
+                let Some(step) = counted(global_gain, step) else {
+                    break;
+                };
+                kept = Some(step);
+            } else {
+                last = Some((global_gain, step));
             }
-            marked = scalefactors.marks_any();
-            kept = Some((global_gain, values, scalefactors, counted));
         }
-        let Some((global_gain, values, scalefactors, counted)) = kept else {
+        let kept = kept.or_else(|| {
+            let (coarsest, step) = last?;
+            if let Some(kept) = counted(coarsest, step) {
+                return Some(kept);
+            }
+            // Every step up to `coarsest` passed its distortion.
+            let (mut passed, mut failed, mut kept) = (granule.global_gain, coarsest, None);
+            while failed - passed > 1 {
+                let middle = passed + (failed - passed) / 2;
+                let step = quantised(middle, marked).expect("the step passed");
+                match counted(middle, step) {
+                    Some(step) => {
+                        passed = middle;
+                        kept = Some(step);
+                    }
+                    None => failed = middle,
+                }
+            }
+            kept
+        });
+        let Some(Kept {
+            global_gain,
+            values,
+            scalefactors,
+            counted,
+        }) = kept
+        else {
             return granule;
         };
         let (coding, _) = counted.choose();
