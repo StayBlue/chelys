@@ -6,7 +6,7 @@
 
 use crate::mp3::header::SamplingFrequency;
 use crate::mp3::huffman::MAX_MAGNITUDE;
-use crate::mp3::huffman::SpectrumCoding;
+use crate::mp3::huffman::{Counted, SpectrumCoding};
 use crate::mp3::{BlockType, GRANULE_LINES, QuantizedGranule, scalefactor_bands};
 
 /// Spec gap: clause C.1.5.4.1 sets `global_gain = qquant + system_constant`
@@ -172,25 +172,21 @@ pub fn inner_loop_lines(
     // step the search ends on.
     let attempt = |global_gain: u8| {
         let values = lines.quantize(global_gain)?;
-        let fits = SpectrumCoding::bits_between(
-            &values,
-            block_type,
-            &bands,
-            sampling_frequency,
-            0,
-            available_bits,
-        );
-        fits.then_some(Step {
+        let counted = SpectrumCoding::count(&values, block_type, &bands, sampling_frequency);
+        counted.bits_between(0, available_bits).then_some(Step {
             global_gain,
             values,
+            counted,
         })
     };
     let granule = |step: Step| {
-        QuantizedGranule::new(
+        let (coding, _) = step.counted.choose();
+        QuantizedGranule::with_coding(
             step.global_gain,
             step.values,
             block_type,
             sampling_frequency,
+            coding,
         )
     };
 
@@ -223,10 +219,13 @@ pub fn inner_loop_lines(
     Some(granule(bisect_between(&attempt, over, fits)))
 }
 
-/// A step size and the values quantised with it.
+/// A step size, the values quantised with it, and their counts.
 struct Step {
     global_gain: u8,
     values: [i32; GRANULE_LINES],
+    /// The values counted for their coding, which the step's granule is
+    /// made with.
+    counted: Counted,
 }
 
 /// A step size near the finest that fits, by bisection over the whole range,

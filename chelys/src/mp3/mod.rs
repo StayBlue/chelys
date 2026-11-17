@@ -239,6 +239,27 @@ impl QuantizedGranule {
     ) -> Self {
         let bands = scalefactor_bands::coding_bands(block_type, sampling_frequency);
         let coding = SpectrumCoding::choose(&values, block_type, &bands, sampling_frequency);
+        Self::with_coding(global_gain, values, block_type, sampling_frequency, coding)
+    }
+
+    /// [`new`](Self::new), with the coding that it would choose already
+    /// chosen, as [`SpectrumCoding::count`] gives it.
+    pub fn with_coding(
+        global_gain: u8,
+        values: [i32; GRANULE_LINES],
+        block_type: BlockType,
+        sampling_frequency: SamplingFrequency,
+        coding: SpectrumCoding,
+    ) -> Self {
+        debug_assert_eq!(
+            coding,
+            SpectrumCoding::choose(
+                &values,
+                block_type,
+                &scalefactor_bands::coding_bands(block_type, sampling_frequency),
+                sampling_frequency,
+            )
+        );
         Self {
             block_type,
             global_gain,

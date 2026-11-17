@@ -7,7 +7,7 @@
 mod spectrum;
 mod tables;
 
-pub use spectrum::{MAX_MAGNITUDE, SpectrumCoding};
+pub use spectrum::{Counted, MAX_MAGNITUDE, SpectrumCoding};
 
 /// A Huffman code word: the low `len` bits of `bits`, written most significant
 /// first.

@@ -6,7 +6,7 @@
 
 use super::inner::{Lines, inner_loop_lines, step_size};
 use crate::mp3::header::SamplingFrequency;
-use crate::mp3::huffman::{MAX_MAGNITUDE, SpectrumCoding};
+use crate::mp3::huffman::{Counted, MAX_MAGNITUDE, SpectrumCoding};
 use crate::mp3::scalefactor_bands::{self, Band, LONG_BANDS};
 use crate::mp3::scalefactors::{PRETAB, Scalefactors, ZeroPart};
 use crate::mp3::side_info::SCFSI_BANDS;
@@ -389,7 +389,7 @@ impl ToSave<'_> {
             .collect();
         // The coarsest step that passes, with its values and scalefactors;
         // its granule is made only once the search ends.
-        let mut kept: Option<(u8, [i32; GRANULE_LINES], Scalefactors)> = None;
+        let mut kept: Option<(u8, [i32; GRANULE_LINES], Scalefactors, Counted)> = None;
         let mut marked = granule.scalefactors.marks_any();
         // The scalefactors, and so their bits, change only where intensity
         // stereo marks them.
@@ -423,23 +423,19 @@ impl ToSave<'_> {
                 break;
             };
             let least = saving.least.saturating_sub(part2);
-            if !SpectrumCoding::bits_between(
-                &values,
-                granule.block_type,
-                self.bands,
-                fs,
-                least,
-                most,
-            ) {
+            let counted = SpectrumCoding::count(&values, granule.block_type, self.bands, fs);
+            if !counted.bits_between(least, most) {
                 break;
             }
             marked = scalefactors.marks_any();
-            kept = Some((global_gain, values, scalefactors));
+            kept = Some((global_gain, values, scalefactors, counted));
         }
-        let Some((global_gain, values, scalefactors)) = kept else {
+        let Some((global_gain, values, scalefactors, counted)) = kept else {
             return granule;
         };
-        let mut coarsest = QuantizedGranule::new(global_gain, values, granule.block_type, fs);
+        let (coding, _) = counted.choose();
+        let mut coarsest =
+            QuantizedGranule::with_coding(global_gain, values, granule.block_type, fs, coding);
         coarsest.scalefactors = scalefactors;
         debug_assert!((saving.least..=available_bits).contains(&coarsest.bit_len(fs)));
         coarsest

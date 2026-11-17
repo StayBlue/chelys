@@ -121,72 +121,30 @@ impl SpectrumCoding {
         if shorter.1 < run.1 { shorter } else { run }
     }
 
-    /// Whether the coding that [`choose`](Self::choose) gives `values`
-    /// needs between `least` and `most` bits. The answer is the same, but
-    /// where bounds on the bits of each split settle it, without searching
-    /// the splits.
-    pub fn bits_between(
+    /// `values` counted for the choice of their coding, so that whether its
+    /// bits fit ([`Counted::bits_between`]) and the coding itself
+    /// ([`Counted::choose`]) can both be had from one count.
+    pub fn count(
         values: &[i32; GRANULE_LINES],
         block_type: BlockType,
         bands: &[Band],
         sampling_frequency: SamplingFrequency,
-        least: usize,
-        most: usize,
-    ) -> bool {
-        let exact = || {
-            let bits = Self::choose_counted(values, block_type, bands, sampling_frequency).1;
-            (least..=most).contains(&bits)
-        };
-        if block_type != BlockType::Normal {
-            return exact();
+    ) -> Counted {
+        match block_type {
+            BlockType::Normal => {
+                let (start, end, zeros_end) = Self::partitions(values);
+                let counted = |start| PartitionCounts::new(values, start, end, bands);
+                Counted::Normal {
+                    run: counted(start),
+                    shorter: zeros_end.map(counted),
+                }
+            }
+            _ => {
+                let (coding, bits) =
+                    Self::choose_counted(values, block_type, bands, sampling_frequency);
+                Counted::Chosen { coding, bits }
+            }
         }
-        let between = Self::bounded_bits_between(values, bands, least, most);
-        debug_assert_eq!(between, exact());
-        between
-    }
-
-    /// [`bits_between`](Self::bits_between) for a normal block.
-    fn bounded_bits_between(
-        values: &[i32; GRANULE_LINES],
-        bands: &[Band],
-        least: usize,
-        most: usize,
-    ) -> bool {
-        let (start, end, zeros_end) = Self::partitions(values);
-        // For each partition, its quadruples' bits and its pairs' bits by
-        // band.
-        let partitions = [Some(start), zeros_end].map(|start| {
-            start.map(|start| {
-                let quads = &values[start..end];
-                let quad_bits = quad_bits(QuadTable::A, quads).min(quad_bits(QuadTable::B, quads));
-                (quad_bits, BandBits::new(&values[..start], bands))
-            })
-        });
-        let partitions = partitions.iter().flatten();
-        // The bits lie between the fewest any partition can need and the
-        // fewest that a split of each needs.
-        let lower = (partitions.clone())
-            .map(|(quad_bits, pairs)| quad_bits + pairs.least())
-            .min()
-            .expect("a partition");
-        if lower > most {
-            return false;
-        }
-        let upper = (partitions.clone())
-            .map(|(quad_bits, pairs)| quad_bits + pairs.upper())
-            .min()
-            .expect("a partition");
-        if upper < least {
-            return false;
-        }
-        if least <= lower && upper <= most {
-            return true;
-        }
-        let bits = (partitions.clone())
-            .map(|(quad_bits, pairs)| quad_bits + pairs.split().2)
-            .min()
-            .expect("a partition");
-        (least..=most).contains(&bits)
     }
 
     /// The partitions to try: `count1` from the first line returned, or
@@ -257,17 +215,7 @@ impl SpectrumCoding {
         // 2.4.2.7). A mixed block has the count of long blocks.
         let (region0_count, region1_count) = match block_type {
             BlockType::Normal => {
-                let (counts, table_select, pair_bits) = subdivide(&values[..end], bands);
-                let coding = Self {
-                    big_values,
-                    count1,
-                    table_select,
-                    region0_count: counts.0,
-                    region1_count: counts.1,
-                    mixed_region1: None,
-                    count1_table,
-                };
-                return (coding, pair_bits + quad_bits);
+                return PartitionCounts::new(values, end, end + 4 * count1, bands).coding();
             }
             BlockType::Start | BlockType::Stop | BlockType::Mixed => (7, 36),
             BlockType::Short => (8, 36),
@@ -375,30 +323,139 @@ impl SpectrumCoding {
     }
 }
 
-/// SUBDIVIDE (clause C.1.5.4.4.6) and the choice of tables (clause
-/// C.1.5.4.4.7) for the `big_values` pairs `values` of a normal block:
-/// returns `(region0_count, region1_count)`, the table of each region and
-/// the bits of the pairs.
-///
-/// Spec gap: "The split strategy is up to the implementation" (clause
-/// C.1.5.4.4.6), which gives assigning a third of the bands to the first
-/// region and a quarter to the last only as "a very simple one for
-/// instance". Here every split the fields allow is tried, each region with
-/// the table that codes it in the fewest bits (see [`cheapest_table`]), and
-/// the split needing the fewest bits overall is kept. The bits it saves let
-/// the inner loop take a finer step. Graded with PEAQ (GstPEAQ 0.6.1, black
-/// box), 22 tracks of pop music at 44.1 kHz in stereo rose from a mean of
-/// -1.88 to -1.80 at 96 kbit/s, from -0.69 to -0.66 at 128 kbit/s and from
-/// -0.18 to -0.17 at 192 kbit/s, and 14 of rock from -0.86 to -0.82 at
-/// 128 kbit/s (from -1.57 to -1.47 for the worst track) and from -0.22 to
-/// -0.21 at 192 kbit/s; at `--vbr` the streams came out 1 to 2% smaller at
-/// the same grade. Encoding takes about 1.4 times as long.
-fn subdivide(values: &[i32], bands: &[Band]) -> ((u8, u8), [u8; 3], usize) {
-    BandBits::new(values, bands).split()
+/// Values counted for the choice of their coding (see
+/// [`SpectrumCoding::count`]).
+pub enum Counted {
+    /// A normal block's: each partition to try, with what its coding
+    /// needs counted, but its split not yet searched.
+    Normal {
+        run: PartitionCounts,
+        shorter: Option<PartitionCounts>,
+    },
+    /// Any other block's, whose coding is chosen at once.
+    Chosen { coding: SpectrumCoding, bits: usize },
+}
+
+impl Counted {
+    /// Whether the coding chosen for the values needs between `least` and
+    /// `most` bits. For a normal block, the bits lie between the fewest any
+    /// partition can need and the fewest that a split of each needs, and
+    /// the splits are searched only where those bounds do not settle it.
+    pub fn bits_between(&self, least: usize, most: usize) -> bool {
+        let between = self.bounded_bits_between(least, most);
+        debug_assert_eq!(between, (least..=most).contains(&self.bits()));
+        between
+    }
+
+    /// The bits of the coding chosen, searching every split.
+    fn bits(&self) -> usize {
+        match self {
+            Self::Normal { run, shorter } => std::iter::once(run)
+                .chain(shorter)
+                .map(|partition| partition.coding().1)
+                .min()
+                .expect("a partition"),
+            Self::Chosen { bits, .. } => *bits,
+        }
+    }
+
+    fn bounded_bits_between(&self, least: usize, most: usize) -> bool {
+        let (run, shorter) = match self {
+            Self::Normal { run, shorter } => (run, shorter),
+            Self::Chosen { bits, .. } => return (least..=most).contains(bits),
+        };
+        let partitions = std::iter::once(run).chain(shorter);
+        let lower = (partitions.clone())
+            .map(|partition| partition.quad_bits().1 + partition.pairs.least())
+            .min()
+            .expect("a partition");
+        if lower > most {
+            return false;
+        }
+        let upper = (partitions.clone())
+            .map(|partition| partition.quad_bits().1 + partition.pairs.upper())
+            .min()
+            .expect("a partition");
+        if upper < least {
+            return false;
+        }
+        if least <= lower && upper <= most {
+            return true;
+        }
+        let bits = (partitions.clone())
+            .map(|partition| partition.quad_bits().1 + partition.pairs.split().2)
+            .min()
+            .expect("a partition");
+        (least..=most).contains(&bits)
+    }
+
+    /// The coding [`SpectrumCoding::choose`] gives the values, and its bits.
+    pub fn choose(self) -> (SpectrumCoding, usize) {
+        match self {
+            Self::Normal { run, shorter } => {
+                let run = run.coding();
+                match shorter.map(|shorter| shorter.coding()) {
+                    Some(shorter) if shorter.1 < run.1 => shorter,
+                    _ => run,
+                }
+            }
+            Self::Chosen { coding, bits } => (coding, bits),
+        }
+    }
+}
+
+/// One partition of a normal block's values, counted: the `big_values`
+/// pairs below line `2 * big_values` and the `count1` quadruples above.
+pub struct PartitionCounts {
+    big_values: usize,
+    count1: usize,
+    /// The quadruples' bits with tables A and B.
+    quad_bits: [usize; 2],
+    pairs: BandBits,
+}
+
+impl PartitionCounts {
+    fn new(values: &[i32; GRANULE_LINES], start: usize, end: usize, bands: &[Band]) -> Self {
+        let quads = &values[start..end];
+        Self {
+            big_values: start / 2,
+            count1: (end - start) / 4,
+            quad_bits: [QuadTable::A, QuadTable::B].map(|table| quad_bits(table, quads)),
+            pairs: BandBits::new(&values[..start], bands),
+        }
+    }
+
+    /// C.1.5.4.4.5: whichever quadruple table needs fewer bits, and those
+    /// bits.
+    fn quad_bits(&self) -> (QuadTable, usize) {
+        let [bits_a, bits_b] = self.quad_bits;
+        if bits_b < bits_a {
+            (QuadTable::B, bits_b)
+        } else {
+            (QuadTable::A, bits_a)
+        }
+    }
+
+    /// The coding with the split of the pairs that needs the fewest bits,
+    /// and its bits.
+    fn coding(&self) -> (SpectrumCoding, usize) {
+        let (count1_table, quad_bits) = self.quad_bits();
+        let ((region0_count, region1_count), table_select, pair_bits) = self.pairs.split();
+        let coding = SpectrumCoding {
+            big_values: self.big_values,
+            count1: self.count1,
+            table_select,
+            region0_count,
+            region1_count,
+            mixed_region1: None,
+            count1_table,
+        };
+        (coding, pair_bits + quad_bits)
+    }
 }
 
 /// The bits of the `big_values` pairs of a normal block, band by band, with
-/// every set of code words: what [`subdivide`] splits.
+/// every set of code words, which [`split`](Self::split) splits.
 struct BandBits {
     /// The bands that hold pairs. A split that gives a region only bands
     /// above them needs as many bits as one that ends the region where
@@ -493,8 +550,24 @@ impl BandBits {
         tables.cheapest(&bits, escapes, largest)
     }
 
-    /// The split needing the fewest bits: `(region0_count, region1_count)`,
-    /// the table of each region and the bits of the pairs.
+    /// SUBDIVIDE (clause C.1.5.4.4.6) and the choice of tables (clause
+    /// C.1.5.4.4.7) for the pairs: the split needing the fewest bits,
+    /// `(region0_count, region1_count)`, the table of each region and the
+    /// bits of the pairs.
+    ///
+    /// Spec gap: "The split strategy is up to the implementation" (clause
+    /// C.1.5.4.4.6), which gives assigning a third of the bands to the first
+    /// region and a quarter to the last only as "a very simple one for
+    /// instance". Here every split the fields allow is tried, each region with
+    /// the table that codes it in the fewest bits (see [`cheapest_table`]), and
+    /// the split needing the fewest bits overall is kept. The bits it saves let
+    /// the inner loop take a finer step. Graded with PEAQ (GstPEAQ 0.6.1, black
+    /// box), 22 tracks of pop music at 44.1 kHz in stereo rose from a mean of
+    /// -1.88 to -1.80 at 96 kbit/s, from -0.69 to -0.66 at 128 kbit/s and from
+    /// -0.18 to -0.17 at 192 kbit/s, and 14 of rock from -0.86 to -0.82 at
+    /// 128 kbit/s (from -1.57 to -1.47 for the worst track) and from -0.22 to
+    /// -0.21 at 192 kbit/s; at `--vbr` the streams came out 1 to 2% smaller at
+    /// the same grade. Encoding takes about 1.4 times as long.
     fn split(&self) -> ((u8, u8), [u8; 3], usize) {
         let (count, least_below) = (self.count, &self.least_below);
         let region = |range| self.region(range);
@@ -586,7 +659,7 @@ const CODE_SETS: usize = 16;
 /// and 24 to 31, which differ only in `linbits`.
 const ESCAPE_SETS: [usize; 2] = [CODE_SETS - 2, CODE_SETS - 1];
 
-/// What [`subdivide`] needs of each table that is used, worked out once.
+/// What [`BandBits`] needs of each table that is used, worked out once.
 struct PairTables {
     /// Each set of code words, with its first table.
     sets: [TableEntry; CODE_SETS],
