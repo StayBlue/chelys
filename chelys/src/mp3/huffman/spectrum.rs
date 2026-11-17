@@ -133,11 +133,11 @@ impl SpectrumCoding {
         match block_type {
             BlockType::Normal => {
                 let (start, end, zeros_end) = Self::partitions(values);
-                let counted = |start| PartitionCounts::new(values, start, end, bands);
-                Counted::Normal {
-                    run: counted(start),
-                    shorter: zeros_end.map(counted),
-                }
+                let run = PartitionCounts::new(values, start, end, bands, None);
+                // The shorter run's pairs start with the run's.
+                let shorter = zeros_end
+                    .map(|start| PartitionCounts::new(values, start, end, bands, Some(&run.pairs)));
+                Counted::Normal { run, shorter }
             }
             _ => {
                 let (coding, bits) =
@@ -215,7 +215,7 @@ impl SpectrumCoding {
         // 2.4.2.7). A mixed block has the count of long blocks.
         let (region0_count, region1_count) = match block_type {
             BlockType::Normal => {
-                return PartitionCounts::new(values, end, end + 4 * count1, bands).coding();
+                return PartitionCounts::new(values, end, end + 4 * count1, bands, None).coding();
             }
             BlockType::Start | BlockType::Stop | BlockType::Mixed => (7, 36),
             BlockType::Short => (8, 36),
@@ -419,13 +419,22 @@ pub struct PartitionCounts {
 }
 
 impl PartitionCounts {
-    fn new(values: &[i32; GRANULE_LINES], start: usize, end: usize, bands: &[Band]) -> Self {
+    /// The partition with `count1` from line `start` to line `end`, taking
+    /// over the bands that `prefix` counted whole, if given, from pairs that
+    /// these start with.
+    fn new(
+        values: &[i32; GRANULE_LINES],
+        start: usize,
+        end: usize,
+        bands: &[Band],
+        prefix: Option<&BandBits>,
+    ) -> Self {
         let quads = &values[start..end];
         Self {
             big_values: start / 2,
             count1: (end - start) / 4,
             quad_bits: [QuadTable::A, QuadTable::B].map(|table| quad_bits(table, quads)),
-            pairs: BandBits::new(&values[..start], bands),
+            pairs: BandBits::new(&values[..start], bands, prefix),
         }
     }
 
@@ -465,6 +474,9 @@ struct BandBits {
     /// above them needs as many bits as one that ends the region where
     /// they begin, which comes first and so is kept.
     count: usize,
+    /// The bands that hold pairs up to their end, which pairs that start
+    /// with these but go on further hold the same.
+    whole: usize,
     /// For each band, each set of code words' bits for the bands below it:
     /// for a set of one table, its bits, a band it cannot code counting
     /// nothing, as no region with it is given to it; for a set of tables
@@ -487,7 +499,9 @@ struct BandBits {
 type Split = ((u8, u8), [u8; 3], usize);
 
 impl BandBits {
-    fn new(values: &[i32], bands: &[Band]) -> Self {
+    /// The bits of the pairs `values`, taking over the bands that `prefix`
+    /// counted whole, if given, from pairs that `values` start with.
+    fn new(values: &[i32], bands: &[Band], prefix: Option<&Self>) -> Self {
         let lines = values.len();
         assert!(
             bands.len() <= LONG_BANDS,
@@ -502,7 +516,18 @@ impl BandBits {
         let mut escapes_below = [0u16; LONG_BANDS + 1];
         let mut least_below = [0usize; LONG_BANDS + 1];
         let mut max = [0u32; LONG_BANDS];
-        for band in 0..count {
+        let first = match prefix {
+            Some(prefix) => {
+                let whole = prefix.whole.min(count);
+                below[..=whole].copy_from_slice(&prefix.below[..=whole]);
+                escapes_below[..=whole].copy_from_slice(&prefix.escapes_below[..=whole]);
+                least_below[..=whole].copy_from_slice(&prefix.least_below[..=whole]);
+                max[..whole].copy_from_slice(&prefix.max[..whole]);
+                whole
+            }
+            None => 0,
+        };
+        for band in first..count {
             let PairCounts {
                 codes,
                 signs,
@@ -528,8 +553,12 @@ impl BandBits {
         }
         // A granule's pairs need too few bits for the sums to overflow.
         assert!(below[count].iter().all(|&bits| bits <= i16::MAX as u16 / 2));
+        let whole = (0..count)
+            .take_while(|&band| bands.get(band + 1).is_some_and(|next| next.start <= lines))
+            .count();
         Self {
             count,
+            whole,
             below,
             escapes_below,
             least_below,
@@ -1015,6 +1044,31 @@ mod tests {
         }
         sparse[3] = 200;
         vec![decaying, sparse, spectrum(&[3; 40]), spectrum(&[1, 2])]
+    }
+
+    /// Pairs counted from the bands that shorter pairs counted whole count
+    /// as they do counted afresh.
+    #[test]
+    fn takes_over_the_whole_bands_of_shorter_pairs() {
+        for values in varied_spectra() {
+            for short in (0..=GRANULE_LINES).step_by(10) {
+                let prefix = BandBits::new(&values[..short], bands(), None);
+                for long in (short..=GRANULE_LINES).step_by(14) {
+                    let fresh = BandBits::new(&values[..long], bands(), None);
+                    let taken = BandBits::new(&values[..long], bands(), Some(&prefix));
+                    assert_eq!(
+                        (fresh.count, fresh.whole, fresh.below, fresh.escapes_below),
+                        (taken.count, taken.whole, taken.below, taken.escapes_below),
+                        "{short} to {long}"
+                    );
+                    assert_eq!(
+                        (fresh.least_below, fresh.max),
+                        (taken.least_below, taken.max),
+                        "{short} to {long}"
+                    );
+                }
+            }
+        }
     }
 
     /// No split the fields allow, each region with the table that codes it
