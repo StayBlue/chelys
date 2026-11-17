@@ -241,11 +241,13 @@ impl Analysis {
     /// predicted (clause D.2.4 b) to d)), remembering their spectrum for the
     /// next block.
     fn next_block(&mut self, samples: &[f64]) -> (Vec<f64>, Vec<f64>) {
-        let size = self.window.len();
+        // Exact: the size is a power of two, so multiplying by its
+        // reciprocal divides by it, without a division for each sample.
+        let reciprocal = 1.0 / self.window.len() as f64;
         let windowed: Vec<f64> = samples
             .iter()
             .zip(&self.window)
-            .map(|(s, w)| s * PCM_SCALE * w / size as f64)
+            .map(|(s, w)| s * PCM_SCALE * w * reciprocal)
             .collect();
         let x = self.fft.transform(&windowed);
 

@@ -159,8 +159,10 @@ impl RealFft {
         self.half.transform(&mut z);
         (0..=half)
             .map(|k| {
-                let zk = z[k % half];
-                let mirrored = z[(half - k) % half].conj();
+                // Z(N/2) = Z(0), without the division that `k % half` takes.
+                let wrapped = |k: usize| if k == half { 0 } else { k };
+                let zk = z[wrapped(k)];
+                let mirrored = z[wrapped(half - k)].conj();
                 let even = Complex {
                     re: (zk.re + mirrored.re) / 2.0,
                     im: (zk.im + mirrored.im) / 2.0,
