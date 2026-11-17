@@ -135,8 +135,16 @@ was recorded with (currently 0.6.1) in the `chelys-conformance` crate's
 documentation, next to the decoders', and update it when the evidence is
 recorded again with another version.
 
+The text of ITU-R BS.1387 may be read to interpret PEAQ's measures and grades,
+for example to attribute a grade to its measures or to find where they judge
+chelys's output. It is not a source for the encoder, and its model is not
+implemented in chelys.
+
 *User, 2026-11-15, when listening tests proved too laborious and GstPEAQ was
 installed: the wording was proposed by the agent and approved by the user.*
+*User, 2026-11-16: reading ITU-R BS.1387 to interpret PEAQ added, when PEAQ's
+grades were to be attributed to its measures; the wording was proposed by the
+agent and approved by the user.*
 
 ## LAME's encoder as a benchmark
 
