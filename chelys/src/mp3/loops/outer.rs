@@ -279,7 +279,14 @@ pub fn outer_loop(
         let measured_against = allowed_for(&scalefactors);
         let excess: f64 = (0..bands.len())
             .filter(|&sb| scalefactors.sent(sb) && !fixed.contains(&sb))
-            .map(|sb| (distortion[sb] / measured_against[sb]).max(1.0).ln())
+            .map(
+                |sb| match (distortion[sb] / measured_against[sb]).max(1.0) {
+                    // ln(1) is 0 exactly, which most bands, within their
+                    // allowance, need no logarithm for.
+                    1.0 => 0.0,
+                    ratio => ratio.ln(),
+                },
+            )
             .sum();
         let violated = excess > 0.0;
         let first = best.is_none();
