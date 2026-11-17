@@ -267,15 +267,25 @@ pub fn outer_loop_with(
         .filter(|_| reuse.is_none())
         .map(|unscaled| unscaled.get_or_init(|| Unscaled::new(xr)));
     let mut lines: Option<Lines> = unscaled.map(|unscaled| unscaled.lines.clone());
-    let update = |lines: &mut Option<Lines>, amplified: &[f64; GRANULE_LINES]| match lines {
-        Some(lines) => lines.update(amplified),
-        None => *lines = Some(Lines::new(amplified)),
+    // The amplification of each band that the lines have: none as `xr` are.
+    let mut applied = vec![1.0; bands.len()];
+    let update = |lines: &mut Option<Lines>, applied: &mut [f64], scalefactors: &Scalefactors| {
+        let factors: Vec<f64> = (0..bands.len())
+            .map(|sb| scalefactors.amplification(sb))
+            .collect();
+        match lines {
+            Some(lines) => lines.amplify(xr, &bands, &factors, applied),
+            None => {
+                *lines = Some(Lines::new(&amplify(xr, scalefactors, &bands)));
+                applied.copy_from_slice(&factors);
+            }
+        }
     };
 
     loop {
-        let amplified = amplify(xr, &scalefactors, &bands);
-        update(&mut lines, &amplified);
+        update(&mut lines, &mut applied, &scalefactors);
         let current = lines.as_ref().expect("lines");
+        let amplified = current.xr();
         // Only the first fit starts from an estimate.
         let first = (unscaled.filter(|_| start_gain.is_none())).map(|unscaled| &unscaled.estimate);
         let granule = fit(
@@ -306,7 +316,7 @@ pub fn outer_loop_with(
         start_gain = Some(granule.global_gain());
 
         let distortion =
-            quantisation_distortion(&amplified, granule.values(), granule.global_gain(), &bands);
+            quantisation_distortion(amplified, granule.values(), granule.global_gain(), &bands);
         let allowed_for = |scalefactors: &Scalefactors| -> Vec<f64> {
             (xmin.iter().enumerate())
                 .map(|(sb, xmin)| xmin * scalefactors.amplification(sb).powi(2))
@@ -373,8 +383,7 @@ pub fn outer_loop_with(
         best.expect("lines without scalefactors always quantise");
     match saving {
         Some(saving) if within_allowance && block_type == BlockType::Normal => {
-            let amplified = amplify(xr, &scalefactors, &bands);
-            update(&mut lines, &amplified);
+            update(&mut lines, &mut applied, &scalefactors);
             let to_save = ToSave {
                 lines: lines.expect("lines"),
                 xmin,

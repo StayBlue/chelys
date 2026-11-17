@@ -7,6 +7,7 @@
 use crate::mp3::header::SamplingFrequency;
 use crate::mp3::huffman::MAX_MAGNITUDE;
 use crate::mp3::huffman::{Counted, SpectrumCoding};
+use crate::mp3::scalefactor_bands::Band;
 use crate::mp3::{BlockType, GRANULE_LINES, QuantizedGranule, scalefactor_bands};
 
 /// Spec gap: clause C.1.5.4.1 sets `global_gain = qquant + system_constant`
@@ -65,17 +66,33 @@ impl Lines {
         }
     }
 
-    /// Makes these lines `xr`, taking the power again only of the lines
-    /// that change, as few do from one iteration of the outer loop to the
-    /// next.
-    pub fn update(&mut self, xr: &[f64; GRANULE_LINES]) {
-        for ((line, powered), &x) in self.xr.iter_mut().zip(&mut self.powered).zip(xr) {
-            if *line != x {
-                *line = x;
-                *powered = power_three_quarters(x);
+    /// Makes these lines `xr` with each of the `bands` multiplied by its
+    /// factor in `factors`, given that those of `applied` were last, and
+    /// sets `applied` to them: only the bands whose factor changes are
+    /// multiplied again and take their powers again. Lines above the last
+    /// band stay as `xr` has them.
+    pub fn amplify(
+        &mut self,
+        xr: &[f64; GRANULE_LINES],
+        bands: &[Band],
+        factors: &[f64],
+        applied: &mut [f64],
+    ) {
+        for ((band, &factor), applied) in bands.iter().zip(factors).zip(applied) {
+            if factor == *applied {
+                continue;
+            }
+            *applied = factor;
+            let lines = band.start..band.end();
+            let lines = (self.xr[lines.clone()].iter_mut())
+                .zip(&mut self.powered[lines.clone()])
+                .zip(&xr[lines]);
+            for ((line, powered), &x) in lines {
+                *line = x * factor;
+                *powered = power_three_quarters(*line);
             }
         }
-        self.end = end(xr);
+        self.end = end(&self.xr);
     }
 
     pub fn xr(&self) -> &[f64; GRANULE_LINES] {
