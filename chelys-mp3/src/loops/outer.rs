@@ -5,13 +5,13 @@
 //! figure C.9.b).
 
 use super::inner::{Lines, Step, StepEstimate, Unscaled, inner_loop_step, nonzero_end, step_size};
-use crate::mp3::header::SamplingFrequency;
-use crate::mp3::huffman::{Counted, MAX_MAGNITUDE, SpectrumCoding};
-use crate::mp3::scalefactor_bands::{self, Band, LONG_BANDS};
-use crate::mp3::scalefactors::{PRETAB, Scalefactors, ZeroPart};
-use crate::mp3::side_info::SCFSI_BANDS;
-use crate::mp3::stereo::IntensityPositions;
-use crate::mp3::{BlockType, GRANULE_LINES, QuantizedGranule};
+use crate::header::SamplingFrequency;
+use crate::huffman::{Counted, MAX_MAGNITUDE, SpectrumCoding};
+use crate::scalefactor_bands::{self, Band, LONG_BANDS};
+use crate::scalefactors::{PRETAB, Scalefactors, ZeroPart};
+use crate::side_info::SCFSI_BANDS;
+use crate::stereo::IntensityPositions;
+use crate::{BlockType, GRANULE_LINES, QuantizedGranule};
 
 /// The scalefactors of a frame's first granule, and the scfsi bands in which
 /// the second granule takes them over (clause C.1.5.4.2.3).
@@ -74,7 +74,7 @@ pub const SAVING_NOISE_DB: f64 = 4.0;
 /// bands whose quantisation noise exceeds the allowed distortion `xmin`.
 /// The lines and `xmin` are in the order they are sent; for short blocks each scalefactor band counts
 /// once per window (see
-/// [`coding_bands`](crate::mp3::scalefactor_bands::coding_bands)).
+/// [`coding_bands`](crate::scalefactor_bands::coding_bands)).
 ///
 /// Each iteration amplifies the lines by the current scalefactors, runs the
 /// inner loop with the bits left after the scalefactors, and measures the
@@ -250,7 +250,7 @@ pub fn outer_loop_with(
         scalefactors.scalefac_scale = reuse.first.scalefac_scale;
         scalefactors.scfsi = reuse.scfsi;
         for (sb, scalefac) in scalefactors.values_mut().iter_mut().enumerate() {
-            if reuse.scfsi[crate::mp3::scalefactors::scfsi_band(sb)] {
+            if reuse.scfsi[crate::scalefactors::scfsi_band(sb)] {
                 *scalefac = reuse.first.values()[sb];
             }
         }
@@ -846,7 +846,7 @@ fn coarser(scalefactors: &Scalefactors) -> Scalefactors {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mp3::loops::{inner_loop, quantize};
+    use crate::loops::{inner_loop, quantize};
 
     const FS: SamplingFrequency = SamplingFrequency::Hz44100;
 

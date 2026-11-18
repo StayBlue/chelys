@@ -1,13 +1,16 @@
 [package]
 name = "chelys"
+description = "Audio encoders implemented from their specifications."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish = false
 
 [dependencies]
+chelys-mp3 = { path = "../chelys-mp3", optional = true }
 
 [features]
-# The encoder's building blocks, for chelys's own test crates: see
-# `chelys::mp3::internals`.
-unstable = []
+default = ["mp3"]
+mp3 = ["dep:chelys-mp3"]
+# Each codec's building blocks, for chelys's own conformance tests.
+unstable = ["chelys-mp3?/unstable"]

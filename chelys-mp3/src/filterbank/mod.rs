@@ -11,7 +11,7 @@ mod analysis_window;
 
 use std::f64::consts::PI;
 
-use crate::mp3::{BlockType, GRANULE_LINES};
+use crate::{BlockType, GRANULE_LINES};
 use analysis_window::ANALYSIS_WINDOW;
 
 const SUBBANDS: usize = 32;

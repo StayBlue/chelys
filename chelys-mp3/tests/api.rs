@@ -7,7 +7,7 @@
 use std::f64::consts::TAU;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use chelys::mp3::{ChannelMode, Config, ConfigError, DELAY, Encoder, Rate, SAMPLE_RATES, bitrates};
+use chelys_mp3::{ChannelMode, Config, ConfigError, DELAY, Encoder, Rate, SAMPLE_RATES, bitrates};
 
 const MODES: [ChannelMode; 4] = [
     ChannelMode::Mono,

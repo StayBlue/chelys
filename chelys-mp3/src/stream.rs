@@ -1889,7 +1889,7 @@ pub fn encode_silence(config: &StreamConfig, frames: usize) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mp3::stream_check;
+    use crate::stream_check;
 
     fn config(crc_protected: bool) -> StreamConfig {
         StreamConfig {

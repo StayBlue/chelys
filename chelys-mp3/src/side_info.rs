@@ -5,7 +5,7 @@
 //! 2.4.1.7 of ISO/IEC 13818-3 for the lower sampling frequencies).
 
 use crate::bitstream::BitWriter;
-use crate::mp3::header::Version;
+use crate::header::Version;
 
 pub const SCFSI_BANDS: usize = 4;
 

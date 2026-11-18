@@ -6,14 +6,14 @@
 //! inner iteration loop (clauses C.1.5.4.4.3 to C.1.5.4.4.8).
 //!
 //! The values are given in the order they are sent, and the scalefactor
-//! bands as [`coding_bands`](crate::mp3::scalefactor_bands::coding_bands)
+//! bands as [`coding_bands`](crate::scalefactor_bands::coding_bands)
 //! gives them for the granule's block type.
 
 use super::{PairTable, QuadTable, pair_table};
 use crate::bitstream::BitWriter;
-use crate::mp3::header::SamplingFrequency;
-use crate::mp3::scalefactor_bands::{Band, LONG_BANDS, MIXED_LONG_LINES};
-use crate::mp3::{BlockType, GRANULE_LINES};
+use crate::header::SamplingFrequency;
+use crate::scalefactor_bands::{Band, LONG_BANDS, MIXED_LONG_LINES};
+use crate::{BlockType, GRANULE_LINES};
 
 /// The largest magnitude allowed in the `big_values` partition (clause
 /// 2.4.2.7).
@@ -1052,8 +1052,8 @@ mod tests {
     fn select_table(values: &[i32]) -> u8 {
         cheapest_table(values).0
     }
-    use crate::mp3::header::SamplingFrequency;
-    use crate::mp3::scalefactor_bands::{coding_bands, long_bands};
+    use crate::header::SamplingFrequency;
+    use crate::scalefactor_bands::{coding_bands, long_bands};
 
     const FS: SamplingFrequency = SamplingFrequency::Hz44100;
 

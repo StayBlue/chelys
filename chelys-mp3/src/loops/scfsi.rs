@@ -5,10 +5,10 @@
 //! (clause C.1.5.4.2.3): which scfsi bands of a frame's second granule take
 //! over the first granule's scalefactors.
 
-use crate::mp3::scalefactor_bands::{self, LONG_BANDS};
-use crate::mp3::scalefactors::SCFSI_STARTS;
-use crate::mp3::side_info::SCFSI_BANDS;
-use crate::mp3::{BlockType, GRANULE_LINES, header::SamplingFrequency};
+use crate::scalefactor_bands::{self, LONG_BANDS};
+use crate::scalefactors::SCFSI_STARTS;
+use crate::side_info::SCFSI_BANDS;
+use crate::{BlockType, GRANULE_LINES, header::SamplingFrequency};
 
 /// The criteria's suggested constants (clause C.1.5.4.2.3).
 const EN_TOT_KRIT: i32 = 10;

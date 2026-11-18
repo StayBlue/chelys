@@ -690,7 +690,7 @@ fn energy(lines: impl Iterator<Item = f64>) -> f64 {
 mod tests {
     use super::*;
     use crate::bitstream::BitWriter;
-    use crate::mp3::scalefactor_bands::LONG_BANDS;
+    use crate::scalefactor_bands::LONG_BANDS;
 
     #[test]
     fn alike_channels_switch_ms_on_and_either_alone_does_not() {

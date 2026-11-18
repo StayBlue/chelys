@@ -379,8 +379,8 @@ fn misc(config: &StreamConfig) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mp3::header::Flags;
-    use crate::mp3::rate::VariableRate;
+    use crate::header::Flags;
+    use crate::rate::VariableRate;
 
     fn config(fs: SamplingFrequency, rate: Rate, mode: Mode) -> StreamConfig {
         StreamConfig {
@@ -464,7 +464,7 @@ mod tests {
         assert_eq!(&frame[4 + 17..4 + 21], b"Info");
         assert_eq!(frame[4 + 21..4 + 25], [0, 0, 0, 0x0F]);
         assert_eq!(frame[4 + 17 + 129], 0x11);
-        let mean = crate::mp3::rate::MeanRate::new(fs.version(), 150_000).unwrap();
+        let mean = crate::rate::MeanRate::new(fs.version(), 150_000).unwrap();
         let near = config(fs, Rate::Mean(mean), Mode::Stereo);
         assert_eq!(header(&near).unwrap().bitrate, kbps(fs, 160));
     }
@@ -504,7 +504,7 @@ mod tests {
         assert_eq!(frame[0x5A..0x5C], tag_crc.to_be_bytes());
         assert!(frame[0x5C..].iter().all(|&b| b == 0));
 
-        let mean = crate::mp3::rate::MeanRate::new(fs.version(), 50_000).unwrap();
+        let mean = crate::rate::MeanRate::new(fs.version(), 50_000).unwrap();
         let mean = config(fs, Rate::Mean(mean), Mode::Stereo);
         assert_eq!(header(&mean).unwrap().bitrate, kbps(fs, 64));
 

@@ -5,7 +5,7 @@
 //! unused are saved for later granules, and handed out again where the
 //! psychoacoustic model asks for more than the average.
 
-use crate::mp3::header::Version;
+use crate::header::Version;
 
 /// The decoder's input buffer, which must hold a frame and the reservoir
 /// before it (clause 2.4.3.4.4).

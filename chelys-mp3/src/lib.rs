@@ -1,11 +1,16 @@
 // Copyright (c) 2026 StayBlue
 // SPDX-License-Identifier: MIT
 
-//! MPEG-1 Audio Layer III, and its extension to lower sampling frequencies in
-//! ISO/IEC 13818-3.
+//! MPEG-1 Audio Layer III, its extension to lower sampling frequencies in
+//! ISO/IEC 13818-3, and MPEG-2.5, implemented from their specifications.
+//! The `chelys` crate offers it as `chelys::mp3`.
+//!
+//! Clause, table and figure references refer to ISO/IEC 11172-3:1993 (first
+//! edition), or, where they name it, to ISO/IEC 13818-3:1998 (second
+//! edition).
 //!
 //! ```
-//! use chelys::mp3::{ChannelMode, Config, Encoder, Rate};
+//! use chelys_mp3::{ChannelMode, Config, Encoder, Rate};
 //!
 //! let config = Config::new(44_100, ChannelMode::Stereo, Rate::Constant { kbps: 128 });
 //! let mut encoder = Encoder::new(config)?;
@@ -13,7 +18,7 @@
 //! let mut mp3 = Vec::new();
 //! encoder.encode_interleaved(&pcm, &mut mp3);
 //! encoder.finish(&mut mp3);
-//! # Ok::<(), chelys::mp3::ConfigError>(())
+//! # Ok::<(), chelys_mp3::ConfigError>(())
 //! ```
 
 // Without `unstable`, the items that only `internals` and the tests use are
@@ -22,6 +27,7 @@
 #![cfg_attr(not(feature = "unstable"), allow(dead_code, unused_imports))]
 
 mod ancillary;
+mod bitstream;
 mod config;
 mod crc;
 mod encoder;
@@ -59,7 +65,7 @@ pub mod internals {
     macro_rules! reexport {
         ($($module:ident),* $(,)?) => {
             $(pub mod $module {
-                pub use crate::mp3::$module::*;
+                pub use crate::$module::*;
             })*
         };
     }

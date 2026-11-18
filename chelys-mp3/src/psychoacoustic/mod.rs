@@ -710,7 +710,7 @@ fn band_ratio<const N: usize>(bands: &[BandWeights; N], thr: &[f64], eb: &[f64])
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mp3::filterbank::Filterbank;
+    use crate::filterbank::Filterbank;
 
     const FS: SamplingFrequency = SamplingFrequency::Hz44100;
 
@@ -895,11 +895,7 @@ mod tests {
                         0.0
                     }
                 });
-                xr = filterbank.granule(
-                    &pcm,
-                    crate::mp3::BlockType::Normal,
-                    crate::mp3::BlockType::Normal,
-                );
+                xr = filterbank.granule(&pcm, crate::BlockType::Normal, crate::BlockType::Normal);
             }
             xr.iter().map(|x| x * x).sum::<f64>()
         };

@@ -12,7 +12,7 @@
 
 use std::f64::consts::TAU;
 
-use chelys::mp3::{ChannelMode, Config, Encoder, Rate};
+use chelys_mp3::{ChannelMode, Config, Encoder, Rate};
 
 /// One and a half seconds: a tone in each channel, apart by a fifth, a
 /// quiet passage, then bursts of noise with sharp onsets.

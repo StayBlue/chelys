@@ -1384,14 +1384,14 @@ const SHORT_BANDS_16000: [BandWeights; SHORT_BANDS] = band_weights_from([
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mp3::header::Version;
+    use crate::header::Version;
 
     fn mpeg1() -> impl Iterator<Item = SamplingFrequency> {
         SamplingFrequency::ALL
             .into_iter()
             .filter(|fs| fs.version() == Version::Mpeg1)
     }
-    use crate::mp3::psychoacoustic::spreading_function;
+    use crate::psychoacoustic::spreading_function;
 
     /// `norm` is printed without its derivation, but in Tables C.7.a to
     /// C.7.c it matches the normalisation `rnorm` of clause D.2.4 f), the

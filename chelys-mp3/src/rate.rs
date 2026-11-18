@@ -231,7 +231,7 @@ pub fn search_variable<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mp3::header::PaddingSchedule;
+    use crate::header::PaddingSchedule;
 
     #[test]
     fn a_mean_rate_lies_between_two_neighbours_of_the_table() {

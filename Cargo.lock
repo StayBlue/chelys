@@ -5,6 +5,9 @@ version = 4
 [[package]]
 name = "chelys"
 version = "0.0.1"
+dependencies = [
+ "chelys-mp3",
+]
 
 [[package]]
 name = "chelys-cli"
@@ -19,6 +22,10 @@ version = "0.0.1"
 dependencies = [
  "chelys",
 ]
+
+[[package]]
+name = "chelys-mp3"
+version = "0.0.1"
 
 [[package]]
 name = "chelys-quality"

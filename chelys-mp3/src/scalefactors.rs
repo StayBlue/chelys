@@ -7,12 +7,12 @@
 //! frequencies), with the intensity stereo positions the right channel sends
 //! in their place (clause 2.4.3.4.9.3), and preemphasis (Table B.6).
 
+use crate::BlockType;
 use crate::bitstream::BitWriter;
-use crate::mp3::BlockType;
-use crate::mp3::header::Version;
-use crate::mp3::scalefactor_bands::{LONG_BANDS, MIXED_SHORT_START, SHORT_BANDS, SHORT_WINDOWS};
-use crate::mp3::side_info::SCFSI_BANDS;
-use crate::mp3::stereo::INTENSITY_SCALE;
+use crate::header::Version;
+use crate::scalefactor_bands::{LONG_BANDS, MIXED_SHORT_START, SHORT_BANDS, SHORT_WINDOWS};
+use crate::side_info::SCFSI_BANDS;
+use crate::stereo::INTENSITY_SCALE;
 
 /// The long scalefactor bands of each scfsi band: `SCFSI_STARTS[band]` up to
 /// `SCFSI_STARTS[band + 1]` (clause 2.4.2.7).
@@ -168,7 +168,7 @@ pub enum Scalefac {
     /// of the long bands, at `sfb`; and after them `scalefac_s[sfb][window]`
     /// from short band 3 up, at `long + 3 * (sfb - 3) + window`. `long` is
     /// 8, or 6 at the lower sampling frequencies (see
-    /// [`mixed_long_bands`](crate::mp3::scalefactor_bands::mixed_long_bands)),
+    /// [`mixed_long_bands`](crate::scalefactor_bands::mixed_long_bands)),
     /// and the scalefactors past those sent are unused.
     Mixed {
         long: usize,
@@ -213,7 +213,7 @@ pub struct ZeroPart {
 impl ZeroPart {
     /// No zero part yet: the scalefactors of the right channel before its
     /// positions are marked (see
-    /// [`IntensityPositions::mark`](crate::mp3::stereo::IntensityPositions::mark)).
+    /// [`IntensityPositions::mark`](crate::stereo::IntensityPositions::mark)).
     pub const UNMARKED: Self = Self {
         start: [usize::MAX; SHORT_WINDOWS],
         bound: usize::MAX,
@@ -295,7 +295,7 @@ impl Scalefactors {
 
     /// The scalefactors in the order they are sent: `scalefac_l[sfb]` at
     /// `sfb`, or `scalefac_s[sfb][window]` at `3 * sfb + window`, the order
-    /// of [`coding_bands`](crate::mp3::scalefactor_bands::coding_bands), and
+    /// of [`coding_bands`](crate::scalefactor_bands::coding_bands), and
     /// for mixed blocks as [`Scalefac::Mixed`] has them.
     pub fn values(&self) -> &[u8] {
         match &self.scalefac {

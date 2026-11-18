@@ -6,9 +6,9 @@
 //! 6,185,539 B1 for MPEG-2.5) and the frame length it implies (clause
 //! 2.4.3.1).
 
+use crate::GRANULE_LINES;
 use crate::bitstream::BitWriter;
-use crate::mp3::GRANULE_LINES;
-use crate::mp3::side_info::SideInfo;
+use crate::side_info::SideInfo;
 
 const SYNCWORD: u32 = 0xFFF;
 /// The sync word that marks MPEG-2.5, "eleven ones and a zero" (US
