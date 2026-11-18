@@ -145,6 +145,10 @@ fn align(input: &[f64], output: &[f32], channels: usize, channel: usize) -> (usi
 /// closely enough to line up: the first frame decodes to the silence
 /// before the input, and each frame after it to the block before its own,
 /// at the level the encoder takes its input at.
+///
+/// This is the evidence for the gap in the standard that [`DELAY`] marks
+/// as settled by decoding with ffmpeg: where the input lands in the
+/// decoded output.
 #[test]
 fn ffmpeg_decodes_the_input_a_frame_late_at_every_sample_rate() {
     for sample_rate in SAMPLE_RATES {
@@ -207,6 +211,11 @@ fn snr_rises_with_the_bitrate() {
 
 /// A tone at a low bitrate decodes at its frequency and level, with little
 /// else.
+///
+/// This is the evidence for the reading of the standard that the
+/// filterbank's `PCM_SCALE` marks as settled by decoding with ffmpeg: the
+/// scale of the decoder's output. At twice or half the scale, the level
+/// would be 6 dB off.
 #[test]
 fn a_tone_keeps_its_frequency_and_level_at_a_low_bitrate() {
     let sample_rate = 44_100;

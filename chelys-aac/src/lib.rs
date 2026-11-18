@@ -94,7 +94,11 @@ pub mod internals {
 ///
 /// Spec gap: the standard does not say what comes before the first block
 /// of input. It is taken as silence, so that the first frame decodes to
-/// silence and the input follows it whole.
+/// silence and the input follows it whole. Settled by decoding with ffmpeg
+/// (black box): the input lands exactly this many samples into its
+/// output, at every sampling frequency, in mono and stereo; the
+/// conformance test is
+/// `ffmpeg_decodes_the_input_a_frame_late_at_every_sample_rate`.
 ///
 /// Decoding with ffmpeg (black box) gives each frame's 1024 samples, from
 /// the first frame on, and trims none: this many samples, the input, then

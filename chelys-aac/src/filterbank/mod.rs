@@ -32,7 +32,9 @@ const LONG_WINDOW: usize = 2 * FRAME_SAMPLES;
 /// once windowed and overlapped and added (clause 15.3.3), the decoder's
 /// output. So the MDCT takes its input at that scale, and the quantizer
 /// (clause C.7.4), the inverse of the decoder's, gives lines that decode
-/// to it.
+/// to it. Settled by decoding with ffmpeg (black box): it decodes a tone
+/// at its level, within 0.1 dB, at full scale 1.0; the conformance test is
+/// `a_tone_keeps_its_frequency_and_level_at_a_low_bitrate`.
 const PCM_SCALE: f64 = 32_768.0;
 
 /// The sine window of clause 15.3.2 of `N` samples:
