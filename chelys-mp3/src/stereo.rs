@@ -11,10 +11,10 @@ use std::f64::consts::{PI, SQRT_2};
 use std::iter::Chain;
 use std::ops::Range;
 
+use super::granule::{BlockType, GRANULE_LINES};
 use super::header::{SamplingFrequency, Version};
 use super::scalefactor_bands::{self, SHORT_WINDOWS};
 use super::scalefactors::{Scalefactors, ZeroPart};
-use super::{BlockType, GRANULE_LINES};
 
 /// The FFT lines the switching criterion sums over, `i = 0` to `511`
 /// (Annex G.2 a)).

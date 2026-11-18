@@ -11,9 +11,9 @@
 
 use super::{PairTable, QuadTable, pair_table};
 use crate::bitstream::BitWriter;
+use crate::granule::{BlockType, GRANULE_LINES};
 use crate::header::SamplingFrequency;
 use crate::scalefactor_bands::{Band, LONG_BANDS, MIXED_LONG_LINES};
-use crate::{BlockType, GRANULE_LINES};
 
 /// The largest magnitude allowed in the `big_values` partition (clause
 /// 2.4.2.7).

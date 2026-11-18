@@ -5,13 +5,13 @@
 //! figure C.9.b).
 
 use super::inner::{Lines, Step, StepEstimate, Unscaled, inner_loop_step, nonzero_end, step_size};
+use crate::granule::{BlockType, GRANULE_LINES, QuantizedGranule};
 use crate::header::SamplingFrequency;
 use crate::huffman::{Counted, MAX_MAGNITUDE, SpectrumCoding};
 use crate::scalefactor_bands::{self, Band, LONG_BANDS};
 use crate::scalefactors::{PRETAB, Scalefactors, ZeroPart};
 use crate::side_info::SCFSI_BANDS;
 use crate::stereo::IntensityPositions;
-use crate::{BlockType, GRANULE_LINES, QuantizedGranule};
 
 /// The scalefactors of a frame's first granule, and the scfsi bands in which
 /// the second granule takes them over (clause C.1.5.4.2.3).

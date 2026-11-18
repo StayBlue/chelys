@@ -11,8 +11,8 @@
 
 use std::ops::Range;
 
+use super::granule::{BlockType, GRANULE_LINES};
 use super::header::{SamplingFrequency, Version};
-use super::{BlockType, GRANULE_LINES};
 
 /// The frequency lines `start..start + width` of one scalefactor band. Short
 /// block indices count the 192 lines of a single short window.

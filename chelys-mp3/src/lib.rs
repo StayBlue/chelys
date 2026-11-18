@@ -32,6 +32,7 @@ mod config;
 mod crc;
 mod encoder;
 mod filterbank;
+mod granule;
 mod header;
 mod huffman;
 mod info_tag;
@@ -44,12 +45,9 @@ mod scalefactors;
 mod side_info;
 mod stereo;
 mod stream;
-#[cfg(test)]
-mod stream_check;
 
 pub use config::{ChannelMode, Config, ConfigError, Rate, SAMPLE_RATES, bitrates};
 pub use encoder::{Encoder, Finished, Sample};
-use stream::{BlockType, GRANULE_LINES, QuantizedGranule, StreamConfig};
 
 /// The encoder's building blocks, for chelys's own conformance tests: the
 /// stages of Annex C, the bitstream's fields and tables, and
@@ -58,6 +56,7 @@ use stream::{BlockType, GRANULE_LINES, QuantizedGranule, StreamConfig};
 /// may change in any release.
 #[cfg(feature = "unstable")]
 pub mod internals {
+    pub use super::granule::*;
     pub use super::stream::*;
 
     /// Wraps each module in one that re-exports its public items, as a

@@ -17,10 +17,10 @@ pub mod switching;
 
 use std::f64::consts::PI;
 
-use super::GRANULE_LINES;
+use super::granule::{BlockType, GRANULE_LINES};
 use super::header::{SamplingFrequency, Version};
 use super::scalefactor_bands::{self, LONG_BANDS, SHORT_BANDS, SHORT_WINDOWS};
-use super::{BlockType, stereo};
+use super::stereo;
 use fft::RealFft;
 use partitions::{BandWeights, Partition, ShortPartition};
 
@@ -895,7 +895,7 @@ mod tests {
                         0.0
                     }
                 });
-                xr = filterbank.granule(&pcm, crate::BlockType::Normal, crate::BlockType::Normal);
+                xr = filterbank.granule(&pcm, BlockType::Normal, BlockType::Normal);
             }
             xr.iter().map(|x| x * x).sum::<f64>()
         };

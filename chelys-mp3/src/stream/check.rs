@@ -5,10 +5,8 @@
 //! main data, and checks the rules of the bit reservoir on it: decoders that
 //! read a whole file need not enforce them.
 
-use super::header::{Bitrate, SamplingFrequency, Version};
-
-/// The decoder's input buffer (clause 2.4.3.4.4).
-const BUFFER_BITS: usize = 7680;
+use crate::header::{Bitrate, SamplingFrequency, Version};
+use crate::reservoir::BUFFER_BITS;
 
 /// A frame as the stream has it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

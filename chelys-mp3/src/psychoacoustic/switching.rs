@@ -7,8 +7,8 @@
 
 use super::super::header::SamplingFrequency;
 use super::super::scalefactor_bands::{self, MIXED_SHORT_START, SHORT_WINDOWS};
-use super::super::{BlockType, GRANULE_LINES};
 use super::{Masking, PsychoacousticModel, ShortMasking, ShortSpectra};
+use crate::granule::{BlockType, GRANULE_LINES};
 
 /// A granule has an attack, and is coded with short blocks, when its
 /// perceptual entropy exceeds this (clause C.1.5.3.2, `switch_pe` in figure

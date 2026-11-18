@@ -4,11 +4,12 @@
 //! Quantisation of frequency lines (clause C.1.5.4.4.1) and the inner
 //! iteration loop that sets the step size (clause C.1.5.4.4, figure C.9.c).
 
+use crate::granule::{BlockType, GRANULE_LINES, QuantizedGranule};
 use crate::header::SamplingFrequency;
 use crate::huffman::MAX_MAGNITUDE;
 use crate::huffman::{Counted, SpectrumCoding};
+use crate::scalefactor_bands;
 use crate::scalefactor_bands::Band;
-use crate::{BlockType, GRANULE_LINES, QuantizedGranule, scalefactor_bands};
 
 /// Spec gap: clause C.1.5.4.1 sets `global_gain = qquant + system_constant`
 /// and leaves the constant to the implementation. The decoder requantises with

@@ -6,8 +6,8 @@
 //! 6,185,539 B1 for MPEG-2.5) and the frame length it implies (clause
 //! 2.4.3.1).
 
-use crate::GRANULE_LINES;
 use crate::bitstream::BitWriter;
+use crate::granule::GRANULE_LINES;
 use crate::side_info::SideInfo;
 
 const SYNCWORD: u32 = 0xFFF;

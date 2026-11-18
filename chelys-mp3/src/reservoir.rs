@@ -9,7 +9,7 @@ use crate::header::Version;
 
 /// The decoder's input buffer, which must hold a frame and the reservoir
 /// before it (clause 2.4.3.4.4).
-const BUFFER_BITS: usize = 7680;
+pub const BUFFER_BITS: usize = 7680;
 
 /// The reservoir's fill, above this share of its maximum, is released.
 const RELEASE_ABOVE: f64 = 0.8;

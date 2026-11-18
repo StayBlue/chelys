@@ -22,7 +22,8 @@
 use super::header::{Bitrate, Emphasis, Header, Mode, SamplingFrequency};
 use super::rate::Rate;
 use super::side_info::SideInfo;
-use super::{DELAY, StreamConfig, crc};
+use super::stream::StreamConfig;
+use super::{DELAY, crc};
 use crate::bitstream::BitWriter;
 
 /// The bytes of the tag: 120 of the Xing fields, 36 of the extension.

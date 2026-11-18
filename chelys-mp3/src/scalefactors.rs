@@ -7,8 +7,8 @@
 //! frequencies), with the intensity stereo positions the right channel sends
 //! in their place (clause 2.4.3.4.9.3), and preemphasis (Table B.6).
 
-use crate::BlockType;
 use crate::bitstream::BitWriter;
+use crate::granule::BlockType;
 use crate::header::Version;
 use crate::scalefactor_bands::{LONG_BANDS, MIXED_SHORT_START, SHORT_BANDS, SHORT_WINDOWS};
 use crate::side_info::SCFSI_BANDS;

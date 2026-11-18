@@ -16,7 +16,7 @@ pub use outer::{
 
 use super::header::SamplingFrequency;
 use super::stereo::IntensityPositions;
-use super::{BlockType, GRANULE_LINES, QuantizedGranule};
+use crate::granule::{BlockType, GRANULE_LINES, QuantizedGranule};
 
 /// The iteration loop of one granule of one channel (figure C.9.a): a granule
 /// whose lines are all zero is coded as such, any other goes through the
