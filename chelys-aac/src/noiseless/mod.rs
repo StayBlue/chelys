@@ -19,4 +19,10 @@
 //! "may be applied", is not.
 
 pub mod codebooks;
+pub mod scalefactors;
+pub mod sections;
+pub mod spectrum;
 mod tables;
+
+#[cfg(test)]
+mod decoder;
