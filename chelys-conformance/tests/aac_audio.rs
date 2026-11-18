@@ -396,3 +396,34 @@ fn inputs_at_the_edges_decode_without_complaint() {
         }
     }
 }
+
+/// A tone in one channel of a pair, the other silent, at a rate that
+/// leaves the pair few bits: the tone decodes alike whichever channel it is
+/// in, as the silent channel takes only what it costs.
+#[test]
+fn a_tone_beside_silence_decodes_alike_in_either_channel() {
+    let sample_rate = 44_100;
+    let fs = f64::from(sample_rate);
+    let len = 20 * 1024;
+    let tone: Vec<f64> = (0..len)
+        .map(|t| 0.8 * (TAU * 1000.0 * t as f64 / fs).sin())
+        .collect();
+    let silence = vec![0.0; len];
+    let mut snrs = Vec::new();
+    for c in 0..2 {
+        let input = if c == 0 {
+            [tone.clone(), silence.clone()]
+        } else {
+            [silence.clone(), tone.clone()]
+        };
+        let context = format!("the tone in channel {c}");
+        let encoded = encode(sample_rate, &input, 6_500);
+        let output = decode(&encoded, 2, &context);
+        let snr = snr_over(&tone, &output, (2, c), DELAY, 2048..len);
+        let quiet = (output.iter().skip(1 - c).step_by(2)).all(|&y| y == 0.0);
+        assert!(quiet, "{context}: the silent channel decodes to silence");
+        snrs.push(snr);
+    }
+    assert!(snrs.iter().all(|&snr| snr > 10.0), "{snrs:?}");
+    assert!((snrs[0] - snrs[1]).abs() < 0.5, "{snrs:?}");
+}

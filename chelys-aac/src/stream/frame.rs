@@ -21,6 +21,9 @@ use crate::window::Windows;
 pub struct Demand {
     pub bit_allocation: f64,
     pub windows: Windows,
+    /// Whether every line of the channel is zero, so that it is coded
+    /// without any (see [`loops::quantize_channel`]).
+    pub silent: bool,
 }
 
 /// The bits of the frame that its channels' noiseless coding does not
@@ -79,16 +82,16 @@ pub fn more_bits(config: &StreamConfig, demands: &[Demand]) -> i64 {
 /// The bits that each channel's `individual_channel_stream()` may take in
 /// the next frame: those the reservoir makes available to the frame for
 /// its `more_bits` (clause C.7.3), less its header and the rest of its
-/// `raw_data_block()`, shared equally.
+/// `raw_data_block()`. A silent channel is given what it costs, the bits
+/// of a channel without lines, and the others equal shares of the rest.
 ///
 /// Spec gap: Annex C does not say how the bits of a frame are shared
 /// between its channels, whose loops each fit one channel's lines to the
-/// bits they are given (clause C.7.1). Each channel is given an equal
-/// share; the loops of the channels after the first may take what those
-/// before them leave (see [`StreamEncoder`](super::StreamEncoder)). Shares
-/// in proportion to each channel's `bit_allocation` were tried, and starved
-/// channels: the allocation is 0 in most frames of music, where the
-/// perceptual entropy is negative (see
+/// bits they are given (clause C.7.1). The share does not depend on the
+/// order of the channels, so that a channel codes alike whichever of a
+/// pair it is. Shares in proportion to each channel's `bit_allocation`
+/// were tried, and starved channels: the allocation is 0 in most frames of
+/// music, where the perceptual entropy is negative (see
 /// [`LongThreshold::bit_allocation`](crate::psychoacoustic::LongThreshold::bit_allocation)),
 /// and a channel whose allocation was 0 beside one whose was not was left
 /// the bits of a channel without lines.
@@ -96,9 +99,27 @@ pub fn bits_per_channel(
     config: &StreamConfig,
     reservoir: &BitReservoir,
     demands: &[Demand],
-) -> u32 {
+) -> Vec<u32> {
     let available = reservoir.available_bits(more_bits(config, demands));
-    available.saturating_sub(overhead_bits(config)) / demands.len() as u32
+    let silent_bits = |demand: &Demand| channel::bits(demand.windows, COMMON_WINDOW, 0);
+    let reserved: u32 = (demands.iter())
+        .filter(|demand| demand.silent)
+        .map(silent_bits)
+        .sum();
+    let coded = demands.iter().filter(|demand| !demand.silent).count() as u32;
+    let share = (available.saturating_sub(overhead_bits(config)))
+        .saturating_sub(reserved)
+        .checked_div(coded)
+        .unwrap_or(0);
+    (demands.iter())
+        .map(|demand| {
+            if demand.silent {
+                silent_bits(demand)
+            } else {
+                share
+            }
+        })
+        .collect()
 }
 
 /// Writes the frame of `channels`, spends its bits from `reservoir`, and
