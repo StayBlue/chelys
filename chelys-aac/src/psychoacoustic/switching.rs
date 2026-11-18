@@ -12,35 +12,46 @@ use crate::stream::FRAME_SAMPLES;
 use crate::window::{Grouping, SHORT_WINDOWS, WindowSequence, WindowShape};
 
 /// `switch_pe`: a frame has an attack, and is coded with short blocks, when
-/// the perceptual entropy of its long block exceeds this (step 13).
+/// the perceptual entropy rises by more than this from one of its short
+/// blocks to the next (step 13, as departed from below).
 ///
 /// Spec gap: step 13 calls `switch_pe` "a implementation dependend
-/// constant". The entropy is taken as printed (see [`Model::analyze`]),
-/// and its partitions below their thresholds in quiet, as those above
-/// about 16 kHz in most music, subtract from it: silence has -9535 at
-/// 44.1 kHz, a steady tone about -9000, and pop music a median of about
-/// -1100, while steady white noise at full scale, which no steady signal
-/// passes, has 800 to 850 at every sampling frequency. Pre-echo control
-/// (step 11) holds the threshold of a block whose energy rises near that
-/// of the block before, which raises its entropy: the frame whose short
-/// windows hold the onset of a click, a burst of noise or a drum hit after
-/// a quiet tone has 65 at the least at 48 kHz, wherever the onset falls,
-/// 197 at 44.1 kHz and more than 800 at 8 to 32 kHz. So the entropy's
-/// sign is taken: a frame has an attack where the bits its audible
-/// partitions ask for outweigh what the others give back. At 64 kHz and
-/// above, the partitions above 20 kHz lower the entropy further, and some
-/// onsets of clicks are missed: at 96 kHz the least is -665.
+/// constant", which it compares with the perceptual entropy of the long
+/// block. This deliberately departs from that comparison, and compares it
+/// with the largest rise of the entropy of the short blocks (step 12), each
+/// from the one before it, the first from the last of the frame before
+/// (see [`Analysis::entropy_rise`]); step 15's entropy is left as printed.
 ///
-/// The entropy is a weak sign of an attack in music, where it is positive
-/// in loud passages whose bands are all audible, as much as at onsets: of
-/// the frames of 5 tracks of pop and rock music at 44.1 kHz above 0, 2 to
-/// 29% had a short window 10 dB louder than the four before it. 0.1 to
-/// 3% of the frames of pop music are coded short, and of rock up to 20%.
-/// PEAQ (GstPEAQ 0.6.1, black box) does not settle it: on 8 tracks of pop
-/// music at 128 kbit/s it grades the more frames coded short the better,
-/// as they keep more of the treble, up to every frame short, -0.78 against
-/// -2.17 with none.
-pub const SWITCH_PE: f64 = 0.0;
+/// The entropy is taken as printed (see [`Model::analyze`]), and its
+/// partitions below their thresholds in quiet subtract from it, by an
+/// amount that depends on the signal and the sampling frequency far more
+/// than an attack adds: silence has -9535 at 44.1 kHz and pop music a
+/// median of about -1100, but the frame that holds a one-sample impulse of
+/// 0.3 over a tone of 0.002 has -868. No constant for the long block's
+/// entropy tells attacks from steady music, and a rise from one short
+/// block to the next, 128 samples later, does, as both lie over the same
+/// background. The criteria were compared by the onsets they catch: of
+/// one-sample impulses of 0.3 and 0.9, clicks and bursts of noise and drum
+/// hits over a quiet tone, and bursts over a louder tone and noise, each at
+/// 32 places in the frame, at every sampling frequency, an onset caught
+/// where a frame whose short windows span it is coded short; and by the
+/// share of frames coded short in two tracks each of pop and rock music,
+/// resampled to every sampling frequency.
+///
+/// - The long block's entropy, with a constant for each sampling frequency
+///   set so that 2% of the frames of pop music are short: 51 to 104
+///   onsets of 192 caught at 8 to 24 kHz, 134 at 32 kHz and 154 at
+///   44.1 kHz, no impulse of 0.3 at any of them; 188 to 192 at 48 to
+///   96 kHz, but with 17 to 21% of the frames of rock music short.
+/// - The long block's entropy over its partitions below 20 kHz alone, so
+///   set: 51 to 151, no impulse of 0.3 at any sampling frequency.
+/// - The rise of the short blocks' entropy, above 200 at every sampling
+///   frequency: every onset over a quiet tone caught, at every place and
+///   sampling frequency, and 0 to 16 of the 32 bursts over the louder
+///   background; 0 to 3.2% of the frames of pop music short, and 0 to 1.5%
+///   of rock. Above 150, 16 to 24 of those bursts are caught, but up to
+///   11% of the frames of pop music at 8 to 16 kHz are short.
+const SWITCH_PE: f64 = 200.0;
 
 /// Two short windows of a frame share a group while the energy of each,
 /// in its short FFT, is within this factor of every other's in the group.
@@ -48,7 +59,7 @@ const GROUPING_RATIO: f64 = 10.0;
 
 /// Whether the frame analyzed as `analysis` has an attack (step 13).
 pub fn attack(analysis: &Analysis) -> bool {
-    analysis.long.perceptual_entropy > SWITCH_PE
+    analysis.entropy_rise > SWITCH_PE
 }
 
 /// The model of one channel, with its output delayed by a frame, so that a
@@ -329,7 +340,7 @@ mod tests {
                     .wrapping_mul(6_364_136_223_846_793_005)
                     .wrapping_add(1);
                 let noise = (state >> 11) as f64 / (1u64 << 53) as f64 - 0.5;
-                let tone = 0.01 * (t as f64 * 0.1).sin();
+                let tone = 0.01 * ((block * FRAME_SAMPLES + t) as f64 * 0.1).sin();
                 // Noise from sample 320 of the last block, which windows 6
                 // and 7 of its frame span: window j spans samples 128 j -
                 // 576 to 128 j - 321 of the frame's block.
@@ -345,8 +356,8 @@ mod tests {
         assert_eq!(grouping.lengths().collect::<Vec<_>>(), [6, 2]);
     }
 
-    /// A burst of noise in a quiet tone is coded with short windows from
-    /// the frame it sets in, a start frame before them and a stop frame
+    /// A burst of noise in a quiet tone is coded with short windows in the
+    /// frame it sets in, with a start frame before it and a stop frame
     /// after, and the tone again with long ones.
     #[test]
     fn an_attack_switches_to_short_windows() {
@@ -360,7 +371,7 @@ mod tests {
                     .wrapping_mul(6_364_136_223_846_793_005)
                     .wrapping_add(1);
                 let noise = (state >> 11) as f64 / (1u64 << 53) as f64 - 0.5;
-                let tone = 0.01 * (t as f64 * 0.1).sin();
+                let tone = 0.01 * ((block * FRAME_SAMPLES + t) as f64 * 0.1).sin();
                 let since = (block * FRAME_SAMPLES + t) as f64 - (8 * FRAME_SAMPLES + 100) as f64;
                 if since >= 0.0 {
                     tone + 0.5 * noise * (-since / 200.0).exp()
@@ -372,24 +383,13 @@ mod tests {
                 sequences.push(switching.decide(attacks).number());
             }
         }
-        assert_eq!(sequences.len(), 15);
-        // The short windows of frame 8 span samples -576 to 575 of its
-        // block, and hold the burst's start.
-        let short = sequences.iter().position(|&s| s == 2).unwrap();
-        assert_eq!(short, 8, "{sequences:?}");
-        assert_eq!(sequences[short - 1], 1, "{sequences:?}");
-        assert!(
-            sequences[..short - 1].iter().all(|&s| s == 0),
-            "{sequences:?}"
-        );
-        let stop = sequences.iter().position(|&s| s == 3).unwrap();
-        assert!(
-            sequences[short..stop].iter().all(|&s| s == 2),
-            "{sequences:?}"
-        );
-        assert!(
-            sequences[stop + 1..].iter().all(|&s| s == 0),
-            "{sequences:?}"
+        // The first frame holds the tone's onset after the silence before
+        // the stream, and the short windows of frame 8, which span samples
+        // -576 to 575 of its block, the burst's.
+        assert_eq!(
+            sequences,
+            [2, 3, 0, 0, 0, 0, 0, 1, 2, 3, 0, 0, 0, 0, 0],
+            "ONLY_LONG 0, LONG_START 1, EIGHT_SHORT 2, LONG_STOP 3"
         );
     }
 }

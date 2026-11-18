@@ -412,6 +412,10 @@ impl Threshold {
 pub struct Analysis {
     pub long: Threshold,
     pub short: [Threshold; SHORT_WINDOWS],
+    /// The largest rise of the perceptual entropy from one short block to
+    /// the next over the frame's eight, from the last of the frame before,
+    /// by which [`switching`] finds an attack.
+    pub entropy_rise: f64,
 }
 
 impl Analysis {
@@ -422,6 +426,7 @@ impl Analysis {
             short: std::array::from_fn(|_| {
                 Threshold::new(GroupBands::short(sampling_frequency, 1))
             }),
+            entropy_rise: 0.0,
         }
     }
 
@@ -537,6 +542,9 @@ pub struct Model {
     short_energy: Vec<f64>,
     short_c: Vec<f64>,
     short_c_min: Vec<f64>,
+    /// The perceptual entropy of the last short block, `None` before the
+    /// first.
+    last_short_entropy: Option<f64>,
 }
 
 impl Model {
@@ -565,6 +573,7 @@ impl Model {
             short_energy: vec![0.0; SHORT_IBLEN + 1],
             short_c: vec![0.0; SHORT_IBLEN + 1],
             short_c_min: vec![0.0; SHORT_IBLEN + 1],
+            last_short_entropy: None,
         }
     }
 
@@ -651,6 +660,14 @@ impl Model {
                 threshold,
             );
         }
+        // The first short block of the stream rises from itself.
+        let mut last = (self.last_short_entropy).unwrap_or(out.short[0].perceptual_entropy);
+        out.entropy_rise = f64::NEG_INFINITY;
+        for threshold in &out.short {
+            out.entropy_rise = out.entropy_rise.max(threshold.perceptual_entropy - last);
+            last = threshold.perceptual_entropy;
+        }
+        self.last_short_entropy = Some(last);
 
         // Step 2: the long FFT of the windowed samples.
         for (s, &w) in self.windowed.iter_mut().zip(&self.long_hann) {
