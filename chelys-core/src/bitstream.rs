@@ -16,7 +16,13 @@ impl BitWriter {
         Self::default()
     }
 
-    /// Writes the low `bits` bits of `value`, most significant first.
+    /// Writes `value` in `bits` bits, most significant first.
+    ///
+    /// # Panics
+    ///
+    /// If `bits` is above 32, or, in builds with debug assertions, if
+    /// `value` does not fit in `bits` bits: a caller's error, of which
+    /// other builds write the low `bits` bits.
     pub fn write(&mut self, value: u32, bits: u32) {
         assert!(bits <= 32, "cannot write {bits} bits at once");
         debug_assert!(
