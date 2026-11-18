@@ -113,9 +113,9 @@ impl PreparedGranule {
             let [(left, left_xmin), (right, right_xmin)] = &mut lines[..] else {
                 unreachable!("joint stereo has two channels")
             };
-            (*left, *right) = stereo::middle_side(left, right);
-            stereo::limit_side(right, granule[0].block_type, fs);
-            let joint = stereo::middle_side_distortion(left_xmin, right_xmin);
+            (*left, *right) = stereo::middle_side::matrix(left, right);
+            stereo::middle_side::limit_side(right, granule[0].block_type, fs);
+            let joint = stereo::middle_side::distortion(left_xmin, right_xmin);
             left_xmin.clone_from(&joint);
             *right_xmin = joint;
         }
@@ -171,7 +171,7 @@ impl Coding for ModelCoding {
         let fs = self.sampling_frequency;
         let ms_stereo = self.ms_stereo;
         let steps = if intensity && self.intensity_allowed && intensity_frame(frame) {
-            0..stereo::INTENSITY_STEPS
+            0..stereo::intensity::STEPS
         } else {
             0..0
         };
@@ -313,13 +313,13 @@ fn middle_side_frame(frame: &[Vec<Filtered<Analysis>>]) -> bool {
             )
         })
         .collect();
-    same_types && stereo::ms_stereo(&spectra)
+    same_types && stereo::middle_side::switches_on(&spectra)
 }
 
 /// Whether a stereo frame may be coded in intensity stereo: if each of its
 /// granules has the same block type in both channels, and none is a mixed
 /// block. Short blocks find the bound in each window (see
-/// [`stereo::IntensityPositions::mark`]).
+/// [`stereo::intensity::Positions::mark`]).
 ///
 /// Spec gap: the standard asks for the same block type in both channels
 /// only for MS stereo (clause 2.4.3.4.9). As intensity stereo moves the left
@@ -357,13 +357,13 @@ fn intensity_frame(frame: &[Vec<Filtered<Analysis>>]) -> bool {
 /// channel gets what that leaves of the right channel's share of the
 /// frame.
 struct IntensityTry {
-    positions: Vec<stereo::IntensityPositions>,
+    positions: Vec<stereo::intensity::Positions>,
     right_bits: Vec<usize>,
 }
 
 impl IntensityTry {
     /// The try at coding `frame` in intensity stereo from the bounds of
-    /// `step` of [`stereo::intensity_bounds`], long or short as each
+    /// `step` of [`stereo::intensity::bounds`], long or short as each
     /// granule's block type has them, given its granules as coded without
     /// it, `plain`.
     ///
@@ -384,9 +384,9 @@ impl IntensityTry {
             .iter()
             .map(|granule| {
                 let block_type = granule[0].block_type;
-                let bound = stereo::intensity_bounds(block_type, fs)[step];
+                let bound = stereo::intensity::bounds(block_type, fs)[step];
                 let (left, right) = (&granule[0].xr, &granule[1].xr);
-                stereo::IntensityPositions::new(left, right, block_type, bound, fs)
+                stereo::intensity::Positions::new(left, right, block_type, bound, fs)
             })
             .collect();
         let right_bits: Vec<usize> = (plain.iter().zip(&positions))
@@ -432,7 +432,7 @@ impl IntensityTry {
 /// was. `None` if `if_outside` gives up on a granule outside its allowed
 /// distortion, or if the reservoir gives the right channel of a granule
 /// in intensity stereo fewer bits than its marks take with all its lines
-/// zero (see [`stereo::IntensityPositions::silent_bits`]), which can happen
+/// zero (see [`stereo::intensity::Positions::silent_bits`]), which can happen
 /// at the lowest bitrates of the lower sampling frequencies. `None` too at
 /// the lower sampling frequencies if the right channel of a granule in
 /// intensity stereo would mark a band.
@@ -444,7 +444,7 @@ impl IntensityTry {
 /// one by all of them. So the encoder sends no marks there: the right
 /// channel is given a value in the band just below the bound where it has
 /// none, in any window of a short block (see
-/// [`stereo::IntensityPositions::fill_below_bound`]), and a frame whose
+/// [`stereo::intensity::Positions::fill_below_bound`]), and a frame whose
 /// right channel would still need a mark is coded from another bound (see
 /// [`search_intensity`]) or without intensity stereo.
 ///
@@ -466,8 +466,8 @@ impl IntensityTry {
 ///
 /// Spec gap: Annex G does not say how to find the allowed distortion of
 /// the channels coded in MS or intensity stereo; see
-/// [`stereo::middle_side_distortion`] and
-/// [`stereo::IntensityPositions::sum_distortion`].
+/// [`stereo::middle_side::distortion`] and
+/// [`stereo::intensity::Positions::sum_distortion`].
 ///
 /// Spec gap: scfsi would have the second granule take over the first
 /// granule's intensity stereo positions, which follow the signal of each
@@ -600,7 +600,7 @@ mod tests {
     #[test]
     fn intensity_search_keeps_the_first_try_that_fits_or_else_the_lowest_that_can_be_coded() {
         use TryOutcome::*;
-        for count in 0..=stereo::INTENSITY_STEPS {
+        for count in 0..=stereo::intensity::STEPS {
             for pattern in 0..3usize.pow(count as u32) {
                 let outcomes: Vec<_> = (0..count)
                     .map(|index| {

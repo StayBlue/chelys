@@ -25,7 +25,7 @@ use chelys::mp3::internals::header::{Bitrate, Flags, Mode, SamplingFrequency};
 use chelys::mp3::internals::rate::StreamRate;
 use chelys::mp3::internals::scalefactor_bands::{self, LONG_BANDS, SHORT_WINDOWS};
 use chelys::mp3::internals::scalefactors::ZeroPart;
-use chelys::mp3::internals::stereo::INTENSITY_SCALE;
+use chelys::mp3::internals::stereo::intensity;
 use chelys::mp3::internals::{
     BlockType, GRANULE_LINES, QuantizedGranule, StreamConfig, encode_granules,
 };
@@ -90,7 +90,7 @@ fn stream(
 /// of [`stream`], with `int_scalefac_compress` below 180, whose `slen` are
 /// `[isc / 36, (isc % 36) / 6, (isc % 36) % 6, 0]`.
 fn scalefac_compress(slen: [u16; 3]) -> u16 {
-    2 * (36 * slen[0] + 6 * slen[1] + slen[2]) + INTENSITY_SCALE
+    2 * (36 * slen[0] + 6 * slen[1] + slen[2]) + intensity::SCALE
 }
 
 /// The root mean square of each channel of `decoded`, over its middle frames.
@@ -252,11 +252,11 @@ fn every_range_of_int_scalefac_compress_sends_positions() {
         ),
         (
             &[(0..6, 4), (6..12, 2), (12..18, 5), (18..21, 0)],
-            2 * (180 + 16 * 3 + 4 * 2 + 3) + INTENSITY_SCALE,
+            2 * (180 + 16 * 3 + 4 * 2 + 3) + intensity::SCALE,
         ),
         (
             &[(0..8, 4), (8..16, 2), (16..21, 0)],
-            2 * (244 + 3 * 3 + 2) + INTENSITY_SCALE,
+            2 * (244 + 3 * 3 + 2) + intensity::SCALE,
         ),
     ];
     for fs in [

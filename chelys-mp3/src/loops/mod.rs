@@ -17,7 +17,7 @@ pub use outer::{Bits, Outcome, Reuse, SAVING_NOISE_DB, Saving, excess, outer_loo
 pub use {inner::step_size, outer::outer_loop};
 
 use super::header::SamplingFrequency;
-use super::stereo::IntensityPositions;
+use super::stereo;
 use crate::granule::{BlockType, GRANULE_LINES, QuantizedGranule};
 
 /// The iteration loop of one granule of one channel (figure C.9.a): a granule
@@ -35,7 +35,7 @@ use crate::granule::{BlockType, GRANULE_LINES, QuantizedGranule};
 ///
 /// If the scalefactors that `intensity` marks do not fit in the
 /// [`available`](Bits::available) bits, which takes fewer than its
-/// [`silent_bits`](IntensityPositions::silent_bits).
+/// [`silent_bits`](stereo::intensity::Positions::silent_bits).
 #[allow(clippy::too_many_arguments)]
 pub fn quantize_granule(
     xr: &[f64; GRANULE_LINES],
@@ -44,7 +44,7 @@ pub fn quantize_granule(
     bits: Bits,
     sampling_frequency: SamplingFrequency,
     reuse: Option<Reuse>,
-    intensity: Option<&IntensityPositions>,
+    intensity: Option<&stereo::intensity::Positions>,
     unscaled: Option<&std::cell::OnceCell<Unscaled>>,
 ) -> Outcome {
     if xr.iter().all(|&x| x == 0.0) {

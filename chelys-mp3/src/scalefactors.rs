@@ -12,7 +12,7 @@ use crate::granule::BlockType;
 use crate::header::Version;
 use crate::scalefactor_bands::{LONG_BANDS, MIXED_SHORT_START, SHORT_BANDS, SHORT_WINDOWS};
 use crate::side_info::SCFSI_BANDS;
-use crate::stereo::INTENSITY_SCALE;
+use crate::stereo::intensity;
 
 /// The long scalefactor bands of each scfsi band: `SCFSI_STARTS[band]` up to
 /// `SCFSI_STARTS[band + 1]` (clause 2.4.2.7).
@@ -213,7 +213,7 @@ pub struct ZeroPart {
 impl ZeroPart {
     /// No zero part yet: the scalefactors of the right channel before its
     /// positions are marked (see
-    /// [`IntensityPositions::mark`](crate::stereo::IntensityPositions::mark)).
+    /// [`intensity::Positions::mark`]).
     pub const UNMARKED: Self = Self {
         start: [usize::MAX; SHORT_WINDOWS],
         bound: usize::MAX,
@@ -439,7 +439,7 @@ impl Scalefactors {
     /// in the fewest bits, or `None` if one is above its
     /// [`limit`](Self::limit). At the lower sampling frequencies it also
     /// sets `preflag` as the scalefactors have it, and in the right channel
-    /// of a frame coded in intensity stereo [`INTENSITY_SCALE`].
+    /// of a frame coded in intensity stereo [`intensity::SCALE`].
     pub fn compress(&self) -> Option<u16> {
         if self.version == Version::Mpeg1 && self.intensity.is_none() {
             return self.long_compress();
@@ -453,7 +453,7 @@ impl Scalefactors {
         let (count, step, offset) = match (self.version, self.intensity) {
             (Version::Mpeg1, _) => (SCALEFAC_COMPRESS.len() as u16, 1, 0),
             (Version::Mpeg2, None) => (LSF_SCALEFAC_COMPRESS, 1, 0),
-            (Version::Mpeg2, Some(_)) => (LSF_SCALEFAC_COMPRESS / 2, 2, INTENSITY_SCALE),
+            (Version::Mpeg2, Some(_)) => (LSF_SCALEFAC_COMPRESS / 2, 2, intensity::SCALE),
         };
         let fits = |c: u16| {
             let preflag_sent = match self.version {

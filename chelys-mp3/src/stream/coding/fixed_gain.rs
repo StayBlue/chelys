@@ -105,7 +105,7 @@ impl<F: FnMut(usize, usize) -> BlockType> Coding for FixedGainCoding<F> {
                     left.block_type, right.block_type,
                     "MS stereo needs one block type"
                 );
-                let (middle, side) = stereo::middle_side(&left.xr, &right.xr);
+                let (middle, side) = stereo::middle_side::matrix(&left.xr, &right.xr);
                 lines = vec![middle, side];
             }
             let quantized: Vec<_> = (granule.iter().zip(&lines))

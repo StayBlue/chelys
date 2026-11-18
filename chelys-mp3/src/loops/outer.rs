@@ -11,7 +11,7 @@ use crate::huffman::{Counted, MAX_MAGNITUDE, SpectrumCoding};
 use crate::scalefactor_bands::{self, Band, LONG_BANDS};
 use crate::scalefactors::{PRETAB, Scalefactors, ZeroPart};
 use crate::side_info::SCFSI_BANDS;
-use crate::stereo::IntensityPositions;
+use crate::stereo;
 
 /// The scalefactors of a frame's first granule, and the scfsi bands in which
 /// the second granule takes them over (clause C.1.5.4.2.3).
@@ -128,14 +128,14 @@ pub const SAVING_NOISE_DB: f64 = 4.0;
 ///
 /// With `intensity`, the granule is the right channel of a frame coded in
 /// intensity stereo, whose zero part sends intensity stereo positions in
-/// place of scalefactors (see [`IntensityPositions::mark`]). Those bands'
+/// place of scalefactors (see [`stereo::intensity::Positions::mark`]). Those bands'
 /// lines quantise to zero whatever their scalefactors, so the loop works
 /// with scalefactors as usual, and each result is marked before its bits are
 /// counted. If the marks take more bits than the scalefactors they replace,
 /// the inner loop runs again with that many fewer bits. At the lower
 /// sampling frequencies, where no marks are sent, a result with nothing in
 /// the band just below the bound is first given a value there (see
-/// [`IntensityPositions::fill_below_bound`]); if that takes more bits than
+/// [`stereo::intensity::Positions::fill_below_bound`]); if that takes more bits than
 /// there are, the inner loop runs again with that many fewer, and failing
 /// that the result is kept marked, which the frame cannot use.
 ///
@@ -194,7 +194,7 @@ pub const SAVING_NOISE_DB: f64 = 4.0;
 /// If `xr` cannot be quantised even without scalefactors, which takes lines
 /// far beyond the decoder's output range, or the marks of `intensity` take
 /// more than the available bits, which takes fewer than its
-/// [`silent_bits`](IntensityPositions::silent_bits).
+/// [`silent_bits`](stereo::intensity::Positions::silent_bits).
 #[cfg(any(test, feature = "unstable"))]
 pub fn outer_loop(
     xr: &[f64; GRANULE_LINES],
@@ -203,7 +203,7 @@ pub fn outer_loop(
     bits: Bits,
     sampling_frequency: SamplingFrequency,
     reuse: Option<Reuse>,
-    intensity: Option<&IntensityPositions>,
+    intensity: Option<&stereo::intensity::Positions>,
 ) -> Outcome {
     outer_loop_with(
         xr,
@@ -229,7 +229,7 @@ pub fn outer_loop_with(
     bits: Bits,
     sampling_frequency: SamplingFrequency,
     reuse: Option<Reuse>,
-    intensity: Option<&IntensityPositions>,
+    intensity: Option<&stereo::intensity::Positions>,
     unscaled: Option<&std::cell::OnceCell<Unscaled>>,
 ) -> Outcome {
     let Bits {
@@ -474,7 +474,7 @@ struct ToSave<'a> {
     bands: &'a [Band],
     fixed: std::ops::Range<usize>,
     sampling_frequency: SamplingFrequency,
-    intensity: Option<&'a IntensityPositions>,
+    intensity: Option<&'a stereo::intensity::Positions>,
 }
 
 impl ToSave<'_> {
@@ -672,7 +672,7 @@ fn fit(
     sampling_frequency: SamplingFrequency,
     start_gain: Option<u8>,
     estimate: Option<&StepEstimate>,
-    intensity: Option<&IntensityPositions>,
+    intensity: Option<&stereo::intensity::Positions>,
 ) -> Option<Fitted> {
     let compress = scalefactors
         .compress()
@@ -1074,7 +1074,8 @@ mod tests {
         let bands = scalefactor_bands::long_bands(FS);
         let mut xr = spectrum();
         xr[bands[12].start..].fill(0.0);
-        let positions = IntensityPositions::new(&spectrum(), &xr, BlockType::Normal, 12, FS);
+        let positions =
+            stereo::intensity::Positions::new(&spectrum(), &xr, BlockType::Normal, 12, FS);
         for bits in [80, 150, 300, 1500] {
             let outcome = outer_loop(
                 &xr,

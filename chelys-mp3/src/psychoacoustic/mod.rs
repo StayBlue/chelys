@@ -20,7 +20,7 @@ use std::f64::consts::PI;
 use super::granule::{BlockType, GRANULE_LINES};
 use super::header::{SamplingFrequency, Version};
 use super::scalefactor_bands::{self, LONG_BANDS, SHORT_BANDS, SHORT_WINDOWS};
-use super::stereo;
+use super::stereo::middle_side;
 use fft::RealFft;
 use partitions::{BandWeights, Partition, ShortPartition};
 
@@ -537,7 +537,7 @@ impl PsychoacousticModel {
             .sum::<f64>();
 
         // Figure C.6.c: the partitions converted to scalefactor bands.
-        let spectrum: Vec<f64> = energy[..stereo::CRITERION_LINES].to_vec();
+        let spectrum: Vec<f64> = energy[..middle_side::CRITERION_LINES].to_vec();
         let long = Masking {
             ratio: band_ratio(self.band_weights, &allowed, &eb),
             perceptual_entropy,
