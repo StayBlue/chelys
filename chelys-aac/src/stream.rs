@@ -8,11 +8,13 @@ use chelys_core::bitstream::BitWriter;
 
 use super::adts::{self, HEADER_LEN};
 use super::audio_specific_config::audio_specific_config;
+use super::channel::CodedChannel;
 use super::channel_configuration::ChannelConfiguration;
 use super::config::Framing;
 use super::raw_data_block;
 use super::reservoir::BitReservoir;
 use super::sampling_frequency::SamplingFrequency;
+use super::window::Windows;
 
 /// The samples of each channel a frame codes (clause 8.2.1.1).
 pub const FRAME_SAMPLES: usize = 1024;
@@ -35,9 +37,16 @@ impl StreamConfig {
         }
     }
 
+    /// The coded channels of a frame of silence.
+    fn silent_channels(&self) -> Vec<CodedChannel> {
+        let channel = CodedChannel::silent(Windows::LONG_SINE, self.sampling_frequency);
+        vec![channel; self.channel_configuration.channels()]
+    }
+
     /// The shortest frame: its channels silent, without fill.
     fn shortest_frame_len(&self) -> usize {
-        self.header_len() + raw_data_block::silent_len(self.channel_configuration)
+        self.header_len()
+            + raw_data_block::min_len(self.channel_configuration, &self.silent_channels())
     }
 
     /// The lowest bitrate that brings each frame the bits of the shortest,
@@ -158,8 +167,11 @@ impl StreamEncoder {
         let (shortest, _) = self.reservoir.frame_len_range();
         let frame_len = shortest.max(self.config.shortest_frame_len());
         self.reservoir.spend(frame_len);
-        let block =
-            raw_data_block::silent(self.config.channel_configuration, frame_len - header_len);
+        let block = raw_data_block::write(
+            self.config.channel_configuration,
+            &self.config.silent_channels(),
+            frame_len - header_len,
+        );
         match self.config.framing {
             Framing::Adts => {
                 let header = adts::Header {

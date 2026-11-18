@@ -25,19 +25,17 @@
 
 mod adts;
 mod audio_specific_config;
+mod channel;
 mod channel_configuration;
 mod config;
 mod encoder;
-// A tested building block that the encoder does not use yet.
-#[cfg(any(test, feature = "unstable"))]
 mod noiseless;
 mod raw_data_block;
 mod reservoir;
 mod sampling_frequency;
-// A tested building block that the encoder does not use yet.
-#[cfg(any(test, feature = "unstable"))]
 mod scalefactor_bands;
 mod stream;
+mod window;
 
 pub use chelys_core::Sample;
 pub use config::{Config, ConfigError, Framing, Rate, SAMPLE_RATES};
@@ -64,12 +62,14 @@ pub mod internals {
     reexport!(
         adts,
         audio_specific_config,
+        channel,
         channel_configuration,
         noiseless,
         raw_data_block,
         reservoir,
         sampling_frequency,
         scalefactor_bands,
+        window,
     );
 }
 

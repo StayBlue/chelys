@@ -213,6 +213,7 @@ impl Sections {
 /// # Panics
 ///
 /// If there are not as many lines as the bands hold: a caller's error.
+#[cfg(any(test, feature = "unstable"))]
 pub fn max_sfb(lines: &[i32], bands: GroupBands) -> usize {
     assert_eq!(lines.len(), bands.lines(), "a group's lines fill its bands");
     lines
@@ -247,6 +248,7 @@ impl Counted {
     /// codes it in the fewest bits, in one section. The sections that
     /// [`choose`](Self::choose) chooses take at least this many, so that
     /// where it is already too many, they need not be chosen.
+    #[cfg(any(test, feature = "unstable"))]
     pub fn least_bits(&self) -> u32 {
         self.least_bits
     }

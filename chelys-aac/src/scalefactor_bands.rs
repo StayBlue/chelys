@@ -17,11 +17,15 @@ use crate::sampling_frequency::SamplingFrequency;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Transform {
     Long,
+    // Constructed by the groups of short windows, which block switching
+    // will use.
+    #[cfg_attr(not(any(test, feature = "unstable")), allow(dead_code))]
     Short,
 }
 
 impl Transform {
     /// The spectral lines of one window.
+    #[cfg(any(test, feature = "unstable"))]
     pub fn lines(self) -> usize {
         match self {
             Self::Long => 1024,
@@ -64,6 +68,7 @@ pub fn swb_offsets(sampling_frequency: SamplingFrequency, transform: Transform) 
 /// would let it pass `num_swb`. But a decoder reads `swb_offset[max_sfb]`
 /// (clause 8.3.4), which the tables give only up to `num_swb`, so
 /// `max_sfb` is taken to be at most `num_swb`.
+#[cfg(any(test, feature = "unstable"))]
 pub fn num_swb(sampling_frequency: SamplingFrequency, transform: Transform) -> usize {
     swb_offsets(sampling_frequency, transform).len() - 1
 }
@@ -95,6 +100,7 @@ impl GroupBands {
     /// # Panics
     ///
     /// If `windows` is not 1 to 8: a caller's error.
+    #[cfg(any(test, feature = "unstable"))]
     pub fn short(sampling_frequency: SamplingFrequency, windows: usize) -> Self {
         assert!(
             (1..=8).contains(&windows),
@@ -112,6 +118,7 @@ impl GroupBands {
     }
 
     /// The windows of the group: 1 for a long window.
+    #[cfg(any(test, feature = "unstable"))]
     pub fn windows(self) -> usize {
         usize::from(self.windows)
     }

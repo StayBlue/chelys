@@ -38,6 +38,7 @@ impl Codebook {
 
     /// The codebook numbered `number`, if it is `ZERO_HCB` or a spectrum
     /// codebook.
+    #[cfg(any(test, feature = "unstable"))]
     pub fn new(number: u8) -> Option<Self> {
         (number <= Self::ESC.0).then_some(Self(number))
     }
