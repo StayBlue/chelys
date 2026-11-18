@@ -28,6 +28,9 @@ mod audio_specific_config;
 mod channel_configuration;
 mod config;
 mod encoder;
+// A tested building block that the encoder does not use yet.
+#[cfg(any(test, feature = "unstable"))]
+mod noiseless;
 mod raw_data_block;
 mod reservoir;
 mod sampling_frequency;
@@ -62,6 +65,7 @@ pub mod internals {
         adts,
         audio_specific_config,
         channel_configuration,
+        noiseless,
         raw_data_block,
         reservoir,
         sampling_frequency,
