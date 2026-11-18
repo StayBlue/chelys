@@ -2,9 +2,19 @@
 // SPDX-License-Identifier: MIT
 
 //! `scale_factor_data()` (Table 18): the scalefactor of each band in a
-//! section with a spectrum codebook, as its difference from the one sent
+//! section whose codebook sends one, as its difference from the one sent
 //! before it, or from `global_gain` for the first (clause 11.3.2), in the
-//! scalefactor codebook (Table A.1).
+//! scalefactor codebook (Table A.1), through the window groups in order.
+//!
+//! The scalefactors of a group are given for its bands `0..max_sfb`, of
+//! which those of bands that send none are not used.
+//!
+//! Spec gap: a band of zeros in a section with a spectrum codebook sends a
+//! scalefactor (Table 18), which scales nothing, and the standard leaves
+//! its value to the encoder. It is sent as the scalefactor before it, a
+//! difference of 0 that costs the fewest bits and leaves the next
+//! difference as it would be without it; the scalefactor given for the
+//! band is not used.
 
 use chelys_core::bitstream::BitWriter;
 
@@ -18,101 +28,104 @@ use super::sections::Sections;
 /// for differences of -60 to +60, but the pseudo code of clause 11.3.2
 /// subtracts it ("decode_huffman() - index_offset"), which would make them
 /// 60 to 180. Clause 9.3 and Table 58 are followed.
-pub const INDEX_OFFSET: i32 = -60;
+const INDEX_OFFSET: i32 = -60;
 
 /// The codeword of a difference of scalefactors, or `None` outside the
 /// codebook's range of -60 to +60 (Table 58).
-pub fn codeword(difference: i32) -> Option<Codeword> {
-    let index = usize::try_from(difference - INDEX_OFFSET).ok()?;
+fn codeword(difference: i32) -> Option<Codeword> {
+    let index = usize::try_from(difference.checked_sub(INDEX_OFFSET)?).ok()?;
     SCALEFACTOR_CODEWORDS.get(index).copied()
 }
 
 /// The bits of the codeword of a difference of 0, which a band of zeros
-/// costs in a section with a spectrum codebook (see [`Dpcm`]).
-pub const REPEATED_BITS: u32 = SCALEFACTOR_CODEWORDS[(0 - INDEX_OFFSET) as usize].len;
+/// costs in a section with a spectrum codebook.
+pub(super) const REPEATED_BITS: u32 = SCALEFACTOR_CODEWORDS[(0 - INDEX_OFFSET) as usize].len;
 
-/// The running scalefactor of `scale_factor_data()`, from which each is
-/// coded as a difference (clause 11.3.2). It starts at `global_gain`, and
-/// runs through the window groups in order.
+/// The bits of `scale_factor_data()` for the window groups `groups`, each
+/// with its sections and scalefactors, from `global_gain`; or `None` if a
+/// difference falls outside the codebook's range.
 ///
-/// Scalefactors are given for bands `0..max_sfb` of a group, of which those
-/// of bands in sections with `ZERO_HCB` are not used.
+/// # Panics
 ///
-/// Spec gap: a band of zeros in a section with a spectrum codebook sends a
-/// scalefactor (Table 18), which scales nothing, and the standard leaves
-/// its value to the encoder. It is sent as the scalefactor before it, a
-/// difference of 0 that costs the fewest bits and leaves the next
-/// difference as it would be without it; the scalefactor given for the
-/// band is not used.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Dpcm {
-    last: u8,
+/// If a group has fewer scalefactors than its sections span bands: a
+/// caller's error.
+pub fn bits<'a>(
+    global_gain: u8,
+    groups: impl IntoIterator<Item = (&'a Sections, &'a [u8])>,
+) -> Option<u32> {
+    let mut bits = 0;
+    for_each_difference(global_gain, groups, |difference| {
+        bits += codeword(difference)?.len;
+        Some(())
+    })?;
+    Some(bits)
 }
 
-impl Dpcm {
-    pub fn new(global_gain: u8) -> Self {
-        Self { last: global_gain }
-    }
+/// Writes `scale_factor_data()` for the window groups `groups`, as
+/// [`bits`] counts it.
+///
+/// # Panics
+///
+/// Where [`bits`] would return `None` or panic, before writing anything: a
+/// caller's error.
+pub fn write<'a>(
+    global_gain: u8,
+    groups: impl IntoIterator<Item = (&'a Sections, &'a [u8])> + Clone,
+    w: &mut BitWriter,
+) {
+    assert!(
+        bits(global_gain, groups.clone()).is_some(),
+        "a difference of scalefactors has no codeword"
+    );
+    for_each_difference(global_gain, groups, |difference| {
+        let codeword = codeword(difference)?;
+        w.write(codeword.bits, codeword.len);
+        Some(())
+    })
+    .expect("differences with codewords");
+}
 
-    /// Counts the bits of a group's scalefactors, and runs on past them;
-    /// or returns `None`, and does not, if a difference falls outside the
-    /// codebook's range.
-    ///
-    /// # Panics
-    ///
-    /// If fewer scalefactors are given than the sections span bands: a
-    /// caller's error.
-    pub fn count(&mut self, sections: &Sections, scalefactors: &[u8]) -> Option<u32> {
-        let mut running = *self;
-        let mut bits = 0;
-        for band in sections.bands_with_scalefactors() {
-            bits += codeword(running.difference(sections, scalefactors, band))?.len;
-        }
-        *self = running;
-        Some(bits)
-    }
-
-    /// Writes a group's part of `scale_factor_data()`, as
-    /// [`count`](Self::count) counts it.
-    ///
-    /// # Panics
-    ///
-    /// Where [`count`](Self::count) would return `None` or panic: a caller's
-    /// error.
-    pub fn write(&mut self, sections: &Sections, scalefactors: &[u8], w: &mut BitWriter) {
-        for band in sections.bands_with_scalefactors() {
-            let difference = self.difference(sections, scalefactors, band);
-            let codeword = codeword(difference)
-                .unwrap_or_else(|| panic!("a difference of {difference} has no codeword"));
-            w.write(codeword.bits, codeword.len);
+/// Calls `f` with each difference sent, from the running scalefactor that
+/// starts at `global_gain` (clause 11.3.2), until it returns `None`.
+fn for_each_difference<'a>(
+    global_gain: u8,
+    groups: impl IntoIterator<Item = (&'a Sections, &'a [u8])>,
+    mut f: impl FnMut(i32) -> Option<()>,
+) -> Option<()> {
+    let mut last = global_gain;
+    for (sections, scalefactors) in groups {
+        assert!(
+            scalefactors.len() >= sections.max_sfb(),
+            "a scalefactor for each band"
+        );
+        for sfb in sections.bands_with_scalefactors() {
+            let difference = if sections.is_zero_band(sfb) {
+                0
+            } else {
+                let difference = i32::from(scalefactors[sfb]) - i32::from(last);
+                last = scalefactors[sfb];
+                difference
+            };
+            f(difference)?;
         }
     }
-
-    /// The difference sent for band `sfb`'s scalefactor, which becomes the
-    /// running one.
-    fn difference(&mut self, sections: &Sections, scalefactors: &[u8], sfb: usize) -> i32 {
-        if sections.is_zero_band(sfb) {
-            return 0;
-        }
-        let scalefactor = scalefactors[sfb];
-        let difference = i32::from(scalefactor) - i32::from(self.last);
-        self.last = scalefactor;
-        difference
-    }
+    Some(())
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::codebooks::Codebook;
     use super::super::decoder::{BitReader, Noise, scale_factor_data, section_data};
     use super::*;
-    use crate::noiseless::codebooks::Codebook;
     use crate::sampling_frequency::SamplingFrequency;
     use crate::scalefactor_bands::{Transform, swb_offsets};
 
+    /// C5: every difference has a codeword or none, without overflow.
     #[test]
     fn differences_have_codewords_from_minus_60_to_60() {
-        assert_eq!(codeword(-61), None);
-        assert_eq!(codeword(61), None);
+        for difference in [-61, 61, i32::MIN, i32::MAX] {
+            assert_eq!(codeword(difference), None);
+        }
         // Table A.1, indexes 0, 60 and 120.
         assert_eq!(codeword(-60), Some(SCALEFACTOR_CODEWORDS[0]));
         assert_eq!(codeword(0), Some(Codeword { bits: 0, len: 1 }));
@@ -123,19 +136,15 @@ mod tests {
     /// Writes the sections and scalefactors of each group, then decodes
     /// them, checking the bits counted and the scalefactors decoded.
     fn round_trip(global_gain: u8, groups: &[(Sections, Vec<u8>)]) {
+        let groups_ref = || groups.iter().map(|(s, sf)| (s, sf.as_slice()));
         let mut w = BitWriter::new();
         let mut counted = 0;
-        let (mut counting, mut writing) = (Dpcm::new(global_gain), Dpcm::new(global_gain));
         for (sections, _) in groups {
             sections.write_section_data(&mut w);
             counted += sections.section_data_bits();
         }
-        for (sections, scalefactors) in groups {
-            counted += counting
-                .count(sections, scalefactors)
-                .expect("differences in range");
-            writing.write(sections, scalefactors, &mut w);
-        }
+        counted += bits(global_gain, groups_ref()).expect("differences in range");
+        write(global_gain, groups_ref(), &mut w);
         assert_eq!(w.bit_len() as u32, counted);
         let bytes = w.into_bytes();
         let mut r = BitReader::new(&bytes);
@@ -175,15 +184,17 @@ mod tests {
             // that is sent to the next, and anything where none is sent.
             let mut sf = i32::from(global_gain);
             let mut groups = Vec::new();
+            let max_sfb = noise.below(15) as usize;
             for _ in 0..1 + noise.below(4) {
                 let windows = 1 + noise.below(3) as u16;
                 let offsets: Vec<_> = (swb_offsets(fs, Transform::Short).iter())
                     .map(|offset| offset * windows)
                     .collect();
                 let lines = noise.spectrum(&offsets, 128 * usize::from(windows));
-                let sections = Sections::choose(&lines, &offsets, Transform::Short).unwrap();
+                let sections =
+                    Sections::choose(&lines, &offsets[..=max_sfb], Transform::Short).unwrap();
                 let mut scalefactors: Vec<u8> =
-                    (1..offsets.len()).map(|_| noise.below(256) as u8).collect();
+                    (0..max_sfb).map(|_| noise.below(256) as u8).collect();
                 for sfb in sections.bands_with_scalefactors() {
                     if !sections.is_zero_band(sfb) {
                         sf = (sf + noise.below(121) as i32 - 60).clamp(0, 255);
@@ -196,22 +207,42 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_difference_out_of_range_is_counted_as_none() {
-        let offsets = swb_offsets(SamplingFrequency::Hz48000, Transform::Long);
+    fn two_bands_of_ones() -> Sections {
         let mut lines = vec![0; 1024];
         lines[0] = 1;
         lines[4] = 1;
-        let sections = Sections::choose(&lines, &offsets[..=2], Transform::Long).unwrap();
-        let mut dpcm = Dpcm::new(100);
-        assert_eq!(
-            dpcm.count(&sections, &[160, 220]),
-            Some(2 * codeword(60).unwrap().len)
-        );
-        assert_eq!(dpcm, Dpcm::new(220));
-        let mut dpcm = Dpcm::new(100);
-        assert_eq!(dpcm.count(&sections, &[161, 161]), None);
-        // The running scalefactor is left as it was.
-        assert_eq!(dpcm, Dpcm::new(100));
+        let offsets = swb_offsets(SamplingFrequency::Hz48000, Transform::Long);
+        Sections::choose(&lines, &offsets[..=2], Transform::Long).unwrap()
+    }
+
+    #[test]
+    fn a_difference_out_of_range_is_counted_as_none() {
+        let sections = two_bands_of_ones();
+        let sixty = codeword(60).unwrap().len;
+        assert_eq!(bits(100, [(&sections, &[160, 220][..])]), Some(2 * sixty));
+        assert_eq!(bits(100, [(&sections, &[161, 161][..])]), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "has no codeword")]
+    fn a_difference_out_of_range_is_not_written() {
+        let sections = two_bands_of_ones();
+        write(100, [(&sections, &[161, 161][..])], &mut BitWriter::new());
+    }
+
+    /// C1: counting leaves nothing behind that writing would start from.
+    #[test]
+    fn bits_counted_are_the_bits_written() {
+        let sections = two_bands_of_ones();
+        let groups = [(&sections, &[220, 180][..])];
+        let counted = bits(240, groups).unwrap();
+        let mut w = BitWriter::new();
+        write(240, groups, &mut w);
+        assert_eq!(w.bit_len() as u32, counted);
+        let bytes = w.into_bytes();
+        let decoded = [(1, 0, 2)];
+        let mut last_sf = 240;
+        let sf = scale_factor_data(&mut BitReader::new(&bytes), &decoded, &mut last_sf);
+        assert_eq!(sf, [220, 180]);
     }
 }

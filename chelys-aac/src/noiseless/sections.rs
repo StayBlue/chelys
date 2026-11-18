@@ -75,7 +75,7 @@ impl Sections {
     /// `spectral_data()`. Merging changes the scalefactors only where it
     /// puts a band with no line but zero in a section with a spectrum
     /// codebook, which sends its scalefactor; that costs the bits of a
-    /// difference of 0 (see [`scalefactors::Dpcm`]).
+    /// difference of 0 (see [`scalefactors::bits`]).
     ///
     /// Spec gap: clause C.8.3 does not say which merge comes first where
     /// two save the same bits; the lower in frequency is taken.
