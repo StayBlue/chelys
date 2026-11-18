@@ -14,3 +14,11 @@ default = ["mp3"]
 mp3 = ["dep:chelys-mp3"]
 # Each codec's building blocks, for chelys's own conformance tests.
 unstable = ["chelys-mp3?/unstable"]
+
+[[example]]
+name = "mp3_tone"
+required-features = ["mp3"]
+
+[[example]]
+name = "mp3_vbr"
+required-features = ["mp3"]
