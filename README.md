@@ -19,8 +19,8 @@ writes MP3 to stdout. Other tools convert from other formats, for example:
 
 ```sh
 ffmpeg -i song.flac -f f32le -ar 44100 -ac 2 - \
-  | cargo run --release -p chelys-cli -- --sample-rate 44100 --channels 2 > song.mp3
+  | cargo run --release -p chelys-cli -- mp3 --sample-rate 44100 --channels 2 > song.mp3
 ```
 
-Run it with `--help` for the bitrates, sampling frequencies and stereo modes it
-supports.
+The codec comes first; run it with `--help` for the codecs, and with
+`mp3 --help` for the bitrates, sampling frequencies and stereo modes of MP3.
