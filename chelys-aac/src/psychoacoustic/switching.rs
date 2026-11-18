@@ -122,9 +122,19 @@ impl BlockSwitching {
 
     /// Chooses the window sequence of the current frame, given `attacks`,
     /// whether it and the frame after it have attacks, with its short
-    /// windows, if it has any, grouped by [`grouping`].
-    pub fn decide(&mut self, attacks: Attacks) -> WindowSequence {
+    /// windows, if it has any, grouped by [`grouping`]; or, where the frame
+    /// cannot `afford_short` windows, the long sequence that may take their
+    /// place: a LONG_STOP_SEQUENCE after a sequence that ends short, and an
+    /// ONLY_LONG_SEQUENCE else, so that the transitions stay meaningful.
+    pub fn decide(&mut self, attacks: Attacks, afford_short: bool) -> WindowSequence {
         let sequence = match next_sequence(self.last, attacks) {
+            WindowSequence::EightShort { .. } if !afford_short => {
+                if ends_short(self.last) {
+                    WindowSequence::LongStop
+                } else {
+                    WindowSequence::OnlyLong
+                }
+            }
             WindowSequence::EightShort { .. } => WindowSequence::EightShort {
                 grouping: grouping(&self.current),
             },
@@ -133,6 +143,15 @@ impl BlockSwitching {
         self.last = Some(sequence);
         sequence
     }
+}
+
+/// Whether `sequence`'s window ends with short windows' slope, so that the
+/// next must start with one (see [`WindowSequence::follows`]).
+fn ends_short(sequence: Option<WindowSequence>) -> bool {
+    matches!(
+        sequence,
+        Some(WindowSequence::LongStart | WindowSequence::EightShort { .. })
+    )
 }
 
 /// The window sequence of a frame, given that of the frame before it, if
@@ -167,10 +186,7 @@ impl BlockSwitching {
 /// stereo; the conformance test is
 /// `attacks_are_coded_with_short_windows_at_every_sample_rate`.
 fn next_sequence(last: Option<WindowSequence>, attacks: Attacks) -> WindowSequence {
-    let after_short = matches!(
-        last,
-        Some(WindowSequence::LongStart | WindowSequence::EightShort { .. })
-    );
+    let after_short = ends_short(last);
     match (attacks.this, attacks.next) {
         (true, _) => WindowSequence::EIGHT_SHORT,
         (false, true) if after_short => WindowSequence::EIGHT_SHORT,
@@ -381,7 +397,7 @@ mod tests {
                 }
             });
             if let Some(attacks) = switching.look_ahead(&samples) {
-                sequences.push(switching.decide(attacks).number());
+                sequences.push(switching.decide(attacks, true).number());
             }
         }
         // The first frame holds the tone's onset after the silence before

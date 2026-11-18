@@ -53,18 +53,25 @@ impl StreamConfig {
         self.header_len() + raw_data_block::min_len(self.channel_configuration, &channels)
     }
 
-    /// The lowest bitrate that brings each frame the bits of the shortest
-    /// frame of the windows whose `ics_info()` is the longest, those of
-    /// eight short windows, so that the reservoir never runs below empty,
-    /// whatever windows a frame is coded with.
+    /// The lowest bitrate that brings each frame the bits of the shortest,
+    /// that of long windows, so that the reservoir never runs below empty.
+    /// A frame that cannot afford the longer `ics_info()` of eight short
+    /// windows is coded with long ones.
     pub fn min_bits_per_second(&self) -> u32 {
+        let bits = 8 * self.shortest_frame_len(Windows::LONG_SINE) as u64;
+        let sample_rate = u64::from(self.sampling_frequency.hz());
+        (bits * sample_rate).div_ceil(FRAME_SAMPLES as u64) as u32
+    }
+
+    /// The bits of the shortest frame of eight short windows, which a
+    /// frame must be able to take to be coded with them (see
+    /// [`StreamEncoder::affords_short`]).
+    fn shortest_short_frame_bits(&self) -> u32 {
         let windows = Windows {
             sequence: WindowSequence::EIGHT_SHORT,
             ..Windows::LONG_SINE
         };
-        let bits = 8 * self.shortest_frame_len(windows) as u64;
-        let sample_rate = u64::from(self.sampling_frequency.hz());
-        (bits * sample_rate).div_ceil(FRAME_SAMPLES as u64) as u32
+        8 * self.shortest_frame_len(windows) as u32
     }
 
     /// The highest bitrate, at which the reservoir holds a byte.
@@ -147,6 +154,8 @@ pub struct StreamEncoder {
     attacks: Vec<Attacks>,
     /// Whether frames may be coded with short windows.
     block_switching: bool,
+    /// [`StreamConfig::shortest_short_frame_bits`].
+    shortest_short_frame_bits: u32,
     /// The samples each channel was given.
     samples: u64,
     frames: u64,
@@ -180,6 +189,7 @@ impl StreamEncoder {
             analyzed: (0..channels).map(|_| AnalyzedChannel::new()).collect(),
             attacks: Vec::with_capacity(channels),
             block_switching: true,
+            shortest_short_frame_bits: config.shortest_short_frame_bits(),
             samples: 0,
             frames: 0,
         }
@@ -191,6 +201,16 @@ impl StreamEncoder {
     pub fn without_block_switching(mut self) -> Self {
         self.block_switching = false;
         self
+    }
+
+    /// Whether the next frame's bits, those the reservoir makes available
+    /// to it when it asks for none beyond the mean, pay for the shortest
+    /// frame of eight short windows in every channel, and so for any
+    /// windows: a frame is given no fewer when it asks for more. Near the
+    /// lowest bitrate they may not, as it is set by the frames of long
+    /// windows (see [`StreamConfig::min_bits_per_second`]).
+    fn affords_short(&self) -> bool {
+        self.shortest_short_frame_bits <= self.reservoir.available_bits(0)
     }
 
     /// The `AudioSpecificConfig()` of ISO/IEC 14496-3 that describes the
@@ -305,6 +325,7 @@ impl StreamEncoder {
         let common_window =
             self.config.channel_configuration == ChannelConfiguration::Stereo && COMMON_WINDOW;
         switching::agree(&mut self.attacks, common_window);
+        let afford_short = self.affords_short();
 
         let analyzers = (self.pcm.iter())
             .zip(&mut self.filterbanks)
@@ -316,7 +337,7 @@ impl StreamEncoder {
             let block = pcm[start..start + FRAME_SAMPLES]
                 .try_into()
                 .expect("a block of samples");
-            let sequence = switching.decide(attacks);
+            let sequence = switching.decide(attacks, afford_short);
             let windows = Windows {
                 sequence,
                 shape: switching::shape(sequence),
@@ -520,6 +541,41 @@ mod tests {
             });
             assert_eq!(sequences.len(), 7);
             assert_eq!(sequences.contains(&2), switching, "{sequences:?}");
+        }
+    }
+
+    /// At the lowest bitrate, which is set by frames of long windows, a
+    /// frame cannot afford the side information of eight short windows,
+    /// and an attack is coded with long ones; a little above it, it is
+    /// coded short.
+    #[test]
+    fn a_frame_without_bits_for_short_windows_stays_long() {
+        let mut config = StreamConfig {
+            sampling_frequency: SamplingFrequency::Hz44100,
+            channel_configuration: ChannelConfiguration::Mono,
+            bits_per_second: 0,
+            framing: Framing::Adts,
+        };
+        let min = config.min_bits_per_second();
+        let mut input = vec![0.0; 12 * FRAME_SAMPLES];
+        for click in [3 * FRAME_SAMPLES + 300, 8 * FRAME_SAMPLES + 900] {
+            input[click] = 0.9;
+        }
+        for (bits_per_second, short) in [(min, false), (min + 1000, true)] {
+            config.bits_per_second = bits_per_second;
+            let mut sequences = Vec::new();
+            let mut encoder = StreamEncoder::new(config);
+            encoder.encode(&[&input], &mut |frame: &[u8]| {
+                // After the header, id_syn_ele, element_instance_tag,
+                // global_gain and ics_reserved_bit.
+                sequences.push((frame[9] >> 6) & 0b11);
+            });
+            assert_eq!(
+                sequences.contains(&2),
+                short,
+                "{bits_per_second}: {sequences:?}"
+            );
+            assert!(sequences.contains(&1), "{bits_per_second}: {sequences:?}");
         }
     }
 
