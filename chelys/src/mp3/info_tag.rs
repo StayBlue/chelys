@@ -28,6 +28,10 @@ use crate::bitstream::BitWriter;
 /// The bytes of the tag: 120 of the Xing fields, 36 of the extension.
 const TAG_LEN: usize = 156;
 
+/// The bytes of the table of contents, which a tag leaves out where its
+/// frame is too short for [`TAG_LEN`] (see [`header`]).
+const TABLE_LEN: usize = 100;
+
 /// Spec reading: the document's dump has the flags `0x0000000F`, and after
 /// them the frame count, the byte count, the table of contents and the
 /// quality, in that order. The comment beside the dump lists the table first;
@@ -36,6 +40,10 @@ const TAG_LEN: usize = 156;
 /// mpg123 take the frame count as sent; the conformance test is
 /// `decoders_read_the_tag_at_every_sampling_frequency`.
 const FLAGS: u32 = 0xF;
+
+/// The bit of [`FLAGS`] that marks the table of contents as sent: the third
+/// field of the dump, the third bit.
+const TABLE_FLAG: u32 = 0x4;
 
 /// The samples by which a decoder delays its output, that the encoder delay
 /// of the extension leaves out.
@@ -52,7 +60,10 @@ const DECODER_DELAY: usize = 529;
 
 /// The frame that holds the tag, at a bitrate whose frames hold it: the
 /// stream's own if it is constant, the one of the table nearest a mean rate,
-/// and otherwise, or where those do not hold it, the lowest that does. It
+/// and otherwise, or where those do not hold it, the lowest that does. At a
+/// constant bitrate whose frames are too short for the whole tag, the tag
+/// leaves out its table of contents, and its frame keeps the stream's
+/// bitrate if it holds the rest. It
 /// has no `crc_check` word, no padding, and in joint stereo neither MS nor
 /// intensity stereo, the stream's [`Flags`](super::header::Flags) (so that a stream marked as
 /// copyright protected has no frame unmarked), and its side information
@@ -69,11 +80,26 @@ const DECODER_DELAY: usize = 529;
 /// frame has been written, so its tag takes the lowest bitrate that holds
 /// it.
 ///
+/// Spec gap: the document lays the tag out with all four Xing fields, and
+/// the extension at fixed offsets after them, but does not say what the
+/// bits of the flags mean, or where the fields after one left out go. At a
+/// constant bitrate whose frames are too short for the whole tag, the tag
+/// leaves out the table, with its bit of the flags cleared, and the extension
+/// follows the quality, so that the frame keeps the stream's bitrate as the
+/// document suggests; at a constant bitrate a decoder can find where to seek
+/// from the bitrate alone. A mean or variable rate keeps the table, whose
+/// offsets a decoder cannot work out, and its frame is at a higher bitrate
+/// if need be. A constant bitrate whose frames do not hold even the tag
+/// without its table keeps it whole at a higher bitrate too, as the bitrate
+/// may change from frame to frame in Layer III (clause 2.4.2.3 of ISO/IEC
+/// 11172-3).
+///
 /// Spec gap: the document does not mention free format, whose bitrate does
 /// not change ("in free format, fixed bitrate is required", clause 2.4.2.3
 /// of ISO/IEC 11172-3), and whose frames' length a decoder learns from the
 /// distance between their headers. The tag's frame is at the stream's
-/// bitrate, and a stream whose frames do not hold the tag has none: `None`.
+/// bitrate, and a stream whose frames do not hold the tag, even without its
+/// table, has none: `None`.
 /// Settled by decoding with mpg123 and LAME (black box): both find the
 /// frames after the tag's, and read the tag, giving the input exactly; the
 /// conformance test is `mpg123_and_lame_decode_free_format`. ffmpeg
@@ -82,20 +108,21 @@ pub fn header(config: &StreamConfig) -> Option<Header> {
     let fs = config.sampling_frequency;
     let channels = config.mode.channels();
     let side_info = SideInfo::len_bytes(fs.version(), channels);
-    let holds = |bitrate: &Bitrate| bitrate.frame_len(fs, false) >= 4 + side_info + TAG_LEN;
+    let room = |bitrate: &Bitrate| bitrate.frame_len(fs, false).saturating_sub(4 + side_info);
+    let holds = |bitrate: &Bitrate| room(bitrate) >= TAG_LEN;
     let preferred = match config.rate {
-        Rate::Constant(bitrate) => Some(bitrate),
+        Rate::Constant(bitrate) => Some(bitrate).filter(|b| room(b) >= TAG_LEN - TABLE_LEN),
         Rate::Mean(mean) => Bitrate::all(fs.version())
-            .min_by_key(|b| b.bits_per_second().abs_diff(mean.bits_per_second())),
+            .min_by_key(|b| b.bits_per_second().abs_diff(mean.bits_per_second()))
+            .filter(holds),
         Rate::Variable(_) => None,
     };
     let bitrate = match preferred {
-        Some(free) if free.is_free() => Some(free).filter(holds)?,
-        _ => preferred.filter(holds).unwrap_or_else(|| {
-            Bitrate::all(fs.version())
-                .find(holds)
-                .expect("the highest bitrate's frames hold the tag")
-        }),
+        Some(bitrate) => bitrate,
+        None if config.rate.lowest().is_free() => return None,
+        None => Bitrate::all(fs.version())
+            .find(holds)
+            .expect("the highest bitrate's frames hold the tag"),
     };
     let mode = match config.mode {
         Mode::JointStereo { .. } => Mode::JointStereo {
@@ -166,6 +193,11 @@ pub fn frame(header: &Header, stream: &Stream) -> Vec<u8> {
     let tag_len = frame.len();
     let frames = stream.frame_lens.len();
     let bytes = tag_len + stream.frame_lens.iter().sum::<usize>();
+    let start = 4 + SideInfo::len_bytes(fs.version(), config.mode.channels());
+    // Only at a constant bitrate is the frame too short for the table (see
+    // `header`).
+    let with_table = tag_len - start >= TAG_LEN;
+    debug_assert!(with_table || matches!(config.rate, Rate::Constant(_)));
 
     let mut tag = Vec::with_capacity(TAG_LEN);
     // Spec reading: "Xing" for streams whose bitrate varies and "Info" for
@@ -175,7 +207,11 @@ pub fn frame(header: &Header, stream: &Stream) -> Vec<u8> {
         Rate::Constant(_) => b"Info",
         Rate::Mean(_) | Rate::Variable(_) => b"Xing",
     });
-    tag.extend_from_slice(&FLAGS.to_be_bytes());
+    let flags = match with_table {
+        true => FLAGS,
+        false => FLAGS & !TABLE_FLAG,
+    };
+    tag.extend_from_slice(&flags.to_be_bytes());
     // Spec reading: the frames after the tag's, and the bytes of the
     // stream with it. The document's dump has the fields big-endian.
     // Settled by decoding with ffmpeg and mpg123 (black box): with the
@@ -184,7 +220,9 @@ pub fn frame(header: &Header, stream: &Stream) -> Vec<u8> {
     // conformance test is `decoders_read_the_tag_at_every_sampling_frequency`.
     tag.extend_from_slice(&(frames as u32).to_be_bytes());
     tag.extend_from_slice(&length(bytes).to_be_bytes());
-    tag.extend(table_of_contents(tag_len, stream.frame_lens, bytes));
+    if with_table {
+        tag.extend(table_of_contents(tag_len, stream.frame_lens, bytes));
+    }
     // Spec gap: the document gives the quality as "0=best 100=worst" beside
     // the dump, and as LAME's own scale, with 100 the best, in the
     // extension, where it is one byte, "byte $9B", the last of the four the
@@ -192,7 +230,8 @@ pub fn frame(header: &Header, stream: &Stream) -> Vec<u8> {
     // scale reads as unknown.
     tag.extend_from_slice(&0u32.to_be_bytes());
 
-    // The extension, from 0x9C of the dump.
+    // The extension, from 0x9C of the dump, or 100 bytes before without the
+    // table.
     tag.extend_from_slice(&encoder_version());
     // Revision 1, and the "VBR method": constant bitrate, "restricted VBR
     // targetting a given average bitrate (ABR)", or "full VBR method1".
@@ -227,7 +266,6 @@ pub fn frame(header: &Header, stream: &Stream) -> Vec<u8> {
     tag.extend_from_slice(&length(bytes).to_be_bytes());
     tag.extend_from_slice(&stream.music_crc.to_be_bytes());
 
-    let start = 4 + SideInfo::len_bytes(fs.version(), config.mode.channels());
     frame[start..start + tag.len()].copy_from_slice(&tag);
     // Spec reading: the CRC of the tag covers "the first 190 bytes
     // ($00-$BD) of the Info header frame", everything before the CRC in the
@@ -404,16 +442,13 @@ mod tests {
     }
 
     /// A constant bitrate keeps its frames for the tag where they hold it,
-    /// and says "Info".
+    /// and says "Info"; so does a mean rate's nearest bitrate.
     #[test]
     fn a_constant_bitrate_keeps_its_frame_size_where_it_can() {
         let fs = SamplingFrequency::Hz48000;
         let mono = config(fs, Rate::Constant(kbps(fs, 64)), Mode::SingleChannel);
         // 4 + 17 + 156 = 177 bytes fit in 192.
         assert_eq!(header(&mono).unwrap().bitrate, kbps(fs, 64));
-        let stereo = config(fs, Rate::Constant(kbps(fs, 56)), Mode::Stereo);
-        // 192 bytes do not fit in 168; 64 kbit/s's 192 do.
-        assert_eq!(header(&stereo).unwrap().bitrate, kbps(fs, 64));
         let stream = Stream {
             config: &mono,
             frame_lens: &[192; 10],
@@ -422,15 +457,66 @@ mod tests {
         };
         let frame = frame(&header(&mono).unwrap(), &stream);
         assert_eq!(&frame[4 + 17..4 + 21], b"Info");
+        assert_eq!(frame[4 + 21..4 + 25], [0, 0, 0, 0x0F]);
         assert_eq!(frame[4 + 17 + 129], 0x11);
-        // A mean rate takes the nearest bitrate of the table.
         let mean = crate::mp3::rate::MeanRate::new(fs.version(), 150_000).unwrap();
         let near = config(fs, Rate::Mean(mean), Mode::Stereo);
         assert_eq!(header(&near).unwrap().bitrate, kbps(fs, 160));
-        // At 8 kHz in one channel the tag takes 4 + 9 + 156 = 169 bytes:
-        // 24 kbit/s's 216.
+    }
+
+    /// A constant bitrate whose frames are too short for the whole tag
+    /// keeps them for the tag without its table, where they hold that, and
+    /// the extension follows the quality. A mean rate keeps the table, at a
+    /// higher bitrate.
+    #[test]
+    fn a_constant_bitrate_too_short_for_the_table_leaves_it_out() {
+        let fs = SamplingFrequency::Hz48000;
+        // 192 bytes do not fit in 168; 4 + 32 + 56 = 92 do.
+        let stereo = config(fs, Rate::Constant(kbps(fs, 56)), Mode::Stereo);
+        let tag_header = header(&stereo).unwrap();
+        assert_eq!(tag_header.bitrate, kbps(fs, 56));
+        let frame_lens = [168; 10];
+        let stream = Stream {
+            config: &stereo,
+            frame_lens: &frame_lens,
+            samples: 10 * 1152 - 528 - 600,
+            music_crc: 0x1234,
+        };
+        let frame = frame(&tag_header, &stream);
+        assert_eq!(frame.len(), 168);
+        assert_eq!(&frame[0x24..0x28], b"Info");
+        assert_eq!(frame[0x28..0x2C], [0, 0, 0, 0x0B]);
+        assert_eq!(frame[0x2C..0x30], 10u32.to_be_bytes());
+        assert_eq!(frame[0x30..0x34], (11 * 168u32).to_be_bytes());
+        assert_eq!(frame[0x34..0x38], [0; 4]);
+        assert_eq!(&frame[0x38..0x3E], b"chelys");
+        assert_eq!(frame[0x41], 0x11);
+        assert_eq!(frame[0x4C], 56);
+        assert_eq!(frame[0x4D..0x50], [0x21, 0x02, 0x58]);
+        assert_eq!(frame[0x54..0x58], (11 * 168u32).to_be_bytes());
+        assert_eq!(frame[0x58..0x5A], [0x12, 0x34]);
+        let tag_crc = music_crc(MUSIC_CRC_START, &frame[..0x5A]);
+        assert_eq!(frame[0x5A..0x5C], tag_crc.to_be_bytes());
+        assert!(frame[0x5C..].iter().all(|&b| b == 0));
+
+        let mean = crate::mp3::rate::MeanRate::new(fs.version(), 50_000).unwrap();
+        let mean = config(fs, Rate::Mean(mean), Mode::Stereo);
+        assert_eq!(header(&mean).unwrap().bitrate, kbps(fs, 64));
+
+        // At 8 kHz the tag without its table takes 4 + 9 + 56 = 69 bytes in
+        // one channel, which fit in 72, and 77 in two, which do not: the
+        // whole tag's 177 bytes need 24 kbit/s's 216.
         let fs = SamplingFrequency::Hz8000;
-        let low = config(fs, Rate::Constant(kbps(fs, 8)), Mode::SingleChannel);
-        assert_eq!(header(&low).unwrap().bitrate, kbps(fs, 24));
+        let mono = config(fs, Rate::Constant(kbps(fs, 8)), Mode::SingleChannel);
+        assert_eq!(header(&mono).unwrap().bitrate, kbps(fs, 8));
+        let stereo = config(fs, Rate::Constant(kbps(fs, 8)), Mode::Stereo);
+        assert_eq!(header(&stereo).unwrap().bitrate, kbps(fs, 24));
+
+        // In free format the frame keeps the stream's bitrate or has no tag.
+        let fs = SamplingFrequency::Hz48000;
+        let free = |bps| Rate::Constant(Bitrate::free(fs.version(), bps).unwrap());
+        let short = config(fs, free(50_000), Mode::Stereo);
+        assert_eq!(header(&short).unwrap().bitrate.bits_per_second(), 50_000);
+        assert!(header(&config(fs, free(20_000), Mode::Stereo)).is_none());
     }
 }

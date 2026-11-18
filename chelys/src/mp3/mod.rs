@@ -621,8 +621,9 @@ impl Encoder {
     }
 
     /// An encoder whose stream starts with a frame for a Xing/Info tag (see
-    /// [`info_tag`]): the number of frames and bytes, a table to seek by,
-    /// and the samples added before and after the input, which make the
+    /// [`info_tag`]): the number of frames and bytes, a table to seek by
+    /// (but at a constant bitrate whose frames are too short for it), and
+    /// the samples added before and after the input, which make the
     /// decoded output the input exactly for decoders that apply them. As
     /// those are known only at the end, the frame is written as a
     /// placeholder, silent and with no tag, and [`finish`](Self::finish)
@@ -2507,8 +2508,8 @@ mod tests {
     /// slots, padded as at a bitrate of the table, keeps to the rules of the
     /// bit reservoir, from frames shorter than any of the table to frames
     /// longer than the decoder's buffer. Where its frames hold the
-    /// Xing/Info tag, the tag's frame is in free format too; where they do
-    /// not, the stream has none.
+    /// Xing/Info tag, with its table or without, the tag's frame is in free
+    /// format too; where they do not, the stream has none.
     #[test]
     fn free_format_streams_keep_their_bitrate() {
         use SamplingFrequency::*;
@@ -2516,7 +2517,7 @@ mod tests {
             (Hz44100, 100_000, Mode::Stereo, false, true),
             (Hz48000, 12_667, Mode::SingleChannel, true, false),
             (Hz32000, 319_999, MS, false, true),
-            (Hz22050, 50_000, MS, true, false),
+            (Hz22050, 50_000, MS, true, true),
             (Hz24000, 8_001, Mode::SingleChannel, false, false),
             (Hz16000, 159_999, Mode::Stereo, true, true),
             (Hz11025, 33_333, MS, false, true),

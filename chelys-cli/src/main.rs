@@ -79,9 +79,10 @@ MPEG-2.5 Layer III at 8, 11.025 and 12 kHz (experimental).
   --private-bit      set each frame's bit for private use (default: off)
 
 Where stdout is a file, the stream starts with a Xing/Info tag: its length,
-a table to seek by, and the samples to trim at its start and end. Through a
-pipe it has none, as the tag is known only once the stream has ended, and
-in free format none where the frames are too short to hold it.";
+a table to seek by (left out at a low constant bitrate, which needs none),
+and the samples to trim at its start and end. Through a pipe it has none,
+as the tag is known only once the stream has ended, and in free format none
+where the frames are too short to hold it.";
 
 struct Options {
     sampling_frequency: SamplingFrequency,

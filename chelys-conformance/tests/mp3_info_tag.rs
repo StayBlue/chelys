@@ -192,25 +192,26 @@ fn decoders_read_the_tag_at_every_sampling_frequency() {
 /// 2000 samples early. The decoded output, untrimmed, lags by [`DELAY`]
 /// from wherever decoding starts. The frames whose main data begins before
 /// the frame decoding starts at decode as silence; at 8 kbit/s and 8 kHz a
-/// frame holds 59 bytes of main data, so the bit reservoir's 255 bytes
-/// reach back at most five frames, 2880 samples, and the output is compared
-/// after them.
+/// frame of two channels holds 51 bytes of main data, so the bit
+/// reservoir's 255 bytes reach back at most five frames, 2880 samples, and
+/// the output is compared after them. (In one channel, the tag would leave
+/// out its table, as the frames hold the rest of it.)
 #[test]
 fn ffmpeg_seeks_by_the_table() {
     let fs = SamplingFrequency::Hz8000;
     let config = StreamConfig {
         rate: Rate::Constant(Bitrate::from_kbps(fs.version(), 8).unwrap()),
         sampling_frequency: fs,
-        mode: Mode::SingleChannel,
+        mode: Mode::Stereo,
         crc_protected: false,
         flags: Flags::default(),
     };
     let input: Vec<f64> = chirp(fs, 5 * 8000).iter().map(|x| x / 30.0).collect();
-    let stream = encode_pcm_with_info_tag(&config, &[&input]);
+    let stream = encode_pcm_with_info_tag(&config, &[&input, &input]);
     for from in [1.0, 2.0, 3.0] {
         let decoded = ffmpeg::decode_mp3_seeking(&stream, from, 1.0);
         assert_eq!(decoded.diagnostics, "", "from {from} s");
-        let output = &decoded.samples;
+        let output = first_channel(&decoded.samples, 2);
         // The input sample that the decoded output's sample 0 is, where its
         // samples from 4000 on line up best with the input.
         let target = (from * 8000.0) as usize;
