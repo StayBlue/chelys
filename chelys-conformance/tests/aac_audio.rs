@@ -52,34 +52,98 @@ fn decode(encoded: &Encoded, channels: usize, context: &str) -> Vec<f32> {
     decoded.samples
 }
 
-/// The `window_sequence` of the first `individual_channel_stream()` of
-/// each frame of a stream in ADTS, as chelys writes it: a header of 7
-/// bytes, then the element's `id_syn_ele` and `element_instance_tag`, a
-/// pair's `common_window`, `global_gain` and `ics_reserved_bit`.
-fn window_sequences(stream: &[u8]) -> Vec<u8> {
+/// The `window_sequence` of each channel of each frame of a stream in ADTS
+/// at `sample_rate`, as chelys writes it: read through each frame's
+/// element, a channel pair's first channel decoded to reach the second,
+/// with the decoder of noiseless coding that chelys's tests share.
+fn window_sequences(stream: &[u8], sample_rate: u32) -> Vec<Vec<u8>> {
+    use chelys::aac::internals::noiseless::decoder::{
+        BitReader, scale_factor_data, section_data, spectral_data,
+    };
+    use chelys::aac::internals::sampling_frequency::SamplingFrequency;
+    use chelys::aac::internals::scalefactor_bands::{Transform, swb_offsets};
+
+    let fs = SamplingFrequency::from_hz(sample_rate).unwrap();
+    // Reads one individual_channel_stream() without a common window, and
+    // gives its window_sequence.
+    let channel = |r: &mut BitReader| -> u8 {
+        let global_gain = r.read(8) as i32;
+        assert_eq!(r.read(1), 0, "ics_reserved_bit");
+        let window_sequence = r.read(2) as u8;
+        r.read(1); // window_shape
+        let (transform, max_sfb, lengths) = if window_sequence == 2 {
+            let max_sfb = r.read(4) as usize;
+            let grouping = r.read(7);
+            let mut lengths = vec![1u16];
+            for i in 0..7 {
+                if grouping & (1 << (6 - i)) == 0 {
+                    lengths.push(1);
+                } else {
+                    *lengths.last_mut().unwrap() += 1;
+                }
+            }
+            (Transform::Short, max_sfb, lengths)
+        } else {
+            let max_sfb = r.read(6) as usize;
+            assert_eq!(r.read(1), 0, "predictor_data_present");
+            (Transform::Long, max_sfb, vec![1])
+        };
+        let sections: Vec<_> = (lengths.iter())
+            .map(|_| section_data(r, transform, max_sfb))
+            .collect();
+        let mut last_sf = global_gain;
+        for sections in &sections {
+            scale_factor_data(r, sections, &mut last_sf);
+        }
+        assert_eq!(r.read(3), 0, "pulse, TNS and gain control flags");
+        let offsets = swb_offsets(fs, transform);
+        for (sections, &len) in sections.iter().zip(&lengths) {
+            let offsets: Vec<u16> = offsets.iter().map(|&o| o * len).collect();
+            let lines = usize::from(*offsets.last().unwrap());
+            spectral_data(r, sections, &offsets, lines);
+        }
+        window_sequence
+    };
     let mut sequences = Vec::new();
     let mut frame = stream;
-    while frame.len() > 9 {
+    while frame.len() > 7 {
         let len = (usize::from(frame[3] & 0b11) << 11)
             | (usize::from(frame[4]) << 3)
             | usize::from(frame[5] >> 5);
-        let bits = u32::from_be_bytes([frame[7], frame[8], frame[9], 0]);
-        let id_syn_ele = bits >> 29;
-        let at = 3 + 4 + u32::from(id_syn_ele == 1) + 8 + 1;
-        sequences.push(((bits >> (32 - at - 2)) & 0b11) as u8);
+        let mut r = BitReader::new(&frame[7..len]);
+        let id_syn_ele = r.read(3);
+        r.read(4); // element_instance_tag
+        sequences.push(match id_syn_ele {
+            0 => vec![channel(&mut r)],
+            1 => {
+                assert_eq!(r.read(1), 0, "common_window");
+                let left = channel(&mut r);
+                vec![left, channel(&mut r)]
+            }
+            other => panic!("element {other}"),
+        });
         frame = &frame[len..];
     }
     sequences
 }
 
-/// Whether `sequences` keep to the meaningful transitions of clause
-/// 15.3.1: a sequence that starts with short windows only after one that
-/// ends with them.
-fn transitions_are_meaningful(sequences: &[u8]) -> bool {
+/// Whether one of the frames whose eight short windows span input sample
+/// `onset` is coded with them in `channel`: frame `f`'s span samples
+/// `1024 f - 576` to `1024 f + 575` (clause 15.3.2).
+fn short_at(sequences: &[Vec<u8>], channel: usize, onset: usize) -> bool {
+    (sequences.iter().enumerate())
+        .filter(|&(f, _)| (1024 * f).saturating_sub(576) <= onset && onset < 1024 * f + 576)
+        .any(|(_, frame)| frame[channel] == 2)
+}
+
+/// Whether each channel's `sequences` keep to the meaningful transitions
+/// of clause 15.3.1: a sequence that starts with short windows only after
+/// one that ends with them.
+fn transitions_are_meaningful(sequences: &[Vec<u8>]) -> bool {
     // ONLY_LONG 0, LONG_START 1, EIGHT_SHORT 2, LONG_STOP 3.
-    sequences
-        .windows(2)
-        .all(|pair| matches!(pair[1], 2 | 3) == matches!(pair[0], 1 | 2))
+    sequences.windows(2).all(|pair| {
+        (pair[0].iter().zip(&pair[1])).all(|(&a, &b)| matches!(b, 2 | 3) == matches!(a, 1 | 2))
+    })
 }
 
 /// The bitrates the encoder takes at `sample_rate` for `channels`.
@@ -462,7 +526,13 @@ fn a_tone_beside_silence_decodes_alike_in_either_channel() {
 /// milliseconds, as of castanets, from `first` on, every `every` samples
 /// and a little later each time, so that they set in at many places in a
 /// frame.
-fn castanets(sample_rate: u32, len: usize, first: usize, every: usize, seed: u64) -> Vec<f64> {
+fn castanets(
+    sample_rate: u32,
+    len: usize,
+    first: usize,
+    every: usize,
+    seed: u64,
+) -> (Vec<f64>, Vec<usize>) {
     let fs = f64::from(sample_rate);
     let decay = fs / 200.0;
     let mut state = seed;
@@ -472,7 +542,7 @@ fn castanets(sample_rate: u32, len: usize, first: usize, every: usize, seed: u64
         onsets.push(onset);
         onset += every + 97 * onsets.len();
     }
-    (0..len)
+    let signal = (0..len)
         .map(|t| {
             state = (state.wrapping_mul(6_364_136_223_846_793_005))
                 .wrapping_add(1_442_695_040_888_963_407);
@@ -484,7 +554,8 @@ fn castanets(sample_rate: u32, len: usize, first: usize, every: usize, seed: u64
                 .sum::<f64>();
             tone + noise * burst
         })
-        .collect()
+        .collect();
+    (signal, onsets)
 }
 
 /// Bursts of noise in a quiet tone are coded with eight short windows, a
@@ -502,25 +573,31 @@ fn attacks_are_coded_with_short_windows_at_every_sample_rate() {
         for channels in [1, 2] {
             let context = format!("{sample_rate} Hz, {channels} channels");
             let len = 64 * 1024;
-            let input: Vec<Vec<f64>> = (0..channels)
-                .map(|c| castanets(sample_rate, len, 0, len / 6, c as u64))
-                .collect();
+            let (input, onsets): (Vec<Vec<f64>>, Vec<Vec<usize>>) = (0..channels)
+                .map(|c| castanets(sample_rate, len, 0, len / 6 + 300 * c, c as u64))
+                .unzip();
             let (_, max) = bitrate_range(sample_rate, channels);
             let bits_per_second = (2 * sample_rate * channels as u32).min(max);
             let encoded = encode(sample_rate, &input, bits_per_second);
-            let sequences = window_sequences(&encoded.stream);
+            let sequences = window_sequences(&encoded.stream, sample_rate);
             assert!(
                 transitions_are_meaningful(&sequences),
                 "{context}: {sequences:?}"
             );
-            // The first burst, at the first sample, makes the first frame
-            // short, with no frame before it.
-            assert_eq!(sequences[0], 2, "{context}: {sequences:?}");
-            // Each of the six bursts, and the quiet tone between them.
-            let short = sequences.iter().filter(|&&s| s == 2).count();
-            let long = sequences.iter().filter(|&&s| s == 0).count();
-            assert!(short >= 6, "{context}: {sequences:?}");
-            assert!(long > sequences.len() / 2, "{context}: {sequences:?}");
+            for (c, onsets) in onsets.iter().enumerate() {
+                // Each burst, the first at the first sample, which makes
+                // the first frame short with no frame before it.
+                assert_eq!(onsets[0], 0);
+                for &onset in onsets {
+                    assert!(
+                        short_at(&sequences, c, onset),
+                        "{context}, channel {c}, onset {onset}: {sequences:?}"
+                    );
+                }
+                // The quiet tone between them.
+                let long = sequences.iter().filter(|frame| frame[c] == 0).count();
+                assert!(long > sequences.len() / 2, "{context}: {sequences:?}");
+            }
             let output = decode(&encoded, channels, &context);
             for (c, input) in input.iter().enumerate() {
                 // The bursts line up only in place.
@@ -532,6 +609,55 @@ fn attacks_are_coded_with_short_windows_at_every_sample_rate() {
                     assert!(
                         off < at - 3.0,
                         "{context}, channel {c}: {off:.1} dB at {lag}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// One-sample impulses over a quiet tone, at many places in a frame, are
+/// coded with short windows in each channel, at sampling frequencies of
+/// every short band table, and come back at about their level.
+#[test]
+fn impulses_over_a_quiet_tone_are_coded_with_short_windows() {
+    for sample_rate in [8_000, 22_050, 44_100, 48_000, 64_000, 96_000] {
+        for channels in [1, 2] {
+            let context = format!("{sample_rate} Hz, {channels} channels");
+            let fs = f64::from(sample_rate);
+            let len = 32 * 1024;
+            // Impulses 3203 samples apart, each 131 later in its frame
+            // than the one before, from 3505; the second channel's 517
+            // later than the first's.
+            let onsets: Vec<Vec<usize>> = (0..channels)
+                .map(|c| (0..8).map(|k| 3505 + 517 * c + 3203 * k).collect())
+                .collect();
+            let input: Vec<Vec<f64>> = (onsets.iter())
+                .map(|onsets| {
+                    let mut input: Vec<f64> = (0..len)
+                        .map(|t| 0.002 * (TAU * 440.0 * t as f64 / fs).sin())
+                        .collect();
+                    for &onset in onsets {
+                        input[onset] += 0.3;
+                    }
+                    input
+                })
+                .collect();
+            let (_, max) = bitrate_range(sample_rate, channels);
+            let encoded = encode(sample_rate, &input, (48_000 * channels as u32).min(max));
+            let sequences = window_sequences(&encoded.stream, sample_rate);
+            assert!(transitions_are_meaningful(&sequences), "{context}");
+            let output = decode(&encoded, channels, &context);
+            for (c, onsets) in onsets.iter().enumerate() {
+                for &onset in onsets {
+                    assert!(
+                        short_at(&sequences, c, onset),
+                        "{context}, channel {c}, onset {onset}: {sequences:?}"
+                    );
+                    let y = f64::from(output[(onset + DELAY) * channels + c]);
+                    assert!(
+                        (y - 0.3).abs() < 0.1,
+                        "{context}, channel {c}, onset {onset}: {y}"
                     );
                 }
             }
@@ -557,22 +683,16 @@ fn short_windows_hold_back_the_noise_before_an_attack() {
         framing: chelys::aac::Framing::Adts,
     };
     let len = 3 * sample_rate as usize;
-    let input = castanets(sample_rate, len, 10_000, 20_000, 7);
-    let onsets: Vec<usize> = (0..len)
-        .filter(|&t| t > 0 && (input[t] - input[t - 1]).abs() > 0.05)
-        .fold(Vec::new(), |mut onsets, t| {
-            if onsets.last().is_none_or(|&last| t > last + 5000) {
-                onsets.push(t);
-            }
-            onsets
-        });
+    let (input, onsets) = castanets(sample_rate, len, 10_000, 20_000, 7);
     assert!(onsets.len() >= 5, "{onsets:?}");
     let pre_echo = |encoder: StreamEncoder| {
         let mut encoder = encoder;
         let mut stream = Vec::new();
         encoder.encode(&[&input], &mut stream);
         let end = encoder.finish(&mut stream);
-        let sequences = window_sequences(&stream);
+        let sequences: Vec<u8> = (window_sequences(&stream, sample_rate).iter())
+            .map(|frame| frame[0])
+            .collect();
         let decoded = ffmpeg::decode_aac(&stream);
         assert_eq!(decoded.diagnostics, "");
         assert_eq!(decoded.samples.len() as u64, end.frames * 1024);

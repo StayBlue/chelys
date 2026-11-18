@@ -24,5 +24,6 @@ pub mod sections;
 pub mod spectrum;
 mod tables;
 
-#[cfg(test)]
-mod decoder;
+/// For chelys's tests, and through `internals` for its conformance tests.
+#[cfg(any(test, feature = "unstable"))]
+pub mod decoder;

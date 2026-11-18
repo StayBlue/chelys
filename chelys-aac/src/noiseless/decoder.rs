@@ -34,7 +34,7 @@ impl<'a> BitReader<'a> {
     }
 
     /// Reads a codeword of `codewords` bit by bit, and returns its index.
-    pub fn decode(&mut self, codewords: &[Codeword]) -> usize {
+    fn decode(&mut self, codewords: &[Codeword]) -> usize {
         let (mut bits, mut len) = (0, 0);
         loop {
             bits = (bits << 1) | self.read(1);
@@ -175,14 +175,16 @@ pub fn spectral_data(
 
 /// A deterministic stream of pseudo-random numbers (xorshift), for tests to
 /// make spectra of.
+#[cfg(test)]
 pub struct Noise(u64);
 
+#[cfg(test)]
 impl Noise {
     pub fn new(seed: u64) -> Self {
         Self(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1)
     }
 
-    pub fn next(&mut self) -> u32 {
+    fn draw(&mut self) -> u32 {
         self.0 ^= self.0 << 13;
         self.0 ^= self.0 >> 7;
         self.0 ^= self.0 << 17;
@@ -191,7 +193,7 @@ impl Noise {
 
     /// A number in `0..n`.
     pub fn below(&mut self, n: u32) -> u32 {
-        self.next() % n
+        self.draw() % n
     }
 
     /// Lines for `offsets`, whose bands are each of zeros or reach a
