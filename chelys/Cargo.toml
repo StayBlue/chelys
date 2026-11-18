@@ -13,7 +13,7 @@ chelys-mp3 = { path = "../chelys-mp3", optional = true }
 
 [features]
 default = ["aac", "mp3"]
-# Codes audio without a psychoacoustic model for now.
+# Codes long blocks only, each channel apart, for now.
 aac = ["dep:chelys-aac"]
 mp3 = ["dep:chelys-mp3"]
 # Each codec's building blocks, for chelys's own conformance tests.

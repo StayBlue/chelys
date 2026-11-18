@@ -10,9 +10,10 @@
 //!
 //! The encoder is being built: for now it codes every frame with the long
 //! window of the sine shape, and fits each channel's lines to its share of
-//! the frame's bits with the inner iteration loop of Annex C alone, at one
-//! quantizer step for all of them. The psychoacoustic model, which shapes
-//! the quantization noise, block switching and stereo coding are to come.
+//! the frame's bits with the iteration loops of Annex C, which shape the
+//! quantization noise of each scalefactor band to what the psychoacoustic
+//! model of Annex C allows for long blocks. Block switching and stereo
+//! coding are to come.
 //!
 //! ```
 //! use chelys_aac::{Config, Encoder, Rate};
@@ -39,6 +40,7 @@ mod encoder;
 mod filterbank;
 mod loops;
 mod noiseless;
+mod psychoacoustic;
 mod raw_data_block;
 mod reservoir;
 mod sampling_frequency;
@@ -76,6 +78,7 @@ pub mod internals {
         filterbank,
         loops,
         noiseless,
+        psychoacoustic,
         raw_data_block,
         reservoir,
         sampling_frequency,

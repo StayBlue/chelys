@@ -143,7 +143,9 @@ fn align(input: &[f64], output: &[f32], channels: usize, channel: usize) -> (usi
 /// ffmpeg gives the input back [`DELAY`] samples late, at a bit a sample
 /// closely enough to line up: the first frame decodes to the silence
 /// before the input, and each frame after it to the block before its own,
-/// at the level the encoder takes its input at.
+/// at the level the encoder takes its input at. The psychoacoustic model
+/// shapes the noise to what it finds masked rather than to the least, so
+/// at 8 kHz, where a bit a sample is fewest, the SNR is about 11 dB.
 ///
 /// This is the evidence for the gap in the standard that [`DELAY`] marks
 /// as settled by decoding with ffmpeg: where the input lands in the
@@ -166,7 +168,7 @@ fn ffmpeg_decodes_the_input_a_frame_late_at_every_sample_rate() {
             for (c, input) in input.iter().enumerate() {
                 let (lag, snr) = align(input, &output, channels, c);
                 assert_eq!(lag, DELAY, "{context}, channel {c}: {snr:.1} dB");
-                assert!(snr > 12.0, "{context}, channel {c}: {snr:.1} dB");
+                assert!(snr > 9.0, "{context}, channel {c}: {snr:.1} dB");
             }
         }
     }
@@ -174,14 +176,17 @@ fn ffmpeg_decodes_the_input_a_frame_late_at_every_sample_rate() {
 
 /// The SNR rises with the bitrate, for signals whose spectra differ:
 /// tones, a sweep over the whole band, and white noise, which no
-/// quantizer codes well at these rates.
+/// quantizer codes well at these rates. The psychoacoustic model allows
+/// the first sweep, which rises to 20 kHz, more noise at its top, where the
+/// thresholds in quiet are high, than an SNR would: at 64 kbit/s, its SNR
+/// is about 34 dB.
 #[test]
 fn snr_rises_with_the_bitrate() {
     let sample_rate = 44_100;
     let len = 3 * sample_rate as usize;
     let signals = [
         ("tones", [(64_000, 33.0), (128_000, 43.0), (256_000, 52.0)]),
-        ("sweep", [(64_000, 40.0), (128_000, 50.0), (256_000, 57.0)]),
+        ("sweep", [(64_000, 31.0), (128_000, 50.0), (256_000, 57.0)]),
         ("noise", [(64_000, 0.5), (128_000, 3.5), (256_000, 11.0)]),
     ];
     for (name, thresholds) in signals {

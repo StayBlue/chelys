@@ -10,13 +10,17 @@ use super::DELAY;
 use super::adts::HEADER_LEN;
 use super::audio_specific_config::audio_specific_config;
 use super::channel::CodedChannel;
+use super::channel::FRAME_LINES;
 use super::channel_configuration::ChannelConfiguration;
 use super::config::Framing;
 use super::filterbank::Filterbank;
 use super::loops;
+use super::psychoacoustic::Model;
 use super::raw_data_block;
+use super::raw_data_block::element::COMMON_WINDOW;
 use super::reservoir::BitReservoir;
 use super::sampling_frequency::SamplingFrequency;
+use super::scalefactor_bands::MAX_BANDS;
 use super::window::Windows;
 
 /// The samples of each channel a frame codes (clause 8.2.1.1).
@@ -127,6 +131,11 @@ pub struct StreamEncoder {
     pcm: Vec<Vec<f64>>,
     /// One for each channel.
     filterbanks: Vec<Filterbank>,
+    /// One for each channel.
+    models: Vec<Model>,
+    /// Each channel of the frame being coded, as analyzed, kept from one
+    /// frame to the next for its memory.
+    analyzed: Vec<AnalyzedChannel>,
     /// The samples each channel was given.
     samples: u64,
     frames: u64,
@@ -153,6 +162,12 @@ impl StreamEncoder {
             reservoir,
             pcm: vec![Vec::with_capacity(FRAME_SAMPLES); config.channel_configuration.channels()],
             filterbanks: vec![Filterbank::new(); config.channel_configuration.channels()],
+            models: (0..config.channel_configuration.channels())
+                .map(|_| Model::new(config.sampling_frequency))
+                .collect(),
+            analyzed: (0..config.channel_configuration.channels())
+                .map(|_| AnalyzedChannel::new())
+                .collect(),
             samples: 0,
             frames: 0,
         }
@@ -215,29 +230,80 @@ impl StreamEncoder {
     }
 
     /// Codes the frame whose block starts at `start` in [`Self::pcm`], and
-    /// gives it to `out`: each channel through its filterbank, and its
-    /// lines through the iteration loops, in the bits the reservoir makes
-    /// available.
+    /// gives it to `out`, in three steps: analyzes each channel, through
+    /// its filterbank and its psychoacoustic model; has the bit reservoir
+    /// make bits available to the frame; and quantizes each channel's lines
+    /// through the iteration loops in its share of them.
+    ///
+    /// The channels are quantized in order, each in its share and the bits
+    /// those before it left: a channel's loops take the finest step that
+    /// fits its bits, which can leave a few unused (figure C.6).
     fn encode_frame<O: FrameSink + ?Sized>(&mut self, start: usize, out: &mut O) {
-        let windows = Windows::LONG_SINE;
-        let available_bits = frame::bits_per_channel(&self.config, &self.reservoir);
-        let channels: Vec<CodedChannel> = (self.pcm.iter())
+        let analyzers = (self.pcm.iter())
             .zip(&mut self.filterbanks)
-            .map(|(pcm, filterbank)| {
-                let block = pcm[start..start + FRAME_SAMPLES]
-                    .try_into()
-                    .expect("a block of samples");
-                let spectrum = filterbank.spectrum(block, windows);
-                loops::quantize_channel(
-                    &spectrum,
-                    windows,
+            .zip(&mut self.models);
+        for (((pcm, filterbank), model), analyzed) in analyzers.zip(&mut self.analyzed) {
+            let block = pcm[start..start + FRAME_SAMPLES]
+                .try_into()
+                .expect("a block of samples");
+            analyzed.analyze(block, filterbank, model);
+        }
+
+        let share = frame::bits_per_channel(&self.config, &self.reservoir);
+
+        let mut left = 0;
+        let channels: Vec<CodedChannel> = (self.analyzed.iter())
+            .map(|analyzed| {
+                let available_bits = share + left;
+                let channel = loops::quantize_channel(
+                    &analyzed.spectrum,
+                    analyzed.windows,
                     self.config.sampling_frequency,
                     available_bits,
-                )
+                    &analyzed.xmin,
+                );
+                left = available_bits - channel.bits(COMMON_WINDOW);
+                channel
             })
             .collect();
         frame::write(&self.config, &mut self.reservoir, &channels, out);
         self.frames += 1;
+    }
+}
+
+/// A channel of a frame as the filterbank and the psychoacoustic model
+/// analyzed it: what its loops quantize, and what it asks of the frame.
+#[derive(Debug)]
+struct AnalyzedChannel {
+    windows: Windows,
+    /// The lines of the frame's transform, in the order they are sent.
+    spectrum: Box<[f64; FRAME_LINES]>,
+    /// The allowed distortion `xmin` of each band of each window group.
+    xmin: Vec<[f64; MAX_BANDS]>,
+}
+
+impl AnalyzedChannel {
+    fn new() -> Self {
+        Self {
+            windows: Windows::LONG_SINE,
+            spectrum: Box::new([0.0; FRAME_LINES]),
+            xmin: Vec::with_capacity(1),
+        }
+    }
+
+    /// Analyzes the channel's next block of samples at full scale 1.0,
+    /// with its filterbank and model.
+    fn analyze(
+        &mut self,
+        block: &[f64; FRAME_SAMPLES],
+        filterbank: &mut Filterbank,
+        model: &mut Model,
+    ) {
+        self.windows = Windows::LONG_SINE;
+        *self.spectrum = filterbank.spectrum(block, self.windows);
+        let threshold = model.analyze(block);
+        self.xmin.clear();
+        self.xmin.push(threshold.xmin(&self.spectrum));
     }
 }
 

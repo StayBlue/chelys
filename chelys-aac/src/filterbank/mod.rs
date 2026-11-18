@@ -34,7 +34,7 @@ const LONG_WINDOW: usize = 2 * FRAME_SAMPLES;
 /// to it. Settled by decoding with ffmpeg (black box): it decodes a tone
 /// at its level, within 0.1 dB, at full scale 1.0; the conformance test is
 /// `a_tone_keeps_its_frequency_and_level_at_a_low_bitrate`.
-const PCM_SCALE: f64 = 32_768.0;
+pub const PCM_SCALE: f64 = 32_768.0;
 
 /// The sine window of clause 15.3.2 of `N` samples:
 /// `W_SIN(n) = sin(pi / N (n + 1/2))`, its left half for `0 <= n < N/2`

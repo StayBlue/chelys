@@ -17,8 +17,8 @@ use crate::reservoir::BitReservoir;
 ///
 /// Spec gap: `more_bits`, the bits a frame needs beyond the mean, comes
 /// from the perceptual entropy that the psychoacoustic model computes
-/// (clause C.1.4, step 15), which the encoder does not compute yet. Until
-/// it does, every frame asks for none, and is given the mean.
+/// (clause C.1.4, step 15), which the encoder does not use yet. Until it
+/// does, every frame asks for none, and is given the mean.
 const MORE_BITS: i64 = 0;
 
 /// The bits that each channel's `individual_channel_stream()` may take in
@@ -28,7 +28,8 @@ const MORE_BITS: i64 = 0;
 /// Spec gap: Annex C does not say how the bits of a frame are shared
 /// between its channels, whose loops each fit one channel's lines to the
 /// bits they are given (clause C.7.1). Each channel is given an equal
-/// share, whatever its lines.
+/// share; the loops of the channels after the first may take what those
+/// before them leave (see [`StreamEncoder`](super::StreamEncoder)).
 pub fn bits_per_channel(config: &StreamConfig, reservoir: &BitReservoir) -> u32 {
     let available = reservoir.available_bits(MORE_BITS);
     let overhead = 8 * config.header_len() as u32

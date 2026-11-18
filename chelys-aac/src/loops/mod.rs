@@ -2,25 +2,52 @@
 // SPDX-License-Identifier: MIT
 
 //! The AAC iteration loops (clause C.7): the inner loop, which fits a
-//! channel's lines to the bits available, and, to come, the outer loop
-//! around it, which shapes the quantization noise with scalefactors.
+//! channel's lines to the bits available, and the outer loop around it,
+//! which shapes the quantization noise with scalefactors.
 
-mod inner;
+pub mod inner;
+pub mod outer;
 
-use inner::inner_loop;
+use inner::{Counting, Lines};
 
 use crate::channel::{CodedChannel, FRAME_LINES};
 use crate::sampling_frequency::SamplingFrequency;
+use crate::scalefactor_bands::MAX_BANDS;
 use crate::window::Windows;
 
-/// The iteration loop of one channel (figure C.6): a channel whose lines
-/// are all zero is coded as such; any other is quantized to fit in
-/// `available_bits`, the bits of its `individual_channel_stream()`.
+/// The most window groups of a channel: the eight short windows of an
+/// EIGHT_SHORT_SEQUENCE, each a group of its own.
+const MAX_GROUPS: usize = 8;
+
+/// The offset in dB that every allowed distortion `xmin` is raised by
+/// before the loops (clause C.7.4.4).
 ///
-/// The outer loop (clause C.7.4.1) is not run yet: it takes the allowed
-/// distortion of each band, `xmin`, from the psychoacoustic model (clause
-/// C.1), which the encoder does not compute yet. The inner loop runs alone,
-/// with every scalefactor 0, as clause C.7.2.1 resets them.
+/// Spec gap: clause C.7.4.4 says the outer loop's procedure "is only valid
+/// in the case the number of available bits is equal to the number of
+/// required bits corresponding to the perceptual entropy", and that
+/// otherwise a constant noise to mask ratio over the bands "can be
+/// realised by applying an offset to the target allowed distortion
+/// xmin(sb), that is the same for all scale factor bands, prior to
+/// starting the loops module", without saying how large. The perceptual
+/// entropy cannot size it here: as printed, it is negative in most frames
+/// of music, whose partitions above about 16 kHz lie below the thresholds
+/// in quiet (see [`Model::analyze`](crate::psychoacoustic::Model::analyze)).
+/// Without an offset, a quarter of the frames of pop music at 128 kbit/s
+/// in stereo ended with every band amplified after some 30 iterations,
+/// with a step some 40 dB coarser than the first and most bands over their
+/// allowance. A fixed offset is taken. Graded with PEAQ (GstPEAQ 0.6.1,
+/// black box), on 8 tracks of pop music at 44.1 kHz in stereo at
+/// 128 kbit/s, offsets of 0, 3, 6 and 9 dB gave means of -2.55, -2.24,
+/// -2.20 and -2.22; at 192 kbit/s, 0, 6 and 12 dB were within 0.015 of each
+/// other, and at 64 kbit/s within 0.005.
+pub const XMIN_OFFSET_DB: f64 = 6.0;
+
+/// The iteration loop of one channel (figure C.6): a channel whose lines
+/// are all zero is coded as such; any other is quantized by the outer loop
+/// to fit in `available_bits`, the bits of its
+/// `individual_channel_stream()`, with the noise of each scalefactor band
+/// of each window group shaped to its allowed distortion `xmin`, raised by
+/// [`XMIN_OFFSET_DB`] (see [`outer::outer_loop`]).
 ///
 /// The bits the channel leaves unused (figure C.6) are not counted here:
 /// the frame's length, spent from the bit reservoir, leaves them there.
@@ -34,9 +61,21 @@ pub fn quantize_channel(
     windows: Windows,
     sampling_frequency: SamplingFrequency,
     available_bits: u32,
+    xmin: &[[f64; MAX_BANDS]],
 ) -> CodedChannel {
     if spectrum.iter().all(|&x| x == 0.0) {
         return CodedChannel::silent(windows, sampling_frequency);
     }
-    inner_loop(spectrum, windows, sampling_frequency, available_bits)
+    let counting = Counting::new(
+        Lines::new(spectrum),
+        windows,
+        sampling_frequency,
+        available_bits,
+    );
+    let offset = 10f64.powf(XMIN_OFFSET_DB / 10.0);
+    let mut target = [[0.0; MAX_BANDS]; MAX_GROUPS];
+    for (target, xmin) in target.iter_mut().zip(xmin) {
+        *target = xmin.map(|xmin| xmin * offset);
+    }
+    outer::outer_loop(counting, &target[..xmin.len()])
 }
