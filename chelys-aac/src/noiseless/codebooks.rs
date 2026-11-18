@@ -24,9 +24,10 @@ pub const MAX_MAGNITUDE: u32 = 8191;
 pub(super) const ESC_FLAG: u32 = 16;
 
 /// A section's codebook, `sect_cb` (Table 17): `ZERO_HCB`, for a section
-/// whose lines are all zero and send nothing, or one of the spectrum
-/// Huffman codebooks 1 to `ESC_HCB` (Table 59). The intensity codebooks,
-/// which code no spectrum, are not among them.
+/// whose lines are all zero and send nothing; one of the spectrum Huffman
+/// codebooks 1 to `ESC_HCB` (Table 59); or, in the right channel of a pair
+/// that shares its window, one of the intensity codebooks, which code no
+/// spectrum but the band's intensity stereo position (clause 12.2.3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Codebook(u8);
 
@@ -35,6 +36,10 @@ impl Codebook {
     pub const ZERO: Self = Self(0);
     /// `ESC_HCB`.
     pub const ESC: Self = Self(11);
+    /// `INTENSITY_HCB2`: intensity stereo out of phase.
+    pub const INTENSITY_OUT_OF_PHASE: Self = Self(14);
+    /// `INTENSITY_HCB`: intensity stereo in phase.
+    pub const INTENSITY: Self = Self(15);
 
     /// The codebook numbered `number`, if it is `ZERO_HCB` or a spectrum
     /// codebook.
@@ -49,9 +54,15 @@ impl Codebook {
     }
 
     /// Whether the bands of a section with this codebook send a scalefactor
-    /// (Table 18): all but those of `ZERO_HCB`.
+    /// (Table 18): those of a spectrum codebook.
     pub fn sends_scalefactor(self) -> bool {
-        self != Self::ZERO
+        self != Self::ZERO && !self.is_intensity()
+    }
+
+    /// Whether this is an intensity codebook, whose bands send an intensity
+    /// stereo position in place of a scalefactor (Table 18).
+    pub fn is_intensity(self) -> bool {
+        self == Self::INTENSITY || self == Self::INTENSITY_OUT_OF_PHASE
     }
 
     /// The largest magnitude of a line the codebook codes: zero for
@@ -61,11 +72,12 @@ impl Codebook {
             .map_or(0, SpectrumCodebook::largest_magnitude)
     }
 
-    /// The spectrum Huffman codebook, or `None` for `ZERO_HCB`.
+    /// The spectrum Huffman codebook, or `None` for `ZERO_HCB` and the
+    /// intensity codebooks.
     pub(super) fn spectrum(self) -> Option<&'static SpectrumCodebook> {
         usize::from(self.0)
             .checked_sub(1)
-            .map(|book| &SPECTRUM_CODEBOOKS[book])
+            .and_then(|book| SPECTRUM_CODEBOOKS.get(book))
     }
 }
 

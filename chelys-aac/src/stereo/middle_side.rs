@@ -12,6 +12,7 @@ use crate::channel::FRAME_LINES;
 use crate::loops::inner;
 use crate::sampling_frequency::SamplingFrequency;
 use crate::scalefactor_bands::MAX_BANDS;
+use crate::stereo::intensity::Intensity;
 use crate::window::{SHORT_WINDOWS, Windows};
 
 /// The middle and side channels of a pair's lines, `M = (L + R) / 2` and
@@ -52,11 +53,22 @@ pub fn matrix(
 /// Such bands take the coding of all the others where they agree, so that
 /// no flag need be sent for each band (see [`MsMask::present`]), and else
 /// left and right.
+///
+/// The bands `intensity` codes in intensity stereo are coded neither way
+/// (clause 12.1.3), and their flags are 0, which leaves each band's phase
+/// as its codebook gives it (clause 12.2.3).
+///
+/// Spec reading: with `ms_mask_present` 2, `invert_intensity` is +1 for
+/// every band (clause 12.2.3), so that a frame whose other bands are all
+/// coded as middle and side could send 2 and no flags. Where a frame has
+/// bands in intensity stereo, it sends 1 and their flags of 0 instead,
+/// which no reading of `ms_used` can take as inverting them.
 pub fn choose(
     windows: Windows,
     sampling_frequency: SamplingFrequency,
     lines: [&[f64; FRAME_LINES]; 4],
     allowed: [&[[f64; MAX_BANDS]]; 4],
+    intensity: &Intensity,
 ) -> MsMask {
     let mut mask = MsMask::NONE;
     let mut ties = MsMask::NONE;
@@ -65,6 +77,9 @@ pub fn choose(
     let mut start = 0;
     for (g, bands) in windows.groups(sampling_frequency).enumerate() {
         for sfb in 0..bands.num_swb() {
+            if intensity.bands[g].codebook(sfb).is_some() {
+                continue;
+            }
             let range = start + bands.offset(sfb)..start + bands.offset(sfb + 1);
             let [l, r, m, s] = std::array::from_fn(|c| {
                 inner::band_bits(&lines[c][range.clone()], allowed[c][g][sfb], &mut scratch)

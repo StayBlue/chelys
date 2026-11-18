@@ -34,12 +34,22 @@ const FIXED_BITS: u32 = 8 + 3;
 const SILENT_GLOBAL_GAIN: u8 = 0;
 
 /// A window group as a channel codes it: its sections, and the scalefactor
-/// of each of its bands below `max_sfb`, of which those of bands that send
-/// none are not used (see [`scalefactors`]).
+/// and intensity stereo position of each of its bands below `max_sfb`, of
+/// which those of bands that send none are not used (see
+/// [`scalefactors`]); a group without bands in intensity stereo may have
+/// no positions.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CodedGroup {
     pub sections: Sections,
     pub scalefactors: Vec<u8>,
+    pub positions: Vec<i8>,
+}
+
+impl CodedGroup {
+    /// What `scale_factor_data()` sends of the group.
+    pub fn scalefactor_data(&self) -> scalefactors::Group<'_> {
+        (&self.sections, &self.scalefactors, &self.positions)
+    }
 }
 
 /// One channel of one frame, quantized and ready for writing: everything
@@ -87,12 +97,8 @@ impl CodedChannel {
                 .all(|group| group.sections.max_sfb() == max_sfb),
             "one max_sfb for every group"
         );
-        let scalefactor_bits = scalefactors::bits(
-            global_gain,
-            groups
-                .iter()
-                .map(|group| (&group.sections, group.scalefactors.as_slice())),
-        )?;
+        let scalefactor_bits =
+            scalefactors::bits(global_gain, groups.iter().map(CodedGroup::scalefactor_data))?;
         Some(Self {
             windows,
             global_gain,
@@ -114,6 +120,7 @@ impl CodedChannel {
                 sections: Sections::choose(&lines[..bands.lines()], bands, 0)
                     .expect("zeros are codable"),
                 scalefactors: Vec::new(),
+                positions: Vec::new(),
             })
             .collect();
         Self::new(
@@ -255,9 +262,9 @@ mod tests {
         let group = CodedGroup {
             sections,
             scalefactors: vec![120, 118, 121],
+            positions: Vec::new(),
         };
-        let sf_bits =
-            scalefactors::bits(120, [(&group.sections, group.scalefactors.as_slice())]).unwrap();
+        let sf_bits = scalefactors::bits(120, [group.scalefactor_data()]).unwrap();
         let channel = CodedChannel::new(Windows::LONG_SINE, fs, 120, lines, vec![group]).unwrap();
         assert_eq!(channel.max_sfb(), 3);
         assert_eq!(
@@ -276,6 +283,7 @@ mod tests {
         let group = CodedGroup {
             sections,
             scalefactors: vec![200],
+            positions: Vec::new(),
         };
         assert_eq!(
             CodedChannel::new(Windows::LONG_SINE, fs, 100, lines, vec![group]),

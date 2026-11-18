@@ -10,7 +10,7 @@ use std::ops::Range;
 use crate::channel::{self, CodedChannel, CodedGroup, FRAME_LINES};
 use crate::noiseless::codebooks::MAX_MAGNITUDE;
 use crate::noiseless::scalefactors;
-use crate::noiseless::sections::{self, Sections};
+use crate::noiseless::sections::{self, IntensityBands, Sections};
 use crate::noiseless::spectrum;
 use crate::scalefactor_bands::{GroupBands, MAX_BANDS};
 
@@ -244,7 +244,7 @@ impl Default for BandScratch {
 /// scalefactors of the outer loop that it was counted with.
 pub struct Counting<'a> {
     lines: Lines<'a>,
-    coding: ChannelCoding,
+    coding: ChannelCoding<'a>,
     /// `scalefactor(sb)` of the outer loop (clause C.7.4.1) of each band of
     /// each window group: how many steps of the quantizer each is
     /// amplified by. All 0 to start with (clause C.7.2.1).
@@ -270,7 +270,7 @@ pub struct Counting<'a> {
 impl<'a> Counting<'a> {
     /// The coding of `lines` as `coding` asks, with every scalefactor 0,
     /// not yet counted.
-    pub fn new(lines: Lines<'a>, coding: ChannelCoding) -> Self {
+    pub fn new(lines: Lines<'a>, coding: ChannelCoding<'a>) -> Self {
         let groups = coding.windows.groups(coding.sampling_frequency).count();
         Self {
             lines,
@@ -359,21 +359,31 @@ impl<'a> Counting<'a> {
             least_max_sfb,
             ..
         } = self.coding;
+        let intensity = self.coding.intensity;
+        let intensity_end = intensity.map_or(0, |intensity| {
+            (intensity.bands.iter())
+                .map(|bands| bands.end())
+                .max()
+                .unwrap_or(0)
+        });
         let max_sfb = self
             .group_lines()
             .map(|(bands, lines)| sections::max_sfb(lines, bands))
             .max()
             .unwrap_or(0)
-            .max(least_max_sfb);
+            .max(least_max_sfb)
+            .max(intensity_end);
         let element_bits = self.coding.element_bits[max_sfb];
         let mut least_bits = channel::bits(windows, common_window, 0) + element_bits;
         self.sections.clear();
         self.counted.clear();
         let mut start = 0;
-        for bands in groups {
+        for (g, bands) in groups.enumerate() {
             let lines = &self.x_quant[start..start + bands.lines()];
             start += bands.lines();
-            let Some(group) = Sections::count(lines, bands, max_sfb) else {
+            let intensity = intensity.map_or(IntensityBands::NONE, |i| i.bands[g]);
+            let Some(group) = Sections::count_with_intensity(lines, bands, max_sfb, intensity)
+            else {
                 return false;
             };
             least_bits += group.least_bits();
@@ -394,10 +404,11 @@ impl<'a> Counting<'a> {
             }
             self.sf_decoder[g] = sf_decoder;
         }
-        let Some(scalefactor_bits) = scalefactors::bits(
-            self.global_gain(common_gain),
-            (self.sections.iter()).zip(self.sf_decoder.iter().map(Vec::as_slice)),
-        ) else {
+        let positions = |g: usize| intensity.map_or(&[][..], |i| &i.positions[g][..]);
+        let groups = (self.sections.iter().zip(&self.sf_decoder).enumerate())
+            .map(|(g, (sections, sf_decoder))| (sections, sf_decoder.as_slice(), positions(g)));
+        let Some(scalefactor_bits) = scalefactors::bits(self.global_gain(common_gain), groups)
+        else {
             return false;
         };
         let noiseless: u32 = (self.sections.iter())
@@ -444,7 +455,11 @@ impl<'a> Counting<'a> {
         let global_gain = self.global_gain(common_gain);
         let groups = (self.sections.into_iter())
             .zip(self.sf_decoder)
-            .map(|(sections, scalefactors)| CodedGroup {
+            .enumerate()
+            .map(|(g, (sections, scalefactors))| CodedGroup {
+                positions: (self.coding.intensity).map_or(Vec::new(), |i| {
+                    i.positions[g][..sections.max_sfb()].to_vec()
+                }),
                 sections,
                 scalefactors,
             })

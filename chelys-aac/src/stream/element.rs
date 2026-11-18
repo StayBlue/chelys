@@ -6,14 +6,16 @@
 
 use super::FRAME_SAMPLES;
 use super::frame::Demand;
-use crate::channel::{self, CodedChannel, FRAME_LINES};
+use crate::channel::{self, CodedChannel, CodedGroup, FRAME_LINES};
 use crate::filterbank::Filterbank;
 use crate::loops::{self, ChannelCoding};
+use crate::noiseless::sections::Sections;
 use crate::psychoacoustic::middle_side::MidSideModel;
 use crate::psychoacoustic::switching::{self, Attacks, BlockSwitching};
 use crate::raw_data_block::element::CodedElement;
 use crate::sampling_frequency::SamplingFrequency;
-use crate::scalefactor_bands::MAX_BANDS;
+use crate::scalefactor_bands::{MAX_BANDS, Transform};
+use crate::stereo::intensity::{self, Intensity};
 use crate::stereo::middle_side::{self, MsMask};
 use crate::window::{SHORT_WINDOWS, WindowSequence, Windows};
 
@@ -100,6 +102,12 @@ pub struct ElementEncoder {
     /// The bands of the frame being coded that a pair that shares its
     /// window codes as middle and side.
     ms: MsMask,
+    /// The lower border frequency above which a pair that shares its window
+    /// is coded in intensity stereo, if it is (see [`intensity::code`]).
+    intensity_border: Option<f64>,
+    /// The bands of the frame being coded that a pair that shares its
+    /// window codes in intensity stereo.
+    intensity: Intensity,
 }
 
 /// What a pair keeps of its middle and side channels.
@@ -110,7 +118,13 @@ struct MidSide {
 }
 
 impl ElementEncoder {
-    pub fn new(sampling_frequency: SamplingFrequency, channels: usize) -> Self {
+    /// The element of `channels` channels at `sampling_frequency`, a pair
+    /// coded in intensity stereo above `intensity_border` Hz, if given.
+    pub fn new(
+        sampling_frequency: SamplingFrequency,
+        channels: usize,
+        intensity_border: Option<f64>,
+    ) -> Self {
         Self {
             sampling_frequency,
             channels: (0..channels)
@@ -125,6 +139,8 @@ impl ElementEncoder {
                 })
             }),
             ms: MsMask::NONE,
+            intensity_border,
+            intensity: Intensity::NONE,
         }
     }
 
@@ -228,6 +244,13 @@ impl ElementEncoder {
     /// alike from the same state, are the same, and where they are short,
     /// their grouping is chosen from both (see [`switching::grouping`]).
     pub fn prepare(&mut self, start: usize, afford_short: bool) {
+        self.transform(start, afford_short);
+        self.code_jointly();
+    }
+
+    /// The first part of [`prepare`](Self::prepare): each channel's
+    /// windows, lines and allowances, and whether a pair shares its window.
+    fn transform(&mut self, start: usize, afford_short: bool) {
         let mut sequences = [WindowSequence::OnlyLong; 2];
         let sequences = &mut sequences[..self.channels.len()];
         for (channel, sequence) in self.channels.iter_mut().zip(sequences.iter_mut()) {
@@ -272,10 +295,51 @@ impl ElementEncoder {
             [left, right] => left.windows == right.windows,
             _ => false,
         };
+    }
+
+    /// The rest of [`prepare`](Self::prepare): a pair that shares its
+    /// window coded in intensity stereo and as middle and side.
+    fn code_jointly(&mut self) {
         self.ms = MsMask::NONE;
+        self.intensity = Intensity::NONE;
         if self.common_window {
+            let short = self.prepared[0].windows.sequence.transform() == Transform::Short;
+            if let (Some(border), false) = (self.intensity_border, short) {
+                self.code_intensity(border);
+            }
             self.code_middle_side();
         }
+    }
+
+    /// Codes the frame's pair, which shares its window, in intensity stereo
+    /// from the first band above `border` Hz up (see [`intensity::code`]).
+    ///
+    /// Spec reading: this deliberately departs from clause C.6.2, which
+    /// codes every window group in intensity stereo, for frames of eight
+    /// short windows, which are not: they are chosen for attacks, whose
+    /// timing intensity stereo would give up in the right channel, moving
+    /// the right channel's attack into the left channel's intensity signal
+    /// and the left's into the right. Coded so, a one-sample impulse in one
+    /// channel of a pair at 64 kHz and 96 kbit/s decoded at about half its
+    /// level.
+    fn code_intensity(&mut self, border: f64) {
+        let fs = self.sampling_frequency;
+        let [left, right] = &mut self.prepared[..] else {
+            unreachable!("a pair")
+        };
+        let windows = left.windows;
+        let first = intensity::first_band_above(fs, windows.sequence.transform(), border);
+        self.intensity = intensity::code(
+            windows,
+            fs,
+            first,
+            [&mut left.spectrum, &mut right.spectrum],
+            [&mut left.xmin, &mut right.xmin],
+        );
+        left.silent = left.spectrum.iter().all(|&x| x == 0.0);
+        // A right channel with bands in intensity stereo sends them, even
+        // where its lines are all zero.
+        right.silent = false;
     }
 
     /// Chooses the bands of the frame's pair, which shares its window, to
@@ -333,12 +397,14 @@ impl ElementEncoder {
             fs,
             [&*left, &*right, &*mid, &*side].map(|c| &*c.spectrum),
             allowed.each_ref().map(|allowed| &allowed[..groups]),
+            &self.intensity,
         );
         let mut start = 0;
         let mut lines_mid_side = 0;
         for (g, bands) in windows.groups(fs).enumerate() {
             for sfb in 0..bands.num_swb() {
-                if self.ms.is_used(g, sfb) {
+                let intensity = self.intensity.bands[g].codebook(sfb).is_some();
+                if self.ms.is_used(g, sfb) && !intensity {
                     let range = start + bands.offset(sfb)..start + bands.offset(sfb + 1);
                     lines_mid_side += range.len();
                     left.spectrum[range.clone()].copy_from_slice(&mid.spectrum[range.clone()]);
@@ -349,9 +415,11 @@ impl ElementEncoder {
             }
             start += bands.lines();
         }
-        for channel in [&mut *left, &mut *right] {
-            channel.silent = channel.spectrum.iter().all(|&x| x == 0.0);
-        }
+        left.silent = left.spectrum.iter().all(|&x| x == 0.0);
+        // A right channel with bands in intensity stereo sends them, even
+        // where its lines are all zero.
+        let intensity = self.intensity.bands.iter().any(|bands| bands.end() > 0);
+        right.silent = !intensity && right.spectrum.iter().all(|&x| x == 0.0);
         if 2 * lines_mid_side >= FRAME_LINES {
             for (coded, mid_side) in [left, right].into_iter().zip([&*mid, &*side]) {
                 coded.bit_allocation = mid_side.bit_allocation;
@@ -436,7 +504,13 @@ impl ElementEncoder {
             if c.silent { self.silent_bits(c) } else { share }
         };
         let mut order: Vec<usize> = (0..self.prepared.len()).collect();
+        // A pair in intensity stereo codes its left channel first, which the
+        // right channel's bands in intensity stereo scale.
+        let in_intensity = self.intensity.bands.iter().any(|bands| bands.end() > 0);
         order.sort_by(|&a, &b| {
+            if in_intensity {
+                return a.cmp(&b);
+            }
             let key = |c: usize| {
                 (
                     !self.prepared[c].silent,
@@ -462,7 +536,7 @@ impl ElementEncoder {
                     common_window: true,
                     ..ChannelCoding::single(windows, fs, budget(a))
                 };
-                let (mut a_channel, b_coding) = loop {
+                let (mut a_channel, intensity, b_coding) = loop {
                     let a_channel = self.code(a, coding);
                     let left = coding.available_bits - a_channel.bits(true);
                     let least_max_sfb = a_channel.max_sfb();
@@ -475,16 +549,21 @@ impl ElementEncoder {
                         b_coding.element_bits[m] =
                             a_channel.extension_bits(m) + ms.flag_bits(groups, m);
                     }
-                    let silent = CodedChannel::silent(windows, fs);
-                    let b_least = silent.bits(true)
-                        + silent.extension_bits(least_max_sfb)
+                    // The bands in intensity stereo that the left channel
+                    // sends.
+                    let intensity = self.intensity.below(least_max_sfb);
+                    let b_least = least_channel(windows, fs, least_max_sfb, &intensity).bits(true)
                         + b_coding.element_bits[least_max_sfb];
                     let floor = self.silent_bits(a);
                     if b_least <= b_coding.available_bits || coding.available_bits <= floor {
-                        break (a_channel, b_coding);
+                        break (a_channel, intensity, b_coding);
                     }
                     let short = b_least - b_coding.available_bits;
                     coding.available_bits = coding.available_bits.saturating_sub(short).max(floor);
+                };
+                let b_coding = ChannelCoding {
+                    intensity: in_intensity.then_some(&intensity),
+                    ..b_coding
                 };
                 let mut b_channel = self.code(b, b_coding);
                 let max_sfb = a_channel.max_sfb().max(b_channel.max_sfb());
@@ -517,13 +596,44 @@ impl ElementEncoder {
 
     /// Codes `prepared` as `coding` asks: without lines where it is
     /// silent, or through the iteration loops.
-    fn code(&self, prepared: &PreparedChannel, coding: ChannelCoding) -> CodedChannel {
+    fn code(&self, prepared: &PreparedChannel, coding: ChannelCoding<'_>) -> CodedChannel {
         if prepared.silent {
             CodedChannel::silent(prepared.windows, self.sampling_frequency)
         } else {
             loops::quantize_channel(&prepared.spectrum, &prepared.xmin, coding)
         }
     }
+}
+
+/// The fewest bits a channel of `windows` can be coded in, as the second of
+/// a pair that shares its window: without lines, its groups spanning
+/// `max_sfb` bands, with the bands of `intensity`, all below it.
+fn least_channel(
+    windows: Windows,
+    sampling_frequency: SamplingFrequency,
+    max_sfb: usize,
+    intensity: &Intensity,
+) -> CodedChannel {
+    let lines = [0; FRAME_LINES];
+    let groups = (windows.groups(sampling_frequency).enumerate())
+        .map(|(g, bands)| {
+            let sections = Sections::count_with_intensity(
+                &lines[..bands.lines()],
+                bands,
+                max_sfb,
+                intensity.bands[g],
+            )
+            .expect("zeros are codable")
+            .choose();
+            CodedGroup {
+                sections,
+                scalefactors: vec![0; max_sfb],
+                positions: intensity.positions[g][..max_sfb].to_vec(),
+            }
+        })
+        .collect();
+    CodedChannel::new(windows, sampling_frequency, 0, lines, groups)
+        .expect("positions within the codebook's reach")
 }
 
 /// Whether the channels of a pair share their attacks, so that a frame
@@ -550,16 +660,33 @@ mod tests {
 
     use super::*;
     use crate::noiseless::decoder::{BitReader, Element, element};
+    use crate::scalefactor_bands::{GroupBands, Transform};
 
-    /// Codes `frames` frames of `input`, one slice of samples for each
-    /// channel, at `bits` for each frame's element, and gives each frame's
-    /// element as decoded with the spectra the encoder quantized.
+    /// `INTENSITY_HCB` and `INTENSITY_HCB2`.
+    const INTENSITY_HCB: u8 = 15;
+    const INTENSITY_HCB2: u8 = 14;
+
+    /// Codes the frames of `input`, one slice of samples for each channel,
+    /// at `bits` for each frame's element, and gives each frame's element
+    /// as decoded with the spectra the filterbanks gave.
     fn round_trip(
         fs: SamplingFrequency,
         input: &[Vec<f64>],
         bits: u32,
     ) -> Vec<(Element, Vec<Vec<f64>>)> {
-        let mut encoder = ElementEncoder::new(fs, input.len());
+        round_trip_with(fs, input, bits, None)
+    }
+
+    /// [`round_trip`], coding a pair in intensity stereo above
+    /// `intensity_border` Hz, if given; the spectra are given as the
+    /// filterbanks gave them, before the pair was coded jointly.
+    fn round_trip_with(
+        fs: SamplingFrequency,
+        input: &[Vec<f64>],
+        bits: u32,
+        intensity_border: Option<f64>,
+    ) -> Vec<(Element, Vec<Vec<f64>>)> {
+        let mut encoder = ElementEncoder::new(fs, input.len(), intensity_border);
         let channels: Vec<&[f64]> = input.iter().map(Vec::as_slice).collect();
         encoder.push(&channels);
         encoder.prime();
@@ -567,7 +694,11 @@ mod tests {
         let mut start = 0;
         while encoder.buffered() - start >= 2 * FRAME_SAMPLES {
             encoder.look_ahead(start + FRAME_SAMPLES, true);
-            encoder.prepare(start, true);
+            encoder.transform(start, true);
+            let original: Vec<Vec<f64>> = (encoder.prepared.iter())
+                .map(|prepared| prepared.spectrum.to_vec())
+                .collect();
+            encoder.code_jointly();
             let coded = encoder.quantize(bits);
             let mut w = BitWriter::new();
             w.write(u32::from(coded.is_pair()), 3);
@@ -579,25 +710,7 @@ mod tests {
             let mut r = BitReader::new(&bytes);
             let decoded = element(&mut r, fs);
             assert_eq!(r.position(), len, "the bits written are those read");
-            // The left and right channels' lines, from the middle and side
-            // channels' where the pair codes them.
-            let mut spectra: Vec<Vec<f64>> = (encoder.prepared.iter())
-                .map(|prepared| prepared.spectrum.to_vec())
-                .collect();
-            if let [left, right] = &mut spectra[..] {
-                let mut start = 0;
-                for (g, bands) in encoder.prepared[0].windows.groups(fs).enumerate() {
-                    for sfb in 0..bands.num_swb() {
-                        if encoder.ms.is_used(g, sfb) {
-                            for i in start + bands.offset(sfb)..start + bands.offset(sfb + 1) {
-                                (left[i], right[i]) = (left[i] + right[i], left[i] - right[i]);
-                            }
-                        }
-                    }
-                    start += bands.lines();
-                }
-            }
-            frames.push((decoded, spectra));
+            frames.push((decoded, original));
             start += FRAME_SAMPLES;
         }
         frames
@@ -693,5 +806,108 @@ mod tests {
                 assert_eq!(left.info.max_sfb, right.info.max_sfb);
             }
         }
+    }
+
+    /// A pair coded in intensity stereo above 6 kHz decodes with each band
+    /// of its right channel there at about its energy, the left channel's
+    /// signal scaled, in phase or out of phase as the channels were; below,
+    /// both channels decode as they would without it.
+    #[test]
+    fn intensity_stereo_keeps_each_bands_level_and_phase() {
+        let fs = SamplingFrequency::Hz44100;
+        let len = 10 * FRAME_SAMPLES;
+        let source = noise(len, 5);
+        let other = noise(len, 6);
+        // The right channel half the left, with a little of its own, in
+        // phase and out of phase, and the same as the left, which codes
+        // its lines below the border as middle and side, leaving the right
+        // channel only its bands in intensity stereo.
+        let cases = [
+            (1.0, 0.5, INTENSITY_HCB),
+            (-1.0, 0.5, INTENSITY_HCB2),
+            (1.0, 1.0, INTENSITY_HCB),
+        ];
+        for (sign, gain, codebook) in cases {
+            let own = if gain == 1.0 { 0.0 } else { 0.05 };
+            let right: Vec<f64> = (source.iter().zip(&other))
+                .map(|(s, o)| sign * gain * s + own * o)
+                .collect();
+            let input = [source.clone(), right];
+            let border = Some(intensity::BORDER_HZ);
+            let frames = round_trip_with(fs, &input, 8000, border);
+            let mut bands_in_intensity = 0;
+            for (f, (decoded, spectra)) in frames.iter().enumerate().skip(1) {
+                let right_ics = &decoded.channels[1];
+                let info = &right_ics.info;
+                // The onset of the noise is coded short.
+                if info.window_sequence == 2 {
+                    continue;
+                }
+                let first = intensity::first_band_above(fs, Transform::Long, 6000.0);
+                let bands = GroupBands::long(fs);
+                let out = decoded.spectra(fs);
+                // The lines of the bands below the border.
+                let mut below = Vec::new();
+                for sfb in 0..info.max_sfb {
+                    let range = bands.offset(sfb)..bands.offset(sfb + 1);
+                    let energy = |lines: &[f64]| lines.iter().map(|x| x * x).sum::<f64>();
+                    if right_ics.codebook(0, sfb) == codebook {
+                        assert!(sfb >= first, "frame {f}, band {sfb}");
+                        bands_in_intensity += 1;
+                        let (original, decoded) = (
+                            energy(&spectra[1][range.clone()]),
+                            energy(&out[1][range.clone()]),
+                        );
+                        let db = 10.0 * (decoded / original).log10();
+                        assert!(db.abs() < 1.5, "frame {f}, band {sfb}: {db:.2} dB");
+                        let product: f64 = (out[0][range.clone()].iter())
+                            .zip(&out[1][range])
+                            .map(|(l, r)| l * r)
+                            .sum();
+                        assert_eq!(product.signum(), sign, "frame {f}, band {sfb}");
+                    } else {
+                        assert!(sfb < first, "frame {f}, band {sfb}");
+                        below.extend(range);
+                    }
+                }
+                let lines =
+                    |spectrum: &[f64]| below.iter().map(|&i| spectrum[i]).collect::<Vec<_>>();
+                let snr = snr(&lines(&spectra[1]), &lines(&out[1]));
+                assert!(snr > 10.0, "frame {f}: {snr:.1} dB");
+            }
+            assert!(bands_in_intensity > 100, "{bands_in_intensity}");
+        }
+    }
+
+    /// Bands of a pair's short windows trimmed to the left channel's
+    /// `max_sfb` keep positions that the scalefactor codebook can send.
+    #[test]
+    fn trimmed_positions_stay_within_reach_of_each_other() {
+        use crate::noiseless::codebooks::Codebook;
+        use crate::noiseless::scalefactors;
+        let mut intensity = Intensity::NONE;
+        for (g, sfb, position) in [(0, 3, 50), (0, 8, 0), (1, 3, -55), (2, 4, 10)] {
+            intensity.bands[g].set(sfb, Some(Codebook::INTENSITY));
+            intensity.positions[g][sfb] = position;
+        }
+        let below = intensity.below(5);
+        assert_eq!(below.bands[0].end(), 4);
+        assert_eq!(below.positions[0][3], 50);
+        assert_eq!(below.positions[1][3], -10);
+        assert_eq!(below.positions[2][4], 10);
+        let fs = SamplingFrequency::Hz48000;
+        let grouping = crate::window::Grouping::from_starts([
+            true, false, true, false, true, false, false, false,
+        ]);
+        let windows = Windows {
+            sequence: WindowSequence::EightShort { grouping },
+            shape: crate::window::WindowShape::Sine,
+        };
+        let channel = least_channel(windows, fs, 5, &below);
+        let groups: Vec<_> = channel
+            .groups()
+            .map(|(group, _)| group.scalefactor_data())
+            .collect();
+        assert!(scalefactors::bits(0, groups).is_some());
     }
 }

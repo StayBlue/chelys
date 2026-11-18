@@ -13,6 +13,7 @@ use inner::{Counting, Lines};
 use crate::channel::{CodedChannel, FRAME_LINES};
 use crate::sampling_frequency::SamplingFrequency;
 use crate::scalefactor_bands::MAX_BANDS;
+use crate::stereo::intensity::Intensity;
 use crate::window::{SHORT_WINDOWS, Windows};
 
 /// The offset in dB that every allowed distortion `xmin` is raised by
@@ -41,7 +42,7 @@ pub const XMIN_OFFSET_DB: f64 = 3.0;
 /// How the loops are to code one channel: everything they take but its
 /// lines and their allowed distortion.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ChannelCoding {
+pub struct ChannelCoding<'a> {
     pub windows: Windows,
     pub sampling_frequency: SamplingFrequency,
     /// The bits the channel's `individual_channel_stream()` may take.
@@ -59,9 +60,12 @@ pub struct ChannelCoding {
     /// before it to that `max_sfb`, and the pair's `ms_used` flags. They
     /// are counted with the channel's bits.
     pub element_bits: [u32; MAX_BANDS + 1],
+    /// For the right channel of a pair that shares its window, the bands it
+    /// codes in intensity stereo, whose lines are to be zero.
+    pub intensity: Option<&'a Intensity>,
 }
 
-impl ChannelCoding {
+impl ChannelCoding<'_> {
     /// The coding of a channel of a `single_channel_element()`, or of a
     /// pair that does not share its window, in `available_bits`.
     pub fn single(
@@ -76,6 +80,7 @@ impl ChannelCoding {
             common_window: false,
             least_max_sfb: 0,
             element_bits: [0; MAX_BANDS + 1],
+            intensity: None,
         }
     }
 }
@@ -97,7 +102,7 @@ impl ChannelCoding {
 pub fn quantize(
     spectrum: &[f64; FRAME_LINES],
     xmin: &[[f64; MAX_BANDS]],
-    coding: ChannelCoding,
+    coding: ChannelCoding<'_>,
 ) -> (CodedChannel, f64) {
     let counting = Counting::new(Lines::new(spectrum), coding);
     let offset = 10f64.powf(XMIN_OFFSET_DB / 10.0);
@@ -113,7 +118,7 @@ pub fn quantize(
 pub fn quantize_channel(
     spectrum: &[f64; FRAME_LINES],
     xmin: &[[f64; MAX_BANDS]],
-    coding: ChannelCoding,
+    coding: ChannelCoding<'_>,
 ) -> CodedChannel {
     quantize(spectrum, xmin, coding).0
 }

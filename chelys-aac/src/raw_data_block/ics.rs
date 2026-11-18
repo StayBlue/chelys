@@ -26,7 +26,7 @@ pub fn write_individual_channel_stream(
     }
     scalefactors::write(
         channel.global_gain(),
-        (channel.groups()).map(|(group, _)| (&group.sections, group.scalefactors.as_slice())),
+        (channel.groups()).map(|(group, _)| group.scalefactor_data()),
         w,
     );
     w.write(0, 1); // pulse_data_present
@@ -79,6 +79,7 @@ mod tests {
         let group = CodedGroup {
             sections,
             scalefactors: vec![101],
+            positions: Vec::new(),
         };
         let channel = CodedChannel::new(Windows::LONG_SINE, fs, 100, lines, vec![group]).unwrap();
         let bits = written(&channel, false);

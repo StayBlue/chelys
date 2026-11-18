@@ -1,0 +1,159 @@
+// Copyright (c) 2026 StayBlue
+// SPDX-License-Identifier: MIT
+
+//! Intensity stereo (clause 12.2): the bands of a pair that shares its
+//! window coded as one signal in its left channel, which the right channel
+//! takes scaled by its intensity stereo position.
+
+use crate::channel::FRAME_LINES;
+use crate::noiseless::codebooks::Codebook;
+use crate::noiseless::sections::IntensityBands;
+use crate::sampling_frequency::SamplingFrequency;
+use crate::scalefactor_bands::{MAX_BANDS, Transform, swb_offsets};
+use crate::window::{SHORT_WINDOWS, Windows};
+
+/// The bands of a pair's window groups coded in intensity stereo, each
+/// with its codebook and its intensity stereo position, `is_position`
+/// (clause 12.2.3).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Intensity {
+    pub bands: [IntensityBands; SHORT_WINDOWS],
+    pub positions: [[i8; MAX_BANDS]; SHORT_WINDOWS],
+}
+
+impl Intensity {
+    /// No band coded in intensity stereo.
+    pub const NONE: Self = Self {
+        bands: [IntensityBands::NONE; SHORT_WINDOWS],
+        positions: [[0; MAX_BANDS]; SHORT_WINDOWS],
+    };
+
+    /// The bands of each group below `max_sfb`, with their positions, each
+    /// within 60 of the one before it that is sent (see [`code`]), as the
+    /// bands left out may have bridged a greater difference.
+    pub fn below(&self, max_sfb: usize) -> Self {
+        let mut below = Self::NONE;
+        let mut last = 0i32;
+        for (g, bands) in self.bands.iter().enumerate() {
+            below.bands[g] = bands.below(max_sfb);
+            for sfb in 0..below.bands[g].end() {
+                if below.bands[g].codebook(sfb).is_some() {
+                    let position = i32::from(self.positions[g][sfb]).clamp(last - 60, last + 60);
+                    below.positions[g][sfb] = position as i8;
+                    last = position;
+                }
+            }
+        }
+        below
+    }
+}
+
+/// The lower border frequency `f0` above which Annex C codes a pair in
+/// intensity stereo: "An average value of f0 = 6 kHz is appropriate for
+/// most types of signals" (clause C.6.2).
+pub const BORDER_HZ: f64 = 6000.0;
+
+/// The first scalefactor band of a window of `transform` at
+/// `sampling_frequency` that lies above `border` Hz: the first whose lowest
+/// line's frequency is `border` or more.
+pub fn first_band_above(
+    sampling_frequency: SamplingFrequency,
+    transform: Transform,
+    border: f64,
+) -> usize {
+    let offsets = swb_offsets(sampling_frequency, transform);
+    let line_hz = f64::from(sampling_frequency.hz()) / (2 * transform.lines()) as f64;
+    (offsets.iter())
+        .position(|&offset| f64::from(offset) * line_hz >= border)
+        .unwrap_or(offsets.len())
+        .min(offsets.len() - 1)
+}
+
+/// Codes the bands of each window group of `windows` from `first` up in
+/// intensity stereo as clause C.6.2 describes, in the pair's lines `left`
+/// and `right`, and the allowed distortion of their bands, `xmin`: puts the
+/// intensity signal in place of the left channel's lines and zeros in place
+/// of the right channel's, and gives the bands with their codebooks and
+/// intensity stereo positions.
+///
+/// For each band of a group, the energies of the left and right channels'
+/// lines, `El` and `Er`, and of their sum, `Es`, give the band's position
+/// `is_position = NINT(2 log2(El / Er))` and its intensity signal,
+/// `speci(i) = (specl(i) + specr(i)) sqrt(El / Es)`, which carries the left
+/// channel's energy; the decoder scales it by `0.5^(0.25 is_position)`,
+/// about `sqrt(Er / El)`, for the right channel (clause 12.2.3).
+///
+/// Spec reading: this deliberately departs from clause C.6.2, which sets
+/// `INTENSITY_HCB`, in phase, for every band, where the band's channels are
+/// opposed, the sum of their lines' products negative: there their sum
+/// cancels, and its energy `Es` can be all but 0, which would have the
+/// intensity signal scale noise up to the left channel's energy and the
+/// right channel take it in phase with the left. Such a band is coded with
+/// `INTENSITY_HCB2`, out of phase, which the decoder takes with the
+/// opposite sign (clause 12.2.3), and its intensity signal is the
+/// difference of the channels' lines, `(specl(i) - specr(i)) sqrt(El /
+/// Ed)`, with `Ed` the difference's energy.
+///
+/// Spec reading: this deliberately departs from clause C.6.2 too where
+/// either channel is silent in a band, where `log2(El / Er)` is not
+/// defined. Where the left channel is, the intensity signal, which carries
+/// its energy, would be silent, and so would the right channel's band;
+/// where the right channel is, its band is better sent as no band than
+/// with a position. Such a band is not coded in intensity stereo: each
+/// channel codes its own lines there, if it has any.
+///
+/// Spec gap: the positions are sent as differences that the scalefactor
+/// codebook codes from -60 to 60 (Table A.1), from 0 for the first (clause
+/// 12.2.3). Each position is limited to -60 to 60, a ratio of 90 dB
+/// between the channels, and to within 60 of the position before it.
+///
+/// Spec gap: clause C.6.2 codes the intensity signal through "the
+/// standard process for quantization and encoding", without saying what
+/// noise its bands may take. Its noise reaches the right channel scaled by
+/// `Er / El`, so a band is allowed the less of the left channel's
+/// allowance and the right channel's scaled up by `El / Er`.
+pub fn code(
+    windows: Windows,
+    sampling_frequency: SamplingFrequency,
+    first: usize,
+    [left, right]: [&mut [f64; FRAME_LINES]; 2],
+    [left_xmin, right_xmin]: [&mut [[f64; MAX_BANDS]]; 2],
+) -> Intensity {
+    let mut intensity = Intensity::NONE;
+    let mut last_position = 0i32;
+    let mut start = 0;
+    for (g, bands) in windows.groups(sampling_frequency).enumerate() {
+        for sfb in first.min(bands.num_swb())..bands.num_swb() {
+            let range = start + bands.offset(sfb)..start + bands.offset(sfb + 1);
+            let (l, r) = (&mut left[range.clone()], &mut right[range]);
+            let energy = |lines: &[f64]| lines.iter().map(|x| x * x).sum::<f64>();
+            let (el, er) = (energy(l), energy(r));
+            if el == 0.0 || er == 0.0 {
+                continue;
+            }
+            let product: f64 = l.iter().zip(&*r).map(|(l, r)| l * r).sum();
+            let (codebook, sign) = if product < 0.0 {
+                (Codebook::INTENSITY_OUT_OF_PHASE, -1.0)
+            } else {
+                (Codebook::INTENSITY, 1.0)
+            };
+            let es: f64 = l.iter().zip(&*r).map(|(l, r)| (l + sign * r).powi(2)).sum();
+            let gain = if es == 0.0 { 0.0 } else { (el / es).sqrt() };
+            for (l, r) in l.iter_mut().zip(r.iter_mut()) {
+                *l = (*l + sign * *r) * gain;
+                *r = 0.0;
+            }
+            let ratio = 2.0 * (el / er).log2();
+            let position = (ratio.round().clamp(-60.0, 60.0) as i32)
+                .clamp(last_position - 60, last_position + 60);
+            last_position = position;
+            intensity.bands[g].set(sfb, Some(codebook));
+            intensity.positions[g][sfb] = position as i8;
+            if er > 0.0 {
+                left_xmin[g][sfb] = left_xmin[g][sfb].min(right_xmin[g][sfb] * el / er);
+            }
+        }
+        start += bands.lines();
+    }
+    intensity
+}

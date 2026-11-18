@@ -4,10 +4,15 @@
 //! `scale_factor_data()` (Table 18): the scalefactor of each band in a
 //! section whose codebook sends one, as its difference from the one sent
 //! before it, or from `global_gain` for the first (clause 11.3.2), in the
-//! scalefactor codebook (Table A.1), through the window groups in order.
+//! scalefactor codebook (Table A.1), through the window groups in order;
+//! and among them, in the bands coded in intensity stereo, the intensity
+//! stereo position of each, as its difference from the position sent
+//! before it, or from 0 for the first (clause 12.2.3), in the same
+//! codebook.
 //!
-//! The scalefactors of a group are given for its bands `0..max_sfb`, of
-//! which those of bands that send none are not used.
+//! The scalefactors and positions of a group are given for its bands
+//! `0..max_sfb`, of which those of bands that send none are not used; a
+//! group without bands in intensity stereo may give no positions.
 //!
 //! Spec gap: a band of zeros in a section with a spectrum codebook sends a
 //! scalefactor (Table 18), which scales nothing, and the standard leaves
@@ -41,18 +46,19 @@ fn codeword(difference: i32) -> Option<Codeword> {
 /// costs in a section with a spectrum codebook.
 pub(super) const REPEATED_BITS: u32 = SCALEFACTOR_CODEWORDS[(0 - INDEX_OFFSET) as usize].len;
 
+/// A window group as `scale_factor_data()` sends it: its sections, its
+/// scalefactors and its intensity stereo positions.
+pub type Group<'a> = (&'a Sections, &'a [u8], &'a [i8]);
+
 /// The bits of `scale_factor_data()` for the window groups `groups`, each
-/// with its sections and scalefactors, from `global_gain`; or `None` if a
-/// difference falls outside the codebook's range.
+/// with its sections, scalefactors and positions, from `global_gain`; or
+/// `None` if a difference falls outside the codebook's range.
 ///
 /// # Panics
 ///
-/// If a group has fewer scalefactors than its sections span bands: a
-/// caller's error.
-pub fn bits<'a>(
-    global_gain: u8,
-    groups: impl IntoIterator<Item = (&'a Sections, &'a [u8])>,
-) -> Option<u32> {
+/// If a group has fewer scalefactors, or positions where it sends any,
+/// than its sections span bands: a caller's error.
+pub fn bits<'a>(global_gain: u8, groups: impl IntoIterator<Item = Group<'a>>) -> Option<u32> {
     let mut bits = 0;
     for_each_difference(global_gain, groups, |difference| {
         bits += codeword(difference)?.len;
@@ -70,7 +76,7 @@ pub fn bits<'a>(
 /// caller's error.
 pub fn write<'a>(
     global_gain: u8,
-    groups: impl IntoIterator<Item = (&'a Sections, &'a [u8])> + Clone,
+    groups: impl IntoIterator<Item = Group<'a>> + Clone,
     w: &mut BitWriter,
 ) {
     assert!(
@@ -86,20 +92,23 @@ pub fn write<'a>(
 }
 
 /// Calls `f` with each difference sent, from the running scalefactor that
-/// starts at `global_gain` (clause 11.3.2), until it returns `None`.
+/// starts at `global_gain` (clause 11.3.2) and the running position that
+/// starts at 0 (clause 12.2.3), until it returns `None`.
 fn for_each_difference<'a>(
     global_gain: u8,
-    groups: impl IntoIterator<Item = (&'a Sections, &'a [u8])>,
+    groups: impl IntoIterator<Item = Group<'a>>,
     mut f: impl FnMut(i32) -> Option<()>,
 ) -> Option<()> {
     let mut last = global_gain;
-    for (sections, scalefactors) in groups {
-        assert!(
-            scalefactors.len() >= sections.max_sfb(),
-            "a scalefactor for each band"
-        );
-        for sfb in sections.bands_with_scalefactors() {
-            let difference = if sections.is_zero_band(sfb) {
+    let mut last_position = 0;
+    for (sections, scalefactors, positions) in groups {
+        for (sfb, position) in sections.bands_with_scalefactors_or_positions() {
+            let difference = if position {
+                let position = i32::from(positions[sfb]);
+                let difference = position - last_position;
+                last_position = position;
+                difference
+            } else if sections.is_zero_band(sfb) {
                 0
             } else {
                 let difference = i32::from(scalefactors[sfb]) - i32::from(last);
@@ -136,7 +145,7 @@ mod tests {
     /// Writes the sections and scalefactors of each group, then decodes
     /// them, checking the bits counted and the scalefactors decoded.
     fn round_trip(global_gain: u8, groups: &[(Sections, Vec<u8>)]) {
-        let groups_ref = || groups.iter().map(|(s, sf)| (s, sf.as_slice()));
+        let groups_ref = || groups.iter().map(|(s, sf)| (s, sf.as_slice(), &[][..]));
         let mut w = BitWriter::new();
         let mut counted = 0;
         for (sections, _) in groups {
@@ -220,22 +229,29 @@ mod tests {
     fn a_difference_out_of_range_is_counted_as_none() {
         let sections = two_bands_of_ones();
         let sixty = codeword(60).unwrap().len;
-        assert_eq!(bits(100, [(&sections, &[160, 220][..])]), Some(2 * sixty));
-        assert_eq!(bits(100, [(&sections, &[161, 161][..])]), None);
+        assert_eq!(
+            bits(100, [(&sections, &[160, 220][..], &[][..])]),
+            Some(2 * sixty)
+        );
+        assert_eq!(bits(100, [(&sections, &[161, 161][..], &[][..])]), None);
     }
 
     #[test]
     #[should_panic(expected = "has no codeword")]
     fn a_difference_out_of_range_is_not_written() {
         let sections = two_bands_of_ones();
-        write(100, [(&sections, &[161, 161][..])], &mut BitWriter::new());
+        write(
+            100,
+            [(&sections, &[161, 161][..], &[][..])],
+            &mut BitWriter::new(),
+        );
     }
 
     /// C1: counting leaves nothing behind that writing would start from.
     #[test]
     fn bits_counted_are_the_bits_written() {
         let sections = two_bands_of_ones();
-        let groups = [(&sections, &[220, 180][..])];
+        let groups = [(&sections, &[220, 180][..], &[][..])];
         let counted = bits(240, groups).unwrap();
         let mut w = BitWriter::new();
         write(240, groups, &mut w);

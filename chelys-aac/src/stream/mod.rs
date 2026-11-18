@@ -17,11 +17,35 @@ use super::raw_data_block;
 use super::raw_data_block::element::CodedElement;
 use super::reservoir::BitReservoir;
 use super::sampling_frequency::SamplingFrequency;
+use super::stereo::intensity;
 use super::window::{WindowSequence, Windows};
 use element::ElementEncoder;
 
 /// The samples of each channel a frame codes (clause 8.2.1.1).
 pub const FRAME_SAMPLES: usize = 1024;
+
+/// The most bits for each sample of each channel at which a pair is coded
+/// in intensity stereo (see [`intensity::code`]).
+///
+/// Spec gap: clause C.6.2 codes the bands above `f0` in intensity stereo,
+/// "one possible implementation" among several, and does not say when.
+/// Intensity stereo gives up the right channel's waveform in those bands
+/// for the bits it saves, which pays only where bits are few. Graded with
+/// PEAQ (GstPEAQ 0.6.1, black box), on 8 tracks of pop music at 44.1 kHz
+/// in stereo and on 3 tracks of rock music and their 3 windows of 3 s
+/// with the most frames coded short, with M/S stereo, intensity stereo
+/// from 6 kHz gave means of -3.711 and -3.611 at 48 kbit/s against -3.754
+/// and -3.636 without, and -3.648 and -3.596 at 64 kbit/s against -3.703
+/// and -3.579. Before bands where a channel is silent and frames of short
+/// windows were left out of it, which changed no grade at 64 kbit/s by
+/// more than 0.001, it gave -3.163 and -2.497 at 96 kbit/s against -2.992
+/// and -2.166, -1.965 and -1.403 at 128 kbit/s against -1.485 and -0.938,
+/// and -0.622 and -0.355 at 192 kbit/s against -0.411 and -0.197; and at
+/// 64 kbit/s from 9 and 12 kHz, -3.657 and -3.591, and -3.673 and -3.591.
+/// The limit lies between 64 and 96 kbit/s, 0.73 and 1.09 bits a sample;
+/// it is set per sample, untested at other sampling frequencies, so as to
+/// hold where a band's lines are as few for its bits.
+pub const INTENSITY_BITS_PER_SAMPLE: f64 = 0.75;
 
 /// What the stream is: what its headers say, its rate and its framing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -87,6 +111,18 @@ impl StreamConfig {
             self.channel_configuration,
             self.bits_per_second,
         )
+    }
+
+    /// The lower border frequency above which a pair is coded in intensity
+    /// stereo, if it is: Annex C's (see [`intensity::BORDER_HZ`]), where
+    /// the stream has at most [`INTENSITY_BITS_PER_SAMPLE`] bits for each
+    /// sample of each channel.
+    fn intensity_border(&self) -> Option<f64> {
+        let channels = self.channel_configuration.channels() as f64;
+        let bits_per_sample =
+            f64::from(self.bits_per_second) / (channels * f64::from(self.sampling_frequency.hz()));
+        (channels == 2.0 && bits_per_sample <= INTENSITY_BITS_PER_SAMPLE)
+            .then_some(intensity::BORDER_HZ)
     }
 
     /// Whether every frame of a stream so configured can be written.
@@ -167,7 +203,11 @@ impl StreamEncoder {
         Self {
             config,
             reservoir,
-            element: ElementEncoder::new(config.sampling_frequency, channels),
+            element: ElementEncoder::new(
+                config.sampling_frequency,
+                channels,
+                config.intensity_border(),
+            ),
             block_switching: true,
             shortest_short_frame_bits: config.shortest_short_frame_bits(),
             samples: 0,
