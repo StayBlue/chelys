@@ -281,7 +281,7 @@ impl SpectrumCoding {
         bands: &[Band],
         end: usize,
     ) -> usize {
-        assert!(end.is_multiple_of(2), "pairs start on even lines");
+        assert!(end % 2 == 0, "pairs start on even lines");
         let mut bits = 0;
         let mut start = 0;
         for (region, region_end) in self.region_ends(bands).into_iter().enumerate() {
@@ -539,9 +539,8 @@ impl BandBits {
                 largest,
             } = PairCounts::new(&values[boundary(band)..boundary(band + 1)]);
             max[band] = largest;
-            let [previous, next] = below
-                .get_disjoint_mut([band, band + 1])
-                .expect("distinct bands");
+            let previous = below[band];
+            let next = &mut below[band + 1];
             for set in 0..CODE_SETS {
                 let bits = if largest <= tables.largest[set] {
                     codes[set]

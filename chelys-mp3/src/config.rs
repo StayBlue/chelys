@@ -307,7 +307,7 @@ fn lower_rate(
         }
         Rate::Free { bits_per_second } => rate::StreamRate::Constant(
             Bitrate::free(version, bits_per_second).ok_or_else(|| {
-                let in_table = bits_per_second.is_multiple_of(1000)
+                let in_table = bits_per_second % 1000 == 0
                     && Bitrate::from_kbps(version, bits_per_second / 1000).is_some();
                 ConfigError::UnsupportedFreeBitrate {
                     sample_rate,

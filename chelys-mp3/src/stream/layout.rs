@@ -259,7 +259,7 @@ pub fn encode_granules(config: &StreamConfig, granules: &[Vec<QuantizedGranule>]
     let channels = config.mode.channels();
     let per_frame = config.sampling_frequency.version().granules();
     assert!(
-        granules.len().is_multiple_of(per_frame),
+        granules.len() % per_frame == 0,
         "a frame holds {per_frame} granules"
     );
     assert!(

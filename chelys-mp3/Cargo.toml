@@ -3,6 +3,7 @@ name = "chelys-mp3"
 description = "An MP3 encoder implemented from ISO/IEC 11172-3 and 13818-3."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 publish = false
 

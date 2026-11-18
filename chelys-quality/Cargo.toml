@@ -3,6 +3,7 @@ name = "chelys-quality"
 description = "Judges chelys output by blind listening tests and by PEAQ, with outside tools as black boxes."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 publish = false
 

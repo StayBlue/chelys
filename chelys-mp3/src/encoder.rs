@@ -155,7 +155,7 @@ impl Encoder {
     pub fn encode_interleaved<S: Sample>(&mut self, samples: &[S], out: &mut Vec<u8>) {
         let channels = self.channels();
         assert!(
-            samples.len().is_multiple_of(channels),
+            samples.len() % channels == 0,
             "{} samples are not a whole number of {channels}-channel frames",
             samples.len(),
         );

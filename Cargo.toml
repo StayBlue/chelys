@@ -8,4 +8,6 @@ default-members = ["chelys", "chelys-cli", "chelys-mp3"]
 [workspace.package]
 version = "0.0.1"
 edition = "2024"
+# The rustc of Debian stable, which is also the first with edition 2024.
+rust-version = "1.85"
 license = "MIT"

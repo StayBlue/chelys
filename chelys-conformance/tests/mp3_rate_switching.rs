@@ -27,7 +27,7 @@ fn input(fs: SamplingFrequency, seconds: f64) -> Vec<f64> {
     (0..(seconds * hz) as usize)
         .map(|t| {
             let s = t as f64 / hz;
-            if ((5.0 * s / seconds) as usize).is_multiple_of(2) {
+            if (5.0 * s / seconds) as usize % 2 == 0 {
                 0.5 * noise()
             } else {
                 0.02 * (TAU * 440.0 * s).sin() + 0.005 * (TAU * 1_000.0 * s).sin()

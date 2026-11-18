@@ -1,0 +1,5 @@
+# The oldest Rust supported, as rust-version in Cargo.toml, so that local
+# builds and CI keep to it. Raise the two together.
+[toolchain]
+channel = "1.85.0"
+components = ["clippy", "rustfmt"]

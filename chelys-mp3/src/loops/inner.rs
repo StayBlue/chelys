@@ -554,7 +554,8 @@ mod tests {
             cases.extend([
                 x,
                 x.floor() + 0.5,
-                (x.floor() + 0.5).next_down(),
+                // The value just below the half.
+                f64::from_bits((x.floor() + 0.5).to_bits() - 1),
                 x - 4500.0,
             ]);
         }
