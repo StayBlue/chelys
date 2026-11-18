@@ -11,6 +11,7 @@ use crate::channel::{self, CodedChannel, CodedGroup, FRAME_LINES};
 use crate::noiseless::codebooks::MAX_MAGNITUDE;
 use crate::noiseless::scalefactors;
 use crate::noiseless::sections::{self, Sections};
+use crate::noiseless::spectrum;
 use crate::scalefactor_bands::{GroupBands, MAX_BANDS};
 
 use super::ChannelCoding;
@@ -162,6 +163,80 @@ impl<'a> Lines<'a> {
             *q = if x < 0.0 { -magnitude } else { magnitude };
         }
         above.fill(0);
+    }
+}
+
+/// The fewest bits that `lines`, one scalefactor band's, take when
+/// quantized with the coarsest step whose distortion is within `allowed`:
+/// none where their energy is, as they can quantize to zero, and else those
+/// of the band's `spectral_data()` in its best codebook (see
+/// [`spectrum::least_bits`]).
+///
+/// The step is searched by successive approximation, as the inner loop
+/// searches it, from the smallest that codes every line (see
+/// [`Lines::start_gain`]) to the largest `global_gain`, taking the
+/// distortion to grow with the step; where even the smallest exceeds
+/// `allowed`, it is taken.
+pub fn band_bits(lines: &[f64], allowed: f64, scratch: &mut BandScratch) -> u32 {
+    let energy: f64 = lines.iter().map(|x| x * x).sum();
+    if energy <= allowed {
+        return 0;
+    }
+    let scaled = &mut scratch.scaled[..lines.len()];
+    for (scaled, &x) in scaled.iter_mut().zip(lines) {
+        *scaled = power_three_quarters(x);
+    }
+    let scaled = &*scaled;
+    let x_quant = &mut scratch.x_quant[..lines.len()];
+    let quantize = |sf_decoder: u8, x_quant: &mut [i32]| {
+        let scale = step_scale(sf_decoder);
+        for ((q, &scaled), &x) in x_quant.iter_mut().zip(scaled).zip(lines) {
+            let magnitude = (scaled * scale + MAGIC_NUMBER).min(BEYOND_MAGNITUDE) as i32;
+            *q = if x < 0.0 { -magnitude } else { magnitude };
+        }
+    };
+    let distortion = |sf_decoder: u8, x_quant: &mut [i32]| {
+        quantize(sf_decoder, x_quant);
+        let gain = decoder_gain(sf_decoder);
+        (lines.iter().zip(&*x_quant))
+            .map(|(&x, &q)| {
+                let error = x.abs() - power_four_thirds(q.unsigned_abs().min(MAX_MAGNITUDE)) * gain;
+                error * error
+            })
+            .sum::<f64>()
+    };
+    let largest = scaled.iter().fold(0.0f64, |a, &x| a.max(x));
+    let start = (16.0 / 3.0 * (largest / MAX_QUANT).log2()).ceil() + f64::from(SF_OFFSET);
+    let start = start.clamp(0.0, 255.0) as u8;
+    // The coarsest step within `allowed`, between `fits`, which is, and
+    // `exceeds`, which is not.
+    let (mut fits, mut exceeds) = (start, u16::from(u8::MAX) + 1);
+    if distortion(start, x_quant) <= allowed {
+        while exceeds - u16::from(fits) > 1 {
+            let middle = ((u16::from(fits) + exceeds) / 2) as u8;
+            if distortion(middle, x_quant) <= allowed {
+                fits = middle;
+            } else {
+                exceeds = u16::from(middle);
+            }
+        }
+    }
+    quantize(fits, x_quant);
+    spectrum::least_bits(x_quant).unwrap_or(u32::MAX / 8)
+}
+
+/// The memory [`band_bits`] works in, for the lines of any band.
+pub struct BandScratch {
+    scaled: [f64; FRAME_LINES],
+    x_quant: [i32; FRAME_LINES],
+}
+
+impl Default for BandScratch {
+    fn default() -> Self {
+        Self {
+            scaled: [0.0; FRAME_LINES],
+            x_quant: [0; FRAME_LINES],
+        }
     }
 }
 

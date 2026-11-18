@@ -8,6 +8,7 @@
 //! 15); and the choice between long and short blocks (step 13), which
 //! [`switching`] makes a frame ahead.
 
+pub mod middle_side;
 pub mod partitions;
 pub mod switching;
 
@@ -190,77 +191,112 @@ impl Tables {
             .get_or_init(|| Self::new(sampling_frequency, transform))
     }
 
-    /// Steps 5 to 12 and the FFT's part of step 14 for one block, from the
-    /// energy `r(w)^2` and unpredictability `c(w)` of each line of its FFT,
-    /// with pre-echo control against `nb_last`, the threshold of the last
-    /// block of this FFT, which it updates, raised by `rpelev`.
+    /// `values` convolved with the spreading function (step 6): for each
+    /// partition, the sum of each partition's value spread into it; the
+    /// other partitions spread nothing into it.
+    fn spread(&self, values: &[f64; MAX_PARTITIONS]) -> [f64; MAX_PARTITIONS] {
+        let n = self.partitions.len();
+        let mut spread = [0.0; MAX_PARTITIONS];
+        for (b, spread) in spread[..n].iter_mut().enumerate() {
+            for bb in self.spread_from[b].clone() {
+                *spread += values[bb] * self.spreading[bb * n + b];
+            }
+        }
+        spread
+    }
+
+    /// Step 5's energy `e(b)` of each partition, from the energy `r(w)^2`
+    /// of each line of the block's FFT, and step 6's spread and normalized
+    /// energy `en(b)`, into `block`; and the spread energy `ecb(b)`.
+    fn energy(&self, energy: &[f64], block: &mut BlockThreshold) -> [f64; MAX_PARTITIONS] {
+        block.e = [0.0; MAX_PARTITIONS];
+        for (b, p) in self.partitions.iter().enumerate() {
+            block.e[b] = energy[p.lines()].iter().sum();
+        }
+        let ecb = self.spread(&block.e);
+        for (b, en) in block.en[..self.partitions.len()].iter_mut().enumerate() {
+            *en = ecb[b] * self.rnorm[b];
+        }
+        ecb
+    }
+
+    /// Steps 5 to 10 for one block, from the energy `r(w)^2` and
+    /// unpredictability `c(w)` of each line of its FFT, into `block`: the
+    /// partitions' energies, their tonality, as `cb(b)`, and the threshold
+    /// `nb(b)` of step 10.
+    fn raw_threshold(&self, energy: &[f64], unpredictability: &[f64], block: &mut BlockThreshold) {
+        let ecb = self.energy(energy, block);
+        // Step 5: the weighted unpredictability of each partition.
+        let mut c = [0.0; MAX_PARTITIONS];
+        for (b, p) in self.partitions.iter().enumerate() {
+            for w in p.lines() {
+                c[b] += energy[w] * unpredictability[w];
+            }
+        }
+        // Step 6: spread, and normalized.
+        let ct = self.spread(&c);
+        for b in 0..self.partitions.len() {
+            // Spec gap: without energy `cb(b) = ct(b) / ecb(b)` is
+            // undefined; its threshold is 0 whatever the tonality, and the
+            // threshold in quiet sets it (step 11). It is taken as 0.
+            block.cb[b] = if ecb[b] == 0.0 { 0.0 } else { ct[b] / ecb[b] };
+        }
+        self.threshold_from_tonality(block);
+    }
+
+    /// Steps 7 to 10 for one block whose `en(b)` and `cb(b)` `block` holds:
+    /// its power ratio `bc(b)` and threshold `nb(b)`.
+    fn threshold_from_tonality(&self, block: &mut BlockThreshold) {
+        for b in 0..self.partitions.len() {
+            // Step 7: the tonality, within 0 and 1.
+            let tb = (-0.299 - 0.43 * block.cb[b].ln()).clamp(0.0, 1.0);
+            // Steps 8 to 10.
+            let snr = tb * TMN + (1.0 - tb) * NMT;
+            block.bc[b] = 10f64.powf(-snr / 10.0);
+            block.nb[b] = block.en[b] * block.bc[b];
+        }
+    }
+
+    /// Steps 11, 12 and the FFT's part of step 14 for one block, from its
+    /// FFT's energy `r(w)^2` of each line and its threshold `nb(b)` in
+    /// `block`, with pre-echo control against `nb_last`, the threshold of
+    /// the last block of this FFT, which it updates, raised by `rpelev`.
     ///
     /// Spec gap: step 11 compares the threshold with `nb_l(b)`, "the
     /// threshold of partition b for the last block". Both step 10 and this
     /// step call their result `nb(b)`, so the text does not say which is
     /// meant; the more literal reading is the
     /// threshold this step gives, which is left in `nb(b)`. This
-    /// deliberately departs from it, and takes the threshold of step 10:
-    /// the energy threshold the last block's signal set, so that a block
-    /// after a quieter one, as at an attack, is held near the quieter one's
-    /// threshold, while a steady signal keeps its own. Taking the threshold
-    /// this step gives would let a long block's threshold rise by `rpelev`,
-    /// 3 dB, a frame at most, so that after silence a loud signal would
-    /// take some twenty frames to reach its own; and a short block's, whose
-    /// `rpelev` is 1, never rise at all but through the threshold in quiet.
-    /// The block before the first is silent, with no threshold.
-    fn threshold(
+    /// deliberately departs from it, and takes the threshold that this step
+    /// starts from: the energy threshold the last block's signal set, so
+    /// that a block after a quieter one, as at an attack, is held near the
+    /// quieter one's threshold, while a steady signal keeps its own. Taking
+    /// the threshold this step gives would let a long block's threshold
+    /// rise by `rpelev`, 3 dB, a frame at most, so that after silence a loud
+    /// signal would take some twenty frames to reach its own; and a short
+    /// block's, whose `rpelev` is 1, never rise at all but through the
+    /// threshold in quiet. The block before the first is silent, with no
+    /// threshold.
+    fn finish(
         &self,
         energy: &[f64],
-        unpredictability: &[f64],
+        block: &BlockThreshold,
         nb_last: &mut [f64],
         rpelev: f64,
         out: &mut Threshold,
     ) {
-        // Step 5: the energy and weighted unpredictability of each
-        // partition.
         let n = self.partitions.len();
-        let mut e = [0.0; MAX_PARTITIONS];
-        let mut c = [0.0; MAX_PARTITIONS];
-        for (b, p) in self.partitions.iter().enumerate() {
-            for w in p.lines() {
-                e[b] += energy[w];
-                c[b] += energy[w] * unpredictability[w];
-            }
-        }
-
         let mut perceptual_entropy = 0.0;
         let mut nb = [0.0; MAX_PARTITIONS];
-        for (b, nb) in nb[..n].iter_mut().enumerate() {
-            // Step 6: spread, and normalized; the other partitions spread
-            // nothing into this one.
-            let (mut ecb, mut ct) = (0.0, 0.0);
-            for bb in self.spread_from[b].clone() {
-                let spreading = self.spreading[bb * n + b];
-                ecb += e[bb] * spreading;
-                ct += c[bb] * spreading;
-            }
-            // Spec gap: without energy `cb(b) = ct(b) / ecb(b)` is
-            // undefined; its threshold is 0 whatever the tonality, and the
-            // threshold in quiet sets it (step 11). It is taken as 0.
-            let cb = if ecb == 0.0 { 0.0 } else { ct / ecb };
-            let en = ecb * self.rnorm[b];
-            // Step 7: the tonality, within 0 and 1.
-            let tb = (-0.299 - 0.43 * cb.ln()).clamp(0.0, 1.0);
-            // Steps 8 to 10.
-            let snr = tb * TMN + (1.0 - tb) * NMT;
-            let bc = 10f64.powf(-snr / 10.0);
-            *nb = en * bc;
-        }
         // Step 11, against the last block's nb(b) of step 10.
         for b in 0..n {
-            let limited = nb[b].min(nb_last[b] * rpelev);
-            nb_last[b] = nb[b];
+            let limited = block.nb[b].min(nb_last[b] * rpelev);
+            nb_last[b] = block.nb[b];
             nb[b] = self.quiet[b].max(limited);
             // Step 12.
             let p = &self.partitions[b];
             let weight = f64::from(p.w_high - p.w_low);
-            perceptual_entropy -= weight * (nb[b] / (e[b] + 1.0)).log10();
+            perceptual_entropy -= weight * (nb[b] / (block.e[b] + 1.0)).log10();
         }
 
         // Step 14.
@@ -274,6 +310,57 @@ impl Tables {
                 .map(|b| nb[b] / self.partitions[b].lines().len() as f64)
                 .fold(f64::INFINITY, f64::min);
             out.npart[band] = thr * lines.len() as f64;
+        }
+    }
+}
+
+/// What steps 5 to 10 give for one block, which steps 11 on take: of each
+/// partition, the energy `e(b)`, the spread and normalized energy `en(b)`,
+/// the tonality as `cb(b)`, the power ratio `bc(b)` that follows from it,
+/// and the threshold `nb(b)` of step 10.
+#[derive(Clone, Debug)]
+struct BlockThreshold {
+    e: [f64; MAX_PARTITIONS],
+    en: [f64; MAX_PARTITIONS],
+    cb: [f64; MAX_PARTITIONS],
+    bc: [f64; MAX_PARTITIONS],
+    nb: [f64; MAX_PARTITIONS],
+}
+
+impl BlockThreshold {
+    const ZERO: Self = Self {
+        e: [0.0; MAX_PARTITIONS],
+        en: [0.0; MAX_PARTITIONS],
+        cb: [0.0; MAX_PARTITIONS],
+        bc: [0.0; MAX_PARTITIONS],
+        nb: [0.0; MAX_PARTITIONS],
+    };
+}
+
+/// One block of a channel as steps 1 to 10 leave it: the lines `X(w)` of
+/// its FFT and their energy `r(w)^2`, and its partitions' thresholds.
+#[derive(Clone, Debug)]
+struct Block {
+    x: Vec<Complex>,
+    energy: Vec<f64>,
+    threshold: BlockThreshold,
+}
+
+impl Block {
+    /// A block of the FFT of shift length `iblen`, of silence.
+    fn new(iblen: usize) -> Self {
+        Self {
+            x: vec![Complex { re: 0.0, im: 0.0 }; iblen + 1],
+            energy: vec![0.0; iblen + 1],
+            threshold: BlockThreshold::ZERO,
+        }
+    }
+
+    /// Takes the FFT's lines `x`, and their energy.
+    fn set(&mut self, x: &[Complex]) {
+        self.x.copy_from_slice(x);
+        for (energy, x) in self.energy.iter_mut().zip(x) {
+            *energy = x.re * x.re + x.im * x.im;
         }
     }
 }
@@ -535,11 +622,13 @@ pub struct Model {
     /// pre-echo control (step 11).
     long_nb_last: Vec<f64>,
     short_nb_last: Vec<f64>,
+    /// The frame's long block and short blocks as steps 1 to 10 leave them
+    /// (see [`Model::analyze`]).
+    long_block: Block,
+    short_blocks: [Block; SHORT_WINDOWS],
     // Buffers kept from one frame to the next for their memory.
     windowed: Vec<f64>,
-    energy: Vec<f64>,
     c: Vec<f64>,
-    short_energy: Vec<f64>,
     short_c: Vec<f64>,
     short_c_min: Vec<f64>,
     /// The perceptual entropy of the last short block, `None` before the
@@ -567,10 +656,10 @@ impl Model {
             short_predictor: Predictor::new(SHORT_IBLEN + 1),
             long_nb_last: vec![0.0; long.partitions.len()],
             short_nb_last: vec![0.0; short.partitions.len()],
+            long_block: Block::new(LONG_IBLEN),
+            short_blocks: std::array::from_fn(|_| Block::new(SHORT_IBLEN)),
             windowed: vec![0.0; 2 * LONG_IBLEN],
-            energy: vec![0.0; LONG_IBLEN],
-            c: vec![0.0; LONG_IBLEN],
-            short_energy: vec![0.0; SHORT_IBLEN + 1],
+            c: vec![0.0; LONG_IBLEN + 1],
             short_c: vec![0.0; SHORT_IBLEN + 1],
             short_c_min: vec![0.0; SHORT_IBLEN + 1],
             last_short_entropy: None,
@@ -625,7 +714,15 @@ impl Model {
     /// blocks with the short FFT": each short block's own unpredictability
     /// is that of its lines, predicted from the two short blocks before it,
     /// across frames.
+    #[cfg(any(test, feature = "unstable"))]
     pub fn analyze(&mut self, block: &[f64; FRAME_SAMPLES], out: &mut Analysis) {
+        self.blocks(block);
+        self.finish(out);
+    }
+
+    /// Steps 1 to 10 of [`analyze`](Self::analyze), for the frame's short
+    /// blocks and its long block, kept for [`finish`](Self::finish).
+    fn blocks(&mut self, block: &[f64; FRAME_SAMPLES]) {
         // Step 1: the window of the block before and this one.
         let (before, after) = self.windowed.split_at_mut(LONG_IBLEN);
         before.copy_from_slice(&*self.previous);
@@ -634,27 +731,50 @@ impl Model {
         }
         self.previous.copy_from_slice(after);
 
-        // The short blocks, steps 2 to 14 for each, and for the long block
+        // The short blocks, steps 2 to 10 for each, and for the long block
         // the least unpredictability of each line over the eight (step 4).
         self.short_c_min.fill(f64::INFINITY);
         let mut short_windowed = [0.0; 2 * SHORT_IBLEN];
-        for (k, threshold) in out.short.iter_mut().enumerate() {
+        for (k, short) in self.short_blocks.iter_mut().enumerate() {
             let start = FIRST_SHORT + k * SHORT_IBLEN;
             let samples = &self.windowed[start..start + 2 * SHORT_IBLEN];
             for ((sw, &s), &w) in short_windowed.iter_mut().zip(samples).zip(&self.short_hann) {
                 *sw = s * w;
             }
             let x = self.short_fft.transform(&short_windowed);
-            for (energy, x) in self.short_energy.iter_mut().zip(x) {
-                *energy = x.re * x.re + x.im * x.im;
-            }
+            short.set(x);
             self.short_predictor.unpredictability(x, &mut self.short_c);
             for (min, &c) in self.short_c_min.iter_mut().zip(&self.short_c) {
                 *min = min.min(c);
             }
-            self.short.threshold(
-                &self.short_energy,
-                &self.short_c,
+            (self.short).raw_threshold(&short.energy, &self.short_c, &mut short.threshold);
+        }
+
+        // Step 2: the long FFT of the windowed samples.
+        for (s, &w) in self.windowed.iter_mut().zip(&self.long_hann) {
+            *s *= w;
+        }
+        let x = self.long_fft.transform(&self.windowed);
+        self.long_block.set(x);
+        // Steps 3 and 4.
+        self.long_predictor
+            .unpredictability(&x[..LONG_CW_LINES], &mut self.c[..LONG_CW_LINES]);
+        for (w, c) in self.c.iter_mut().enumerate().skip(LONG_CW_LINES) {
+            *c = self.short_c_min[((w + 4) / 8).min(SHORT_IBLEN)];
+        }
+        // Steps 5 to 10.
+        let long = &mut self.long_block;
+        (self.long).raw_threshold(&long.energy, &self.c, &mut long.threshold);
+    }
+
+    /// Steps 11 to 14 of [`analyze`](Self::analyze), for the blocks that
+    /// [`blocks`](Self::blocks) left, into `out`, with the largest rise of
+    /// the short blocks' entropy.
+    fn finish(&mut self, out: &mut Analysis) {
+        for (short, threshold) in self.short_blocks.iter().zip(&mut out.short) {
+            (self.short).finish(
+                &short.energy,
+                &short.threshold,
                 &mut self.short_nb_last,
                 RPELEV_SHORT,
                 threshold,
@@ -668,25 +788,10 @@ impl Model {
             last = threshold.perceptual_entropy;
         }
         self.last_short_entropy = Some(last);
-
-        // Step 2: the long FFT of the windowed samples.
-        for (s, &w) in self.windowed.iter_mut().zip(&self.long_hann) {
-            *s *= w;
-        }
-        let x = self.long_fft.transform(&self.windowed);
-        for (energy, x) in self.energy.iter_mut().zip(x) {
-            *energy = x.re * x.re + x.im * x.im;
-        }
-        // Steps 3 and 4.
-        self.long_predictor
-            .unpredictability(&x[..LONG_CW_LINES], &mut self.c[..LONG_CW_LINES]);
-        for (w, c) in self.c.iter_mut().enumerate().skip(LONG_CW_LINES) {
-            *c = self.short_c_min[(w + 4) / 8];
-        }
-        // Steps 5 to 14.
-        self.long.threshold(
-            &self.energy,
-            &self.c,
+        let long = &self.long_block;
+        (self.long).finish(
+            &long.energy,
+            &long.threshold,
             &mut self.long_nb_last,
             RPELEV_LONG,
             &mut out.long,

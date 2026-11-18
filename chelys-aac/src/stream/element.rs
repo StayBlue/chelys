@@ -9,11 +9,12 @@ use super::frame::Demand;
 use crate::channel::{self, CodedChannel, FRAME_LINES};
 use crate::filterbank::Filterbank;
 use crate::loops::{self, ChannelCoding};
+use crate::psychoacoustic::middle_side::MidSideModel;
 use crate::psychoacoustic::switching::{self, Attacks, BlockSwitching};
 use crate::raw_data_block::element::CodedElement;
 use crate::sampling_frequency::SamplingFrequency;
 use crate::scalefactor_bands::MAX_BANDS;
-use crate::stereo::middle_side::MsMask;
+use crate::stereo::middle_side::{self, MsMask};
 use crate::window::{SHORT_WINDOWS, WindowSequence, Windows};
 
 /// One channel of the element: its samples not yet coded, and what codes
@@ -93,6 +94,19 @@ pub struct ElementEncoder {
     prepared: Vec<PreparedChannel>,
     /// Whether the frame being coded is a pair that shares its window.
     common_window: bool,
+    /// For a pair, the model of its middle and side channels, and their
+    /// lines and allowances in the frame being coded.
+    mid_side: Option<Box<MidSide>>,
+    /// The bands of the frame being coded that a pair that shares its
+    /// window codes as middle and side.
+    ms: MsMask,
+}
+
+/// What a pair keeps of its middle and side channels.
+#[derive(Debug)]
+struct MidSide {
+    model: MidSideModel,
+    channels: [PreparedChannel; 2],
 }
 
 impl ElementEncoder {
@@ -104,6 +118,13 @@ impl ElementEncoder {
                 .collect(),
             prepared: (0..channels).map(|_| PreparedChannel::new()).collect(),
             common_window: false,
+            mid_side: (channels == 2).then(|| {
+                Box::new(MidSide {
+                    model: MidSideModel::new(sampling_frequency),
+                    channels: [PreparedChannel::new(), PreparedChannel::new()],
+                })
+            }),
+            ms: MsMask::NONE,
         }
     }
 
@@ -144,11 +165,8 @@ impl ElementEncoder {
 
     /// Has the models analyze the first block, that of the first frame.
     pub fn prime(&mut self) {
-        for channel in &mut self.channels {
-            let block = *channel.block(0);
-            let attacks = channel.switching.look_ahead(&block);
-            debug_assert!(attacks.is_none(), "the first block");
-        }
+        let attacks = self.analyze(0);
+        debug_assert!(attacks.is_none(), "the first block");
     }
 
     /// Has the models analyze the block at `next`, after that of the frame
@@ -157,21 +175,40 @@ impl ElementEncoder {
     /// their attacks, so that they can share their windows (see
     /// [`prepare`](Self::prepare)).
     pub fn look_ahead(&mut self, next: usize, block_switching: bool) {
-        let mut attacks = [Attacks {
-            this: false,
-            next: false,
-        }; 2];
+        let mut attacks = self.analyze(next).expect("primed");
         let attacks = &mut attacks[..self.channels.len()];
-        for (channel, attacks) in self.channels.iter_mut().zip(attacks.iter_mut()) {
-            let block = *channel.block(next);
-            let found = channel.switching.look_ahead(&block).expect("primed");
-            if block_switching {
-                *attacks = found;
-            }
+        if !block_switching {
+            attacks.fill(Attacks {
+                this: false,
+                next: false,
+            });
         }
         switching::agree(attacks, SHARED_ATTACKS);
         for (channel, &attacks) in self.channels.iter_mut().zip(attacks.iter()) {
             channel.attacks = attacks;
+        }
+    }
+
+    /// Has each channel's model, and a pair's model of its middle and side
+    /// channels, analyze the block at `start`, and gives each channel's
+    /// attacks in the frame before and in this one, but for the first
+    /// block.
+    fn analyze(&mut self, start: usize) -> Option<[Attacks; 2]> {
+        match (&mut self.channels[..], &mut self.mid_side) {
+            ([left, right], Some(mid_side)) => {
+                let blocks = [*left.block(start), *right.block(start)];
+                BlockSwitching::look_ahead_pair(
+                    [&mut left.switching, &mut right.switching],
+                    &mut mid_side.model,
+                    [&blocks[0], &blocks[1]],
+                )
+            }
+            ([channel], _) => {
+                let block = *channel.block(start);
+                let attacks = channel.switching.look_ahead(&block)?;
+                Some([attacks; 2])
+            }
+            _ => unreachable!("an element of one channel or two"),
         }
     }
 
@@ -234,6 +271,92 @@ impl ElementEncoder {
             [left, right] => left.windows == right.windows,
             _ => false,
         };
+        self.ms = MsMask::NONE;
+        if self.common_window {
+            self.code_middle_side();
+        }
+    }
+
+    /// Chooses the bands of the frame's pair, which shares its window, to
+    /// code as middle and side (see [`middle_side::choose`]), and puts the
+    /// middle channel's lines and allowances in place of the left
+    /// channel's in those bands, and the side channel's in place of the
+    /// right's.
+    ///
+    /// The allowance of the middle and side channels' bands, `xmin(n)`
+    /// (step 14), is that of their own thresholds, as the imaging control
+    /// adjusts them (see [`MidSideModel::look_ahead`]); the left and right
+    /// channels' are adjusted too, whichever bands are coded so.
+    ///
+    /// Spec gap: Annex C gives the perceptual entropy and `bit_allocation`
+    /// of each channel's block (clause C.1.4, step 15), and does not say
+    /// what they are for a channel coded as left in some bands and middle
+    /// in others. They are taken as those of the middle and side channels
+    /// where those code at least half of the frame's lines, and else as
+    /// those of the left and right channels.
+    fn code_middle_side(&mut self) {
+        let fs = self.sampling_frequency;
+        let Some(mid_side) = &mut self.mid_side else {
+            unreachable!("a pair")
+        };
+        let [left, right] = &mut self.prepared[..] else {
+            unreachable!("a pair")
+        };
+        let windows = left.windows;
+        let [mid, side] = &mut mid_side.channels;
+        middle_side::matrix(
+            &left.spectrum,
+            &right.spectrum,
+            &mut mid.spectrum,
+            &mut side.spectrum,
+        );
+        let analyses = mid_side.model.current();
+        for (channel, analysis) in [&mut *mid, &mut *side].into_iter().zip(analyses) {
+            channel.windows = windows;
+            analysis.xmin(windows, &channel.spectrum, &mut channel.xmin);
+            channel.bit_allocation = analysis.bit_allocation(windows.sequence);
+            channel.perceptual_entropy = analysis.perceptual_entropy(windows.sequence);
+        }
+        let offset = 10f64.powf(loops::XMIN_OFFSET_DB / 10.0);
+        let raised = |channel: &PreparedChannel| {
+            let mut raised = [[0.0; MAX_BANDS]; SHORT_WINDOWS];
+            for (raised, xmin) in raised.iter_mut().zip(&channel.xmin) {
+                *raised = xmin.map(|xmin| xmin * offset);
+            }
+            raised
+        };
+        let allowed = [raised(left), raised(right), raised(mid), raised(side)];
+        let groups = left.xmin.len();
+        self.ms = middle_side::choose(
+            windows,
+            fs,
+            [&*left, &*right, &*mid, &*side].map(|c| &*c.spectrum),
+            allowed.each_ref().map(|allowed| &allowed[..groups]),
+        );
+        let mut start = 0;
+        let mut lines_mid_side = 0;
+        for (g, bands) in windows.groups(fs).enumerate() {
+            for sfb in 0..bands.num_swb() {
+                if self.ms.is_used(g, sfb) {
+                    let range = start + bands.offset(sfb)..start + bands.offset(sfb + 1);
+                    lines_mid_side += range.len();
+                    left.spectrum[range.clone()].copy_from_slice(&mid.spectrum[range.clone()]);
+                    right.spectrum[range.clone()].copy_from_slice(&side.spectrum[range]);
+                    left.xmin[g][sfb] = mid.xmin[g][sfb];
+                    right.xmin[g][sfb] = side.xmin[g][sfb];
+                }
+            }
+            start += bands.lines();
+        }
+        for channel in [&mut *left, &mut *right] {
+            channel.silent = channel.spectrum.iter().all(|&x| x == 0.0);
+        }
+        if 2 * lines_mid_side >= FRAME_LINES {
+            for (coded, mid_side) in [left, right].into_iter().zip([&*mid, &*side]) {
+                coded.bit_allocation = mid_side.bit_allocation;
+                coded.perceptual_entropy = mid_side.perceptual_entropy;
+            }
+        }
     }
 
     /// The windows the frame's pair shares, if it does.
@@ -333,7 +456,7 @@ impl ElementEncoder {
                 let windows = a.windows;
                 let groups = windows.groups(fs).count();
                 let num_swb = windows.groups(fs).next().expect("a group").num_swb();
-                let ms = MsMask::NONE;
+                let ms = self.ms;
                 let mut coding = ChannelCoding {
                     common_window: true,
                     ..ChannelCoding::single(windows, fs, budget(a))
@@ -455,9 +578,24 @@ mod tests {
             let mut r = BitReader::new(&bytes);
             let decoded = element(&mut r, fs);
             assert_eq!(r.position(), len, "the bits written are those read");
-            let spectra = (encoder.prepared.iter())
+            // The left and right channels' lines, from the middle and side
+            // channels' where the pair codes them.
+            let mut spectra: Vec<Vec<f64>> = (encoder.prepared.iter())
                 .map(|prepared| prepared.spectrum.to_vec())
                 .collect();
+            if let [left, right] = &mut spectra[..] {
+                let mut start = 0;
+                for (g, bands) in encoder.prepared[0].windows.groups(fs).enumerate() {
+                    for sfb in 0..bands.num_swb() {
+                        if encoder.ms.is_used(g, sfb) {
+                            for i in start + bands.offset(sfb)..start + bands.offset(sfb + 1) {
+                                (left[i], right[i]) = (left[i] + right[i], left[i] - right[i]);
+                            }
+                        }
+                    }
+                    start += bands.lines();
+                }
+            }
             frames.push((decoded, spectra));
             start += FRAME_SAMPLES;
         }
@@ -509,13 +647,25 @@ mod tests {
                     panic!("a pair")
                 };
                 assert_eq!(left.info, right.info);
+                let energy = |lines: &[f64]| lines.iter().map(|x| x * x).sum::<f64>();
+                let pair_energy = energy(&spectra[0]) + energy(&spectra[1]);
                 for (c, decoded) in decoded.spectra(fs).iter().enumerate() {
                     let original = &spectra[c];
                     if original.iter().any(|&x| x != 0.0) {
                         let snr = snr(original, decoded);
                         assert!(snr > 10.0, "pair {i}, frame {f}, channel {c}: {snr} dB");
                     } else {
-                        assert!(decoded.iter().all(|&x| x == 0.0));
+                        // Coded as middle and side, a silent channel takes
+                        // the difference of their noise, which they may
+                        // take up to their thresholds in quiet: where the
+                        // other channel's energy is near its own, the
+                        // middle and side channels, each with half its
+                        // amplitude, are below theirs.
+                        let noise = energy(decoded);
+                        assert!(
+                            noise <= 1e-2 * pair_energy,
+                            "pair {i}, frame {f}, channel {c}: {noise} against {pair_energy}"
+                        );
                     }
                 }
             }

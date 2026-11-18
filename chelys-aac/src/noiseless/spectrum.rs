@@ -63,6 +63,19 @@ pub(super) fn bits_by_codebook(lines: &[i32], class: usize, top: usize) -> [u32;
     bits
 }
 
+/// The fewest bits that `lines`, a scalefactor band's quantized lines, take
+/// in `spectral_data()` in any codebook that codes them, or `None` if a
+/// line's magnitude exceeds what any codes.
+pub fn least_bits(lines: &[i32]) -> Option<u32> {
+    let largest = lines
+        .iter()
+        .map(|line| line.unsigned_abs())
+        .max()
+        .unwrap_or(0);
+    let class = super::codebooks::class(largest)?;
+    bits_by_codebook(lines, class, class).into_iter().min()
+}
+
 fn spectrum_codebook(books: &[Codebook], i: usize) -> &'static SpectrumCodebook {
     books[i].spectrum().expect("a spectrum codebook")
 }

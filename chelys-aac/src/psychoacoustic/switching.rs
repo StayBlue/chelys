@@ -6,6 +6,7 @@
 //! rest of each frame's windows: the grouping of its short windows and its
 //! window shape.
 
+use super::middle_side::MidSideModel;
 use super::{Analysis, Model};
 use crate::sampling_frequency::SamplingFrequency;
 use crate::stream::FRAME_SAMPLES;
@@ -104,10 +105,37 @@ impl BlockSwitching {
     /// and this one have attacks; or `None` for the first block, before
     /// which there is no frame to choose windows for.
     pub fn look_ahead(&mut self, block: &[f64; FRAME_SAMPLES]) -> Option<Attacks> {
+        self.begin(block);
+        self.end()
+    }
+
+    /// [`look_ahead`](Self::look_ahead) for the two channels of a pair,
+    /// `[left, right]`, with the model of its middle and side channels,
+    /// which adjusts their thresholds (see [`MidSideModel::look_ahead`]).
+    pub fn look_ahead_pair(
+        [left, right]: [&mut Self; 2],
+        mid_side: &mut MidSideModel,
+        [left_block, right_block]: [&[f64; FRAME_SAMPLES]; 2],
+    ) -> Option<[Attacks; 2]> {
+        left.begin(left_block);
+        right.begin(right_block);
+        mid_side.look_ahead(&mut left.model, &mut right.model);
+        let left = left.end();
+        let right = right.end();
+        left.zip(right).map(|(left, right)| [left, right])
+    }
+
+    /// Takes the next block through steps 1 to 10 of the model.
+    fn begin(&mut self, block: &[f64; FRAME_SAMPLES]) {
         if self.primed {
             std::mem::swap(&mut self.current, &mut self.ahead);
         }
-        self.model.analyze(block, &mut self.ahead);
+        self.model.blocks(block);
+    }
+
+    /// Finishes the analysis of the block [`begin`](Self::begin) took.
+    fn end(&mut self) -> Option<Attacks> {
+        self.model.finish(&mut self.ahead);
         let primed = std::mem::replace(&mut self.primed, true);
         primed.then(|| Attacks {
             this: attack(&self.current),

@@ -4,9 +4,86 @@
 //! M/S stereo (clause 12.1): the bands of a pair that share their window
 //! coded as middle and side rather than left and right.
 
+use std::cmp::Ordering;
+
 use chelys_core::bitstream::BitWriter;
 
-use crate::window::SHORT_WINDOWS;
+use crate::channel::FRAME_LINES;
+use crate::loops::inner;
+use crate::sampling_frequency::SamplingFrequency;
+use crate::scalefactor_bands::MAX_BANDS;
+use crate::window::{SHORT_WINDOWS, Windows};
+
+/// The middle and side channels of a pair's lines, `M = (L + R) / 2` and
+/// `S = (L - R) / 2`, which clause 12.1.3 decodes as `L = M + S` and `R =
+/// M - S`, into `mid` and `side`.
+pub fn matrix(
+    left: &[f64; FRAME_LINES],
+    right: &[f64; FRAME_LINES],
+    mid: &mut [f64; FRAME_LINES],
+    side: &mut [f64; FRAME_LINES],
+) {
+    for (((m, s), &l), &r) in mid.iter_mut().zip(side.iter_mut()).zip(left).zip(right) {
+        *m = (l + r) / 2.0;
+        *s = (l - r) / 2.0;
+    }
+}
+
+/// Chooses the bands of a pair that shares `windows` to code as middle and
+/// side (clause C.6.1, steps 3 to 5): from the lines `[left, right, mid,
+/// side]` and what each band of each group of each may take as noise,
+/// `allowed`, the bits each band takes coded as left and right and as
+/// middle and side are estimated, each channel's band quantized with the
+/// coarsest step within its allowance (see [`inner::band_bits`]), and a
+/// band is coded as middle and side where that takes fewer.
+///
+/// Spec reading: steps 3 and 4 quantize each channel's lines "with the
+/// appropriate calculated and quantized threshold", and count "the number
+/// of bits actually required" to code them. A band's bits are taken as
+/// those of its lines in its best codebook alone: its section and
+/// scalefactor, which the band costs in either coding, are left out.
+///
+/// Spec gap: step 5 does not say which coding a band takes where both
+/// take as many bits, as where all four channels' bands quantize to zero.
+/// Such bands take the coding of all the others where they agree, so that
+/// no flag need be sent for each band (see [`MsMask::present`]), and else
+/// left and right.
+pub fn choose(
+    windows: Windows,
+    sampling_frequency: SamplingFrequency,
+    lines: [&[f64; FRAME_LINES]; 4],
+    allowed: [&[[f64; MAX_BANDS]]; 4],
+) -> MsMask {
+    let mut mask = MsMask::NONE;
+    let mut ties = MsMask::NONE;
+    let (mut any_left_right, mut any_mid_side) = (false, false);
+    let mut scratch = inner::BandScratch::default();
+    let mut start = 0;
+    for (g, bands) in windows.groups(sampling_frequency).enumerate() {
+        for sfb in 0..bands.num_swb() {
+            let range = start + bands.offset(sfb)..start + bands.offset(sfb + 1);
+            let [l, r, m, s] = std::array::from_fn(|c| {
+                inner::band_bits(&lines[c][range.clone()], allowed[c][g][sfb], &mut scratch)
+            });
+            let (left_right, mid_side) = (l + r, m + s);
+            match mid_side.cmp(&left_right) {
+                Ordering::Equal => ties.set(g, sfb, true),
+                Ordering::Less => {
+                    mask.set(g, sfb, true);
+                    any_mid_side = true;
+                }
+                Ordering::Greater => any_left_right = true,
+            }
+        }
+        start += bands.lines();
+    }
+    if any_mid_side && !any_left_right {
+        for g in 0..SHORT_WINDOWS {
+            mask.used[g] |= ties.used[g];
+        }
+    }
+    mask
+}
 
 /// `ms_used[g][sfb]` (clause 12.1.2.1) of a pair's window groups: a bit for
 /// each band of each group.
@@ -21,7 +98,6 @@ impl MsMask {
         used: [0; SHORT_WINDOWS],
     };
 
-    #[cfg(test)]
     pub fn set(&mut self, g: usize, sfb: usize, used: bool) {
         if used {
             self.used[g] |= 1 << sfb;
