@@ -84,7 +84,7 @@ pub(super) struct FrameEncoder<C: Coding> {
     /// Each channel's PCM from the first granule not yet filtered.
     pcm: Vec<Vec<f64>>,
     /// The samples each channel has been given.
-    samples: usize,
+    samples: u64,
     /// The length of each frame written.
     frame_lens: Vec<usize>,
     pub(super) ancillary: AncillaryQueue,
@@ -98,7 +98,7 @@ pub(super) struct Ended {
     /// The length of each frame.
     pub(super) frame_lens: Vec<usize>,
     /// The samples each channel was given.
-    pub(super) samples: usize,
+    pub(super) samples: u64,
     /// The bits of ancillary data that the last frames had no room for.
     pub(super) ancillary_dropped: usize,
 }
@@ -136,7 +136,7 @@ impl<C: Coding> FrameEncoder<C> {
         for (pcm, samples) in self.pcm.iter_mut().zip(channels) {
             pcm.extend_from_slice(samples);
         }
-        self.samples += len;
+        self.samples += len as u64;
         let frame_samples = self.samples_per_frame();
         let mut start = 0;
         while self.pcm[0].len() - start >= frame_samples + LOOK_AHEAD {
@@ -154,8 +154,9 @@ impl<C: Coding> FrameEncoder<C> {
     /// codes them, and appends the rest of the stream to `out`.
     pub(super) fn finish(mut self, out: &mut Vec<u8>) -> Ended {
         let frame_samples = self.samples_per_frame();
-        let frames = (self.samples + DELAY).div_ceil(frame_samples);
-        let remaining = frames - self.frame_lens.len();
+        let frames = (self.samples + DELAY as u64).div_ceil(frame_samples as u64);
+        // Few: the frames of the PCM held and of DELAY.
+        let remaining = (frames - self.frame_lens.len() as u64) as usize;
         for pcm in &mut self.pcm {
             pcm.resize(remaining * frame_samples + LOOK_AHEAD, 0.0);
         }

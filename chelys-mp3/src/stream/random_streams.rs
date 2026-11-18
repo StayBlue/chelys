@@ -250,8 +250,8 @@ impl Case {
             .sampling_frequency
             .version()
             .samples_per_frame();
-        assert_eq!(finished.samples, samples);
-        assert_eq!(finished.frames, frames.len());
+        assert_eq!(finished.samples, samples as u64);
+        assert_eq!(finished.frames, frames.len() as u64);
         assert_eq!(frames.len(), (samples + DELAY).div_ceil(samples_per_frame));
 
         let mut at = 0;

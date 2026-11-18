@@ -54,9 +54,9 @@ pub struct Finished {
     /// [`info_tag_len`](Encoder::info_tag_len) bytes of the stream.
     pub info_tag: Option<Vec<u8>>,
     /// The frames of audio, after the tag's frame if there is one.
-    pub frames: usize,
+    pub frames: u64,
     /// The samples each channel was given.
-    pub samples: usize,
+    pub samples: u64,
     /// The bits of ancillary data that the last frames had no room for,
     /// dropped.
     pub ancillary_dropped: usize,

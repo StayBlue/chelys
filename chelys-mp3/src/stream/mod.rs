@@ -183,9 +183,9 @@ pub struct StreamEnd {
     /// [`with_info_tag`](StreamEncoder::with_info_tag) whose stream has one.
     pub info_tag: Option<Vec<u8>>,
     /// The frames of audio, after the tag's frame if there is one.
-    pub frames: usize,
+    pub frames: u64,
     /// The samples each channel was given.
-    pub samples: usize,
+    pub samples: u64,
     /// The bits of ancillary data that the last frames had no room for.
     pub ancillary_dropped: usize,
 }
@@ -354,7 +354,7 @@ impl StreamEncoder {
         });
         StreamEnd {
             info_tag,
-            frames: ended.frame_lens.len(),
+            frames: ended.frame_lens.len() as u64,
             samples: ended.samples,
             ancillary_dropped: ended.ancillary_dropped,
         }

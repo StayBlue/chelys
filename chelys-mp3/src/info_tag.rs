@@ -164,7 +164,7 @@ pub struct Stream<'a> {
     /// The length in bytes of each frame of the stream after the tag's.
     pub frame_lens: &'a [usize],
     /// The input samples of each channel.
-    pub samples: usize,
+    pub samples: u64,
     /// The CRC of the bytes of the stream after the tag's frame (see
     /// [`music_crc`]).
     pub music_crc: u16,
@@ -348,13 +348,13 @@ fn encoder_version() -> [u8; 9] {
 /// input (see [`DECODER_DELAY`]).
 fn delays(stream: &Stream) -> [u8; 3] {
     let fs = stream.config.sampling_frequency;
-    let decoded = stream.frame_lens.len() * fs.version().samples_per_frame();
+    let decoded = stream.frame_lens.len() as u64 * fs.version().samples_per_frame() as u64;
     let delay = DELAY - DECODER_DELAY;
     let padding = decoded
-        .checked_sub(stream.samples + delay)
-        .filter(|padding| (DECODER_DELAY..1 << 12).contains(padding))
+        .checked_sub(stream.samples + delay as u64)
+        .filter(|padding| (DECODER_DELAY as u64..1 << 12).contains(padding))
         .expect("the stream covers the input and the decoder's delay after it");
-    let both = ((delay << 12) | padding) as u32;
+    let both = ((delay as u32) << 12) | padding as u32;
     let [_, high, middle, low] = both.to_be_bytes();
     [high, middle, low]
 }

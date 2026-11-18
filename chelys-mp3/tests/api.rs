@@ -264,8 +264,11 @@ fn finishing_gives_the_tag_and_the_counts() {
     assert_eq!(tag.len(), tag_len);
     assert_eq!(tag[..4], stream[..4]);
     assert_eq!(finished.samples, 5_000);
-    assert_eq!(finished.frames, (5_000 + DELAY).div_ceil(576));
-    assert_eq!(finished.ancillary_dropped, 8 * 1_000 - 8 * finished.frames);
+    assert_eq!(finished.frames, (5_000 + DELAY as u64).div_ceil(576));
+    assert_eq!(
+        finished.ancillary_dropped as u64,
+        8 * 1_000 - 8 * finished.frames
+    );
 
     let untagged = Config::new(22_050, ChannelMode::Mono, Rate::Constant { kbps: 32 });
     assert_eq!(Encoder::new(untagged).unwrap().info_tag_len(), None);
