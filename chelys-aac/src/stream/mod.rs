@@ -4,9 +4,10 @@
 //! The frames of a stream: one per block of 1024 samples of each channel,
 //! each as long as the bit reservoir lets it be, framed as asked.
 
-use chelys_core::bitstream::BitWriter;
+mod frame;
 
-use super::adts::{self, HEADER_LEN};
+use super::DELAY;
+use super::adts::HEADER_LEN;
 use super::audio_specific_config::audio_specific_config;
 use super::channel::CodedChannel;
 use super::channel_configuration::ChannelConfiguration;
@@ -113,12 +114,26 @@ impl<F: FnMut(&[u8])> FrameSink for F {
     }
 }
 
-/// Codes a stream frame by frame.
+/// Codes a stream from PCM as it arrives, in any lengths, a frame for each
+/// block of [`FRAME_SAMPLES`] of each channel.
 #[derive(Clone, Debug)]
 pub struct StreamEncoder {
     config: StreamConfig,
     reservoir: BitReservoir,
+    /// Each channel's samples that no frame has coded yet: fewer than a
+    /// block's between calls.
+    pcm: Vec<Vec<f64>>,
+    /// The samples each channel was given.
+    samples: u64,
     frames: u64,
+}
+
+/// What a [`StreamEncoder`] coded, once it has finished.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StreamEnd {
+    pub frames: u64,
+    /// The samples each channel was given.
+    pub samples: u64,
 }
 
 impl StreamEncoder {
@@ -132,12 +147,10 @@ impl StreamEncoder {
         Self {
             config,
             reservoir,
+            pcm: vec![Vec::with_capacity(FRAME_SAMPLES); config.channel_configuration.channels()],
+            samples: 0,
             frames: 0,
         }
-    }
-
-    pub fn config(&self) -> &StreamConfig {
-        &self.config
     }
 
     /// The `AudioSpecificConfig()` of ISO/IEC 14496-3 that describes the
@@ -149,43 +162,66 @@ impl StreamEncoder {
         )
     }
 
-    /// The frames coded so far.
-    pub fn frames(&self) -> u64 {
-        self.frames
+    /// Takes `channels`, the next samples of each channel at full scale
+    /// 1.0, and gives `out` the frames they complete.
+    ///
+    /// # Panics
+    ///
+    /// If there is not one slice for each channel, all of one length: a
+    /// caller's error.
+    pub fn encode<O: FrameSink + ?Sized>(&mut self, channels: &[&[f64]], out: &mut O) {
+        assert_eq!(channels.len(), self.pcm.len(), "one slice per channel");
+        let len = channels[0].len();
+        assert!(
+            channels.iter().all(|c| c.len() == len),
+            "every channel has the same number of samples"
+        );
+        for (pcm, samples) in self.pcm.iter_mut().zip(channels) {
+            pcm.extend_from_slice(samples);
+        }
+        self.samples += len as u64;
+        let mut start = 0;
+        while self.pcm[0].len() - start >= FRAME_SAMPLES {
+            self.encode_frame(start, out);
+            start += FRAME_SAMPLES;
+        }
+        for pcm in &mut self.pcm {
+            pcm.drain(..start);
+        }
     }
 
-    /// Codes the frame whose window ends with `block`, the next
-    /// [`FRAME_SAMPLES`] of each channel, and gives it to `out`.
+    /// Ends the stream: pads the input with silence to whole frames, at
+    /// least [`DELAY`] samples past it, so that the decoded output holds
+    /// all of the input, and gives `out` the frames left.
+    pub fn finish<O: FrameSink + ?Sized>(mut self, out: &mut O) -> StreamEnd {
+        let frames = (self.samples + DELAY as u64).div_ceil(FRAME_SAMPLES as u64);
+        // Few: those of the samples held and of DELAY.
+        let remaining = (frames - self.frames) as usize;
+        for pcm in &mut self.pcm {
+            pcm.resize(remaining * FRAME_SAMPLES, 0.0);
+        }
+        for frame in 0..remaining {
+            self.encode_frame(frame * FRAME_SAMPLES, out);
+        }
+        StreamEnd {
+            frames: self.frames,
+            samples: self.samples,
+        }
+    }
+
+    /// Codes the frame whose block starts at `start` in [`Self::pcm`], and
+    /// gives it to `out`.
     ///
     /// The encoder does not analyse its input yet: every frame codes each
     /// channel's spectrum as all zero, so the stream decodes to silence.
-    pub fn encode<O: FrameSink + ?Sized>(&mut self, block: &[&[f64]], out: &mut O) {
-        debug_assert!(block.iter().all(|channel| channel.len() == FRAME_SAMPLES));
-        let header_len = self.config.header_len();
-        // As short as the reservoir allows: the silent channels, filled
-        // only where the reservoir is full (clause 8.8.2.2).
-        let (shortest, _) = self.reservoir.frame_len_range();
-        let frame_len = shortest.max(self.config.shortest_frame_len());
-        self.reservoir.spend(frame_len);
-        let block = raw_data_block::write(
-            self.config.channel_configuration,
-            &self.config.silent_channels(),
-            frame_len - header_len,
+    fn encode_frame<O: FrameSink + ?Sized>(&mut self, start: usize, out: &mut O) {
+        debug_assert!(
+            self.pcm
+                .iter()
+                .all(|pcm| pcm.len() >= start + FRAME_SAMPLES)
         );
-        match self.config.framing {
-            Framing::Adts => {
-                let header = adts::Header {
-                    sampling_frequency: self.config.sampling_frequency,
-                    channel_configuration: self.config.channel_configuration,
-                };
-                let mut w = BitWriter::new();
-                header.write(&mut w, frame_len, self.reservoir.adts_buffer_fullness());
-                let mut frame = w.into_bytes();
-                frame.extend_from_slice(&block);
-                out.frame(&frame);
-            }
-            Framing::Raw => out.frame(&block),
-        }
+        let channels = self.config.silent_channels();
+        frame::write(&self.config, &mut self.reservoir, &channels, out);
         self.frames += 1;
     }
 }
@@ -193,13 +229,12 @@ impl StreamEncoder {
 /// A stream of `frames` silent frames, each apart, for tests.
 #[cfg(any(test, feature = "unstable"))]
 pub fn encode_silence(config: StreamConfig, frames: usize) -> Vec<Vec<u8>> {
-    let silence = vec![0.0; FRAME_SAMPLES];
-    let block = vec![silence.as_slice(); config.channel_configuration.channels()];
+    let silence = vec![0.0; frames * FRAME_SAMPLES];
+    let channels = vec![silence.as_slice(); config.channel_configuration.channels()];
     let mut encoder = StreamEncoder::new(config);
     let mut out = Vec::new();
-    for _ in 0..frames {
-        encoder.encode(&block, &mut |frame: &[u8]| out.push(frame.to_vec()));
-    }
+    encoder.encode(&channels, &mut |frame: &[u8]| out.push(frame.to_vec()));
+    assert_eq!(out.len(), frames);
     out
 }
 
