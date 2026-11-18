@@ -5,14 +5,16 @@
 //! variable bitrate by switching the bitrate_index. The switching of the
 //! bitrate_index can be used either to optimize storage requirements on DSM
 //! or to interpolate any mean data rate by switching between nearby values
-//! in the bitrate table." [`Rate::Variable`] does the first, and
-//! [`Rate::Mean`] the second.
+//! in the bitrate table." [`StreamRate::Variable`] does the first, and
+//! [`StreamRate::Mean`] the second.
 
 use super::header::{Bitrate, SamplingFrequency, Version};
 
-/// How each frame's bitrate is chosen.
+/// How each frame's bitrate is chosen: a [`Config`](crate::Config)'s
+/// [`Rate`](crate::Rate) in the bitrates of the stream's frames, as a
+/// [`StreamConfig`](crate::stream::StreamConfig) has it.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Rate {
+pub enum StreamRate {
     /// Every frame at one bitrate, padded as
     /// [`PaddingSchedule`](super::header::PaddingSchedule) has it. The one
     /// rate that may be free format ([`Bitrate::free`]).
@@ -21,7 +23,7 @@ pub enum Rate {
     Variable(VariableRate),
 }
 
-impl Rate {
+impl StreamRate {
     /// The [`Version`] whose bitrates the frames have.
     pub fn version(self) -> Version {
         self.lowest().version()

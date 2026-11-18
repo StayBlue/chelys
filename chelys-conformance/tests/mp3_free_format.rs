@@ -9,7 +9,7 @@ use std::process::Command;
 
 use chelys::mp3::DELAY;
 use chelys::mp3::internals::header::{Bitrate, Flags, Mode, SamplingFrequency};
-use chelys::mp3::internals::rate::Rate;
+use chelys::mp3::internals::rate::StreamRate;
 use chelys::mp3::internals::{StreamConfig, encode_pcm, encode_pcm_with_info_tag, info_tag};
 use chelys_conformance::{Decoder, lame, mpg123};
 
@@ -90,7 +90,9 @@ fn mpg123_and_lame_decode_free_format() {
         for (fs, bits_per_second, mode, crc_protected) in cases {
             scope.spawn(move || {
                 let config = StreamConfig {
-                    rate: Rate::Constant(Bitrate::free(fs.version(), bits_per_second).unwrap()),
+                    rate: StreamRate::Constant(
+                        Bitrate::free(fs.version(), bits_per_second).unwrap(),
+                    ),
                     sampling_frequency: fs,
                     mode,
                     crc_protected,
@@ -155,7 +157,7 @@ fn ffmpeg_does_not_decode_free_format() {
     let input = chirp(fs, 44_100);
     let decodes = |bitrate| {
         let config = StreamConfig {
-            rate: Rate::Constant(bitrate),
+            rate: StreamRate::Constant(bitrate),
             sampling_frequency: fs,
             mode: Mode::SingleChannel,
             crc_protected: false,

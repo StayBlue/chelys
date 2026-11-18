@@ -8,7 +8,7 @@ use std::f64::consts::TAU;
 
 use chelys::mp3::DELAY;
 use chelys::mp3::internals::header::{Bitrate, Flags, Mode, SamplingFrequency};
-use chelys::mp3::internals::rate::{MeanRate, Rate, VariableRate};
+use chelys::mp3::internals::rate::{MeanRate, StreamRate, VariableRate};
 use chelys::mp3::internals::side_info::SideInfo;
 use chelys::mp3::internals::{StreamConfig, encode_pcm_with_info_tag, info_tag};
 use chelys_conformance::{Decoder, ffmpeg, lame, mpg123};
@@ -76,11 +76,16 @@ fn decoders_read_the_tag_at_every_sampling_frequency() {
         ms_stereo: true,
     };
     let cases = [
-        (Hz44100, Rate::Constant(at(Hz44100, 128)), ms, false),
-        (Hz48000, Rate::Constant(at(Hz48000, 32)), Mode::Stereo, true),
+        (Hz44100, StreamRate::Constant(at(Hz44100, 128)), ms, false),
+        (
+            Hz48000,
+            StreamRate::Constant(at(Hz48000, 32)),
+            Mode::Stereo,
+            true,
+        ),
         (
             Hz32000,
-            Rate::Variable(VariableRate {
+            StreamRate::Variable(VariableRate {
                 lowest: at(Hz32000, 32),
                 highest: at(Hz32000, 320),
                 noise_offset_db: 0.0,
@@ -90,19 +95,19 @@ fn decoders_read_the_tag_at_every_sampling_frequency() {
         ),
         (
             Hz22050,
-            Rate::Mean(MeanRate::new(Hz22050.version(), 50_000).unwrap()),
+            StreamRate::Mean(MeanRate::new(Hz22050.version(), 50_000).unwrap()),
             ms,
             true,
         ),
         (
             Hz24000,
-            Rate::Constant(at(Hz24000, 8)),
+            StreamRate::Constant(at(Hz24000, 8)),
             Mode::SingleChannel,
             false,
         ),
         (
             Hz16000,
-            Rate::Variable(VariableRate {
+            StreamRate::Variable(VariableRate {
                 lowest: at(Hz16000, 8),
                 highest: at(Hz16000, 160),
                 noise_offset_db: 0.0,
@@ -110,16 +115,16 @@ fn decoders_read_the_tag_at_every_sampling_frequency() {
             Mode::Stereo,
             false,
         ),
-        (Hz11025, Rate::Constant(at(Hz11025, 32)), ms, false),
+        (Hz11025, StreamRate::Constant(at(Hz11025, 32)), ms, false),
         (
             Hz12000,
-            Rate::Constant(at(Hz12000, 8)),
+            StreamRate::Constant(at(Hz12000, 8)),
             Mode::SingleChannel,
             true,
         ),
         (
             Hz8000,
-            Rate::Variable(VariableRate {
+            StreamRate::Variable(VariableRate {
                 lowest: at(Hz8000, 8),
                 highest: at(Hz8000, 64),
                 noise_offset_db: 0.0,
@@ -222,7 +227,7 @@ fn decoders_read_the_tag_without_its_table() {
         for (fs, kbps, mode, crc_protected) in cases {
             scope.spawn(move || {
                 let config = StreamConfig {
-                    rate: Rate::Constant(Bitrate::from_kbps(fs.version(), kbps).unwrap()),
+                    rate: StreamRate::Constant(Bitrate::from_kbps(fs.version(), kbps).unwrap()),
                     sampling_frequency: fs,
                     mode,
                     crc_protected,
@@ -310,7 +315,7 @@ fn decoders_read_the_tag_without_its_table() {
 fn ffmpeg_seeks_by_the_table() {
     let fs = SamplingFrequency::Hz8000;
     let config = StreamConfig {
-        rate: Rate::Constant(Bitrate::from_kbps(fs.version(), 8).unwrap()),
+        rate: StreamRate::Constant(Bitrate::from_kbps(fs.version(), 8).unwrap()),
         sampling_frequency: fs,
         mode: Mode::Stereo,
         crc_protected: false,
@@ -351,7 +356,7 @@ fn ffmpeg_seeks_by_the_table() {
 fn ffmpeg_applies_the_delays_for_some_encoders_only() {
     let fs = SamplingFrequency::Hz44100;
     let config = StreamConfig {
-        rate: Rate::Constant(Bitrate::from_kbps(fs.version(), 128).unwrap()),
+        rate: StreamRate::Constant(Bitrate::from_kbps(fs.version(), 128).unwrap()),
         sampling_frequency: fs,
         mode: Mode::SingleChannel,
         crc_protected: false,

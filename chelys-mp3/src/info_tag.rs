@@ -20,7 +20,7 @@
 //! `decoders_read_the_tag_at_every_sampling_frequency`.
 
 use super::header::{Bitrate, Emphasis, Header, Mode, SamplingFrequency};
-use super::rate::Rate;
+use super::rate::StreamRate;
 use super::side_info::SideInfo;
 use super::stream::StreamConfig;
 use super::{DELAY, crc};
@@ -117,11 +117,11 @@ pub fn header(config: &StreamConfig) -> Option<Header> {
     let room = |bitrate: &Bitrate| bitrate.frame_len(fs, false).saturating_sub(4 + side_info);
     let holds = |bitrate: &Bitrate| room(bitrate) >= TAG_LEN;
     let preferred = match config.rate {
-        Rate::Constant(bitrate) => Some(bitrate).filter(|b| room(b) >= TAG_LEN - TABLE_LEN),
-        Rate::Mean(mean) => Bitrate::all(fs.version())
+        StreamRate::Constant(bitrate) => Some(bitrate).filter(|b| room(b) >= TAG_LEN - TABLE_LEN),
+        StreamRate::Mean(mean) => Bitrate::all(fs.version())
             .min_by_key(|b| b.bits_per_second().abs_diff(mean.bits_per_second()))
             .filter(holds),
-        Rate::Variable(_) => None,
+        StreamRate::Variable(_) => None,
     };
     let bitrate = match preferred {
         Some(bitrate) => bitrate,
@@ -203,15 +203,15 @@ pub fn frame(header: &Header, stream: &Stream) -> Vec<u8> {
     // Only at a constant bitrate is the frame too short for the table (see
     // `header`).
     let with_table = tag_len - start >= TAG_LEN;
-    debug_assert!(with_table || matches!(config.rate, Rate::Constant(_)));
+    debug_assert!(with_table || matches!(config.rate, StreamRate::Constant(_)));
 
     let mut tag = Vec::with_capacity(TAG_LEN);
     // Spec reading: "Xing" for streams whose bitrate varies and "Info" for
     // those at one bitrate, as the document has LAME do ("LAME VBR & ABR:
     // "Xing"", "LAME CBR: "Info"").
     tag.extend_from_slice(match config.rate {
-        Rate::Constant(_) => b"Info",
-        Rate::Mean(_) | Rate::Variable(_) => b"Xing",
+        StreamRate::Constant(_) => b"Info",
+        StreamRate::Mean(_) | StreamRate::Variable(_) => b"Xing",
     });
     let flags = match with_table {
         true => FLAGS,
@@ -244,9 +244,9 @@ pub fn frame(header: &Header, stream: &Stream) -> Vec<u8> {
     // Spec reading: a mean rate targets an average bitrate, and the variable
     // rate is the encoder's only full VBR method.
     let method = match config.rate {
-        Rate::Constant(_) => 1,
-        Rate::Mean(_) => 2,
-        Rate::Variable(_) => 3,
+        StreamRate::Constant(_) => 1,
+        StreamRate::Mean(_) => 2,
+        StreamRate::Variable(_) => 3,
     };
     tag.push(0x10 | method);
     // The lowpass filter ("00h => unknown"); the peak amplitude and the
@@ -256,9 +256,9 @@ pub fn frame(header: &Header, stream: &Stream) -> Vec<u8> {
     // The bitrate: the target of a mean rate, the lowest of a variable one,
     // or the constant one, in kbit/s, "255 if bigger".
     let kbps = match config.rate {
-        Rate::Constant(bitrate) => bitrate.bits_per_second() / 1000,
-        Rate::Mean(mean) => mean.bits_per_second().div_ceil(1000),
-        Rate::Variable(variable) => variable.lowest.bits_per_second() / 1000,
+        StreamRate::Constant(bitrate) => bitrate.bits_per_second() / 1000,
+        StreamRate::Mean(mean) => mean.bits_per_second().div_ceil(1000),
+        StreamRate::Variable(variable) => variable.lowest.bits_per_second() / 1000,
     };
     tag.push(kbps.min(255) as u8);
     tag.extend_from_slice(&delays(stream));
@@ -383,7 +383,7 @@ mod tests {
     use crate::header::Flags;
     use crate::rate::VariableRate;
 
-    fn config(fs: SamplingFrequency, rate: Rate, mode: Mode) -> StreamConfig {
+    fn config(fs: SamplingFrequency, rate: StreamRate, mode: Mode) -> StreamConfig {
         StreamConfig {
             rate,
             sampling_frequency: fs,
@@ -403,7 +403,7 @@ mod tests {
     #[test]
     fn fields_fall_where_the_dump_has_them() {
         let fs = SamplingFrequency::Hz44100;
-        let rate = Rate::Variable(VariableRate {
+        let rate = StreamRate::Variable(VariableRate {
             lowest: kbps(fs, 32),
             highest: kbps(fs, 320),
             noise_offset_db: 0.0,
@@ -452,7 +452,7 @@ mod tests {
     #[test]
     fn a_constant_bitrate_keeps_its_frame_size_where_it_can() {
         let fs = SamplingFrequency::Hz48000;
-        let mono = config(fs, Rate::Constant(kbps(fs, 64)), Mode::SingleChannel);
+        let mono = config(fs, StreamRate::Constant(kbps(fs, 64)), Mode::SingleChannel);
         // 4 + 17 + 156 = 177 bytes fit in 192.
         assert_eq!(header(&mono).unwrap().bitrate, kbps(fs, 64));
         let stream = Stream {
@@ -466,7 +466,7 @@ mod tests {
         assert_eq!(frame[4 + 21..4 + 25], [0, 0, 0, 0x0F]);
         assert_eq!(frame[4 + 17 + 129], 0x11);
         let mean = crate::rate::MeanRate::new(fs.version(), 150_000).unwrap();
-        let near = config(fs, Rate::Mean(mean), Mode::Stereo);
+        let near = config(fs, StreamRate::Mean(mean), Mode::Stereo);
         assert_eq!(header(&near).unwrap().bitrate, kbps(fs, 160));
     }
 
@@ -478,7 +478,7 @@ mod tests {
     fn a_constant_bitrate_too_short_for_the_table_leaves_it_out() {
         let fs = SamplingFrequency::Hz48000;
         // 192 bytes do not fit in 168; 4 + 32 + 56 = 92 do.
-        let stereo = config(fs, Rate::Constant(kbps(fs, 56)), Mode::Stereo);
+        let stereo = config(fs, StreamRate::Constant(kbps(fs, 56)), Mode::Stereo);
         let tag_header = header(&stereo).unwrap();
         assert_eq!(tag_header.bitrate, kbps(fs, 56));
         let frame_lens = [168; 10];
@@ -506,21 +506,21 @@ mod tests {
         assert!(frame[0x5C..].iter().all(|&b| b == 0));
 
         let mean = crate::rate::MeanRate::new(fs.version(), 50_000).unwrap();
-        let mean = config(fs, Rate::Mean(mean), Mode::Stereo);
+        let mean = config(fs, StreamRate::Mean(mean), Mode::Stereo);
         assert_eq!(header(&mean).unwrap().bitrate, kbps(fs, 64));
 
         // At 8 kHz the tag without its table takes 4 + 9 + 56 = 69 bytes in
         // one channel, which fit in 72, and 77 in two, which do not: the
         // whole tag's 177 bytes need 24 kbit/s's 216.
         let fs = SamplingFrequency::Hz8000;
-        let mono = config(fs, Rate::Constant(kbps(fs, 8)), Mode::SingleChannel);
+        let mono = config(fs, StreamRate::Constant(kbps(fs, 8)), Mode::SingleChannel);
         assert_eq!(header(&mono).unwrap().bitrate, kbps(fs, 8));
-        let stereo = config(fs, Rate::Constant(kbps(fs, 8)), Mode::Stereo);
+        let stereo = config(fs, StreamRate::Constant(kbps(fs, 8)), Mode::Stereo);
         assert_eq!(header(&stereo).unwrap().bitrate, kbps(fs, 24));
 
         // In free format the frame keeps the stream's bitrate or has no tag.
         let fs = SamplingFrequency::Hz48000;
-        let free = |bps| Rate::Constant(Bitrate::free(fs.version(), bps).unwrap());
+        let free = |bps| StreamRate::Constant(Bitrate::free(fs.version(), bps).unwrap());
         let short = config(fs, free(50_000), Mode::Stereo);
         assert_eq!(header(&short).unwrap().bitrate.bits_per_second(), 50_000);
         assert!(header(&config(fs, free(20_000), Mode::Stereo)).is_none());

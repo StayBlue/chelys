@@ -259,14 +259,18 @@ impl Config {
     }
 }
 
-fn lower_rate(rate: Rate, sample_rate: u32, version: Version) -> Result<rate::Rate, ConfigError> {
+fn lower_rate(
+    rate: Rate,
+    sample_rate: u32,
+    version: Version,
+) -> Result<rate::StreamRate, ConfigError> {
     let table = |kbps: u32| {
         Bitrate::from_kbps(version, kbps)
             .ok_or(ConfigError::UnsupportedBitrate { sample_rate, kbps })
     };
     Ok(match rate {
-        Rate::Constant { kbps } => rate::Rate::Constant(table(kbps)?),
-        Rate::Mean { bits_per_second } => rate::Rate::Mean(
+        Rate::Constant { kbps } => rate::StreamRate::Constant(table(kbps)?),
+        Rate::Mean { bits_per_second } => rate::StreamRate::Mean(
             MeanRate::new(version, bits_per_second).ok_or(ConfigError::UnsupportedMeanBitrate {
                 sample_rate,
                 bits_per_second,
@@ -295,14 +299,14 @@ fn lower_rate(rate: Rate, sample_rate: u32, version: Version) -> Result<rate::Ra
             if !noise_offset_db.is_finite() {
                 return Err(ConfigError::NoiseOffset { noise_offset_db });
             }
-            rate::Rate::Variable(VariableRate {
+            rate::StreamRate::Variable(VariableRate {
                 lowest,
                 highest,
                 noise_offset_db,
             })
         }
-        Rate::Free { bits_per_second } => {
-            rate::Rate::Constant(Bitrate::free(version, bits_per_second).ok_or_else(|| {
+        Rate::Free { bits_per_second } => rate::StreamRate::Constant(
+            Bitrate::free(version, bits_per_second).ok_or_else(|| {
                 let in_table = bits_per_second.is_multiple_of(1000)
                     && Bitrate::from_kbps(version, bits_per_second / 1000).is_some();
                 ConfigError::UnsupportedFreeBitrate {
@@ -310,8 +314,8 @@ fn lower_rate(rate: Rate, sample_rate: u32, version: Version) -> Result<rate::Ra
                     bits_per_second,
                     in_table,
                 }
-            })?)
-        }
+            })?,
+        ),
     })
 }
 

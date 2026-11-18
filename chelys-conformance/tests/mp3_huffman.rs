@@ -11,7 +11,7 @@
 
 use chelys::mp3::internals::header::{Bitrate, Flags, Mode, SamplingFrequency};
 use chelys::mp3::internals::huffman::{MAX_MAGNITUDE, QuadTable, SpectrumCoding, pair_table};
-use chelys::mp3::internals::rate::Rate;
+use chelys::mp3::internals::rate::StreamRate;
 use chelys::mp3::internals::{
     BlockType, GRANULE_LINES, QuantizedGranule, StreamConfig, encode_granules,
 };
@@ -22,7 +22,7 @@ type Spectrum = [i32; GRANULE_LINES];
 fn config(sampling_frequency: SamplingFrequency) -> StreamConfig {
     StreamConfig {
         // The highest: 320 kbit/s, or 160 at the lower sampling frequencies.
-        rate: Rate::Constant(Bitrate::all(sampling_frequency.version()).last().unwrap()),
+        rate: StreamRate::Constant(Bitrate::all(sampling_frequency.version()).last().unwrap()),
         sampling_frequency,
         mode: Mode::SingleChannel,
         crc_protected: false,

@@ -20,14 +20,14 @@ pub use layout::{encode_granules, encode_silence, write_frame};
 
 use crate::header::{Bitrate, Emphasis, Flags, Header, Mode, SamplingFrequency};
 use crate::info_tag;
-use crate::rate::Rate;
+use crate::rate::StreamRate;
 use crate::reservoir::Reservoir;
 use coding::ModelCoding;
 use frame_encoder::FrameEncoder;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct StreamConfig {
-    pub rate: Rate,
+    pub rate: StreamRate,
     pub sampling_frequency: SamplingFrequency,
     pub mode: Mode,
     pub crc_protected: bool,
@@ -40,11 +40,11 @@ impl StreamConfig {
     ///
     /// # Panics
     ///
-    /// If the rate is not [`Rate::Constant`].
+    /// If the rate is not [`StreamRate::Constant`].
     #[cfg(any(test, feature = "unstable"))]
     fn constant_bitrate(&self) -> Bitrate {
         match self.rate {
-            Rate::Constant(bitrate) => bitrate,
+            StreamRate::Constant(bitrate) => bitrate,
             rate => panic!("{rate:?} is not a constant bitrate"),
         }
     }
@@ -143,7 +143,7 @@ pub fn encode_pcm_with_info_tag(config: &StreamConfig, channels: &[&[f64]]) -> V
 /// if the mode allows it, and frames short of bits are coded in intensity
 /// stereo if the mode allows that (Annex G.2).
 ///
-/// At a [`Rate::Variable`] each frame is kept at a bitrate at which every
+/// At a [`StreamRate::Variable`] each frame is kept at a bitrate at which every
 /// band's noise stays within its allowance (see [`loops::excess`](crate::loops::excess)). In
 /// MPEG-1, a frame of normal blocks is quantised once, each granule left as
 /// coarse as its allowance lets it, and kept at the lowest bitrate whose
@@ -201,7 +201,7 @@ impl StreamEncoder {
     /// # Panics
     ///
     /// If the rate's bitrates are not of the version of the sampling
-    /// frequency, or a [`Rate::Variable`] has its lowest bitrate above its
+    /// frequency, or a [`StreamRate::Variable`] has its lowest bitrate above its
     /// highest.
     pub fn new(config: StreamConfig) -> Self {
         let fs = config.sampling_frequency;
@@ -399,7 +399,7 @@ mod tests {
     #[test]
     fn streaming_does_not_depend_on_how_the_input_is_divided() {
         let config = StreamConfig {
-            rate: Rate::Constant(Bitrate::from_kbps(Version::Mpeg1, 32).unwrap()),
+            rate: StreamRate::Constant(Bitrate::from_kbps(Version::Mpeg1, 32).unwrap()),
             sampling_frequency: SamplingFrequency::Hz44100,
             mode: Mode::JointStereo {
                 intensity_stereo: false,
@@ -506,9 +506,9 @@ mod tests {
         ms_stereo: true,
     };
 
-    fn variable(fs: SamplingFrequency, kbps: [u32; 2], noise_offset_db: f64) -> Rate {
+    fn variable(fs: SamplingFrequency, kbps: [u32; 2], noise_offset_db: f64) -> StreamRate {
         let at = |kbps| Bitrate::from_kbps(fs.version(), kbps).unwrap();
-        Rate::Variable(rate::VariableRate {
+        StreamRate::Variable(rate::VariableRate {
             lowest: at(kbps[0]),
             highest: at(kbps[1]),
             noise_offset_db,
@@ -529,10 +529,10 @@ mod tests {
     fn dual_channel_codes_as_stereo() {
         use SamplingFrequency::*;
         let mean = |fs: SamplingFrequency, kbps: u32| {
-            Rate::Mean(rate::MeanRate::new(fs.version(), kbps * 1000).unwrap())
+            StreamRate::Mean(rate::MeanRate::new(fs.version(), kbps * 1000).unwrap())
         };
         let at = |fs: SamplingFrequency, kbps| {
-            Rate::Constant(Bitrate::from_kbps(fs.version(), kbps).unwrap())
+            StreamRate::Constant(Bitrate::from_kbps(fs.version(), kbps).unwrap())
         };
         let cases = [
             (Hz44100, at(Hz44100, 128), false),
@@ -578,9 +578,9 @@ mod tests {
     fn frames_carry_the_queued_ancillary_data() {
         use SamplingFrequency::*;
         let at = |fs: SamplingFrequency, kbps| {
-            Rate::Constant(Bitrate::from_kbps(fs.version(), kbps).unwrap())
+            StreamRate::Constant(Bitrate::from_kbps(fs.version(), kbps).unwrap())
         };
-        let mean = Rate::Mean(rate::MeanRate::new(Version::Mpeg1, 100_000).unwrap());
+        let mean = StreamRate::Mean(rate::MeanRate::new(Version::Mpeg1, 100_000).unwrap());
         let cases = [
             (Hz44100, at(Hz44100, 128), MS, false, 1000),
             (Hz48000, mean, Mode::Stereo, true, 2000),
@@ -650,7 +650,7 @@ mod tests {
     #[test]
     fn ancillary_data_fits_the_shortest_frame() {
         let config = StreamConfig {
-            rate: Rate::Constant(Bitrate::from_kbps(Version::Mpeg1, 32).unwrap()),
+            rate: StreamRate::Constant(Bitrate::from_kbps(Version::Mpeg1, 32).unwrap()),
             sampling_frequency: SamplingFrequency::Hz48000,
             mode: Mode::SingleChannel,
             crc_protected: false,
@@ -680,7 +680,7 @@ mod tests {
     fn flags_mark_every_frame_and_change_nothing_else() {
         use SamplingFrequency::*;
         let at = |fs: SamplingFrequency, kbps| {
-            Rate::Constant(Bitrate::from_kbps(fs.version(), kbps).unwrap())
+            StreamRate::Constant(Bitrate::from_kbps(fs.version(), kbps).unwrap())
         };
         let cases = [
             (Hz44100, at(Hz44100, 128), MS, true),
@@ -876,7 +876,7 @@ mod tests {
                 scope.spawn(move || {
                     let bitrate = Bitrate::free(fs.version(), bits_per_second).unwrap();
                     let config = StreamConfig {
-                        rate: Rate::Constant(bitrate),
+                        rate: StreamRate::Constant(bitrate),
                         sampling_frequency: fs,
                         mode,
                         crc_protected,
@@ -952,7 +952,7 @@ mod tests {
         ] {
             let mean = rate::MeanRate::new(fs.version(), kbps * 1000).unwrap();
             let config = StreamConfig {
-                rate: Rate::Mean(mean),
+                rate: StreamRate::Mean(mean),
                 sampling_frequency: fs,
                 mode: MS,
                 crc_protected: false,

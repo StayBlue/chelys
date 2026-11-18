@@ -7,7 +7,7 @@ use std::f64::consts::TAU;
 
 use chelys::mp3::internals::header::{Bitrate, Flags, Mode, SamplingFrequency, Version};
 use chelys::mp3::internals::huffman::QuadTable;
-use chelys::mp3::internals::rate::Rate;
+use chelys::mp3::internals::rate::StreamRate;
 use chelys::mp3::internals::scalefactor_bands;
 use chelys::mp3::internals::scalefactors::Scalefactors;
 use chelys::mp3::internals::{
@@ -18,7 +18,7 @@ use chelys_conformance::DECODERS;
 
 fn config(sampling_frequency: SamplingFrequency, mode: Mode, kbps: u32) -> StreamConfig {
     StreamConfig {
-        rate: Rate::Constant(Bitrate::from_kbps(Version::Mpeg2, kbps).unwrap()),
+        rate: StreamRate::Constant(Bitrate::from_kbps(Version::Mpeg2, kbps).unwrap()),
         sampling_frequency,
         mode,
         crc_protected: false,

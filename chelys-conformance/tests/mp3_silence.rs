@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 use chelys::mp3::internals::header::{Bitrate, Flags, Mode, SamplingFrequency, Version};
-use chelys::mp3::internals::rate::Rate;
+use chelys::mp3::internals::rate::StreamRate;
 use chelys::mp3::internals::{StreamConfig, encode_silence};
 use chelys_conformance::ffmpeg::{self, StreamInfo};
 
@@ -23,7 +23,7 @@ fn ffmpeg_decodes_silence_in_every_configuration() {
             for mode in modes {
                 for crc_protected in [false, true] {
                     let config = StreamConfig {
-                        rate: Rate::Constant(bitrate),
+                        rate: StreamRate::Constant(bitrate),
                         sampling_frequency,
                         mode,
                         crc_protected,
@@ -65,7 +65,7 @@ fn ffmpeg_reports_a_corrupted_crc() {
     ] {
         for mode in [Mode::SingleChannel, Mode::Stereo] {
             let config = StreamConfig {
-                rate: Rate::Constant(Bitrate::from_kbps(version, kbps).unwrap()),
+                rate: StreamRate::Constant(Bitrate::from_kbps(version, kbps).unwrap()),
                 sampling_frequency,
                 mode,
                 crc_protected: true,

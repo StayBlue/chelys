@@ -12,7 +12,7 @@ use crate::granule::{BlockType, GRANULE_LINES, MAX_PART2_3_LENGTH, QuantizedGran
 use crate::header::{SamplingFrequency, Version};
 use crate::loops::scfsi::{self, GranuleSummary};
 use crate::psychoacoustic::switching::{BlockSwitching, SwitchedMasking};
-use crate::rate::Rate;
+use crate::rate::StreamRate;
 use crate::reservoir::Reservoir;
 use crate::scalefactors::Scalefactors;
 use crate::stream::StreamConfig;
@@ -56,7 +56,7 @@ impl ModelCoding {
         let fs = config.sampling_frequency;
         let (ms_allowed, intensity_allowed) = config.joint_stereo();
         let noise_factor = match config.rate {
-            Rate::Variable(variable) => variable.noise_factor(),
+            StreamRate::Variable(variable) => variable.noise_factor(),
             _ => 1.0,
         };
         Self {
@@ -67,7 +67,7 @@ impl ModelCoding {
             intensity_allowed,
             noise_factor,
             saving_noise_db: match config.rate {
-                Rate::Variable(_) => 0.0,
+                StreamRate::Variable(_) => 0.0,
                 _ => loops::SAVING_NOISE_DB,
             },
             sampling_frequency: fs,

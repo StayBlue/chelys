@@ -7,7 +7,7 @@
 use std::f64::consts::TAU;
 
 use chelys::mp3::internals::header::{Bitrate, Flags, Mode, SamplingFrequency};
-use chelys::mp3::internals::rate::Rate;
+use chelys::mp3::internals::rate::StreamRate;
 use chelys::mp3::internals::{StreamConfig, StreamEncoder};
 use chelys_conformance::{DECODERS, Decoder};
 
@@ -64,7 +64,7 @@ fn decoders_decode_streams_with_ancillary_data() {
         (SamplingFrequency::Hz22050, 64, Mode::SingleChannel, 8 * 48),
     ] {
         let config = StreamConfig {
-            rate: Rate::Constant(Bitrate::from_kbps(fs.version(), kbps).unwrap()),
+            rate: StreamRate::Constant(Bitrate::from_kbps(fs.version(), kbps).unwrap()),
             sampling_frequency: fs,
             mode,
             crc_protected: false,

@@ -251,7 +251,7 @@ pub(super) fn frame_contents(
 ///
 /// # Panics
 ///
-/// If the rate is not [`Rate::Constant`](crate::rate::Rate::Constant), the
+/// If the rate is not [`StreamRate::Constant`](crate::rate::StreamRate::Constant), the
 /// granules do not divide into frames for the configured channels, or a
 /// frame's granules do not fit in it.
 #[cfg(any(test, feature = "unstable"))]
@@ -298,11 +298,11 @@ pub fn encode_silence(config: &StreamConfig, frames: usize) -> Vec<u8> {
 mod tests {
     use super::*;
     use crate::header::{Bitrate, Emphasis, Flags, SamplingFrequency, Version};
-    use crate::rate::Rate;
+    use crate::rate::StreamRate;
 
     fn config(crc_protected: bool) -> StreamConfig {
         StreamConfig {
-            rate: Rate::Constant(Bitrate::from_kbps(Version::Mpeg1, 128).unwrap()),
+            rate: StreamRate::Constant(Bitrate::from_kbps(Version::Mpeg1, 128).unwrap()),
             sampling_frequency: SamplingFrequency::Hz44100,
             mode: Mode::Stereo,
             crc_protected,

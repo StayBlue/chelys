@@ -8,7 +8,7 @@ use std::f64::consts::TAU;
 use std::ops::Range;
 
 use chelys::mp3::internals::header::{Bitrate, Flags, Mode, SamplingFrequency};
-use chelys::mp3::internals::rate::{MeanRate, Rate, VariableRate};
+use chelys::mp3::internals::rate::{MeanRate, StreamRate, VariableRate};
 use chelys::mp3::internals::{StreamConfig, encode_pcm};
 use chelys_conformance::{DECODERS, Decoder};
 
@@ -66,14 +66,14 @@ fn every_decoder_follows_the_bitrate_from_frame_to_frame() {
     use SamplingFrequency::*;
     let at = |fs: SamplingFrequency, kbps| Bitrate::from_kbps(fs.version(), kbps).unwrap();
     let variable = |fs, lowest, highest| {
-        Rate::Variable(VariableRate {
+        StreamRate::Variable(VariableRate {
             lowest: at(fs, lowest),
             highest: at(fs, highest),
             noise_offset_db: 0.0,
         })
     };
     let mean = |fs: SamplingFrequency, kbps: u32| {
-        Rate::Mean(MeanRate::new(fs.version(), kbps * 1000).unwrap())
+        StreamRate::Mean(MeanRate::new(fs.version(), kbps * 1000).unwrap())
     };
     let ms = Mode::JointStereo {
         intensity_stereo: false,

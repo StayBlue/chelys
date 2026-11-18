@@ -5,7 +5,7 @@
 //! reads them.
 
 use chelys::mp3::internals::header::{Bitrate, Flags, Mode, SamplingFrequency};
-use chelys::mp3::internals::rate::Rate;
+use chelys::mp3::internals::rate::StreamRate;
 use chelys::mp3::internals::{StreamConfig, encode_silence};
 use chelys_conformance::{DECODERS, Decoder, mpg123};
 
@@ -26,7 +26,7 @@ fn mpg123_reads_the_flags() {
                 original: bits & 4 != 0,
             };
             let config = StreamConfig {
-                rate: Rate::Constant(Bitrate::from_kbps(fs.version(), 64).unwrap()),
+                rate: StreamRate::Constant(Bitrate::from_kbps(fs.version(), 64).unwrap()),
                 sampling_frequency: fs,
                 mode,
                 crc_protected: bits % 3 == 0,

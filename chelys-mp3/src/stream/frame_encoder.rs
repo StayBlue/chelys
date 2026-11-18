@@ -12,7 +12,7 @@ use crate::DELAY;
 use crate::ancillary::AncillaryQueue;
 use crate::granule::{BlockType, GRANULE_LINES, MAX_PART2_3_LENGTH};
 use crate::header::{Bitrate, PaddingSchedule, Version};
-use crate::rate::{MeanRateSchedule, Rate};
+use crate::rate::{MeanRateSchedule, StreamRate};
 use crate::reservoir::Reservoir;
 use crate::{filterbank, rate, scalefactor_bands};
 
@@ -44,9 +44,11 @@ impl Schedule {
             config.rate
         );
         match config.rate {
-            Rate::Constant(bitrate) => Self::Constant(bitrate, PaddingSchedule::new(bitrate, fs)),
-            Rate::Mean(mean) => Self::Mean(MeanRateSchedule::new(mean, fs)),
-            Rate::Variable(variable) => Self::Variable {
+            StreamRate::Constant(bitrate) => {
+                Self::Constant(bitrate, PaddingSchedule::new(bitrate, fs))
+            }
+            StreamRate::Mean(mean) => Self::Mean(MeanRateSchedule::new(mean, fs)),
+            StreamRate::Variable(variable) => Self::Variable {
                 bitrates: variable.bitrates(),
                 previous: 0,
             },
