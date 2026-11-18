@@ -11,6 +11,8 @@ mod check;
 mod coding;
 mod frame_encoder;
 mod layout;
+#[cfg(test)]
+mod random_streams;
 
 #[cfg(feature = "unstable")]
 pub use coding::{encode_pcm_with_global_gain, encode_with_block_types};

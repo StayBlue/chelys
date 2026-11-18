@@ -165,7 +165,17 @@ fn walk(stream: &[u8], free: Option<Bitrate>) -> Vec<Frame> {
 /// frame's main data begins, or for the last frame to the end of the stream
 /// (clause 2.4.2.8).
 pub fn ancillary(stream: &[u8]) -> Vec<Vec<bool>> {
-    let frames = frames(stream);
+    ancillary_of(stream, &frames(stream))
+}
+
+/// The ancillary bits of each frame of a stream in free format at
+/// `bitrate`, after the checks of [`free_frames`], as [`ancillary`] gives
+/// them.
+pub fn free_ancillary(stream: &[u8], bitrate: Bitrate) -> Vec<Vec<bool>> {
+    ancillary_of(stream, &free_frames(stream, bitrate))
+}
+
+fn ancillary_of(stream: &[u8], frames: &[Frame]) -> Vec<Vec<bool>> {
     let slots: Vec<u8> = frames
         .iter()
         .flat_map(|f| stream[f.slot.0..f.slot.1].iter().copied())
