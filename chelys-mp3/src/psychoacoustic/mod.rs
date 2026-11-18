@@ -11,17 +11,17 @@
 //! [`switching::BlockSwitching`] also chooses the block type and gives the
 //! threshold for short blocks where it switches to them.
 
-mod fft;
 pub mod partitions;
 pub mod switching;
 
 use std::f64::consts::PI;
 
+use chelys_core::fft::RealFft;
+
 use super::granule::{BlockType, GRANULE_LINES};
 use super::header::{SamplingFrequency, Version};
 use super::scalefactor_bands::{self, LONG_BANDS, SHORT_BANDS, SHORT_WINDOWS};
 use super::stereo::middle_side;
-use fft::RealFft;
 use partitions::{BandWeights, Partition, ShortPartition};
 
 const LONG_FFT: usize = 1024;

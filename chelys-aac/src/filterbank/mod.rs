@@ -8,7 +8,6 @@
 //! decoder's IMDCT (clause 15.3.1) with its overlap and add (clause
 //! 15.3.3).
 
-mod fft;
 mod mdct;
 
 use std::sync::OnceLock;

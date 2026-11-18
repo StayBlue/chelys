@@ -1,9 +1,10 @@
 // Copyright (c) 2026 StayBlue
 // SPDX-License-Identifier: MIT
 
-//! The "standard forward FFT" of clause D.2.4 b): an iterative radix-2
-//! decimation-in-time transform, `X(k) = sum x(n) e^(-2 pi i k n / N)`, without
-//! normalisation, and its form for real input, [`RealFft`].
+//! The "standard forward FFT" of the psychoacoustic models (clause D.2.4 b)
+//! of ISO/IEC 11172-3, clause C.1.4 of ISO/IEC 13818-7): an iterative
+//! radix-2 decimation-in-time transform, `X(k) = sum x(n) e^(-2 pi i k n /
+//! N)`, without normalisation, and its form for real input, [`RealFft`].
 
 use std::f64::consts::PI;
 
@@ -29,6 +30,15 @@ impl Complex {
     }
 }
 
+impl std::ops::Mul for Complex {
+    type Output = Self;
+
+    fn mul(self, other: Self) -> Self {
+        Complex::mul(self, other)
+    }
+}
+
+#[derive(Debug)]
 pub struct Fft {
     /// For each butterfly of span 2, the position whose value the bit
     /// reversal brings to its first input, `rev(2m)`; that of its second is
@@ -190,6 +200,7 @@ impl Fft {
 /// real, `E(k) = (Z(k) + conj(Z(N/2 - k))) / 2` and
 /// `O(k) = (Z(k) - conj(Z(N/2 - k))) / 2i`, and
 /// `X(k) = E(k) + e^(-2 pi i k / N) O(k)`, with `Z(N/2) = Z(0)`.
+#[derive(Debug)]
 pub struct RealFft {
     half: Fft,
     /// `e^(-2 pi i k / N)` for `k <= N / 2`.

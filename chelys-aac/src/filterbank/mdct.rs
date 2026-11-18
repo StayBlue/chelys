@@ -23,7 +23,16 @@
 
 use std::f64::consts::PI;
 
-use super::fft::{Complex, Fft};
+use chelys_core::fft::{Complex, Fft};
+
+/// The most lines of any window: the 1024 of a long one.
+const MAX_LINES: usize = 1024;
+
+/// `e^(i * angle)`.
+fn unit(angle: f64) -> Complex {
+    let (im, re) = angle.sin_cos();
+    Complex { re, im }
+}
 
 /// The MDCT of one window length, with its twiddle factors precomputed.
 #[derive(Debug)]
@@ -41,23 +50,26 @@ impl Mdct {
     ///
     /// # Panics
     ///
-    /// If `window_len` is not a power of two of 4 at least: a caller's
-    /// error.
+    /// If `window_len` is not a power of two from 8 to twice
+    /// [`MAX_LINES`]: a caller's error.
     pub fn new(window_len: usize) -> Self {
         assert!(
-            window_len.is_power_of_two() && window_len >= 4,
+            window_len.is_power_of_two() && (8..=2 * MAX_LINES).contains(&window_len),
             "an MDCT of {window_len} samples"
         );
         let lines = window_len / 2;
         let m = lines as f64;
         Self {
             pre: (0..lines / 2)
-                .map(|p| Complex::unit(-PI * (4 * p + 1) as f64 / (4.0 * m)))
+                .map(|p| unit(-PI * (4 * p + 1) as f64 / (4.0 * m)))
                 .collect(),
             post: (0..lines / 2)
                 .map(|q| {
-                    let w = Complex::unit(-PI * q as f64 / m);
-                    Complex::new(2.0 * w.re, 2.0 * w.im)
+                    let w = unit(-PI * q as f64 / m);
+                    Complex {
+                        re: 2.0 * w.re,
+                        im: 2.0 * w.im,
+                    }
                 })
                 .collect(),
             fft: Fft::new(lines / 2),
@@ -86,12 +98,20 @@ impl Mdct {
                 z[m_ - m / 2] - z[3 * m / 2 - 1 - m_]
             }
         };
-        let mut v: Vec<Complex> = (self.pre.iter().enumerate())
-            .map(|(p, &pre)| Complex::new(u(2 * p), u(m - 1 - 2 * p)).mul(pre))
-            .collect();
-        self.fft.transform(&mut v);
+        let mut v = [Complex::default(); MAX_LINES / 2];
+        let v = &mut v[..m / 2];
+        self.fft.transform_from(
+            |p| {
+                let folded = Complex {
+                    re: u(2 * p),
+                    im: u(m - 1 - 2 * p),
+                };
+                folded * self.pre[p]
+            },
+            v,
+        );
         for (q, (v, &post)) in v.iter().zip(&self.post).enumerate() {
-            let w = v.mul(post);
+            let w = *v * post;
             lines[2 * q] = w.re;
             lines[m - 1 - 2 * q] = -w.im;
         }
@@ -118,7 +138,7 @@ pub(super) mod tests {
 
     #[test]
     fn matches_the_formula_of_the_standard() {
-        for window_len in [4, 16, 256, 2048] {
+        for window_len in [8, 16, 256, 2048] {
             let mdct = Mdct::new(window_len);
             let z: Vec<f64> = (0..window_len)
                 .map(|n| (n as f64 * 0.731).sin() + 0.25 * (n as f64 * 0.05).cos())
