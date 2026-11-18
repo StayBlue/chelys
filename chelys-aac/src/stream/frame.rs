@@ -61,15 +61,17 @@ fn overhead_bits(config: &StreamConfig) -> u32 {
 ///
 /// Spec reading: this deliberately departs from clause C.7.3 where
 /// `more_bits` is negative, which is taken as 0. The perceptual entropy as
-/// printed is negative in most frames of music, so that `bit_allocation`
-/// is 0 (see
-/// [`LongThreshold::bit_allocation`](crate::psychoacoustic::LongThreshold::bit_allocation)),
-/// and where it is not, it is a few hundred bits; `more_bits` is then
-/// about `side_info_bits - mean_bits`. Clause C.7.3 would give such a frame
-/// only its side information, until the reservoir is full: the first
-/// three frames of a stream at 128 kbit/s in stereo, and more at lower
-/// rates, would be coded without lines, and lose their audio. Taken as 0,
-/// a frame is given the mean, and the reservoir keeps what the loops leave,
+/// printed is negative in most frames of music, and far below 0 for
+/// silence (-9535 at 44.1 kHz) and steady tones (about -8980 for one of
+/// 1 kHz at half of full scale), so that `bit_allocation` is 0 (see
+/// [`LongThreshold::bit_allocation`](crate::psychoacoustic::LongThreshold::bit_allocation));
+/// where it is not, it is a few hundred bits. `more_bits` is then about
+/// `side_info_bits - mean_bits`, and clause C.7.3 would give such a frame
+/// only its side information whenever the reservoir has room: the first
+/// three frames of a stream at 128 kbit/s in stereo, more at lower rates,
+/// and a frame in which audio sets in after the reservoir has given bits
+/// away, would be coded without lines, and lose their audio. Taken as 0, a
+/// frame is given the mean, and the reservoir keeps what the loops leave,
 /// for frames that ask for more.
 pub fn more_bits(config: &StreamConfig, demands: &[Demand]) -> i64 {
     let allocation: f64 = demands.iter().map(|demand| demand.bit_allocation).sum();

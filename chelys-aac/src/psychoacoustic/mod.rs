@@ -296,8 +296,9 @@ impl LongThreshold {
     /// 3000 (step 15).
     ///
     /// Spec gap: the entropy is negative where the thresholds exceed the
-    /// energy, as in silence (see [`Model::analyze`]), where `sqrt(PE)` is
-    /// undefined; the allocation is then 0, the lower limit.
+    /// energy, as in silence, -9535 at 44.1 kHz, and in most frames of
+    /// music (see [`Model::analyze`]), where `sqrt(PE)` is undefined; the
+    /// allocation is then 0, the lower limit.
     pub fn bit_allocation(&self) -> f64 {
         let pe = self.perceptual_entropy.max(0.0);
         (PEW1_LONG * pe + PEW2_LONG * pe.sqrt()).min(MAX_BIT_ALLOCATION)
@@ -369,16 +370,27 @@ impl Model {
     /// before it, across frames.
     ///
     /// Spec reading: the perceptual entropy (step 12) weighs each partition
-    /// by `w_high(b) - w_low(b)`, one less than its lines, which would give
-    /// a partition of one line no entropy whatever its energy, where step
-    /// 14 counts a partition's lines as `w_high(b) + 1 - w_low(b)`, and the
-    /// tables give each partition's width as that count. The entropy is a
-    /// sum over lines, so the count of lines is taken.
+    /// by `w_high(b) - w_low(b)`, one less than its lines, where step 14
+    /// counts a partition's lines as `w_high(b) + 1 - w_low(b)` and the
+    /// tables give that count as its width, so that a partition of one line
+    /// adds nothing whatever its energy. Nothing in the text shows the
+    /// weight to be misprinted, and it is taken as printed. It matters most
+    /// where the energy lies in the narrowest partitions: at 44.1 kHz, the
+    /// frame in which half of full scale at 0 Hz sets in after silence has
+    /// an entropy of -159 so, and of -16 with each partition's lines; white
+    /// noise setting in after silence, a median of 306 against 350.
     ///
     /// Spec reading: the entropy is taken as printed, with no floor: a
     /// partition whose threshold exceeds its energy plus one subtracts from
     /// it, so silence and quiet passages, whose partitions sit below the
-    /// thresholds in quiet, have a negative entropy.
+    /// thresholds in quiet, have a negative entropy. At 44.1 kHz, silence
+    /// has -9535, a steady tone of 1 kHz at half of full scale about
+    /// -8980, and pop music a median of about -1100, where the partitions
+    /// above about 16 kHz lie below their thresholds in quiet; white noise
+    /// at a quarter of full scale has about +300. A floor at 0 for each
+    /// partition would instead give silence an entropy of its own, from
+    /// partitions whose threshold is below 1, as chelys's MP3 encoder found
+    /// of model 2.
     pub fn analyze(&mut self, block: &[f64; FRAME_SAMPLES]) -> LongThreshold {
         let tables = self.long;
         // Step 1: the window of the block before and this one.
@@ -475,7 +487,8 @@ impl Model {
             nb[b] = tables.quiet[b].max(limited);
             // Step 12.
             let p = &tables.partitions[b];
-            perceptual_entropy -= p.lines().len() as f64 * (nb[b] / (e[b] + 1.0)).log10();
+            let weight = f64::from(p.w_high - p.w_low);
+            perceptual_entropy -= weight * (nb[b] / (e[b] + 1.0)).log10();
         }
 
         // Step 14.
