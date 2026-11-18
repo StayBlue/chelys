@@ -103,10 +103,11 @@ fn finishing_gives_the_counts() {
         let mut out = |frame: &[u8]| frames.push(frame.len());
         encoder.encode_interleaved(&pcm(samples, 2), &mut out);
         let finished = encoder.finish(&mut out);
+        let (samples, delay) = (samples as u64, DELAY as u64);
         assert_eq!(finished.samples, samples);
-        assert_eq!(finished.frames, (samples + DELAY).div_ceil(1024));
-        assert_eq!(finished.frames, frames.len());
-        assert_eq!(finished.frames * 1024, DELAY + samples + finished.padding);
+        assert_eq!(finished.frames, (samples + delay).div_ceil(1024));
+        assert_eq!(finished.frames, frames.len() as u64);
+        assert_eq!(finished.frames * 1024, delay + samples + finished.padding);
         assert!(finished.padding < 1024);
     }
 }

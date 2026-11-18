@@ -46,7 +46,7 @@ pub struct Encoder {
     /// than a frame's between calls.
     block: Vec<Vec<f64>>,
     /// The samples each channel was given.
-    samples: usize,
+    samples: u64,
 }
 
 /// What [`Encoder::finish`] gives.
@@ -54,13 +54,13 @@ pub struct Encoder {
 #[non_exhaustive]
 pub struct Finished {
     /// The frames of the stream.
-    pub frames: usize,
+    pub frames: u64,
     /// The samples each channel was given.
-    pub samples: usize,
+    pub samples: u64,
     /// The samples of silence that the decoded output of each channel ends
     /// with, after [`DELAY`](super::DELAY) samples and the input: the
     /// frames' samples, `1024 * frames`, are all three together.
-    pub padding: usize,
+    pub padding: u64,
 }
 
 impl Encoder {
@@ -122,7 +122,7 @@ impl Encoder {
                 self.encode_block(out);
             }
         }
-        self.samples += samples.len() / channels;
+        self.samples += (samples.len() / channels) as u64;
     }
 
     /// Encodes one slice of samples per channel, and gives `out` the frames
@@ -162,7 +162,7 @@ impl Encoder {
             }
             start = end;
         }
-        self.samples += len;
+        self.samples += len as u64;
     }
 
     /// Codes the frame gathered, which is whole, and starts the next.
@@ -178,7 +178,9 @@ impl Encoder {
     /// least [`DELAY`](super::DELAY) samples past it, so that the decoded
     /// output holds all of the input, and gives `out` the frames left.
     pub fn finish<O: FrameSink + ?Sized>(mut self, out: &mut O) -> Finished {
-        let frames = (self.samples + super::DELAY).div_ceil(FRAME_SAMPLES);
+        let delay = super::DELAY as u64;
+        let frame_samples = FRAME_SAMPLES as u64;
+        let frames = (self.samples + delay).div_ceil(frame_samples);
         while self.stream.frames() < frames {
             for block in &mut self.block {
                 block.resize(FRAME_SAMPLES, 0.0);
@@ -188,7 +190,7 @@ impl Encoder {
         Finished {
             frames,
             samples: self.samples,
-            padding: frames * FRAME_SAMPLES - super::DELAY - self.samples,
+            padding: frames * frame_samples - delay - self.samples,
         }
     }
 }

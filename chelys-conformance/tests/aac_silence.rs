@@ -27,8 +27,9 @@ fn ffmpeg_decodes_silence_at_every_sample_rate() {
         for channels in [1, 2] {
             let context = format!("{sample_rate} Hz, {channels} channels");
             let (stream, finished) = encode_silence(sample_rate, channels);
-            assert_eq!(finished.samples, SAMPLES);
-            assert_eq!(finished.frames * 1024, DELAY + SAMPLES + finished.padding);
+            let (samples, delay) = (SAMPLES as u64, DELAY as u64);
+            assert_eq!(finished.samples, samples);
+            assert_eq!(finished.frames * 1024, delay + samples + finished.padding);
 
             let expected = StreamInfo {
                 codec_name: "aac".to_owned(),
@@ -45,7 +46,7 @@ fn ffmpeg_decodes_silence_at_every_sample_rate() {
             assert_eq!(decoded.diagnostics, "", "{context}");
             assert_eq!(
                 decoded.samples.len(),
-                finished.frames * 1024 * channels,
+                finished.frames as usize * 1024 * channels,
                 "{context}"
             );
             assert!(decoded.samples.iter().all(|&s| s == 0.0), "{context}");

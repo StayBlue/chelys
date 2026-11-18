@@ -109,7 +109,7 @@ impl<F: FnMut(&[u8])> FrameSink for F {
 pub struct StreamEncoder {
     config: StreamConfig,
     reservoir: BitReservoir,
-    frames: usize,
+    frames: u64,
 }
 
 impl StreamEncoder {
@@ -141,7 +141,7 @@ impl StreamEncoder {
     }
 
     /// The frames coded so far.
-    pub fn frames(&self) -> usize {
+    pub fn frames(&self) -> u64 {
         self.frames
     }
 
