@@ -10,10 +10,22 @@ use super::config::{Config, ConfigError};
 use super::stream::{FRAME_SAMPLES, FrameSink, StreamEncoder};
 
 /// Converts a sample to the encoder's scale, clamped to
-/// [`MAX_MAGNITUDE`](chelys_core::sample::MAX_MAGNITUDE), and reads one that
-/// is NaN or infinite as silence.
+/// [`MAX_MAGNITUDE`](chelys_core::sample::MAX_MAGNITUDE).
+///
+/// # Panics
+///
+/// If the sample is NaN or infinite.
 fn convert<S: Sample>(sample: S) -> f64 {
-    sample::convert(sample).unwrap_or(0.0)
+    sample::convert(sample).expect("a sample is not a finite number")
+}
+
+/// Refuses input with a sample that is NaN or infinite before any of it is
+/// coded, so that a refused call writes nothing.
+fn assert_finite<S: Sample>(samples: &[S]) {
+    assert!(
+        samples.iter().all(|&s| sample::convert(s).is_some()),
+        "a sample is not a finite number"
+    );
 }
 
 /// Encodes PCM as MPEG-2 AAC in the Low Complexity profile (ISO/IEC
@@ -22,23 +34,19 @@ fn convert<S: Sample>(sample: S) -> f64 {
 /// The encoder is being built: for now every frame codes each channel as
 /// silence, whatever the input, in a stream that is valid as it will be.
 ///
-/// A frame is coded once its 1024 samples of each channel have arrived; the
-/// stream does not depend on how the input is divided between calls, even
-/// within a sample frame. [`finish`](Self::finish) codes the rest. The
-/// decoded output lags the input by [`DELAY`](super::DELAY) samples, and
-/// ends with [`Finished::padding`] samples of silence.
-///
-/// No input makes it panic: a sample that is NaN or infinite is read as
-/// silence, and one beyond 65536 times full scale is clamped there.
+/// A frame is coded once its 1024 samples of each channel have arrived, and
+/// the input is converted a frame at a time, so a call of any length needs
+/// no more memory than a frame. The stream does not depend on how the
+/// input is divided between calls. [`finish`](Self::finish) codes the
+/// rest. The decoded output lags the input by [`DELAY`](super::DELAY)
+/// samples, and ends with [`Finished::padding`] samples of silence.
 pub struct Encoder {
     stream: StreamEncoder,
-    /// The input of each channel, converted, that no frame has coded yet.
-    pcm: Vec<Vec<f64>>,
+    /// Each channel's samples of the frame being gathered, converted: fewer
+    /// than a frame's between calls.
+    block: Vec<Vec<f64>>,
     /// The samples each channel was given.
-    given: Vec<usize>,
-    /// The channel of the next interleaved sample: where the last call
-    /// ended within a sample frame.
-    next_channel: usize,
+    samples: usize,
 }
 
 /// What [`Encoder::finish`] gives.
@@ -47,8 +55,7 @@ pub struct Encoder {
 pub struct Finished {
     /// The frames of the stream.
     pub frames: usize,
-    /// The samples each channel was given: of a channel given fewer than
-    /// another, as many as that one, as it was padded with silence to them.
+    /// The samples each channel was given.
     pub samples: usize,
     /// The samples of silence that the decoded output of each channel ends
     /// with, after [`DELAY`](super::DELAY) samples and the input: the
@@ -66,9 +73,8 @@ impl Encoder {
         let channels = config.channel_configuration.channels();
         Ok(Self {
             stream: StreamEncoder::new(config),
-            pcm: vec![Vec::new(); channels],
-            given: vec![0; channels],
-            next_channel: 0,
+            block: vec![Vec::with_capacity(FRAME_SAMPLES); channels],
+            samples: 0,
         })
     }
 
@@ -91,51 +97,80 @@ impl Encoder {
     /// Encodes interleaved samples, one of each channel in turn, and gives
     /// `out` the frames they complete.
     ///
-    /// The samples need not be whole sample frames: a call may end within
-    /// one, and the next go on from there.
+    /// # Panics
+    ///
+    /// If the number of samples is not a multiple of the number of
+    /// channels, or a sample is NaN or infinite. Samples beyond 65536 times
+    /// full scale are clamped there.
     pub fn encode_interleaved<S: Sample, O: FrameSink + ?Sized>(
         &mut self,
         samples: &[S],
         out: &mut O,
     ) {
         let channels = self.channels();
-        for &sample in samples {
-            self.pcm[self.next_channel].push(convert(sample));
-            self.given[self.next_channel] += 1;
-            self.next_channel = (self.next_channel + 1) % channels;
+        assert!(
+            samples.len() % channels == 0,
+            "{} samples are not a whole number of {channels}-channel frames",
+            samples.len(),
+        );
+        assert_finite(samples);
+        for frame in samples.chunks_exact(channels) {
+            for (block, &sample) in self.block.iter_mut().zip(frame) {
+                block.push(convert(sample));
+            }
+            if self.block[0].len() == FRAME_SAMPLES {
+                self.encode_block(out);
+            }
         }
-        self.encode_blocks(out);
+        self.samples += samples.len() / channels;
     }
 
     /// Encodes one slice of samples per channel, and gives `out` the frames
     /// they complete.
     ///
-    /// The slices need not be of one length: a channel given more than
-    /// another waits for it. Slices past the encoder's channels are
-    /// ignored, and a channel without one is given nothing.
+    /// # Panics
+    ///
+    /// If the number of slices is not the number of channels, the slices
+    /// are of different lengths, or a sample is NaN or infinite. Samples
+    /// beyond 65536 times full scale are clamped there.
     pub fn encode_planar<S: Sample, O: FrameSink + ?Sized>(
         &mut self,
         channels: &[&[S]],
         out: &mut O,
     ) {
-        for ((pcm, given), samples) in self.pcm.iter_mut().zip(&mut self.given).zip(channels) {
-            pcm.extend(samples.iter().map(|&s| convert(s)));
-            *given += samples.len();
+        assert_eq!(
+            channels.len(),
+            self.channels(),
+            "one slice of samples per channel"
+        );
+        let len = channels[0].len();
+        assert!(
+            channels.iter().all(|c| c.len() == len),
+            "every channel has the same number of samples"
+        );
+        for samples in channels {
+            assert_finite(samples);
         }
-        self.encode_blocks(out);
+        let mut start = 0;
+        while start < len {
+            let end = len.min(start + FRAME_SAMPLES - self.block[0].len());
+            for (block, samples) in self.block.iter_mut().zip(channels) {
+                block.extend(samples[start..end].iter().map(|&s| convert(s)));
+            }
+            if self.block[0].len() == FRAME_SAMPLES {
+                self.encode_block(out);
+            }
+            start = end;
+        }
+        self.samples += len;
     }
 
-    /// Codes every frame whose samples have all arrived.
-    fn encode_blocks<O: FrameSink + ?Sized>(&mut self, out: &mut O) {
-        let ready = self.pcm.iter().map(Vec::len).min().unwrap_or(0) / FRAME_SAMPLES;
-        for i in 0..ready {
-            let block: Vec<&[f64]> = (self.pcm.iter())
-                .map(|pcm| &pcm[i * FRAME_SAMPLES..][..FRAME_SAMPLES])
-                .collect();
-            self.stream.encode(&block, out);
-        }
-        for pcm in &mut self.pcm {
-            pcm.drain(..ready * FRAME_SAMPLES);
+    /// Codes the frame gathered, which is whole, and starts the next.
+    fn encode_block<O: FrameSink + ?Sized>(&mut self, out: &mut O) {
+        let block: Vec<&[f64]> = self.block.iter().map(Vec::as_slice).collect();
+        self.stream.encode(&block, out);
+        for block in &mut self.block {
+            block.clear();
         }
     }
 
@@ -143,18 +178,17 @@ impl Encoder {
     /// least [`DELAY`](super::DELAY) samples past it, so that the decoded
     /// output holds all of the input, and gives `out` the frames left.
     pub fn finish<O: FrameSink + ?Sized>(mut self, out: &mut O) -> Finished {
-        let samples = self.given.iter().copied().max().unwrap_or(0);
-        let frames = (samples + super::DELAY).div_ceil(FRAME_SAMPLES);
-        let left = (frames - self.stream.frames()) * FRAME_SAMPLES;
-        for pcm in &mut self.pcm {
-            pcm.resize(left, 0.0);
+        let frames = (self.samples + super::DELAY).div_ceil(FRAME_SAMPLES);
+        while self.stream.frames() < frames {
+            for block in &mut self.block {
+                block.resize(FRAME_SAMPLES, 0.0);
+            }
+            self.encode_block(out);
         }
-        self.encode_blocks(out);
-        debug_assert_eq!(self.stream.frames(), frames);
         Finished {
             frames,
-            samples,
-            padding: frames * FRAME_SAMPLES - super::DELAY - samples,
+            samples: self.samples,
+            padding: frames * FRAME_SAMPLES - super::DELAY - self.samples,
         }
     }
 }
