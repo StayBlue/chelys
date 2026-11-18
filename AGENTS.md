@@ -159,3 +159,28 @@ get there. Record the LAME version the benchmark was run with in the
 
 *User, 2026-11-16, when the gap to an established encoder was to be measured:
 the wording was proposed by the agent and approved by the user.*
+
+## AAC
+
+chelys's AAC encoder is implemented from ISO/IEC 13818-7:2006 and ISO/IEC
+14496-3:2019, and their official corrigenda, only, under the same clean-room
+rules as the standards named under "Clean room"; they are the sources added
+for AAC. It encodes AAC-LC only.
+
+- 13818-7 is followed for the AAC-LC bitstream, ADTS and the encoding process.
+  Its Annex C, the encoder including its psychoacoustic model, is followed as
+  written, as the annexes of ISO/IEC 11172-3 are; 14496-3 refers to it for
+  these tools.
+- 14496-3 is followed only for what MPEG-4 adds to AAC-LC, such as the
+  `AudioSpecificConfig`.
+- Other AAC encoders and decoders, for example FDK AAC, libxaac, FAAC, FAAD2
+  and the reference software of ISO/IEC 13818-5 and 14496-5, fall under
+  "Clean room" as the codecs named there do.
+- Ask before adding any tool outside AAC-LC, or an MPEG-4 tool such as
+  perceptual noise substitution (PNS).
+
+Where the standards leave something open, black-box decoding with ffmpeg may
+settle it, documented as for the standards.
+
+*User, 2026-11-18, when the standards were given: the wording was proposed by
+the agent and approved by the user.*
