@@ -10,7 +10,7 @@ use super::tables;
 /// A Huffman codeword: the low `len` bits of `bits`, sent most significant
 /// first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Codeword {
+pub(super) struct Codeword {
     pub bits: u32,
     pub len: u32,
 }
@@ -21,7 +21,7 @@ pub const MAX_MAGNITUDE: u32 = 8191;
 
 /// The magnitude from which `ESC_HCB` codes a line with an escape sequence,
 /// `ESC_FLAG` (clause 9.2.2).
-pub const ESC_FLAG: u32 = 16;
+pub(super) const ESC_FLAG: u32 = 16;
 
 /// A section's codebook, `sect_cb` (Table 17): `ZERO_HCB`, for a section
 /// whose lines are all zero and send nothing, or one of the spectrum
@@ -47,29 +47,52 @@ impl Codebook {
         self.0
     }
 
+    /// Whether the bands of a section with this codebook send a scalefactor
+    /// (Table 18): all but those of `ZERO_HCB`.
+    pub fn sends_scalefactor(self) -> bool {
+        self != Self::ZERO
+    }
+
+    /// The largest magnitude of a line the codebook codes: zero for
+    /// `ZERO_HCB`.
+    pub fn largest_magnitude(self) -> u32 {
+        self.spectrum()
+            .map_or(0, SpectrumCodebook::largest_magnitude)
+    }
+
     /// The spectrum Huffman codebook, or `None` for `ZERO_HCB`.
-    pub fn spectrum(self) -> Option<&'static SpectrumCodebook> {
+    pub(super) fn spectrum(self) -> Option<&'static SpectrumCodebook> {
         usize::from(self.0)
             .checked_sub(1)
             .map(|book| &SPECTRUM_CODEBOOKS[book])
     }
+}
 
-    /// The largest magnitude of a line the codebook codes: zero for
-    /// `ZERO_HCB`, the LAV for the others, and with escape sequences
-    /// [`MAX_MAGNITUDE`] for `ESC_HCB`.
-    pub fn largest_magnitude(self) -> u32 {
-        match self.spectrum() {
-            None => 0,
-            Some(book) if book.has_escapes() => MAX_MAGNITUDE,
-            Some(book) => book.lav,
-        }
-    }
+/// The codebooks by the largest magnitude they code (Table 59):
+/// `ZERO_HCB`, the pairs that share a LAV, and `ESC_HCB`. The two of a pair
+/// share their codeword indexes too.
+pub(super) const CLASSES: [&[Codebook]; 7] = [
+    &[Codebook(0)],
+    &[Codebook(1), Codebook(2)],
+    &[Codebook(3), Codebook(4)],
+    &[Codebook(5), Codebook(6)],
+    &[Codebook(7), Codebook(8)],
+    &[Codebook(9), Codebook(10)],
+    &[Codebook(11)],
+];
+
+/// The first of [`CLASSES`] whose codebooks code lines of up to `largest`,
+/// or `None` above [`MAX_MAGNITUDE`].
+pub(super) fn class(largest: u32) -> Option<usize> {
+    CLASSES
+        .iter()
+        .position(|books| books[0].largest_magnitude() >= largest)
 }
 
 /// A spectrum Huffman codebook (Table 59 and Tables A.2 to A.12), which
 /// codes an n-tuple of quantized lines by a codeword index.
 #[derive(Debug)]
-pub struct SpectrumCodebook {
+pub(super) struct SpectrumCodebook {
     number: u8,
     /// `unsigned_cb`: whether the codeword codes magnitudes, each nonzero
     /// one followed by its sign bit.
@@ -85,29 +108,34 @@ pub struct SpectrumCodebook {
 }
 
 impl SpectrumCodebook {
-    pub fn number(&self) -> u8 {
+    pub(super) fn number(&self) -> u8 {
         self.number
     }
 
-    pub fn is_unsigned(&self) -> bool {
+    pub(super) fn is_unsigned(&self) -> bool {
         self.unsigned
     }
 
     /// The lines of each n-tuple: 4 for codebooks 1 to 4, 2 from
     /// `FIRST_PAIR_HCB` on.
-    pub fn dimension(&self) -> usize {
+    pub(super) fn dimension(&self) -> usize {
         self.dimension
-    }
-
-    /// The LAV of Table 59, which for `ESC_HCB` is `ESC_FLAG`.
-    pub fn lav(&self) -> u32 {
-        self.lav
     }
 
     /// Whether lines of [`ESC_FLAG`] and more are coded with escape
     /// sequences: `ESC_HCB` alone.
-    pub fn has_escapes(&self) -> bool {
+    pub(super) fn has_escapes(&self) -> bool {
         self.number == Codebook::ESC.0
+    }
+
+    /// The largest magnitude of a line the codebook codes: its LAV, or with
+    /// escape sequences [`MAX_MAGNITUDE`] for `ESC_HCB`.
+    pub(super) fn largest_magnitude(&self) -> u32 {
+        if self.has_escapes() {
+            MAX_MAGNITUDE
+        } else {
+            self.lav
+        }
     }
 
     /// The codeword index of `tuple`, by clause 9.3 run backwards: each line
@@ -117,11 +145,11 @@ impl SpectrumCodebook {
     /// `2 * LAV + 1` or `LAV + 1`, first line most significant.
     ///
     /// `tuple` holds [`dimension`](Self::dimension) lines that the codebook
-    /// can code (see [`Codebook::largest_magnitude`]); for others the index
-    /// is another tuple's or out of range.
-    pub fn index(&self, tuple: &[i32]) -> usize {
+    /// codes (see [`largest_magnitude`](Self::largest_magnitude)); for
+    /// others the index is another tuple's or out of range.
+    pub(super) fn index(&self, tuple: &[i32]) -> usize {
         debug_assert_eq!(tuple.len(), self.dimension);
-        let modulus = self.modulus() as usize;
+        let modulus = modulus(self.unsigned, self.lav) as usize;
         tuple.iter().fold(0, |index, &line| {
             let digit = if self.unsigned {
                 line.unsigned_abs().min(self.lav)
@@ -133,18 +161,14 @@ impl SpectrumCodebook {
     }
 
     /// The codeword with codeword index `index`.
-    pub fn codeword(&self, index: usize) -> Codeword {
+    pub(super) fn codeword(&self, index: usize) -> Codeword {
         self.codewords[index]
     }
 
     /// The bits of the codeword with index `index` and of the sign bits
     /// that follow it, short of any escape sequences.
-    pub fn tuple_bits(&self, index: usize) -> u32 {
+    pub(super) fn tuple_bits(&self, index: usize) -> u32 {
         u32::from(self.tuple_bits[index])
-    }
-
-    fn modulus(&self) -> u32 {
-        modulus(self.unsigned, self.lav)
     }
 }
 
@@ -155,7 +179,7 @@ const fn modulus(unsigned: bool, lav: u32) -> u32 {
 
 /// The bits of the escape sequence of a magnitude of [`ESC_FLAG`] to
 /// [`MAX_MAGNITUDE`], as [`escape_sequence`] gives them: `2 * N + 5`.
-pub fn escape_bits(magnitude: u32) -> u32 {
+pub(super) fn escape_bits(magnitude: u32) -> u32 {
     debug_assert!((ESC_FLAG..=MAX_MAGNITUDE).contains(&magnitude));
     2 * magnitude.ilog2() - 3
 }
@@ -169,7 +193,7 @@ pub fn escape_bits(magnitude: u32) -> u32 {
 /// # Panics
 ///
 /// If the magnitude is out of that range: a caller's error.
-pub fn escape_sequence(magnitude: u32) -> Codeword {
+pub(super) fn escape_sequence(magnitude: u32) -> Codeword {
     assert!(
         (ESC_FLAG..=MAX_MAGNITUDE).contains(&magnitude),
         "{magnitude} has no escape sequence"
@@ -186,7 +210,7 @@ pub fn escape_sequence(magnitude: u32) -> Codeword {
 
 /// The scalefactor codebook (Table A.1), whose codeword index is a
 /// difference of scalefactors less `index_offset` (Table 58).
-pub static SCALEFACTOR_CODEWORDS: [Codeword; 121] = tables::SCALEFACTOR;
+pub(super) static SCALEFACTOR_CODEWORDS: [Codeword; 121] = tables::SCALEFACTOR;
 
 /// Builds a codebook from `(index, length, codeword)` rows, which must run
 /// over the indexes in order.
@@ -310,6 +334,7 @@ mod tests {
     #[test]
     fn codebooks_follow_table_59() {
         assert!(Codebook::ZERO.spectrum().is_none());
+        assert!(!Codebook::ZERO.sends_scalefactor());
         assert_eq!(Codebook::ZERO.largest_magnitude(), 0);
         assert_eq!(Codebook::new(12), None);
         // Number, unsigned_cb, dimension, LAV, codewords, largest magnitude.
@@ -333,7 +358,7 @@ mod tests {
                     book.number(),
                     book.is_unsigned(),
                     book.dimension(),
-                    book.lav(),
+                    book.lav,
                     book.codewords.len(),
                 ),
                 (number, unsigned, dimension, lav, len)
@@ -341,7 +366,24 @@ mod tests {
             let codebook = Codebook::new(number).unwrap();
             assert_eq!(codebook.number(), number);
             assert_eq!(codebook.largest_magnitude(), largest);
+            assert_eq!(book.largest_magnitude(), largest);
+            assert_eq!(codebook.sends_scalefactor(), number > 0);
             assert_eq!(book.has_escapes(), number == 11);
+        }
+    }
+
+    #[test]
+    fn classes_rise_with_the_largest_magnitude() {
+        let classes = [(0, 0), (1, 1), (2, 2), (3, 3), (4, 3), (5, 4), (7, 4)];
+        let classes = classes.into_iter().chain([(8, 5), (12, 5), (13, 6)]);
+        for (largest, class) in classes.chain([(16, 6), (MAX_MAGNITUDE, 6)]) {
+            assert_eq!(super::class(largest), Some(class), "{largest}");
+        }
+        assert_eq!(super::class(MAX_MAGNITUDE + 1), None);
+        for (class, books) in CLASSES.iter().enumerate() {
+            for book in *books {
+                assert_eq!(super::class(book.largest_magnitude()), Some(class));
+            }
         }
     }
 

@@ -118,7 +118,7 @@ mod tests {
     use super::super::decoder::{BitReader, Noise, scale_factor_data, section_data};
     use super::*;
     use crate::sampling_frequency::SamplingFrequency;
-    use crate::scalefactor_bands::{Transform, swb_offsets};
+    use crate::scalefactor_bands::GroupBands;
 
     /// C5: every difference has a codeword or none, without overflow.
     #[test]
@@ -149,7 +149,9 @@ mod tests {
         let bytes = w.into_bytes();
         let mut r = BitReader::new(&bytes);
         let decoded: Vec<_> = (groups.iter())
-            .map(|(sections, _)| section_data(&mut r, sections.transform(), sections.max_sfb()))
+            .map(|(sections, _)| {
+                section_data(&mut r, sections.bands().transform(), sections.max_sfb())
+            })
             .collect();
         let mut last_sf = i32::from(global_gain);
         let mut expected_last = i32::from(global_gain);
@@ -186,13 +188,13 @@ mod tests {
             let mut groups = Vec::new();
             let max_sfb = noise.below(15) as usize;
             for _ in 0..1 + noise.below(4) {
-                let windows = 1 + noise.below(3) as u16;
-                let offsets: Vec<_> = (swb_offsets(fs, Transform::Short).iter())
-                    .map(|offset| offset * windows)
+                let bands = GroupBands::short(fs, 1 + noise.below(3) as usize);
+                let offsets: Vec<_> = (0..=bands.num_swb())
+                    .map(|sfb| bands.offset(sfb) as u16)
                     .collect();
-                let lines = noise.spectrum(&offsets, 128 * usize::from(windows));
-                let sections =
-                    Sections::choose(&lines, &offsets[..=max_sfb], Transform::Short).unwrap();
+                let mut lines = noise.spectrum(&offsets, bands.lines());
+                lines[bands.offset(max_sfb)..].fill(0);
+                let sections = Sections::choose(&lines, bands, max_sfb).unwrap();
                 let mut scalefactors: Vec<u8> =
                     (0..max_sfb).map(|_| noise.below(256) as u8).collect();
                 for sfb in sections.bands_with_scalefactors() {
@@ -211,8 +213,7 @@ mod tests {
         let mut lines = vec![0; 1024];
         lines[0] = 1;
         lines[4] = 1;
-        let offsets = swb_offsets(SamplingFrequency::Hz48000, Transform::Long);
-        Sections::choose(&lines, &offsets[..=2], Transform::Long).unwrap()
+        Sections::choose(&lines, GroupBands::long(SamplingFrequency::Hz48000), 2).unwrap()
     }
 
     #[test]
