@@ -436,7 +436,7 @@ fn slots_per_frame(
 
 /// Decides `padding_bit` frame by frame so that the mean frame length matches
 /// the bitrate exactly: after `k` frames the total length is `floor(k * N)`
-/// slots, `N` as in [`slots_per_frame`], which meets the "(+0, -1 slot)"
+/// slots, `N` as in `slots_per_frame`, which meets the "(+0, -1 slot)"
 /// bound of clause 2.4.2.3.
 ///
 /// Spec gap: that clause's sample procedure ("can be used") is optional; it

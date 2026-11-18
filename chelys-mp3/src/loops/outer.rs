@@ -199,7 +199,7 @@ pub const SAVING_NOISE_DB: f64 = 4.0;
 /// ancillary data that leaves the granule few bits. Should the first
 /// iteration, without scalefactors, not fit, its lines are quantised at the
 /// largest step with the values of the highest zeroed, as few as the rest
-/// need to fit (see [`truncated_step`]): a valid granule that loses the
+/// need to fit (see `truncated_step`): a valid granule that loses the
 /// highest frequencies rather than the whole granule. With intensity
 /// stereo, that result is marked, or given a value below the bound, and
 /// its bits counted again, as any other. The loop then goes on as ever:

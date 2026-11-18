@@ -201,7 +201,7 @@ const BEYOND_MAGNITUDE: i32 = 2 * MAX_MAGNITUDE as i32;
 /// does not change with the level of the lines, it cannot give a step that
 /// depends on it, as the step that fits does. It is not used: the search
 /// starts from `start_gain` if given, as the outer loop does with the step
-/// of its last iteration, and otherwise from [`estimated_gain`].
+/// of its last iteration, and otherwise from `estimated_gain`.
 /// Spec reading: that step may already fit, and the search then goes to
 /// finer steps, which the loop of figure C.9.c never does. Either way it
 /// ends on a step that fits with the next finer step not fitting, as that

@@ -32,7 +32,7 @@
 //!   for the same frequencies (see the test
 //!   `mpeg25_threshold_follows_the_rate_twice_as_high`).
 //! - The conversion to scalefactor bands is computed (see
-//!   [`weights_by_frequency`]), as the bands are not those of the higher
+//!   `weights_by_frequency`), as the bands are not those of the higher
 //!   rate (see [`scalefactor_bands::long_bands`]).
 
 use std::sync::LazyLock;
@@ -85,7 +85,7 @@ pub enum Snr {
     Db(f64),
     /// As the ratio of the threshold to the spread energy, as in Tables
     /// D.3.d to D.3.f of ISO/IEC 13818-3 (see
-    /// [`short_partitions_from_ratios`]).
+    /// `short_partitions_from_ratios`).
     Ratio(f64),
 }
 

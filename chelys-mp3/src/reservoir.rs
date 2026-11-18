@@ -30,8 +30,8 @@ const BORROW_SHARE: f64 = 0.6;
 ///
 /// The reservoir has two limits. Between frames it holds what the frames
 /// the stream may still have could begin in: no more than the limit of the
-/// shortest of them. Once a frame's length is chosen, [`for_frame`]
-/// (Self::for_frame) lowers that to the frame's own limit.
+/// shortest of them. Once a frame's length is chosen,
+/// [`for_frame`](Self::for_frame) lowers that to the frame's own limit.
 #[derive(Clone, Debug)]
 pub struct Reservoir {
     bits: isize,
