@@ -167,6 +167,11 @@ impl Filterbank {
     /// Windows the samples with the long window of `sequence` (clause
     /// 15.3.2, a, b and d), its left half of the shape `left` and its right
     /// half of `right`.
+    ///
+    /// # Panics
+    ///
+    /// For an EIGHT_SHORT_SEQUENCE, which has no long window: a caller's
+    /// error.
     fn long_window(&mut self, sequence: WindowSequence, left: WindowShape, right: WindowShape) {
         let half = FRAME_SAMPLES;
         let long_left = &window(left, Transform::Long)[..half];
@@ -181,26 +186,28 @@ impl Filterbank {
             WindowSequence::OnlyLong | WindowSequence::LongStart => {
                 multiply(z_left, x_left, long_left);
             }
-            _ => {
+            WindowSequence::LongStop => {
                 let (zeros, rest) = z_left.split_at_mut(FIRST_SHORT);
                 zeros.fill(0.0);
                 let (slope, ones) = rest.split_at_mut(SHORT_LINES);
                 multiply(slope, &x_left[FIRST_SHORT..], short_left);
                 ones.copy_from_slice(&x_left[FIRST_SHORT + SHORT_LINES..]);
             }
+            WindowSequence::EightShort { .. } => unreachable!("eight short windows"),
         }
         // The right half: W_RIGHT,2048, or ones, W_RIGHT,256 and zeros.
         match sequence {
             WindowSequence::OnlyLong | WindowSequence::LongStop => {
                 multiply(z_right, x_right, long_right);
             }
-            _ => {
+            WindowSequence::LongStart => {
                 let (ones, rest) = z_right.split_at_mut(START_SLOPE - half);
                 ones.copy_from_slice(&x_right[..START_SLOPE - half]);
                 let (slope, zeros) = rest.split_at_mut(SHORT_LINES);
                 multiply(slope, &x_right[START_SLOPE - half..], short_right);
                 zeros.fill(0.0);
             }
+            WindowSequence::EightShort { .. } => unreachable!("eight short windows"),
         }
     }
 

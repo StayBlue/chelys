@@ -181,9 +181,10 @@ fn next_sequence(last: Option<WindowSequence>, attacks: Attacks) -> WindowSequen
 }
 
 /// Makes the channels of one element agree on their attacks, where they
-/// share their windows: an attack in either is taken as one in both, so
-/// that their window sequences, chosen alike from the same state, are the
-/// same.
+/// are to share their windows: an attack in either is taken as one in
+/// both, so that their window sequences, chosen alike from the same state,
+/// are of the same kind. Their groupings, chosen from each channel's own
+/// short blocks (see [`grouping`]), are not yet made to agree.
 pub fn agree(attacks: &mut [Attacks], common_window: bool) {
     if common_window {
         let this = attacks.iter().any(|a| a.this);

@@ -47,6 +47,14 @@ pub fn write_single_channel_element(channel: &CodedChannel, w: &mut BitWriter) {
 
 /// Writes a `channel_pair_element()` (Table 14), after its `id_syn_ele`.
 pub fn write_channel_pair_element(left: &CodedChannel, right: &CodedChannel, w: &mut BitWriter) {
+    // The ics_info() sent once for both: their windows and max_sfb.
+    if COMMON_WINDOW {
+        debug_assert_eq!(
+            (left.windows(), left.max_sfb()),
+            (right.windows(), right.max_sfb()),
+            "a common window shared by channels of different windows"
+        );
+    }
     w.write(ELEMENT_INSTANCE_TAG, 4);
     w.write_bool(COMMON_WINDOW);
     write_individual_channel_stream(left, COMMON_WINDOW, w);
