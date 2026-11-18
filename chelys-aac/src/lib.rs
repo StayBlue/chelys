@@ -29,6 +29,9 @@ mod channel;
 mod channel_configuration;
 mod config;
 mod encoder;
+// A tested building block that the encoder does not use yet.
+#[cfg(any(test, feature = "unstable"))]
+mod filterbank;
 mod noiseless;
 mod raw_data_block;
 mod reservoir;
@@ -64,6 +67,7 @@ pub mod internals {
         audio_specific_config,
         channel,
         channel_configuration,
+        filterbank,
         noiseless,
         raw_data_block,
         reservoir,
