@@ -11,10 +11,9 @@ use crate::channel::{self, CodedChannel, CodedGroup, FRAME_LINES};
 use crate::noiseless::codebooks::MAX_MAGNITUDE;
 use crate::noiseless::scalefactors;
 use crate::noiseless::sections::{self, Sections};
-use crate::raw_data_block::element::COMMON_WINDOW;
-use crate::sampling_frequency::SamplingFrequency;
 use crate::scalefactor_bands::{GroupBands, MAX_BANDS};
-use crate::window::Windows;
+
+use super::ChannelCoding;
 
 /// `SF_OFFSET` (clauses 11.3.3 and C.7.4): `sf_decoder = common_scalefac
 /// - scalefactor + SF_OFFSET`.
@@ -170,9 +169,7 @@ impl<'a> Lines<'a> {
 /// scalefactors of the outer loop that it was counted with.
 pub struct Counting<'a> {
     lines: Lines<'a>,
-    windows: Windows,
-    sampling_frequency: SamplingFrequency,
-    available_bits: u32,
+    coding: ChannelCoding,
     /// `scalefactor(sb)` of the outer loop (clause C.7.4.1) of each band of
     /// each window group: how many steps of the quantizer each is
     /// amplified by. All 0 to start with (clause C.7.2.1).
@@ -196,20 +193,13 @@ pub struct Counting<'a> {
 }
 
 impl<'a> Counting<'a> {
-    /// The coding of `lines` in the window groups of `windows` in at most
-    /// `available_bits`, with every scalefactor 0, not yet counted.
-    pub fn new(
-        lines: Lines<'a>,
-        windows: Windows,
-        sampling_frequency: SamplingFrequency,
-        available_bits: u32,
-    ) -> Self {
-        let groups = windows.groups(sampling_frequency).count();
+    /// The coding of `lines` as `coding` asks, with every scalefactor 0,
+    /// not yet counted.
+    pub fn new(lines: Lines<'a>, coding: ChannelCoding) -> Self {
+        let groups = coding.windows.groups(coding.sampling_frequency).count();
         Self {
             lines,
-            windows,
-            sampling_frequency,
-            available_bits,
+            coding,
             scalefactors: vec![[0; MAX_BANDS]; groups],
             x_quant: [0; FRAME_LINES],
             counted: Vec::with_capacity(groups),
@@ -227,8 +217,8 @@ impl<'a> Counting<'a> {
     /// The window groups' bands, each with its first line in the channel.
     pub fn groups(&self) -> impl Iterator<Item = (usize, GroupBands)> + use<'a> {
         let mut start = 0;
-        self.windows
-            .groups(self.sampling_frequency)
+        (self.coding.windows)
+            .groups(self.coding.sampling_frequency)
             .map(move |bands| {
                 let first = start;
                 start += bands.lines();
@@ -273,7 +263,8 @@ impl<'a> Counting<'a> {
     /// [`Self::count_at`], but for keeping what it fitted.
     fn count(&mut self, common_gain: u8, band_limit: usize) -> bool {
         let mut start = 0;
-        for (g, bands) in self.windows.groups(self.sampling_frequency).enumerate() {
+        let groups = self.coding.windows.groups(self.coding.sampling_frequency);
+        for (g, bands) in groups.clone().enumerate() {
             let sent = band_limit.min(bands.num_swb());
             for sb in 0..sent {
                 let Some(sf_decoder) = self.sf_decoder(common_gain, g, sb) else {
@@ -291,18 +282,24 @@ impl<'a> Counting<'a> {
             .map(|(bands, lines)| sections::max_sfb(lines, bands))
             .max()
             .unwrap_or(0);
-        let mut least_bits = channel::bits(self.windows, COMMON_WINDOW, 0);
+        let ChannelCoding {
+            windows,
+            available_bits,
+            common_window,
+            ..
+        } = self.coding;
+        let mut least_bits = channel::bits(windows, common_window, 0);
         self.sections.clear();
         self.counted.clear();
         let mut start = 0;
-        for bands in self.windows.groups(self.sampling_frequency) {
+        for bands in groups {
             let lines = &self.x_quant[start..start + bands.lines()];
             start += bands.lines();
             let Some(group) = Sections::count(lines, bands, max_sfb) else {
                 return false;
             };
             least_bits += group.least_bits();
-            if least_bits > self.available_bits {
+            if least_bits > available_bits {
                 return false;
             }
             self.counted.push(group);
@@ -328,8 +325,7 @@ impl<'a> Counting<'a> {
         let noiseless: u32 = (self.sections.iter())
             .map(|s| s.section_data_bits() + s.spectral_data_bits())
             .sum();
-        channel::bits(self.windows, COMMON_WINDOW, noiseless + scalefactor_bits)
-            <= self.available_bits
+        channel::bits(windows, common_window, noiseless + scalefactor_bits) <= available_bits
     }
 
     /// `global_gain` for the sections and scalefactors counted last: the
@@ -375,8 +371,8 @@ impl<'a> Counting<'a> {
             })
             .collect();
         CodedChannel::new(
-            self.windows,
-            self.sampling_frequency,
+            self.coding.windows,
+            self.coding.sampling_frequency,
             global_gain,
             self.x_quant,
             groups,
@@ -479,13 +475,15 @@ pub fn first_inner_loop(counting: &mut Counting) -> (u8, usize) {
     }
     panic!(
         "not even a channel without lines fits in {} bits",
-        counting.available_bits
+        counting.coding.available_bits
     );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sampling_frequency::SamplingFrequency;
+    use crate::window::Windows;
 
     fn spectrum(f: impl FnMut(usize) -> f64) -> [f64; FRAME_LINES] {
         std::array::from_fn(f)
@@ -573,7 +571,10 @@ mod tests {
 
     /// The first run of the inner loop with every scalefactor 0.
     fn flat(lines: &[f64; FRAME_LINES], fs: SamplingFrequency, available: u32) -> CodedChannel {
-        let mut counting = Counting::new(Lines::new(lines), Windows::LONG_SINE, fs, available);
+        let mut counting = Counting::new(
+            Lines::new(lines),
+            ChannelCoding::single(Windows::LONG_SINE, fs, available),
+        );
         let (gain, band_limit) = first_inner_loop(&mut counting);
         counting.into_channel(gain, band_limit)
     }
@@ -584,8 +585,11 @@ mod tests {
         for (seed, available) in [(1, 100), (2, 400), (3, 1500), (4, 4000), (5, 12_000)] {
             let lines = noise(seed);
             let channel = flat(&lines, fs, available);
-            assert!(channel.bits(COMMON_WINDOW) <= available, "{available}");
-            let mut counting = Counting::new(Lines::new(&lines), Windows::LONG_SINE, fs, available);
+            assert!(channel.bits(false) <= available, "{available}");
+            let mut counting = Counting::new(
+                Lines::new(&lines),
+                ChannelCoding::single(Windows::LONG_SINE, fs, available),
+            );
             let start = counting.lines.start_gain();
             let smallest = (start..=u8::MAX)
                 .find(|&gain| counting.count_at(gain, MAX_BANDS))
@@ -611,10 +615,10 @@ mod tests {
     fn lines_too_loud_for_any_step_lose_their_highest_bands() {
         let fs = SamplingFrequency::Hz8000;
         let lines = spectrum(|i| if i % 2 == 0 { 1e14 } else { -1e14 });
-        let silent = CodedChannel::silent(Windows::LONG_SINE, fs).bits(COMMON_WINDOW);
+        let silent = CodedChannel::silent(Windows::LONG_SINE, fs).bits(false);
         for available in [silent, silent + 30, 300] {
             let channel = flat(&lines, fs, available);
-            assert!(channel.bits(COMMON_WINDOW) <= available);
+            assert!(channel.bits(false) <= available);
             assert!(channel.max_sfb() < 40);
             if channel.max_sfb() > 0 {
                 assert_eq!(channel.global_gain(), u8::MAX);
@@ -626,7 +630,10 @@ mod tests {
     fn amplified_bands_are_sent_with_lower_scalefactors() {
         let fs = SamplingFrequency::Hz44100;
         let lines = noise(9);
-        let mut counting = Counting::new(Lines::new(&lines), Windows::LONG_SINE, fs, 1 << 20);
+        let mut counting = Counting::new(
+            Lines::new(&lines),
+            ChannelCoding::single(Windows::LONG_SINE, fs, 1 << 20),
+        );
         counting.scalefactors[0][3] = 5;
         counting.scalefactors[0][4] = 2;
         let gain = 140;
@@ -649,7 +656,10 @@ mod tests {
     fn a_scalefactor_below_zero_does_not_fit() {
         let fs = SamplingFrequency::Hz44100;
         let lines = noise(9);
-        let mut counting = Counting::new(Lines::new(&lines), Windows::LONG_SINE, fs, 1 << 20);
+        let mut counting = Counting::new(
+            Lines::new(&lines),
+            ChannelCoding::single(Windows::LONG_SINE, fs, 1 << 20),
+        );
         counting.scalefactors[0][3] = 41;
         assert_eq!(counting.sf_decoder(41, 0, 3), Some(0));
         assert_eq!(counting.sf_decoder(40, 0, 3), None);
@@ -660,7 +670,10 @@ mod tests {
     fn a_channel_is_built_from_the_scalefactors_it_is_asked_for() {
         let fs = SamplingFrequency::Hz44100;
         let lines = noise(9);
-        let mut counting = Counting::new(Lines::new(&lines), Windows::LONG_SINE, fs, 1 << 20);
+        let mut counting = Counting::new(
+            Lines::new(&lines),
+            ChannelCoding::single(Windows::LONG_SINE, fs, 1 << 20),
+        );
         assert!(counting.count_at(140, MAX_BANDS));
         // Changed after the count, as the outer loop restores them: the
         // channel is counted again with them.

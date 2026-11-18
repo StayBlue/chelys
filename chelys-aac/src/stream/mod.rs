@@ -4,25 +4,21 @@
 //! The frames of a stream: one per block of 1024 samples of each channel,
 //! each as long as the bit reservoir lets it be, framed as asked.
 
+mod element;
 mod frame;
 
 use super::DELAY;
 use super::adts::HEADER_LEN;
 use super::audio_specific_config::audio_specific_config;
 use super::channel::CodedChannel;
-use super::channel::FRAME_LINES;
 use super::channel_configuration::ChannelConfiguration;
 use super::config::Framing;
-use super::filterbank::Filterbank;
-use super::loops;
-use super::psychoacoustic::switching::{self, Attacks, BlockSwitching};
 use super::raw_data_block;
-use super::raw_data_block::element::COMMON_WINDOW;
+use super::raw_data_block::element::CodedElement;
 use super::reservoir::BitReservoir;
 use super::sampling_frequency::SamplingFrequency;
-use super::scalefactor_bands::MAX_BANDS;
-use super::window::{SHORT_WINDOWS, WindowSequence, Windows};
-use frame::Demand;
+use super::window::{WindowSequence, Windows};
+use element::ElementEncoder;
 
 /// The samples of each channel a frame codes (clause 8.2.1.1).
 pub const FRAME_SAMPLES: usize = 1024;
@@ -46,11 +42,14 @@ impl StreamConfig {
     }
 
     /// The shortest frame of channels with `windows`: its channels
-    /// silent, without fill.
+    /// silent, each with its own `ics_info()`, without fill.
     fn shortest_frame_len(&self, windows: Windows) -> usize {
         let channel = CodedChannel::silent(windows, self.sampling_frequency);
-        let channels = vec![channel; self.channel_configuration.channels()];
-        self.header_len() + raw_data_block::min_len(self.channel_configuration, &channels)
+        let element = match self.channel_configuration {
+            ChannelConfiguration::Mono => CodedElement::single(channel),
+            ChannelConfiguration::Stereo => CodedElement::pair(channel.clone(), channel),
+        };
+        self.header_len() + raw_data_block::min_len(&element)
     }
 
     /// The lowest bitrate that brings each frame the bits of the shortest,
@@ -137,21 +136,8 @@ impl<F: FnMut(&[u8])> FrameSink for F {
 pub struct StreamEncoder {
     config: StreamConfig,
     reservoir: BitReservoir,
-    /// Each channel's samples that no frame has coded yet: the block of the
-    /// frame coded next, and fewer than a block's after it, between calls.
-    pcm: Vec<Vec<f64>>,
-    /// One for each channel.
-    filterbanks: Vec<Filterbank>,
-    /// One for each channel: the psychoacoustic model, a block ahead of the
-    /// filterbank.
-    switchings: Vec<BlockSwitching>,
-    /// Whether the models have analyzed the block of the frame coded next.
-    primed: bool,
-    /// Each channel of the frame being coded, as analyzed, kept from one
-    /// frame to the next for its memory.
-    analyzed: Vec<AnalyzedChannel>,
-    /// Each channel's attacks in the frame being coded and the one after.
-    attacks: Vec<Attacks>,
+    /// The one element of each frame, which `channel_configuration` gives.
+    element: ElementEncoder,
     /// Whether frames may be coded with short windows.
     block_switching: bool,
     /// [`StreamConfig::shortest_short_frame_bits`].
@@ -178,16 +164,10 @@ impl StreamEncoder {
             .reservoir()
             .unwrap_or_else(|| panic!("a stream that cannot be written: {config:?}"));
         let channels = config.channel_configuration.channels();
-        let fs = config.sampling_frequency;
         Self {
             config,
             reservoir,
-            pcm: vec![Vec::with_capacity(2 * FRAME_SAMPLES); channels],
-            filterbanks: (0..channels).map(|_| Filterbank::new(fs)).collect(),
-            switchings: (0..channels).map(|_| BlockSwitching::new(fs)).collect(),
-            primed: false,
-            analyzed: (0..channels).map(|_| AnalyzedChannel::new()).collect(),
-            attacks: Vec::with_capacity(channels),
+            element: ElementEncoder::new(config.sampling_frequency, channels),
             block_switching: true,
             shortest_short_frame_bits: config.shortest_short_frame_bits(),
             samples: 0,
@@ -231,15 +211,17 @@ impl StreamEncoder {
     /// If there is not one slice for each channel, all of one length: a
     /// caller's error.
     pub fn encode<O: FrameSink + ?Sized>(&mut self, channels: &[&[f64]], out: &mut O) {
-        assert_eq!(channels.len(), self.pcm.len(), "one slice per channel");
+        assert_eq!(
+            channels.len(),
+            self.element.channels(),
+            "one slice per channel"
+        );
         let len = channels[0].len();
         assert!(
             channels.iter().all(|c| c.len() == len),
             "every channel has the same number of samples"
         );
-        for (pcm, samples) in self.pcm.iter_mut().zip(channels) {
-            pcm.extend_from_slice(samples);
-        }
+        self.element.push(channels);
         self.samples += len as u64;
         self.encode_buffered(out);
     }
@@ -247,21 +229,15 @@ impl StreamEncoder {
     /// Codes the frames whose blocks, and the block after each, are
     /// buffered, and drops their samples.
     fn encode_buffered<O: FrameSink + ?Sized>(&mut self, out: &mut O) {
-        if !self.primed && self.pcm[0].len() >= FRAME_SAMPLES {
-            for (switching, pcm) in self.switchings.iter_mut().zip(&self.pcm) {
-                let block = pcm[..FRAME_SAMPLES].try_into().expect("a block");
-                switching.look_ahead(block);
-            }
-            self.primed = true;
+        if !self.element.is_primed() && self.element.buffered() >= FRAME_SAMPLES {
+            self.element.prime();
         }
         let mut start = 0;
-        while self.primed && self.pcm[0].len() - start >= 2 * FRAME_SAMPLES {
+        while self.element.is_primed() && self.element.buffered() - start >= 2 * FRAME_SAMPLES {
             self.encode_frame(start, out);
             start += FRAME_SAMPLES;
         }
-        for pcm in &mut self.pcm {
-            pcm.drain(..start);
-        }
+        self.element.drain(start);
     }
 
     /// Ends the stream: pads the input with silence to whole frames, at
@@ -273,9 +249,7 @@ impl StreamEncoder {
         // Few: those of the samples held and of DELAY, and the block after
         // the last.
         let remaining = (frames - self.frames) as usize;
-        for pcm in &mut self.pcm {
-            pcm.resize((remaining + 1) * FRAME_SAMPLES, 0.0);
-        }
+        self.element.pad((remaining + 1) * FRAME_SAMPLES);
         self.encode_buffered(out);
         debug_assert_eq!(self.frames, frames);
         StreamEnd {
@@ -284,148 +258,24 @@ impl StreamEncoder {
         }
     }
 
-    /// Codes the frame whose block starts at `start` in [`Self::pcm`], the
-    /// block after it following, and gives it to `out`, in four steps:
-    /// chooses each channel's windows, from its psychoacoustic model's
-    /// analysis of the frame and of the next one; transforms each channel's
-    /// block with them in its filterbank, and from its spectrum and the
-    /// model's thresholds finds what each scalefactor band may take as
-    /// noise; has the bit reservoir make bits available to the frame for
-    /// the bits the model asks for; and quantizes each channel's lines
-    /// through the iteration loops in its share of them.
-    ///
-    /// Each channel is quantized in its share and the bits that those
-    /// quantized before it left: a channel's loops take the finest step
-    /// that fits its bits, one of 1.5 dB, which leaves about 90 bits unused
-    /// on average at 128 kbit/s in stereo (figure C.6). Spec gap: Annex C
-    /// does not say what becomes of them within a frame. The channels are
-    /// quantized in order of their perceptual entropy, the least first, so
-    /// that what one leaves goes to one that asks for more, whatever their
-    /// order in the frame; a channel of zeros, given just what it costs,
-    /// leaves nothing. Graded with PEAQ (GstPEAQ 0.6.1, black box), 8
-    /// tracks of pop music at 44.1 kHz in stereo at 128 kbit/s gave a mean
-    /// of -2.19 so, and -2.35 with the bits left to the reservoir.
+    /// Codes the frame whose block starts at `start` in the samples
+    /// buffered, the block after it following, and gives it to `out`, in
+    /// four steps: has the element's psychoacoustic models analyze the block
+    /// after it, for the attacks that choose the frame's windows; prepares
+    /// the element's channels for quantization (see
+    /// [`ElementEncoder::prepare`]); has the bit reservoir make bits
+    /// available to the frame for the bits the model asks for; and
+    /// quantizes the element in them.
     fn encode_frame<O: FrameSink + ?Sized>(&mut self, start: usize, out: &mut O) {
-        let next = start + FRAME_SAMPLES;
-        self.attacks.clear();
-        for (switching, pcm) in self.switchings.iter_mut().zip(&self.pcm) {
-            let block = pcm[next..next + FRAME_SAMPLES].try_into().expect("a block");
-            let attacks = switching.look_ahead(block).expect("primed");
-            self.attacks.push(if self.block_switching {
-                attacks
-            } else {
-                Attacks {
-                    this: false,
-                    next: false,
-                }
-            });
-        }
-        // The channels of the frame's one element, which a pair would make
-        // agree if they shared their windows.
-        let common_window =
-            self.config.channel_configuration == ChannelConfiguration::Stereo && COMMON_WINDOW;
-        switching::agree(&mut self.attacks, common_window);
+        self.element
+            .look_ahead(start + FRAME_SAMPLES, self.block_switching);
         let afford_short = self.affords_short();
-
-        let analyzers = (self.pcm.iter())
-            .zip(&mut self.filterbanks)
-            .zip(&mut self.switchings)
-            .zip(&self.attacks);
-        for ((((pcm, filterbank), switching), &attacks), analyzed) in
-            analyzers.zip(&mut self.analyzed)
-        {
-            let block = pcm[start..start + FRAME_SAMPLES]
-                .try_into()
-                .expect("a block of samples");
-            let sequence = switching.decide(attacks, afford_short);
-            let windows = Windows {
-                sequence,
-                shape: switching::shape(sequence),
-            };
-            analyzed.analyze(block, windows, filterbank, switching);
-        }
-
-        let demands: Vec<Demand> = (self.analyzed.iter())
-            .map(|analyzed| Demand {
-                bit_allocation: analyzed.bit_allocation,
-                windows: analyzed.windows,
-                silent: analyzed.spectrum.iter().all(|&x| x == 0.0),
-            })
-            .collect();
-        let shares = frame::bits_per_channel(&self.config, &self.reservoir, &demands);
-
-        // The channels in order of their perceptual entropy, the least
-        // first, so that the bits each leaves go to those that ask for
-        // more.
-        let mut order: Vec<usize> = (0..self.analyzed.len()).collect();
-        order.sort_by(|&a, &b| {
-            let pe = |c: usize| self.analyzed[c].perceptual_entropy;
-            pe(a).total_cmp(&pe(b))
-        });
-        let mut channels: Vec<Option<CodedChannel>> = vec![None; order.len()];
-        let mut left = 0;
-        for c in order {
-            let analyzed = &self.analyzed[c];
-            let available_bits = shares[c] + left;
-            let channel = loops::quantize_channel(
-                &analyzed.spectrum,
-                analyzed.windows,
-                self.config.sampling_frequency,
-                available_bits,
-                &analyzed.xmin,
-            );
-            left = available_bits - channel.bits(COMMON_WINDOW);
-            channels[c] = Some(channel);
-        }
-        let channels: Vec<CodedChannel> = channels.into_iter().map(|c| c.expect("coded")).collect();
-        frame::write(&self.config, &mut self.reservoir, &channels, out);
+        self.element.prepare(start, afford_short);
+        let demand = self.element.demand();
+        let available_bits = frame::element_bits(&self.config, &self.reservoir, &demand);
+        let element = self.element.quantize(available_bits);
+        frame::write(&self.config, &mut self.reservoir, &element, out);
         self.frames += 1;
-    }
-}
-
-/// A channel of a frame as the filterbank and the psychoacoustic model
-/// analyzed it: what its loops quantize, and what it asks of the frame.
-#[derive(Debug)]
-struct AnalyzedChannel {
-    windows: Windows,
-    /// The lines of the frame's transform, in the order they are sent.
-    spectrum: Box<[f64; FRAME_LINES]>,
-    /// The allowed distortion `xmin` of each band of each window group.
-    xmin: Vec<[f64; MAX_BANDS]>,
-    /// `bit_allocation` (clause C.1.4, step 15).
-    bit_allocation: f64,
-    /// The perceptual entropy (clause C.1.4, steps 12 and 15).
-    perceptual_entropy: f64,
-}
-
-impl AnalyzedChannel {
-    fn new() -> Self {
-        Self {
-            windows: Windows::LONG_SINE,
-            spectrum: Box::new([0.0; FRAME_LINES]),
-            xmin: Vec::with_capacity(SHORT_WINDOWS),
-            bit_allocation: 0.0,
-            perceptual_entropy: 0.0,
-        }
-    }
-
-    /// Transforms the channel's block of samples at full scale 1.0 with
-    /// `windows` in its filterbank, and takes what its loops are to allow
-    /// and what it asks of the frame from the model's analysis of the
-    /// frame, which `switching` holds.
-    fn analyze(
-        &mut self,
-        block: &[f64; FRAME_SAMPLES],
-        windows: Windows,
-        filterbank: &mut Filterbank,
-        switching: &BlockSwitching,
-    ) {
-        self.windows = windows;
-        filterbank.spectrum(block, windows, &mut self.spectrum);
-        let analysis = switching.current();
-        analysis.xmin(windows, &self.spectrum, &mut self.xmin);
-        self.bit_allocation = analysis.bit_allocation(windows.sequence);
-        self.perceptual_entropy = analysis.perceptual_entropy(windows.sequence);
     }
 }
 

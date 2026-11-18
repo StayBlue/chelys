@@ -21,50 +21,69 @@ use crate::channel::CodedChannel;
 /// test is `ffmpeg_decodes_silence_at_every_sample_rate`.
 const ELEMENT_INSTANCE_TAG: u32 = 0;
 
-/// `common_window` of every `channel_pair_element()`.
-///
-/// Spec gap: Annex C does not say when the two channels of a pair share
-/// their `ics_info()`, which makes them share their windows and `max_sfb`,
-/// and lets them be coded as middle and side (clause 12.1). While each
-/// channel is quantized apart, with its own `max_sfb`, and middle and side
-/// are not coded, the channels do not share it.
-pub const COMMON_WINDOW: bool = false;
-
 /// The bits of a `single_channel_element()` besides its channel's
 /// `individual_channel_stream()`: `element_instance_tag`.
-pub const SINGLE_CHANNEL_ELEMENT_BITS: u32 = 4;
+const SINGLE_CHANNEL_ELEMENT_BITS: u32 = 4;
 
 /// The bits of a `channel_pair_element()` besides its channels'
-/// `individual_channel_stream()`s, with `common_window` 0:
+/// `individual_channel_stream()`s and the fields of a common window:
 /// `element_instance_tag` and `common_window`.
-pub const CHANNEL_PAIR_ELEMENT_BITS: u32 = 4 + 1;
+const CHANNEL_PAIR_ELEMENT_BITS: u32 = 4 + 1;
 
-/// Writes a `single_channel_element()` (Table 13), after its `id_syn_ele`.
-pub fn write_single_channel_element(channel: &CodedChannel, w: &mut BitWriter) {
-    w.write(ELEMENT_INSTANCE_TAG, 4);
-    write_individual_channel_stream(channel, false, w);
+/// One element of a frame as it is written: a `single_channel_element()`
+/// of one channel, or a `channel_pair_element()` of two, each with its own
+/// `ics_info()` (`common_window` 0).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodedElement {
+    channels: Vec<CodedChannel>,
 }
 
-/// Writes a `channel_pair_element()` (Table 14), after its `id_syn_ele`.
-pub fn write_channel_pair_element(left: &CodedChannel, right: &CodedChannel, w: &mut BitWriter) {
-    // The ics_info() sent once for both: their windows and max_sfb.
-    if COMMON_WINDOW {
-        debug_assert_eq!(
-            (left.windows(), left.max_sfb()),
-            (right.windows(), right.max_sfb()),
-            "a common window shared by channels of different windows"
-        );
+impl CodedElement {
+    pub fn single(channel: CodedChannel) -> Self {
+        Self {
+            channels: vec![channel],
+        }
     }
-    w.write(ELEMENT_INSTANCE_TAG, 4);
-    w.write_bool(COMMON_WINDOW);
-    write_individual_channel_stream(left, COMMON_WINDOW, w);
-    write_individual_channel_stream(right, COMMON_WINDOW, w);
-}
 
-/// The bits of `channel` in its element, which is single or one of a
-/// pair with `common_window` 0.
-pub fn channel_bits(channel: &CodedChannel) -> u32 {
-    channel.bits(COMMON_WINDOW)
+    pub fn pair(left: CodedChannel, right: CodedChannel) -> Self {
+        Self {
+            channels: vec![left, right],
+        }
+    }
+
+    /// Whether the element is a `channel_pair_element()`.
+    pub fn is_pair(&self) -> bool {
+        self.channels.len() == 2
+    }
+
+    /// The bits of the element besides its `id_syn_ele`.
+    pub fn bits(&self) -> u32 {
+        let channels: u32 = self.channels.iter().map(|c| c.bits(false)).sum();
+        Self::fields_bits(self.channels.len()) + channels
+    }
+
+    /// The bits of an element of `channels` channels besides their
+    /// `individual_channel_stream()`s.
+    pub fn fields_bits(channels: usize) -> u32 {
+        if channels == 1 {
+            SINGLE_CHANNEL_ELEMENT_BITS
+        } else {
+            CHANNEL_PAIR_ELEMENT_BITS
+        }
+    }
+
+    /// Writes the element (Table 13 or 14), after its `id_syn_ele`.
+    pub fn write(&self, w: &mut BitWriter) {
+        let start = w.bit_len();
+        w.write(ELEMENT_INSTANCE_TAG, 4);
+        if self.is_pair() {
+            w.write_bool(false); // common_window
+        }
+        for channel in &self.channels {
+            write_individual_channel_stream(channel, false, w);
+        }
+        debug_assert_eq!(w.bit_len() - start, self.bits() as usize);
+    }
 }
 
 #[cfg(test)]
@@ -75,10 +94,11 @@ mod tests {
     use crate::sampling_frequency::SamplingFrequency;
     use crate::window::Windows;
 
-    fn written(write: impl FnOnce(&mut BitWriter)) -> String {
+    fn written(element: &CodedElement) -> String {
         let mut w = BitWriter::new();
-        write(&mut w);
+        element.write(&mut w);
         let len = w.bit_len();
+        assert_eq!(len as u32, element.bits());
         binary_digits(&w.into_bytes())[..len].to_owned()
     }
 
@@ -89,23 +109,15 @@ mod tests {
     #[test]
     fn single_channel_element_is_a_tag_and_a_stream() {
         let ics = ["00000000", "00000000000", "000"].concat();
-        let bits = written(|w| write_single_channel_element(&silent(), w));
+        let bits = written(&CodedElement::single(silent()));
         assert_eq!(bits, ["0000", &ics].concat());
-        assert_eq!(
-            bits.len() as u32,
-            SINGLE_CHANNEL_ELEMENT_BITS + channel_bits(&silent())
-        );
     }
 
     #[test]
     fn channel_pair_element_has_a_window_for_each_channel() {
         let ics = ["00000000", "00000000000", "000"].concat();
-        let bits = written(|w| write_channel_pair_element(&silent(), &silent(), w));
+        let bits = written(&CodedElement::pair(silent(), silent()));
         // element_instance_tag, common_window, then the two streams.
         assert_eq!(bits, ["0000", "0", &ics, &ics].concat());
-        assert_eq!(
-            bits.len() as u32,
-            CHANNEL_PAIR_ELEMENT_BITS + 2 * channel_bits(&silent())
-        );
     }
 }

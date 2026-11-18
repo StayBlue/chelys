@@ -115,17 +115,24 @@ impl BlockSwitching {
         })
     }
 
+    /// Whether the model has analyzed a block, so that the next one
+    /// analyzed gives the attacks of the frame before it.
+    pub fn is_primed(&self) -> bool {
+        self.primed
+    }
+
     /// The analysis of the frame whose windows are chosen next.
     pub fn current(&self) -> &Analysis {
         &self.current
     }
 
     /// Chooses the window sequence of the current frame, given `attacks`,
-    /// whether it and the frame after it have attacks, with its short
-    /// windows, if it has any, grouped by [`grouping`]; or, where the frame
-    /// cannot `afford_short` windows, the long sequence that may take their
-    /// place: a LONG_STOP_SEQUENCE after a sequence that ends short, and an
-    /// ONLY_LONG_SEQUENCE else, so that the transitions stay meaningful.
+    /// whether it and the frame after it have attacks, its short windows,
+    /// if it has any, each a group of its own, for [`grouping`] to group;
+    /// or, where the frame cannot `afford_short` windows, the long sequence
+    /// that may take their place: a LONG_STOP_SEQUENCE after a sequence
+    /// that ends short, and an ONLY_LONG_SEQUENCE else, so that the
+    /// transitions stay meaningful.
     pub fn decide(&mut self, attacks: Attacks, afford_short: bool) -> WindowSequence {
         let sequence = match next_sequence(self.last, attacks) {
             WindowSequence::EightShort { .. } if !afford_short => {
@@ -135,9 +142,6 @@ impl BlockSwitching {
                     WindowSequence::OnlyLong
                 }
             }
-            WindowSequence::EightShort { .. } => WindowSequence::EightShort {
-                grouping: grouping(&self.current),
-            },
             sequence => sequence,
         };
         self.last = Some(sequence);
@@ -209,9 +213,10 @@ pub fn agree(attacks: &mut [Attacks], common_window: bool) {
     }
 }
 
-/// The grouping of a frame's short windows (clause 8.3.4): consecutive
-/// windows share a group while the energy of each, in its short FFT, is
-/// within a factor of 10 of every other's in the group.
+/// The grouping of a frame's short windows (clause 8.3.4) in the channels
+/// `analyses`, which share it: consecutive windows share a group while the
+/// energy of each, in its short FFT, is within a factor of 10 of every
+/// other's in the group, in every channel.
 ///
 /// Spec gap: Annex C says only that "the coefficients associated with
 /// contiguous short windows can be grouped such that they share
@@ -227,19 +232,19 @@ pub fn agree(attacks: &mut [Attacks], common_window: bool) {
 /// short, with the sine window for every frame: each window a group of its
 /// own gave a mean of -1.216, a factor of 4 -1.070, of 10 -1.058, of 30
 /// -1.058, and every window in one group -1.057.
-pub fn grouping(analysis: &Analysis) -> Grouping {
-    let energy = analysis
-        .short
-        .each_ref()
-        .map(|threshold| threshold.epart.iter().sum::<f64>());
+pub fn grouping(analyses: &[&Analysis]) -> Grouping {
+    let energy = |analysis: &Analysis, w: usize| analysis.short[w].epart.iter().sum::<f64>();
     let mut starts = [false; SHORT_WINDOWS];
-    let (mut least, mut most) = (energy[0], energy[0]);
-    for w in 1..SHORT_WINDOWS {
-        least = least.min(energy[w]);
-        most = most.max(energy[w]);
-        if most > GROUPING_RATIO * least {
-            starts[w] = true;
-            (least, most) = (energy[w], energy[w]);
+    let mut first = 0;
+    for (w, starts) in starts.iter_mut().enumerate().skip(1) {
+        *starts = analyses.iter().any(|analysis| {
+            let group = (first..=w).map(|w| energy(analysis, w));
+            let least = group.clone().fold(f64::INFINITY, f64::min);
+            let most = group.fold(0.0, f64::max);
+            most > GROUPING_RATIO * least
+        });
+        if *starts {
+            first = w;
         }
     }
     Grouping::from_starts(starts)
@@ -369,7 +374,7 @@ mod tests {
             });
             model.analyze(&samples, &mut analysis);
         }
-        let grouping = grouping(&analysis);
+        let grouping = grouping(&[&analysis]);
         assert_eq!(grouping.lengths().collect::<Vec<_>>(), [6, 2]);
     }
 

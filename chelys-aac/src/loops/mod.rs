@@ -38,40 +38,70 @@ use crate::window::{SHORT_WINDOWS, Windows};
 /// 6 dB at 64 kbit/s.
 pub const XMIN_OFFSET_DB: f64 = 3.0;
 
-/// The iteration loop of one channel (figure C.6): a channel whose lines
-/// are all zero is coded as such; any other is quantized by the outer loop
-/// to fit in `available_bits`, the bits of its
-/// `individual_channel_stream()`, with the noise of each scalefactor band
-/// of each window group shaped to its allowed distortion `xmin`, raised by
-/// [`XMIN_OFFSET_DB`] (see [`outer::outer_loop`]).
+/// How the loops are to code one channel: everything they take but its
+/// lines and their allowed distortion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChannelCoding {
+    pub windows: Windows,
+    pub sampling_frequency: SamplingFrequency,
+    /// The bits the channel's `individual_channel_stream()` may take.
+    pub available_bits: u32,
+    /// Whether the channel shares the `ics_info()` of its pair, which its
+    /// `individual_channel_stream()` then does not send.
+    pub common_window: bool,
+}
+
+impl ChannelCoding {
+    /// The coding of a channel of a `single_channel_element()`, or of a
+    /// pair that does not share its window, in `available_bits`.
+    pub fn single(
+        windows: Windows,
+        sampling_frequency: SamplingFrequency,
+        available_bits: u32,
+    ) -> Self {
+        Self {
+            windows,
+            sampling_frequency,
+            available_bits,
+            common_window: false,
+        }
+    }
+}
+
+/// The iteration loop of one channel (figure C.6): quantizes the lines
+/// `spectrum` by the outer loop to fit as `coding` asks, with the noise of
+/// each scalefactor band of each window group shaped to its allowed
+/// distortion `xmin`, raised by [`XMIN_OFFSET_DB`] (see
+/// [`outer::outer_loop`]). Gives the channel and how far its noise exceeds
+/// the raised allowance (see [`outer::excess`]).
 ///
 /// The bits the channel leaves unused (figure C.6) are not counted here:
 /// the frame's length, spent from the bit reservoir, leaves them there.
 ///
 /// # Panics
 ///
-/// If not even a channel without lines fits in `available_bits`: a
+/// If not even a channel without lines fits in the available bits: a
 /// caller's error.
-pub fn quantize_channel(
+pub fn quantize(
     spectrum: &[f64; FRAME_LINES],
-    windows: Windows,
-    sampling_frequency: SamplingFrequency,
-    available_bits: u32,
     xmin: &[[f64; MAX_BANDS]],
-) -> CodedChannel {
-    if spectrum.iter().all(|&x| x == 0.0) {
-        return CodedChannel::silent(windows, sampling_frequency);
-    }
-    let counting = Counting::new(
-        Lines::new(spectrum),
-        windows,
-        sampling_frequency,
-        available_bits,
-    );
+    coding: ChannelCoding,
+) -> (CodedChannel, f64) {
+    let counting = Counting::new(Lines::new(spectrum), coding);
     let offset = 10f64.powf(XMIN_OFFSET_DB / 10.0);
     let mut target = [[0.0; MAX_BANDS]; SHORT_WINDOWS];
     for (target, xmin) in target.iter_mut().zip(xmin) {
         *target = xmin.map(|xmin| xmin * offset);
     }
     outer::outer_loop(counting, &target[..xmin.len()])
+}
+
+/// [`quantize`] for a `single_channel_element()`'s channel, without its
+/// excess.
+pub fn quantize_channel(
+    spectrum: &[f64; FRAME_LINES],
+    xmin: &[[f64; MAX_BANDS]],
+    coding: ChannelCoding,
+) -> CodedChannel {
+    quantize(spectrum, xmin, coding).0
 }

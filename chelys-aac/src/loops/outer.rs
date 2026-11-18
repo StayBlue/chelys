@@ -102,13 +102,18 @@ pub const MAX_AMPLIFICATION: u8 = 60;
 /// running the outer loop on what is left.
 ///
 /// The offset to every `xmin` of clause C.7.4.4 is applied before the loop
-/// (see [`quantize_channel`](super::quantize_channel)).
-pub fn outer_loop(mut counting: Counting, xmin: &[[f64; MAX_BANDS]]) -> CodedChannel {
+/// (see [`quantize`](super::quantize)).
+///
+/// Gives the channel and the excess of its iteration (see [`excess`]).
+pub fn outer_loop(mut counting: Counting, xmin: &[[f64; MAX_BANDS]]) -> (CodedChannel, f64) {
     let groups: Vec<_> = counting.groups().collect();
     assert_eq!(xmin.len(), groups.len(), "an xmin for each window group");
+    let mut distortion = vec![[0.0; MAX_BANDS]; groups.len()];
     let (mut gain, band_limit) = first_inner_loop(&mut counting);
     if band_limit < MAX_BANDS {
-        return counting.into_channel(gain, band_limit);
+        quantization_distortion(&counting, gain, &mut distortion);
+        let excess = excess(&groups, &distortion, xmin);
+        return (counting.into_channel(gain, band_limit), excess);
     }
     // Whether each band's energy exceeds its xmin: those the loop is to
     // amplify, if it can.
@@ -121,7 +126,6 @@ pub fn outer_loop(mut counting: Counting, xmin: &[[f64; MAX_BANDS]]) -> CodedCha
             *audible = energy > xmin[g][sb];
         }
     }
-    let mut distortion = vec![[0.0; MAX_BANDS]; groups.len()];
     // The iteration of the least excess: its scalefactors, and its excess
     // and step.
     let mut best_scalefactors = counting.scalefactors.clone();
@@ -159,15 +163,15 @@ pub fn outer_loop(mut counting: Counting, xmin: &[[f64; MAX_BANDS]]) -> CodedCha
             None => break,
         }
     }
-    let (_, gain) = best.expect("an iteration was measured");
+    let (excess, gain) = best.expect("an iteration was measured");
     counting.scalefactors.copy_from_slice(&best_scalefactors);
-    counting.into_channel(gain, MAX_BANDS)
+    (counting.into_channel(gain, MAX_BANDS), excess)
 }
 
 /// How far the distortion of the bands exceeds their allowance: the sum,
 /// over the bands whose distortion exceeds their `xmin`, of the natural
-/// logarithm of the ratio.
-fn excess(
+/// logarithm of the ratio; 0 where none does.
+pub fn excess(
     groups: &[(usize, crate::scalefactor_bands::GroupBands)],
     distortion: &[[f64; MAX_BANDS]],
     xmin: &[[f64; MAX_BANDS]],
@@ -214,7 +218,7 @@ mod tests {
     use super::super::inner::Lines;
     use super::*;
     use crate::channel::FRAME_LINES;
-    use crate::raw_data_block::element::COMMON_WINDOW;
+    use crate::loops::ChannelCoding;
     use crate::sampling_frequency::SamplingFrequency;
     use crate::scalefactor_bands::GroupBands;
     use crate::window::Windows;
@@ -247,8 +251,11 @@ mod tests {
         xmin: [f64; MAX_BANDS],
     ) -> (CodedChannel, [[f64; MAX_BANDS]; 1]) {
         let fs = SamplingFrequency::Hz44100;
-        let counting = Counting::new(Lines::new(spectrum), Windows::LONG_SINE, fs, available);
-        let channel = outer_loop(counting, &[xmin]);
+        let counting = Counting::new(
+            Lines::new(spectrum),
+            ChannelCoding::single(Windows::LONG_SINE, fs, available),
+        );
+        let (channel, _) = outer_loop(counting, &[xmin]);
         // Measure the coded channel's distortion as a decoder would.
         let bands = GroupBands::long(fs);
         let (group, lines) = channel.groups().next().unwrap();
@@ -280,7 +287,7 @@ mod tests {
         let energy = band_energy(&spectrum, bands);
         let xmin = std::array::from_fn(|sb| energy[sb] * if sb < 20 { 1e-4 } else { 1e-1 });
         let (channel, distortion) = outcome(&spectrum, 7000, xmin);
-        assert!(channel.bits(COMMON_WINDOW) <= 7000);
+        assert!(channel.bits(false) <= 7000);
         for (sb, xmin) in xmin[..bands.num_swb()].iter().enumerate() {
             assert!(distortion[0][sb] <= *xmin, "band {sb}");
         }
@@ -299,10 +306,13 @@ mod tests {
         let energy = band_energy(&spectrum, bands);
         let xmin = std::array::from_fn(|sb| energy[sb] * if sb < 20 { 1e-4 } else { 1e-1 });
         let (channel, distortion) = outcome(&spectrum, 3000, xmin);
-        assert!(channel.bits(COMMON_WINDOW) <= 3000);
+        assert!(channel.bits(false) <= 3000);
         // With every scalefactor 0, as the first run of the inner loop
         // quantizes.
-        let mut counting = Counting::new(Lines::new(&spectrum), Windows::LONG_SINE, fs, 3000);
+        let mut counting = Counting::new(
+            Lines::new(&spectrum),
+            ChannelCoding::single(Windows::LONG_SINE, fs, 3000),
+        );
         let (gain, _) = first_inner_loop(&mut counting);
         let mut flat = [[0.0; MAX_BANDS]];
         quantization_distortion(&counting, gain, &mut flat);
@@ -329,7 +339,7 @@ mod tests {
             let strict = |sb: usize| sb == 20 || sb == 40;
             let xmin = std::array::from_fn(|sb| energy[sb] * if strict(sb) { 1e-30 } else { 0.5 });
             let (channel, _) = outcome(&spectrum, available, xmin);
-            assert!(channel.bits(COMMON_WINDOW) <= available);
+            assert!(channel.bits(false) <= available);
             let (group, _) = channel.groups().next().unwrap();
             let sent: Vec<u8> = (group.sections.bands_with_scalefactors())
                 .filter(|&sb| !group.sections.is_zero_band(sb))
@@ -356,8 +366,10 @@ mod tests {
             let energy = band_energy(&spectrum, bands);
             let xmin = std::array::from_fn(|sb| energy[sb] * if sb < 20 { 1e-4 } else { 0.3 });
             let (_, kept) = outcome(&spectrum, available, xmin);
-            let mut counting =
-                Counting::new(Lines::new(&spectrum), Windows::LONG_SINE, fs, available);
+            let mut counting = Counting::new(
+                Lines::new(&spectrum),
+                ChannelCoding::single(Windows::LONG_SINE, fs, available),
+            );
             let (gain, _) = first_inner_loop(&mut counting);
             let mut first = [[0.0; MAX_BANDS]];
             quantization_distortion(&counting, gain, &mut first);
