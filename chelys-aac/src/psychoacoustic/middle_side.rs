@@ -95,7 +95,13 @@ impl MidSideModel {
     /// unpredictability `cb(b)` (step 7), so each partition of the middle
     /// and side channels takes the lesser of the left and right channels'
     /// `cb(b)`, which is the minimum of each partition's unpredictability
-    /// and the more tonal value both. Their energies `r(w)^2` are those of
+    /// and the more tonal value both. The minimum of `c(w)` of each line,
+    /// weighted anew by the middle and side channels' energies, would read
+    /// "C(w)" more literally, but not "in each threshold calculation band".
+    /// A partition without energy in one channel, whose `cb(b)` is not
+    /// defined (see `Tables::raw_threshold`), takes the other's: its
+    /// placeholder of 0 would otherwise make it the most tonal. Their
+    /// energies `r(w)^2` are those of
     /// the lines `(X_L(w) + X_R(w)) / 2` and `(X_L(w) - X_R(w)) / 2` of the
     /// left and right channels' FFTs, which the FFT, being linear, gives
     /// for the middle and side channels' samples.
@@ -201,10 +207,12 @@ fn pair_block(
         // lesser power ratio bc(b) (steps 8 and 9): the same as steps 7 to
         // 10 give from it.
         for b in 0..tables.partitions.len() {
-            let more_tonal = if left.threshold.cb[b] <= right.threshold.cb[b] {
-                &left.threshold
-            } else {
-                &right.threshold
+            let (left, right) = (&left.threshold, &right.threshold);
+            let more_tonal = match (left.en[b] == 0.0, right.en[b] == 0.0) {
+                (true, false) => right,
+                (false, true) => left,
+                _ if left.cb[b] <= right.cb[b] => left,
+                _ => right,
             };
             threshold.cb[b] = more_tonal.cb[b];
             threshold.bc[b] = more_tonal.bc[b];
@@ -247,9 +255,9 @@ fn pair_block(
 /// *Lengy)`, which multiplies a threshold by an energy and compares a
 /// threshold with the ratio `bmax`, where `Rfthr`, beside it, is `max(Rthr
 /// *t, min (Rthr, bmax*Rengy)`; it is taken as misprinted, and read as
-/// `Rfthr` is. `Mfthr` and `Sfthr` are printed with a closing parenthesis
-/// short, and are read as above. The definitions list `Mengy, Sengy,
-/// Rengy, Sengy`, taken as `Lengy` for the second `Sengy`.
+/// `Rfthr` is. `Rfthr`, `Mfthr` and `Sfthr` are printed with a closing
+/// parenthesis short, and are read as above. The definitions list `Mengy,
+/// Sengy, Rengy, Sengy`, taken as `Lengy` for the second `Sengy`.
 ///
 /// Spec gap: `t = Mthr / Sthr` is undefined where both are 0, as in a
 /// silent partition. Their ratio is then taken as 1: neither channel's

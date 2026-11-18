@@ -77,6 +77,7 @@ pub fn section_data(
             }
             sect_len += sect_esc_val as usize;
         }
+        assert_ne!(sect_len, 0, "a section of no bands");
         sections.push((sect_cb, k, k + sect_len));
         k += sect_len;
     }
@@ -92,15 +93,24 @@ const INTENSITY_HCB: u8 = 15;
 /// The scalefactors `sf[g][sfb]` of one group (Table 18, clause 11.3.2),
 /// from `last_sf`, which they leave at the last one decoded; and in the
 /// bands of an intensity codebook, `is_position[g][sfb]` in their place,
-/// from `last_is`, likewise (clause 12.2.3). A band of `ZERO_HCB` has 0.
+/// from `last_is`, likewise (clause 12.2.3), where the group is of the
+/// right channel of a pair that shares its window, which alone may take
+/// them, as `intensity` says. A band of `ZERO_HCB` has 0.
 pub fn scale_factor_data(
     r: &mut BitReader,
     sections: &[(u8, usize, usize)],
     last_sf: &mut i32,
     last_is: &mut i32,
+    intensity: bool,
 ) -> Vec<i32> {
     let mut sf = Vec::new();
     for &(sect_cb, start, end) in sections {
+        let is_intensity = sect_cb == INTENSITY_HCB || sect_cb == INTENSITY_HCB2;
+        assert!(!matches!(sect_cb, 12 | 13), "a reserved codebook");
+        assert!(
+            intensity || !is_intensity,
+            "intensity outside a pair's right channel"
+        );
         for _ in start..end {
             if sect_cb == ZERO_HCB {
                 sf.push(0);
@@ -108,7 +118,7 @@ pub fn scale_factor_data(
             }
             // Table 58: index_offset -60.
             let dpcm = r.decode(&SCALEFACTOR_CODEWORDS) as i32 - 60;
-            if sect_cb == INTENSITY_HCB || sect_cb == INTENSITY_HCB2 {
+            if is_intensity {
                 *last_is += dpcm;
                 sf.push(*last_is);
             } else {
@@ -276,11 +286,13 @@ impl Ics {
 
 /// Reads an `individual_channel_stream()` (Table 16) of the Low Complexity
 /// profile at `fs`, with its own `ics_info()`, or that of its pair,
-/// `common`.
+/// `common`, whose right channel it is, and so may take intensity
+/// positions, if `right`.
 pub fn individual_channel_stream(
     r: &mut BitReader,
     fs: SamplingFrequency,
     common: Option<&IcsInfo>,
+    right: bool,
 ) -> Ics {
     let global_gain = r.read(8) as i32;
     let info = match common {
@@ -292,7 +304,10 @@ pub fn individual_channel_stream(
         .collect();
     let (mut last_sf, mut last_is) = (global_gain, 0);
     let scalefactors = (sections.iter())
-        .map(|sections| scale_factor_data(r, sections, &mut last_sf, &mut last_is))
+        .map(|sections| {
+            let intensity = right && common.is_some();
+            scale_factor_data(r, sections, &mut last_sf, &mut last_is, intensity)
+        })
         .collect();
     assert_eq!(r.read(3), 0, "pulse, TNS and gain control flags");
     let lines = (sections.iter().zip(&info.group_lengths))
@@ -329,7 +344,7 @@ pub fn element(r: &mut BitReader, fs: SamplingFrequency) -> Element {
     r.read(4); // element_instance_tag
     match id_syn_ele {
         0 => Element {
-            channels: vec![individual_channel_stream(r, fs, None)],
+            channels: vec![individual_channel_stream(r, fs, None, false)],
             common_window: false,
             ms_mask_present: 0,
             ms_used: Vec::new(),
@@ -350,8 +365,8 @@ pub fn element(r: &mut BitReader, fs: SamplingFrequency) -> Element {
                 }
                 info = Some(common);
             }
-            let left = individual_channel_stream(r, fs, info.as_ref());
-            let right = individual_channel_stream(r, fs, info.as_ref());
+            let left = individual_channel_stream(r, fs, info.as_ref(), false);
+            let right = individual_channel_stream(r, fs, info.as_ref(), true);
             Element {
                 channels: vec![left, right],
                 common_window,
@@ -397,7 +412,7 @@ impl Element {
                 spectrum
             })
             .collect();
-        if let [left, right] = &mut spectra[..] {
+        if let ([left, right], true) = (&mut spectra[..], self.common_window) {
             let info = &self.channels[0].info;
             let right_ics = &self.channels[1];
             let mut start = 0;

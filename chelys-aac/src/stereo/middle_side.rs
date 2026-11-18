@@ -39,9 +39,13 @@ pub fn matrix(
 ///
 /// Spec reading: steps 3 and 4 quantize each channel's lines "with the
 /// appropriate calculated and quantized threshold", and count "the number
-/// of bits actually required" to code them. A band's bits are taken as
-/// those of its lines in its best codebook alone: its section and
-/// scalefactor, which the band costs in either coding, are left out.
+/// of bits actually required" to code them. They are estimated band by
+/// band, before the loops quantize the pair: a band's bits are taken as
+/// those of its lines in its best codebook alone. What else a band costs
+/// is left out: its share of the sections, which may differ where the two
+/// codings take different codebooks; its scalefactor, which a band
+/// quantized to zero in a section of `ZERO_HCB` does not send; and the
+/// `ms_used` flags.
 ///
 /// Spec gap: step 5 does not say which coding a band takes where both
 /// take as many bits, as where all four channels' bands quantize to zero.

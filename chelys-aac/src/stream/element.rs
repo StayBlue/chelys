@@ -218,14 +218,15 @@ impl ElementEncoder {
     /// them in its filterbank, and from its spectrum and the model's
     /// thresholds finds what each scalefactor band may take as noise.
     ///
-    /// Spec gap: Annex C does not say when the two channels of a pair share
-    /// their `ics_info()`, `common_window` 1, which makes them share their
-    /// windows and `max_sfb` and lets them be coded as middle and side
-    /// (clause 12.1.1). A pair shares it in every frame whose windows agree.
-    /// Its channels share their attacks (see [`SHARED_ATTACKS`]), so that
-    /// their window sequences, chosen alike from the same state, are the
-    /// same, and where they are short, their grouping is chosen from both
-    /// (see [`switching::grouping`]).
+    /// A pair shares its `ics_info()`, `common_window` 1, where "each
+    /// individual channel in the pair window switch together" (clause
+    /// 8.3.2.3), which makes them share their windows and `max_sfb` and lets
+    /// them be coded as middle and side (clause 12.1.1): in every frame
+    /// whose windows agree. Spec gap: Annex C does not say whether a pair's
+    /// channels are to switch together. Its channels share their attacks
+    /// (see [`SHARED_ATTACKS`]), so that their window sequences, chosen
+    /// alike from the same state, are the same, and where they are short,
+    /// their grouping is chosen from both (see [`switching::grouping`]).
     pub fn prepare(&mut self, start: usize, afford_short: bool) {
         let mut sequences = [WindowSequence::OnlyLong; 2];
         let sequences = &mut sequences[..self.channels.len()];

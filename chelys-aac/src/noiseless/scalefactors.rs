@@ -156,7 +156,7 @@ mod tests {
         let mut last_sf = i32::from(global_gain);
         let mut expected_last = i32::from(global_gain);
         for ((sections, scalefactors), decoded) in groups.iter().zip(&decoded) {
-            let sf = scale_factor_data(&mut r, decoded, &mut last_sf, &mut 0);
+            let sf = scale_factor_data(&mut r, decoded, &mut last_sf, &mut 0, false);
             for (sfb, &sf) in sf.iter().enumerate() {
                 let codebook = (sections.iter())
                     .find(|s| (s.start..s.end).contains(&sfb))
@@ -243,7 +243,13 @@ mod tests {
         let bytes = w.into_bytes();
         let decoded = [(1, 0, 2)];
         let mut last_sf = 240;
-        let sf = scale_factor_data(&mut BitReader::new(&bytes), &decoded, &mut last_sf, &mut 0);
+        let sf = scale_factor_data(
+            &mut BitReader::new(&bytes),
+            &decoded,
+            &mut last_sf,
+            &mut 0,
+            false,
+        );
         assert_eq!(sf, [220, 180]);
     }
 }
