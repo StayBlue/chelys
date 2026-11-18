@@ -52,6 +52,36 @@ fn decode(encoded: &Encoded, channels: usize, context: &str) -> Vec<f32> {
     decoded.samples
 }
 
+/// The `window_sequence` of the first `individual_channel_stream()` of
+/// each frame of a stream in ADTS, as chelys writes it: a header of 7
+/// bytes, then the element's `id_syn_ele` and `element_instance_tag`, a
+/// pair's `common_window`, `global_gain` and `ics_reserved_bit`.
+fn window_sequences(stream: &[u8]) -> Vec<u8> {
+    let mut sequences = Vec::new();
+    let mut frame = stream;
+    while frame.len() > 9 {
+        let len = (usize::from(frame[3] & 0b11) << 11)
+            | (usize::from(frame[4]) << 3)
+            | usize::from(frame[5] >> 5);
+        let bits = u32::from_be_bytes([frame[7], frame[8], frame[9], 0]);
+        let id_syn_ele = bits >> 29;
+        let at = 3 + 4 + u32::from(id_syn_ele == 1) + 8 + 1;
+        sequences.push(((bits >> (32 - at - 2)) & 0b11) as u8);
+        frame = &frame[len..];
+    }
+    sequences
+}
+
+/// Whether `sequences` keep to the meaningful transitions of clause
+/// 15.3.1: a sequence that starts with short windows only after one that
+/// ends with them.
+fn transitions_are_meaningful(sequences: &[u8]) -> bool {
+    // ONLY_LONG 0, LONG_START 1, EIGHT_SHORT 2, LONG_STOP 3.
+    sequences
+        .windows(2)
+        .all(|pair| matches!(pair[1], 2 | 3) == matches!(pair[0], 1 | 2))
+}
+
 /// The bitrates the encoder takes at `sample_rate` for `channels`.
 fn bitrate_range(sample_rate: u32, channels: usize) -> (u32, u32) {
     match config(sample_rate, channels, 0).check() {
@@ -426,4 +456,135 @@ fn a_tone_beside_silence_decodes_alike_in_either_channel() {
     }
     assert!(snrs.iter().all(|&snr| snr > 10.0), "{snrs:?}");
     assert!((snrs[0] - snrs[1]).abs() < 0.5, "{snrs:?}");
+}
+
+/// A quiet tone with bursts of noise that die away within a few
+/// milliseconds, as of castanets, from `first` on, every `every` samples
+/// and a little later each time, so that they set in at many places in a
+/// frame.
+fn castanets(sample_rate: u32, len: usize, first: usize, every: usize, seed: u64) -> Vec<f64> {
+    let fs = f64::from(sample_rate);
+    let decay = fs / 200.0;
+    let mut state = seed;
+    let mut onset = first;
+    let mut onsets = Vec::new();
+    while onset < len {
+        onsets.push(onset);
+        onset += every + 97 * onsets.len();
+    }
+    (0..len)
+        .map(|t| {
+            state = (state.wrapping_mul(6_364_136_223_846_793_005))
+                .wrapping_add(1_442_695_040_888_963_407);
+            let noise = (state >> 11) as f64 / (1u64 << 53) as f64 - 0.5;
+            let tone = 0.01 * (TAU * 440.0 * t as f64 / fs).sin();
+            let burst = (onsets.iter())
+                .filter(|&&onset| onset <= t)
+                .map(|&onset| (-((t - onset) as f64) / decay).exp())
+                .sum::<f64>();
+            tone + noise * burst
+        })
+        .collect()
+}
+
+/// Bursts of noise in a quiet tone are coded with eight short windows, a
+/// start sequence before them and a stop sequence after, at every sampling
+/// frequency, in mono and stereo; ffmpeg decodes them without complaint,
+/// with the bursts in place. The first burst, at the first sample, makes
+/// the first frame short, with no frame before it.
+#[test]
+fn attacks_are_coded_with_short_windows_at_every_sample_rate() {
+    for sample_rate in SAMPLE_RATES {
+        for channels in [1, 2] {
+            let context = format!("{sample_rate} Hz, {channels} channels");
+            let len = 64 * 1024;
+            let input: Vec<Vec<f64>> = (0..channels)
+                .map(|c| castanets(sample_rate, len, 0, len / 6, c as u64))
+                .collect();
+            let (_, max) = bitrate_range(sample_rate, channels);
+            let bits_per_second = (2 * sample_rate * channels as u32).min(max);
+            let encoded = encode(sample_rate, &input, bits_per_second);
+            let sequences = window_sequences(&encoded.stream);
+            assert!(
+                transitions_are_meaningful(&sequences),
+                "{context}: {sequences:?}"
+            );
+            // The first burst, at the first sample, makes the first frame
+            // short, with no frame before it.
+            assert_eq!(sequences[0], 2, "{context}: {sequences:?}");
+            // Each of the six bursts, and the quiet tone between them.
+            let short = sequences.iter().filter(|&&s| s == 2).count();
+            let long = sequences.iter().filter(|&&s| s == 0).count();
+            assert!(short >= 6, "{context}: {sequences:?}");
+            assert!(long > sequences.len() / 2, "{context}: {sequences:?}");
+            let output = decode(&encoded, channels, &context);
+            for (c, input) in input.iter().enumerate() {
+                // The bursts line up only in place.
+                let snr_at = |lag: usize| snr(input, &output, channels, c, lag);
+                let at = snr_at(DELAY);
+                assert!(at > 6.0, "{context}, channel {c}: {at:.1} dB");
+                for lag in [DELAY - 64, DELAY - 1, DELAY + 1, DELAY + 64] {
+                    let off = snr_at(lag);
+                    assert!(
+                        off < at - 3.0,
+                        "{context}, channel {c}: {off:.1} dB at {lag}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Short windows keep the quantization noise of an attack from spreading
+/// before it: before a burst of noise in a quiet tone, the error of the
+/// decoded output is far less with block switching than with long windows
+/// alone.
+#[test]
+fn short_windows_hold_back_the_noise_before_an_attack() {
+    use chelys::aac::internals::channel_configuration::ChannelConfiguration;
+    use chelys::aac::internals::sampling_frequency::SamplingFrequency;
+    use chelys::aac::internals::{StreamConfig, StreamEncoder};
+
+    let sample_rate = 44_100;
+    let config = StreamConfig {
+        sampling_frequency: SamplingFrequency::Hz44100,
+        channel_configuration: ChannelConfiguration::Mono,
+        bits_per_second: 48_000,
+        framing: chelys::aac::Framing::Adts,
+    };
+    let len = 3 * sample_rate as usize;
+    let input = castanets(sample_rate, len, 10_000, 20_000, 7);
+    let onsets: Vec<usize> = (0..len)
+        .filter(|&t| t > 0 && (input[t] - input[t - 1]).abs() > 0.05)
+        .fold(Vec::new(), |mut onsets, t| {
+            if onsets.last().is_none_or(|&last| t > last + 5000) {
+                onsets.push(t);
+            }
+            onsets
+        });
+    assert!(onsets.len() >= 5, "{onsets:?}");
+    let pre_echo = |encoder: StreamEncoder| {
+        let mut encoder = encoder;
+        let mut stream = Vec::new();
+        encoder.encode(&[&input], &mut stream);
+        let end = encoder.finish(&mut stream);
+        let sequences = window_sequences(&stream);
+        let decoded = ffmpeg::decode_aac(&stream);
+        assert_eq!(decoded.diagnostics, "");
+        assert_eq!(decoded.samples.len() as u64, end.frames * 1024);
+        let output = decoded.samples;
+        // The error over the 1024 samples before each onset, short of the
+        // last 128, over which a short window rises.
+        let error: f64 = (onsets.iter())
+            .flat_map(|&onset| onset - 1024..onset - 128)
+            .map(|t| (f64::from(output[t + DELAY]) - input[t]).powi(2))
+            .sum();
+        (error, sequences)
+    };
+    let (switched, sequences) = pre_echo(StreamEncoder::new(config));
+    assert!(sequences.contains(&2), "{sequences:?}");
+    let (long, sequences) = pre_echo(StreamEncoder::new(config).without_block_switching());
+    assert!(sequences.iter().all(|&s| s == 0));
+    let gain = 10.0 * (long / switched).log10();
+    assert!(gain > 10.0, "{gain:.1} dB less error before the attacks");
 }
