@@ -115,12 +115,13 @@ pub fn decode_aac(stream: &[u8]) -> Decoded {
     }
 }
 
-/// Describes the first audio stream of an AAC stream in ADTS, as detected
-/// by ffprobe, with the profile it names.
+/// Describes the first audio stream of an AAC stream in ADTS, read as
+/// ADTS, as ffprobe reports it, with the profile it names. Left to detect
+/// the format, ffprobe takes a stream of a few frames for FLAC.
 pub fn probe_aac(stream: &[u8]) -> (StreamInfo, String) {
     let file = TempFile::new("aac", stream);
     let output = run(Command::new("ffprobe")
-        .args(["-v", "error", "-select_streams", "a:0"])
+        .args(["-v", "error", "-f", "aac", "-select_streams", "a:0"])
         .args([
             "-show_entries",
             "stream=codec_name,profile,sample_rate,channels",

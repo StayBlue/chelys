@@ -77,6 +77,28 @@ fn ffmpeg_derives_the_audio_specific_config_from_adts() {
     }
 }
 
+/// A stream of two frames, the fewest but one, which ffprobe would take
+/// for FLAC if it detected the format, is read as ADTS.
+#[test]
+fn ffmpeg_reads_the_shortest_streams() {
+    let config = Config::new(
+        48_000,
+        1,
+        Rate::Constant {
+            bits_per_second: 64_000,
+        },
+    );
+    let mut encoder = Encoder::new(config).unwrap();
+    let mut stream = Vec::new();
+    encoder.encode_interleaved(&[0.0f32], &mut stream);
+    assert_eq!(encoder.finish(&mut stream).frames, 2);
+    let (info, profile) = ffmpeg::probe_aac(&stream);
+    assert_eq!((info.codec_name.as_str(), profile.as_str()), ("aac", "LC"));
+    let decoded = ffmpeg::decode_aac(&stream);
+    assert_eq!(decoded.diagnostics, "");
+    assert_eq!(decoded.samples.len(), 2 * 1024);
+}
+
 /// Guards the oracle itself: if ffmpeg stopped reporting what it cannot
 /// decode, a wrong field would pass the test above unnoticed. Here the
 /// first frame's `max_sfb` is beyond the bands there are.
