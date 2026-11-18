@@ -117,6 +117,10 @@ struct LongTables {
     partitions: &'static [Row],
     /// `sprdngf(bval(bb), bval(b))` at `bb * partitions + b`.
     spreading: Vec<f64>,
+    /// The partitions `bb` that spread into each partition `b`: those
+    /// whose `sprdngf(bval(bb), bval(b))` is not 0, which lie together
+    /// about `b`, as the function falls with the distance either way.
+    spread_from: Vec<Range<usize>>,
     /// `rnorm(b)` (step 6).
     rnorm: Vec<f64>,
     /// `qsthr(b)` as an energy (step 11).
@@ -139,6 +143,20 @@ impl LongTables {
         let rnorm = (0..n)
             .map(|b| 1.0 / (0..n).map(|bb| spreading[bb * n + b]).sum::<f64>())
             .collect();
+        let spread_from = (0..n)
+            .map(|b| {
+                let spreads = |bb: &usize| spreading[bb * n + b] != 0.0;
+                let first = (0..n)
+                    .find(spreads)
+                    .expect("a partition spreads into itself");
+                let last = (0..n)
+                    .rev()
+                    .find(spreads)
+                    .expect("a partition spreads into itself");
+                debug_assert!((first..=last).all(|bb| spreads(&bb)));
+                first..last + 1
+            })
+            .collect();
         let reference = quiet_reference(LONG_IBLEN);
         let quiet = (partitions.iter())
             .map(|p| reference * 10f64.powf(p.qsthr / 10.0))
@@ -155,6 +173,7 @@ impl LongTables {
         Self {
             partitions,
             spreading,
+            spread_from,
             rnorm,
             quiet,
             bands,
@@ -447,9 +466,10 @@ impl Model {
         let mut perceptual_entropy = 0.0;
         let mut nb = [0.0; MAX_PARTITIONS];
         for (b, nb) in nb[..n].iter_mut().enumerate() {
-            // Step 6: spread, and normalized.
+            // Step 6: spread, and normalized; the other partitions spread
+            // nothing into this one.
             let (mut ecb, mut ct) = (0.0, 0.0);
-            for bb in 0..n {
+            for bb in tables.spread_from[b].clone() {
                 let spreading = tables.spreading[bb * n + b];
                 ecb += e[bb] * spreading;
                 ct += c[bb] * spreading;
