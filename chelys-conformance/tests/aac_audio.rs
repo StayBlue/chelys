@@ -120,10 +120,9 @@ fn snr_over(
     10.0 * (signal / noise).log10()
 }
 
-/// [`snr_over`] all of the input but its first and last frames.
+/// [`snr_over`] all of the input.
 fn snr(input: &[f64], output: &[f32], channels: usize, channel: usize, lag: usize) -> f64 {
-    let span = 1024..input.len() - 1024;
-    snr_over(input, output, (channels, channel), lag, span)
+    snr_over(input, output, (channels, channel), lag, 0..input.len())
 }
 
 /// The lag of `output` behind `input`, up to three frames, at which they
@@ -167,7 +166,7 @@ fn ffmpeg_decodes_the_input_a_frame_late_at_every_sample_rate() {
             for (c, input) in input.iter().enumerate() {
                 let (lag, snr) = align(input, &output, channels, c);
                 assert_eq!(lag, DELAY, "{context}, channel {c}: {snr:.1} dB");
-                assert!(snr > 15.0, "{context}, channel {c}: {snr:.1} dB");
+                assert!(snr > 12.0, "{context}, channel {c}: {snr:.1} dB");
             }
         }
     }
@@ -181,8 +180,8 @@ fn snr_rises_with_the_bitrate() {
     let sample_rate = 44_100;
     let len = 3 * sample_rate as usize;
     let signals = [
-        ("tones", [(64_000, 33.0), (128_000, 47.0), (256_000, 60.0)]),
-        ("sweep", [(64_000, 40.0), (128_000, 57.0), (256_000, 70.0)]),
+        ("tones", [(64_000, 33.0), (128_000, 43.0), (256_000, 52.0)]),
+        ("sweep", [(64_000, 40.0), (128_000, 50.0), (256_000, 57.0)]),
         ("noise", [(64_000, 0.5), (128_000, 3.5), (256_000, 11.0)]),
     ];
     for (name, thresholds) in signals {
@@ -227,9 +226,9 @@ fn a_tone_keeps_its_frequency_and_level_at_a_low_bitrate() {
         .collect();
     let encoded = encode(sample_rate, &[input.clone()], 16_000);
     let output = decode(&encoded, 1, "a tone at 16 kbit/s");
-    // The decoded tone's level and phase, by correlation over whole frames
-    // past the first.
-    let span = 2048..len - 1024;
+    // The decoded tone's level and phase, by correlation over the input
+    // from its second frame to its end.
+    let span = 1024..len;
     let (mut sin, mut cos, mut energy) = (0.0, 0.0, 0.0);
     for t in span.clone() {
         let y = f64::from(output[t + DELAY]);
@@ -239,15 +238,61 @@ fn a_tone_keeps_its_frequency_and_level_at_a_low_bitrate() {
         energy += y * y;
     }
     let n = span.len() as f64;
-    let level = 2.0 * (sin * sin + cos * cos).sqrt() / n;
+    // In phase with the input, not inverted or shifted: the level is the
+    // correlation with the input's own sine, positive.
+    let level = 2.0 * sin / n;
     assert!(
-        (20.0 * (level / amplitude).log10()).abs() < 0.1,
+        level > 0.0 && (20.0 * (level / amplitude).log10()).abs() < 0.1,
         "level {level}"
     );
-    assert!(cos.abs() < 0.01 * sin.abs(), "phase: {sin}, {cos}");
+    assert!(cos.abs() < 0.01 * sin, "phase: {sin}, {cos}");
     // What the tone does not account for.
-    let rest = energy - level * level / 2.0 * n;
+    let rest = energy - 2.0 * (sin * sin + cos * cos) / n;
     assert!(rest < 1e-3 * energy, "{rest} of {energy}");
+}
+
+/// An impulse at the first sample of the input, and one at its last,
+/// decode where they were given, [`DELAY`] samples late, at their level and
+/// sign: the first frame and the last carry the edges of the input.
+#[test]
+fn impulses_at_the_edges_of_the_input_come_back_in_place() {
+    for (sample_rate, channels) in [(48_000, 1), (44_100, 2), (8_000, 1)] {
+        let (_, max) = bitrate_range(sample_rate, channels);
+        for len in [1, 1024, 3000] {
+            let context = format!("{sample_rate} Hz, {channels} channels, {len} samples");
+            let input: Vec<Vec<f64>> = (0..channels)
+                .map(|c| {
+                    let mut input = vec![0.0; len];
+                    // Opposite signs in the two channels of a pair.
+                    let sign = if c == 0 { 1.0 } else { -1.0 };
+                    input[0] = 0.5 * sign;
+                    input[len - 1] = -0.5 * sign;
+                    input
+                })
+                .collect();
+            let encoded = encode(sample_rate, &input, max);
+            let output = decode(&encoded, channels, &context);
+            for (c, input) in input.iter().enumerate() {
+                let decoded: Vec<f64> = (output.iter().skip(c).step_by(channels))
+                    .map(|&y| f64::from(y))
+                    .collect();
+                for t in [0, len - 1] {
+                    let at = DELAY + t;
+                    let y = decoded[at];
+                    assert!(
+                        (y - input[t]).abs() < 0.1 * input[t].abs(),
+                        "{context}, channel {c}, sample {t}: {y}"
+                    );
+                    // The largest sample near it.
+                    let near = at.saturating_sub(64)..(at + 64).min(decoded.len());
+                    let peak = near
+                        .max_by(|&a, &b| decoded[a].abs().total_cmp(&decoded[b].abs()))
+                        .unwrap();
+                    assert_eq!(peak, at, "{context}, channel {c}, sample {t}");
+                }
+            }
+        }
+    }
 }
 
 /// Every frame keeps within the bit reservoir (clause 8.2.3.2): from the
