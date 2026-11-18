@@ -92,7 +92,12 @@ const DECODER_DELAY: usize = 529;
 /// if need be. A constant bitrate whose frames do not hold even the tag
 /// without its table keeps it whole at a higher bitrate too, as the bitrate
 /// may change from frame to frame in Layer III (clause 2.4.2.3 of ISO/IEC
-/// 11172-3).
+/// 11172-3). Settled by decoding with ffmpeg, mpg123 and LAME (black box):
+/// mpg123 and LAME give the input exactly, and follow a changed encoder
+/// delay where the extension follows the quality; ffmpeg skips the tag's
+/// frame, gives the duration of the frames after it, and applies the delays
+/// given "LAME" for the encoder there; the conformance test is
+/// `decoders_read_the_tag_without_its_table`.
 ///
 /// Spec gap: the document does not mention free format, whose bitrate does
 /// not change ("in free format, fixed bitrate is required", clause 2.4.2.3
