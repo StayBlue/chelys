@@ -804,6 +804,13 @@ fn tone_amplitude(samples: &[f64], sample_rate: u32, frequency: f64, start: usiz
 /// was, at every sampling frequency whose band reaches past 9 kHz, where
 /// the tones lie in bands apart, at 0.7 bit a sample. The right channel
 /// sends bands of both intensity codebooks.
+///
+/// This is the evidence for the reading of the standard that
+/// `stereo::middle_side::choose` marks as settled by decoding with ffmpeg:
+/// frames with bands in intensity stereo are sent with `ms_mask_present` 1
+/// and their flags 0, which ffmpeg decodes in phase. Sent with
+/// `ms_mask_present` 2, as clause 12.2.3 allows, the right channel's tones
+/// came back inverted.
 #[test]
 fn intensity_stereo_keeps_each_tones_panning() {
     for sample_rate in SAMPLE_RATES.into_iter().filter(|&fs| fs >= 22_050) {

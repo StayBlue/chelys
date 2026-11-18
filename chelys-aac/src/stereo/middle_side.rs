@@ -62,7 +62,12 @@ pub fn matrix(
 /// every band (clause 12.2.3), so that a frame whose other bands are all
 /// coded as middle and side could send 2 and no flags. Where a frame has
 /// bands in intensity stereo, it sends 1 and their flags of 0 instead,
-/// which no reading of `ms_used` can take as inverting them.
+/// which no reading of `ms_used` can take as inverting them. Settled by
+/// decoding with ffmpeg (black box): sent with `ms_mask_present` 2, the
+/// right channel's tones in intensity stereo decoded with their phase
+/// inverted, against clause 12.2.3; sent with 1 and flags of 0, in the
+/// phase their codebooks give, at every sampling frequency. The
+/// conformance test is `intensity_stereo_keeps_each_tones_panning`.
 pub fn choose(
     windows: Windows,
     sampling_frequency: SamplingFrequency,
