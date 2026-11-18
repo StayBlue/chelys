@@ -4,9 +4,9 @@
 //! The header's `private_bit`, `copyright` and `original/copy`, as mpg123
 //! reads them.
 
-use chelys::mp3::header::{Bitrate, Flags, Mode, SamplingFrequency};
-use chelys::mp3::rate::Rate;
-use chelys::mp3::{StreamConfig, encode_silence};
+use chelys::mp3::internals::header::{Bitrate, Flags, Mode, SamplingFrequency};
+use chelys::mp3::internals::rate::Rate;
+use chelys::mp3::internals::{StreamConfig, encode_silence};
 use chelys_conformance::{DECODERS, Decoder, mpg123};
 
 /// In every combination, in one channel and two and in both versions,

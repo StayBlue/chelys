@@ -59,6 +59,12 @@ impl Version {
         }
     }
 
+    /// The Layer III bitrates of the table in kbit/s, lowest first, without
+    /// free format.
+    pub fn table_kbps(self) -> &'static [u32] {
+        &self.kbps()[1..]
+    }
+
     /// The Layer III bitrates in kbit/s, indexed by `bitrate_index`; index 0
     /// is free format (clause 2.4.2.3, and clause 2.4.2.3 of ISO/IEC
     /// 13818-3).

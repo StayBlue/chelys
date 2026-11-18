@@ -6,3 +6,8 @@ license.workspace = true
 publish = false
 
 [dependencies]
+
+[features]
+# The encoder's building blocks, for chelys's own test crates: see
+# `chelys::mp3::internals`.
+unstable = []

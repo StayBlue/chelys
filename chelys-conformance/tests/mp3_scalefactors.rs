@@ -13,11 +13,13 @@
 //! scalefactor sent with the wrong width, in the wrong band, or with the
 //! wrong multiplier or preemphasis decodes at least a factor of 2^(1/2) off.
 
-use chelys::mp3::header::{Bitrate, Flags, Mode, SamplingFrequency, Version};
-use chelys::mp3::rate::Rate;
-use chelys::mp3::scalefactor_bands::{self, LONG_BANDS};
-use chelys::mp3::scalefactors::{PRETAB, Scalefac, Scalefactors};
-use chelys::mp3::{BlockType, GRANULE_LINES, QuantizedGranule, StreamConfig, encode_granules};
+use chelys::mp3::internals::header::{Bitrate, Flags, Mode, SamplingFrequency, Version};
+use chelys::mp3::internals::rate::Rate;
+use chelys::mp3::internals::scalefactor_bands::{self, LONG_BANDS};
+use chelys::mp3::internals::scalefactors::{PRETAB, Scalefac, Scalefactors};
+use chelys::mp3::internals::{
+    BlockType, GRANULE_LINES, QuantizedGranule, StreamConfig, encode_granules,
+};
 use chelys_conformance::ffmpeg;
 
 const GLOBAL_GAIN: u8 = 150;

@@ -17,9 +17,7 @@ use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::process::ExitCode;
 use std::str::FromStr;
 
-use chelys::mp3::header::{Bitrate, Flags, Mode, SamplingFrequency};
-use chelys::mp3::rate::{MeanRate, Rate, VariableRate};
-use chelys::mp3::{Encoder, StreamConfig};
+use chelys::mp3::{ChannelMode, Config, ConfigError, Encoder, Rate, bitrates};
 
 const USAGE: &str = "\
 usage: chelys --sample-rate HZ --channels N
@@ -85,7 +83,7 @@ as the tag is known only once the stream has ended, and in free format none
 where the frames are too short to hold it.";
 
 struct Options {
-    sampling_frequency: SamplingFrequency,
+    sample_rate: u32,
     channels: usize,
     rate: Rate,
     /// On unless turned off, following ffmpeg's command line: its MP3
@@ -110,8 +108,36 @@ struct Options {
     /// -0.003 at 192 and +0.005 at `--vbr`, better in 24, 13, 12 and 21 of
     /// the 35 windows.
     mixed_blocks: bool,
-    crc_protected: bool,
-    flags: Flags,
+    crc: bool,
+    copyright: bool,
+    original: bool,
+    private_bit: bool,
+}
+
+impl Options {
+    /// The encoder's configuration, without a Xing/Info tag.
+    fn config(&self) -> Config {
+        let mode = match (
+            self.channels,
+            self.dual_channel,
+            self.joint_stereo,
+            self.intensity_stereo,
+        ) {
+            (1, _, _, _) => ChannelMode::Mono,
+            (_, true, _, _) => ChannelMode::DualChannel,
+            (_, _, false, false) => ChannelMode::Stereo,
+            (_, _, ms_stereo, intensity_stereo) => ChannelMode::JointStereo {
+                ms_stereo,
+                intensity_stereo,
+            },
+        };
+        Config::new(self.sample_rate, mode, self.rate)
+            .mixed_blocks(self.mixed_blocks)
+            .crc(self.crc)
+            .copyright(self.copyright)
+            .original(self.original)
+            .private_bit(self.private_bit)
+    }
 }
 
 /// The noise `--vbr` allows each band beyond what the psychoacoustic model
@@ -155,11 +181,11 @@ fn value<T: FromStr>(args: &mut impl Iterator<Item = String>, name: &str) -> Res
 
 fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
     let (mut sample_rate, mut channels, mut bitrate) = (None, None, None);
-    let (mut vbr, mut min_bitrate, mut max_bitrate, mut vbr_noise) = (false, None, None, None);
+    let (mut vbr, mut min_kbps, mut max_kbps, mut vbr_noise) = (false, None, None, None);
     let mut free_format = false;
-    let mut flags = Flags::default();
+    let (mut copyright, mut original, mut private_bit) = (false, false, false);
     let (mut joint_stereo, mut dual_channel) = (true, false);
-    let (mut intensity_stereo, mut crc_protected) = (false, false);
+    let (mut intensity_stereo, mut crc) = (false, false);
     let mut mixed_blocks = false;
     let mut args = args.into_iter();
     while let Some(flag) = args.next() {
@@ -170,94 +196,51 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
             "--bitrate" => bitrate = Some(value::<u32>(args, &flag)?),
             "--free-format" => free_format = true,
             "--vbr" => vbr = true,
-            "--min-bitrate" => min_bitrate = Some(value::<u32>(args, &flag)?),
-            "--max-bitrate" => max_bitrate = Some(value::<u32>(args, &flag)?),
+            "--min-bitrate" => min_kbps = Some(value::<u32>(args, &flag)?),
+            "--max-bitrate" => max_kbps = Some(value::<u32>(args, &flag)?),
             "--vbr-noise" => vbr_noise = Some(value::<f64>(args, &flag)?),
             "--no-joint-stereo" => joint_stereo = false,
             "--dual-channel" => dual_channel = true,
             "--intensity-stereo" => intensity_stereo = true,
             "--mixed-blocks" => mixed_blocks = true,
-            "--crc" => crc_protected = true,
-            "--copyright" => flags.copyright = true,
-            "--original" => flags.original = true,
-            "--private-bit" => flags.private = true,
+            "--crc" => crc = true,
+            "--copyright" => copyright = true,
+            "--original" => original = true,
+            "--private-bit" => private_bit = true,
             // An empty message asks for the usage text alone.
             "-h" | "--help" => return Err(String::new()),
             other => return Err(format!("unknown argument: {other}")),
         }
     }
     let sample_rate = sample_rate.ok_or("--sample-rate is required")?;
-    let sampling_frequency = SamplingFrequency::ALL
-        .into_iter()
-        .find(|fs| fs.hz() == sample_rate)
-        .ok_or(format!("unsupported sample rate: {sample_rate}"))?;
     let channels = match channels.ok_or("--channels is required")? {
         n @ (1 | 2) => n as usize,
         n => return Err(format!("unsupported channel count: {n}")),
-    };
-    let version = sampling_frequency.version();
-    let table_bitrate = |kbps: u32| {
-        Bitrate::from_kbps(version, kbps)
-            .ok_or(format!("unsupported bitrate at {sample_rate} Hz: {kbps}"))
     };
     let rate = if vbr {
         if bitrate.is_some() || free_format {
             return Err("--bitrate and --free-format exclude --vbr".to_owned());
         }
-        let mut bitrates = Bitrate::all(version);
-        let lowest = match min_bitrate {
-            Some(kbps) => table_bitrate(kbps)?,
-            None => bitrates.next().expect("a table of bitrates"),
-        };
-        let highest = match max_bitrate {
-            Some(kbps) => table_bitrate(kbps)?,
-            None => bitrates.last().expect("a table of bitrates"),
-        };
-        if lowest.bits_per_second() > highest.bits_per_second() {
-            return Err("--min-bitrate is above --max-bitrate".to_owned());
+        Rate::Variable {
+            min_kbps,
+            max_kbps,
+            noise_offset_db: vbr_noise.unwrap_or(DEFAULT_VBR_NOISE_DB),
         }
-        let noise_offset_db = vbr_noise.unwrap_or(DEFAULT_VBR_NOISE_DB);
-        if !noise_offset_db.is_finite() {
-            return Err(format!(
-                "--vbr-noise: not a finite number: {noise_offset_db}"
-            ));
-        }
-        Rate::Variable(VariableRate {
-            lowest,
-            highest,
-            noise_offset_db,
-        })
     } else {
-        if min_bitrate.is_some() || max_bitrate.is_some() || vbr_noise.is_some() {
+        if min_kbps.is_some() || max_kbps.is_some() || vbr_noise.is_some() {
             return Err("--min-bitrate, --max-bitrate and --vbr-noise need --vbr".to_owned());
         }
         let kbps = bitrate.unwrap_or(128);
-        if free_format {
-            let free = kbps
-                .checked_mul(1000)
-                .and_then(|bps| Bitrate::free(version, bps));
-            match free {
-                Some(bitrate) => Rate::Constant(bitrate),
-                None if Bitrate::from_kbps(version, kbps).is_some() => {
-                    return Err(format!(
-                        "--free-format: {kbps} kbit/s is in the list; leave out --free-format"
-                    ));
-                }
-                None => {
-                    return Err(format!(
-                        "--free-format: unsupported bitrate at {sample_rate} Hz: {kbps}"
-                    ));
-                }
+        let in_table = bitrates(sample_rate).is_none_or(|table| table.contains(&kbps));
+        match kbps.checked_mul(1000) {
+            Some(bits_per_second) if free_format => Rate::Free { bits_per_second },
+            None if free_format => {
+                return Err(format!(
+                    "--free-format: unsupported bitrate at {sample_rate} Hz: {kbps}"
+                ));
             }
-        } else {
-            match Bitrate::from_kbps(version, kbps) {
-                Some(bitrate) => Rate::Constant(bitrate),
-                None => kbps
-                    .checked_mul(1000)
-                    .and_then(|bps| MeanRate::new(version, bps))
-                    .map(Rate::Mean)
-                    .ok_or(format!("unsupported bitrate at {sample_rate} Hz: {kbps}"))?,
-            }
+            Some(bits_per_second) if !in_table => Rate::Mean { bits_per_second },
+            _ => Rate::Constant { kbps },
         }
     };
     if intensity_stereo && channels != 2 {
@@ -269,20 +252,63 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
     if dual_channel && intensity_stereo {
         return Err("--dual-channel and --intensity-stereo exclude each other".to_owned());
     }
-    if mixed_blocks && sampling_frequency == SamplingFrequency::Hz8000 {
-        return Err("--mixed-blocks: not at 8000 Hz".to_owned());
-    }
-    Ok(Options {
-        sampling_frequency,
+    let options = Options {
+        sample_rate,
         channels,
         rate,
         joint_stereo,
         dual_channel,
         intensity_stereo,
         mixed_blocks,
-        crc_protected,
-        flags,
-    })
+        crc,
+        copyright,
+        original,
+        private_bit,
+    };
+    options
+        .config()
+        .check()
+        .map_err(|e| describe(e, kbps_of(rate)))?;
+    Ok(options)
+}
+
+/// The bitrate given with `--bitrate`, in kbit/s, if any.
+fn kbps_of(rate: Rate) -> Option<u32> {
+    match rate {
+        Rate::Constant { kbps } => Some(kbps),
+        Rate::Mean { bits_per_second } | Rate::Free { bits_per_second } => {
+            Some(bits_per_second / 1000)
+        }
+        _ => None,
+    }
+}
+
+/// The message for a configuration the encoder does not take, in terms of
+/// the command line's flags.
+fn describe(error: ConfigError, kbps: Option<u32>) -> String {
+    let kbps = kbps.unwrap_or_default();
+    match error {
+        ConfigError::UnsupportedMeanBitrate { sample_rate, .. } => {
+            format!("unsupported bitrate at {sample_rate} Hz: {kbps}")
+        }
+        ConfigError::UnsupportedBitrate { sample_rate, kbps } => {
+            format!("unsupported bitrate at {sample_rate} Hz: {kbps}")
+        }
+        ConfigError::UnsupportedFreeBitrate { in_table: true, .. } => {
+            format!("--free-format: {kbps} kbit/s is in the list; leave out --free-format")
+        }
+        ConfigError::UnsupportedFreeBitrate { sample_rate, .. } => {
+            format!("--free-format: unsupported bitrate at {sample_rate} Hz: {kbps}")
+        }
+        ConfigError::BitrateRange { .. } => "--min-bitrate is above --max-bitrate".to_owned(),
+        ConfigError::NoiseOffset { noise_offset_db } => {
+            format!("--vbr-noise: not a finite number: {noise_offset_db}")
+        }
+        ConfigError::MixedBlocksUnsupported { sample_rate } => {
+            format!("--mixed-blocks: not at {sample_rate} Hz")
+        }
+        error => error.to_string(),
+    }
 }
 
 fn main() -> ExitCode {
@@ -298,27 +324,7 @@ fn main() -> ExitCode {
         }
     };
 
-    let config = StreamConfig {
-        rate: options.rate,
-        sampling_frequency: options.sampling_frequency,
-        mode: match (
-            options.channels,
-            options.dual_channel,
-            options.joint_stereo,
-            options.intensity_stereo,
-        ) {
-            (1, _, _, _) => Mode::SingleChannel,
-            (_, true, _, _) => Mode::DualChannel,
-            (_, _, false, false) => Mode::Stereo,
-            (_, _, ms_stereo, intensity_stereo) => Mode::JointStereo {
-                intensity_stereo,
-                ms_stereo,
-            },
-        },
-        crc_protected: options.crc_protected,
-        flags: options.flags,
-    };
-    match encode(config, options.channels, options.mixed_blocks) {
+    match encode(options.config()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
             eprintln!("chelys: {message}");
@@ -327,24 +333,18 @@ fn main() -> ExitCode {
     }
 }
 
-/// Encodes stdin to stdout as it arrives, with mixed blocks if
-/// `mixed_blocks` is set.
-fn encode(config: StreamConfig, channels: usize, mixed_blocks: bool) -> Result<(), String> {
-    let frame_bytes = 4 * channels;
+/// Encodes stdin to stdout as it arrives.
+fn encode(config: Config) -> Result<(), String> {
     let mut stdin = std::io::stdin().lock();
     let file = seekable_stdout();
     let mut stdout = std::io::stdout().lock();
-    let mut encoder = match file {
-        Some(_) => Encoder::with_info_tag(config),
-        None => Encoder::new(config),
-    };
-    if mixed_blocks {
-        encoder = encoder.with_mixed_blocks();
-    }
+    let config = config.info_tag(file.is_some());
+    let mut encoder = Encoder::new(config).map_err(|e| e.to_string())?;
+    let frame_bytes = 4 * encoder.channels();
     let mut input = vec![0; 64 * 1024];
     // Bytes read but not yet decoded: the start of an incomplete sample frame.
     let mut held = 0;
-    let mut pcm = vec![Vec::new(); channels];
+    let mut pcm = Vec::new();
     let mut stream = Vec::new();
     loop {
         let read = match stdin.read(&mut input[held..]) {
@@ -355,17 +355,19 @@ fn encode(config: StreamConfig, channels: usize, mixed_blocks: bool) -> Result<(
         };
         let filled = held + read;
         let whole = filled - filled % frame_bytes;
-        for samples in &mut pcm {
-            samples.clear();
-        }
-        for (i, bytes) in input[..whole].chunks_exact(4).enumerate() {
-            let sample = f32::from_le_bytes(bytes.try_into().unwrap());
-            pcm[i % channels].push(f64::from(sample));
+        pcm.clear();
+        pcm.extend(
+            (input[..whole].chunks_exact(4))
+                .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap())),
+        );
+        if let Some(sample) = pcm.iter().find(|s| !s.is_finite()) {
+            return Err(format!(
+                "input holds a sample that is not a finite number: {sample}"
+            ));
         }
         input.copy_within(whole..filled, 0);
         held = filled - whole;
-        let slices: Vec<&[f64]> = pcm.iter().map(Vec::as_slice).collect();
-        encoder.encode(&slices, &mut stream);
+        encoder.encode_interleaved(&pcm, &mut stream);
         write(&mut stdout, &mut stream)?;
     }
     if held != 0 {
@@ -373,7 +375,7 @@ fn encode(config: StreamConfig, channels: usize, mixed_blocks: bool) -> Result<(
             "input is not a whole number of {frame_bytes}-byte sample frames"
         ));
     }
-    let tag = encoder.finish(&mut stream);
+    let tag = encoder.finish(&mut stream).info_tag;
     write(&mut stdout, &mut stream)?;
     stdout.flush().map_err(|e| format!("writing stdout: {e}"))?;
     match (tag, file) {

@@ -12,15 +12,13 @@
 
 use std::f64::consts::TAU;
 
-use chelys::mp3::header::{Bitrate, Flags, Mode, SamplingFrequency};
-use chelys::mp3::rate::Rate;
-use chelys::mp3::{StreamConfig, encode_pcm};
+use chelys::mp3::{ChannelMode, Config, Encoder, Rate};
 
 /// One and a half seconds: a tone in each channel, apart by a fifth, a
 /// quiet passage, then bursts of noise with sharp onsets.
-fn input(fs: SamplingFrequency) -> [Vec<f64>; 2] {
-    let hz = f64::from(fs.hz());
-    let len = 3 * fs.hz() as usize / 2;
+fn input(sample_rate: u32) -> [Vec<f64>; 2] {
+    let hz = f64::from(sample_rate);
+    let len = 3 * sample_rate as usize / 2;
     let mut seed = 0x2545_F491_4F6C_DD1Du64;
     let mut noise = move || {
         seed ^= seed << 13;
@@ -61,78 +59,50 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     })
 }
 
-const MS: Mode = Mode::JointStereo {
+const MS: ChannelMode = ChannelMode::JointStereo {
+    ms_stereo: true,
     intensity_stereo: false,
-    ms_stereo: true,
 };
-const MS_IS: Mode = Mode::JointStereo {
-    intensity_stereo: true,
+const MS_IS: ChannelMode = ChannelMode::JointStereo {
     ms_stereo: true,
+    intensity_stereo: true,
 };
 
-/// Sampling frequency, kbit/s, mode, error check, and the stream's length
-/// and hash.
-const STREAMS: [(SamplingFrequency, u32, Mode, bool, usize, u64); 8] = [
+/// Sample rate, kbit/s, mode, error check, and the stream's length and
+/// hash.
+const STREAMS: [(u32, u32, ChannelMode, bool, usize, u64); 8] = [
+    (44_100, 128, MS, false, 24659, 0xA57F_DF71_1E69_7196),
+    (44_100, 64, MS_IS, false, 12329, 0x5699_6067_A462_D2D9),
     (
-        SamplingFrequency::Hz44100,
-        128,
-        MS,
-        false,
-        24659,
-        0xA57F_DF71_1E69_7196,
-    ),
-    (
-        SamplingFrequency::Hz44100,
-        64,
-        MS_IS,
-        false,
-        12329,
-        0x5699_6067_A462_D2D9,
-    ),
-    (
-        SamplingFrequency::Hz32000,
+        32_000,
         320,
-        Mode::Stereo,
+        ChannelMode::Stereo,
         true,
         61920,
         0x84DF_5785_62E0_68F2,
     ),
     (
-        SamplingFrequency::Hz48000,
+        48_000,
         64,
-        Mode::SingleChannel,
+        ChannelMode::Mono,
         false,
         12288,
         0xD709_F742_FFB8_AAD3,
     ),
+    (22_050, 32, MS_IS, false, 6269, 0x64B3_3378_78DE_AC83),
     (
-        SamplingFrequency::Hz22050,
-        32,
-        MS_IS,
-        false,
-        6269,
-        0x64B3_3378_78DE_AC83,
-    ),
-    (
-        SamplingFrequency::Hz16000,
+        16_000,
         8,
-        Mode::SingleChannel,
+        ChannelMode::Mono,
         true,
         1584,
         0xD8FA_70F9_662C_4B46,
     ),
+    (8_000, 16, MS, false, 3312, 0x33A2_5E5A_B2C0_DB6B),
     (
-        SamplingFrequency::Hz8000,
-        16,
-        MS,
-        false,
-        3312,
-        0x33A2_5E5A_B2C0_DB6B,
-    ),
-    (
-        SamplingFrequency::Hz11025,
+        11_025,
         24,
-        Mode::Stereo,
+        ChannelMode::Stereo,
         false,
         4858,
         0x9B27_2AC3_C953_7FE9,
@@ -143,20 +113,17 @@ const STREAMS: [(SamplingFrequency, u32, Mode, bool, usize, u64); 8] = [
 fn constant_bitrate_streams_are_unchanged() {
     let results = std::thread::scope(|scope| {
         STREAMS
-            .map(|(fs, kbps, mode, crc_protected, ..)| {
+            .map(|(sample_rate, kbps, mode, crc, ..)| {
                 scope.spawn(move || {
-                    let config = StreamConfig {
-                        rate: Rate::Constant(Bitrate::from_kbps(fs.version(), kbps).unwrap()),
-                        sampling_frequency: fs,
-                        mode,
-                        crc_protected,
-                        flags: Flags::default(),
-                    };
-                    let [left, right] = input(fs);
-                    let stream = match mode {
-                        Mode::SingleChannel => encode_pcm(&config, &[&left]),
-                        _ => encode_pcm(&config, &[&left, &right]),
-                    };
+                    let config = Config::new(sample_rate, mode, Rate::Constant { kbps }).crc(crc);
+                    let mut encoder = Encoder::new(config).unwrap();
+                    let [left, right] = input(sample_rate);
+                    let mut stream = Vec::new();
+                    match mode {
+                        ChannelMode::Mono => encoder.encode_planar(&[&left], &mut stream),
+                        _ => encoder.encode_planar(&[&left, &right], &mut stream),
+                    }
+                    encoder.finish(&mut stream);
                     (stream.len(), fnv1a(&stream))
                 })
             })
@@ -164,8 +131,8 @@ fn constant_bitrate_streams_are_unchanged() {
     });
     let mismatches: Vec<String> = (STREAMS.iter().zip(results))
         .filter(|((.., len, hash), got)| (*len, *hash) != *got)
-        .map(|((fs, kbps, mode, crc, ..), (len, hash))| {
-            format!("({fs:?}, {kbps}, {mode:?}, {crc}): {len}, {hash:#018X}")
+        .map(|((sample_rate, kbps, mode, crc, ..), (len, hash))| {
+            format!("({sample_rate}, {kbps}, {mode:?}, {crc}): {len}, {hash:#018X}")
         })
         .collect();
     assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));

@@ -5,12 +5,12 @@
 
 use std::f64::consts::TAU;
 
-use chelys::mp3::header::{Bitrate, Flags, Mode, SamplingFrequency, Version};
-use chelys::mp3::huffman::QuadTable;
-use chelys::mp3::rate::Rate;
-use chelys::mp3::scalefactor_bands;
-use chelys::mp3::scalefactors::Scalefactors;
-use chelys::mp3::{
+use chelys::mp3::internals::header::{Bitrate, Flags, Mode, SamplingFrequency, Version};
+use chelys::mp3::internals::huffman::QuadTable;
+use chelys::mp3::internals::rate::Rate;
+use chelys::mp3::internals::scalefactor_bands;
+use chelys::mp3::internals::scalefactors::Scalefactors;
+use chelys::mp3::internals::{
     BlockType, GRANULE_LINES, QuantizedGranule, StreamConfig, encode_granules, encode_pcm,
     encode_pcm_with_global_gain, encode_silence, encode_with_block_types,
 };
@@ -381,8 +381,8 @@ fn noise_to_mask(
     judge: SamplingFrequency,
     input_at_judge: &[f64],
 ) -> (f64, f64) {
-    use chelys::mp3::filterbank::Filterbank;
-    use chelys::mp3::psychoacoustic::PsychoacousticModel;
+    use chelys::mp3::internals::filterbank::Filterbank;
+    use chelys::mp3::internals::psychoacoustic::PsychoacousticModel;
 
     let decoded = chelys_conformance::ffmpeg::decode_mp3(stream);
     assert_eq!(decoded.diagnostics, "");

@@ -1,9 +1,9 @@
 // Copyright (c) 2026 StayBlue
 // SPDX-License-Identifier: MIT
 
-use chelys::mp3::header::{Bitrate, Flags, Mode, SamplingFrequency, Version};
-use chelys::mp3::rate::Rate;
-use chelys::mp3::{StreamConfig, encode_silence};
+use chelys::mp3::internals::header::{Bitrate, Flags, Mode, SamplingFrequency, Version};
+use chelys::mp3::internals::rate::Rate;
+use chelys::mp3::internals::{StreamConfig, encode_silence};
 use chelys_conformance::ffmpeg::{self, StreamInfo};
 
 #[test]

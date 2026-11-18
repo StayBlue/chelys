@@ -9,10 +9,12 @@
 //! pair of code words, or a region boundary that disagrees with the decoder
 //! makes one encoding decode differently from the rest.
 
-use chelys::mp3::header::{Bitrate, Flags, Mode, SamplingFrequency};
-use chelys::mp3::huffman::{MAX_MAGNITUDE, QuadTable, SpectrumCoding, pair_table};
-use chelys::mp3::rate::Rate;
-use chelys::mp3::{BlockType, GRANULE_LINES, QuantizedGranule, StreamConfig, encode_granules};
+use chelys::mp3::internals::header::{Bitrate, Flags, Mode, SamplingFrequency};
+use chelys::mp3::internals::huffman::{MAX_MAGNITUDE, QuadTable, SpectrumCoding, pair_table};
+use chelys::mp3::internals::rate::Rate;
+use chelys::mp3::internals::{
+    BlockType, GRANULE_LINES, QuantizedGranule, StreamConfig, encode_granules,
+};
 use chelys_conformance::ffmpeg;
 
 type Spectrum = [i32; GRANULE_LINES];

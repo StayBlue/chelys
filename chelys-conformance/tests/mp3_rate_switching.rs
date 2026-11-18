@@ -7,9 +7,9 @@
 use std::f64::consts::TAU;
 use std::ops::Range;
 
-use chelys::mp3::header::{Bitrate, Flags, Mode, SamplingFrequency};
-use chelys::mp3::rate::{MeanRate, Rate, VariableRate};
-use chelys::mp3::{StreamConfig, encode_pcm};
+use chelys::mp3::internals::header::{Bitrate, Flags, Mode, SamplingFrequency};
+use chelys::mp3::internals::rate::{MeanRate, Rate, VariableRate};
+use chelys::mp3::internals::{StreamConfig, encode_pcm};
 use chelys_conformance::{DECODERS, Decoder};
 
 /// Loud noise and a quiet tone in turn, each for a fifth of `seconds`,

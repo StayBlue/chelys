@@ -6,9 +6,11 @@
 
 use std::f64::consts::TAU;
 
-use chelys::mp3::header::{Bitrate, Flags, Mode, SamplingFrequency};
-use chelys::mp3::rate::Rate;
-use chelys::mp3::{Encoder, GRANULE_LINES, StreamConfig, encode_pcm, encode_silence};
+use chelys::mp3::internals::header::{Bitrate, Flags, Mode, SamplingFrequency};
+use chelys::mp3::internals::rate::Rate;
+use chelys::mp3::internals::{
+    GRANULE_LINES, StreamConfig, StreamEncoder, encode_pcm, encode_silence,
+};
 use chelys_conformance::{DECODERS, Decoder, ffmpeg};
 
 fn config(kbps: u32, sampling_frequency: SamplingFrequency, mode: Mode) -> StreamConfig {
@@ -398,7 +400,7 @@ fn mixed_blocks_take_the_place_of_short_ones() {
             .collect();
         let config = config(kbps, sampling_frequency, Mode::SingleChannel);
         let encode = |mixed: bool| {
-            let mut encoder = Encoder::new(config);
+            let mut encoder = StreamEncoder::new(config);
             if mixed {
                 encoder = encoder.with_mixed_blocks();
             }

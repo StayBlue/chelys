@@ -7,5 +7,5 @@
 //! ISO/IEC 11172-3:1993 (first edition), or, where they name it, to ISO/IEC
 //! 13818-3:1998 (second edition).
 
-pub mod bitstream;
+mod bitstream;
 pub mod mp3;

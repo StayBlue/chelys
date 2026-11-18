@@ -6,10 +6,11 @@
 
 use std::f64::consts::TAU;
 
-use chelys::mp3::header::{Bitrate, Flags, Mode, SamplingFrequency};
-use chelys::mp3::rate::{MeanRate, Rate, VariableRate};
-use chelys::mp3::side_info::SideInfo;
-use chelys::mp3::{DELAY, StreamConfig, encode_pcm_with_info_tag, info_tag};
+use chelys::mp3::DELAY;
+use chelys::mp3::internals::header::{Bitrate, Flags, Mode, SamplingFrequency};
+use chelys::mp3::internals::rate::{MeanRate, Rate, VariableRate};
+use chelys::mp3::internals::side_info::SideInfo;
+use chelys::mp3::internals::{StreamConfig, encode_pcm_with_info_tag, info_tag};
 use chelys_conformance::{Decoder, ffmpeg, lame, mpg123};
 
 /// A tone that rises in pitch, so that only one lag lines it up.

@@ -6,9 +6,11 @@
 
 use std::f64::consts::TAU;
 
-use chelys::mp3::header::{Bitrate, Flags, Mode, SamplingFrequency};
-use chelys::mp3::rate::Rate;
-use chelys::mp3::{BlockType, StreamConfig, encode_pcm_with_global_gain, encode_with_block_types};
+use chelys::mp3::internals::header::{Bitrate, Flags, Mode, SamplingFrequency};
+use chelys::mp3::internals::rate::Rate;
+use chelys::mp3::internals::{
+    BlockType, StreamConfig, encode_pcm_with_global_gain, encode_with_block_types,
+};
 use chelys_conformance::{DECODERS, ffmpeg};
 
 fn config(sampling_frequency: SamplingFrequency, mode: Mode) -> StreamConfig {

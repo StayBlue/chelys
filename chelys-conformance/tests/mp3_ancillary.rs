@@ -6,9 +6,9 @@
 
 use std::f64::consts::TAU;
 
-use chelys::mp3::header::{Bitrate, Flags, Mode, SamplingFrequency};
-use chelys::mp3::rate::Rate;
-use chelys::mp3::{Encoder, StreamConfig};
+use chelys::mp3::internals::header::{Bitrate, Flags, Mode, SamplingFrequency};
+use chelys::mp3::internals::rate::Rate;
+use chelys::mp3::internals::{StreamConfig, StreamEncoder};
 use chelys_conformance::{DECODERS, Decoder};
 
 fn tones(fs: f64, seconds: f64) -> Vec<f64> {
@@ -40,7 +40,7 @@ fn snr(input: &[f64], output: &[f32], channels: usize) -> f64 {
 /// The stream of `config` for `input` in every channel, with `per_frame`
 /// bits of each frame given to `data`.
 fn encode(config: StreamConfig, input: &[f64], per_frame: usize, data: &[u8]) -> Vec<u8> {
-    let mut encoder = Encoder::new(config).with_ancillary(per_frame);
+    let mut encoder = StreamEncoder::new(config).with_ancillary(per_frame);
     encoder.push_ancillary(data);
     let mut stream = Vec::new();
     encoder.encode(&vec![input; config.mode.channels()], &mut stream);

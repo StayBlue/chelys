@@ -21,12 +21,14 @@
 //! stereo positions and the scalefactors mark as settled by decoding with
 //! ffmpeg, mpg123 and LAME.
 
-use chelys::mp3::header::{Bitrate, Flags, Mode, SamplingFrequency};
-use chelys::mp3::rate::Rate;
-use chelys::mp3::scalefactor_bands::{self, LONG_BANDS, SHORT_WINDOWS};
-use chelys::mp3::scalefactors::ZeroPart;
-use chelys::mp3::stereo::INTENSITY_SCALE;
-use chelys::mp3::{BlockType, GRANULE_LINES, QuantizedGranule, StreamConfig, encode_granules};
+use chelys::mp3::internals::header::{Bitrate, Flags, Mode, SamplingFrequency};
+use chelys::mp3::internals::rate::Rate;
+use chelys::mp3::internals::scalefactor_bands::{self, LONG_BANDS, SHORT_WINDOWS};
+use chelys::mp3::internals::scalefactors::ZeroPart;
+use chelys::mp3::internals::stereo::INTENSITY_SCALE;
+use chelys::mp3::internals::{
+    BlockType, GRANULE_LINES, QuantizedGranule, StreamConfig, encode_granules,
+};
 use chelys_conformance::{DECODERS, Decoded, Decoder};
 
 const FS: SamplingFrequency = SamplingFrequency::Hz22050;
