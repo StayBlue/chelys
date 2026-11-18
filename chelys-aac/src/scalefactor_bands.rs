@@ -68,6 +68,73 @@ pub fn num_swb(sampling_frequency: SamplingFrequency, transform: Transform) -> u
     swb_offsets(sampling_frequency, transform).len() - 1
 }
 
+/// The scalefactor bands of a window group (clause 8.3.4): of a long
+/// window, or of a group of 1 to 8 short windows of an
+/// EIGHT_SHORT_SEQUENCE, each of whose bands holds that band of every
+/// window of the group.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GroupBands {
+    transform: Transform,
+    swb_offsets: &'static [u16],
+    windows: u16,
+}
+
+impl GroupBands {
+    /// The bands of a long window at `sampling_frequency`.
+    pub fn long(sampling_frequency: SamplingFrequency) -> Self {
+        Self {
+            transform: Transform::Long,
+            swb_offsets: swb_offsets(sampling_frequency, Transform::Long),
+            windows: 1,
+        }
+    }
+
+    /// The bands of a group of `windows` short windows at
+    /// `sampling_frequency`.
+    ///
+    /// # Panics
+    ///
+    /// If `windows` is not 1 to 8: a caller's error.
+    pub fn short(sampling_frequency: SamplingFrequency, windows: usize) -> Self {
+        assert!(
+            (1..=8).contains(&windows),
+            "a group has 1 to 8 windows, not {windows}"
+        );
+        Self {
+            transform: Transform::Short,
+            swb_offsets: swb_offsets(sampling_frequency, Transform::Short),
+            windows: windows as u16,
+        }
+    }
+
+    pub fn transform(self) -> Transform {
+        self.transform
+    }
+
+    /// The windows of the group: 1 for a long window.
+    pub fn windows(self) -> usize {
+        usize::from(self.windows)
+    }
+
+    /// `num_swb`: the bands of each window, and the most that `max_sfb`
+    /// can count (see [`num_swb`]).
+    pub fn num_swb(self) -> usize {
+        self.swb_offsets.len() - 1
+    }
+
+    /// `sect_sfb_offset[g][sfb]`: the first of the group's lines, in the
+    /// order they are sent (clause 8.3.5), in band `sfb`, or for `num_swb`
+    /// the end of the last.
+    pub fn offset(self, sfb: usize) -> usize {
+        usize::from(self.swb_offsets[sfb]) * usize::from(self.windows)
+    }
+
+    /// The group's lines: 1024, or 128 for each short window.
+    pub fn lines(self) -> usize {
+        self.offset(self.num_swb())
+    }
+}
+
 /// Table 45: num_swb_long_window 49, at 44.1 and 48 kHz.
 const LONG_44100_48000: [u16; 50] = [
     0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 48, 56, 64, 72, 80, 88, 96, 108, 120, 132, 144, 160,
@@ -192,5 +259,29 @@ mod tests {
         assert_eq!(swb_offsets(Hz8000, Transform::Long)[39], 944);
         assert_eq!(swb_offsets(Hz64000, Transform::Long)[29], 304);
         assert_eq!(swb_offsets(Hz96000, Transform::Short)[11], 92);
+    }
+
+    #[test]
+    fn groups_of_short_windows_hold_each_band_of_every_window() {
+        use SamplingFrequency::*;
+        let long = GroupBands::long(Hz96000);
+        assert_eq!(
+            (long.num_swb(), long.lines(), long.offset(40)),
+            (41, 1024, 960)
+        );
+        // Table 46: band 13 starts at line 112.
+        let group = GroupBands::short(Hz44100, 3);
+        assert_eq!((group.num_swb(), group.windows()), (14, 3));
+        assert_eq!(
+            (long.transform(), group.transform()),
+            (Transform::Long, Transform::Short)
+        );
+        assert_eq!((group.offset(13), group.lines()), (3 * 112, 3 * 128));
+    }
+
+    #[test]
+    #[should_panic(expected = "1 to 8 windows")]
+    fn a_group_holds_at_most_eight_windows() {
+        GroupBands::short(SamplingFrequency::Hz48000, 9);
     }
 }
