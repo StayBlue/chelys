@@ -311,6 +311,41 @@ pub fn inner_loop_step(
     Some(bisect_between(&attempt, over, fits))
 }
 
+/// The last resort for `lines` that do not fit in `available_bits` even at
+/// the coarsest step, where [`inner_loop_step`] gives `None`: the coarsest
+/// step, keeping the values of the most lines from the lowest up whose
+/// Huffman coding fits, and zeroing the rest. A granule whose values are
+/// all zero takes no bits, so one always fits. The lines are in the order
+/// they are sent: the highest bands are zeroed, in short blocks those of
+/// every window, though the cut may fall between a band's windows.
+///
+/// Spec gap: see `outer_loop`, which takes this step where nothing else
+/// fits. Fewer lines may take more bits, as values are coded in pairs and
+/// quadruples, so every number of lines is tried, from the most down,
+/// rather than bisected; this path is taken only for lines far beyond
+/// full scale.
+pub fn truncated_step(
+    lines: &Lines,
+    available_bits: usize,
+    block_type: BlockType,
+    sampling_frequency: SamplingFrequency,
+) -> Step {
+    let bands = scalefactor_bands::coding_bands(block_type, sampling_frequency);
+    let attempt = |end: usize| {
+        let values = lines.quantize_below(u8::MAX, end)?;
+        let counted = SpectrumCoding::count(&values, block_type, &bands, sampling_frequency);
+        counted.bits_between(0, available_bits).then(|| Step {
+            global_gain: u8::MAX,
+            values,
+            counted: Box::new(counted),
+        })
+    };
+    (0..=lines.end)
+        .rev()
+        .find_map(attempt)
+        .expect("values that are all zero take no bits")
+}
+
 /// A step size, the values quantised with it, and their counts.
 pub struct Step {
     pub global_gain: u8,
@@ -614,5 +649,33 @@ mod tests {
         let granule = inner_loop(&tone_granule(), 0, BlockType::Normal, fs, None).unwrap();
         let bands = scalefactor_bands::long_bands(fs);
         assert_eq!(granule.coding.bit_count(&granule.values, bands), 0);
+    }
+
+    /// The last resort keeps the most lines that fit, though fewer may take
+    /// more bits: values are coded in pairs, and `(12, 2)` takes fewer than
+    /// `(12, 0)`.
+    #[test]
+    fn the_last_resort_keeps_the_most_lines_that_fit() {
+        let fs = SamplingFrequency::Hz44100;
+        let step = step_size(u8::MAX);
+        let line = |value: f64| step * (value + 0.0946).powf(4.0 / 3.0);
+        let mut xr = [0.0; GRANULE_LINES];
+        xr[..3].copy_from_slice(&[line(12.0), line(2.0), line(12.0)]);
+        let lines = Lines::new(&xr);
+        let bands = scalefactor_bands::long_bands(fs);
+        let bits = |values: &[i32; GRANULE_LINES]| {
+            SpectrumCoding::count(values, BlockType::Normal, bands, fs)
+                .choose()
+                .0
+                .bit_count(values, bands)
+        };
+        let prefix = |end: usize| lines.quantize_below(u8::MAX, end).unwrap();
+        assert_eq!(prefix(3)[..3], [12, 2, 12]);
+        let available = bits(&prefix(2));
+        assert!(bits(&prefix(1)) > available && bits(&prefix(3)) > available);
+
+        let step = truncated_step(&lines, available, BlockType::Normal, fs);
+        assert_eq!(step.global_gain, u8::MAX);
+        assert_eq!(step.values, prefix(2));
     }
 }

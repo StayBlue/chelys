@@ -47,7 +47,10 @@ mod sealed {
 /// have, are coded as given, and a decoder that does not clip gives them
 /// back; but past some ten million times full scale a granule no longer
 /// quantises within the range of `global_gain`. The clamp keeps every
-/// finite sample codable, far below that and far above any real signal.
+/// finite sample within that range, far below that and far above any real
+/// signal. Lines that need more bits than their granule has even at the
+/// largest step, as from some hundreds of times full scale at low
+/// bitrates, lose their highest frequencies (see the outer loop).
 const MAX_MAGNITUDE: f64 = 65_536.0;
 
 /// Converts a sample to the encoder's scale.

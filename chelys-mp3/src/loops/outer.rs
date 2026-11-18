@@ -4,7 +4,9 @@
 //! The outer iteration loop, or distortion control loop (clause C.1.5.4.3,
 //! figure C.9.b).
 
-use super::inner::{Lines, Step, StepEstimate, Unscaled, inner_loop_step, nonzero_end, step_size};
+use super::inner::{
+    Lines, Step, Unscaled, inner_loop_step, nonzero_end, step_size, truncated_step,
+};
 use crate::granule::{BlockType, GRANULE_LINES, QuantizedGranule};
 use crate::header::SamplingFrequency;
 use crate::huffman::{Counted, MAX_MAGNITUDE, SpectrumCoding};
@@ -189,11 +191,26 @@ pub const SAVING_NOISE_DB: f64 = 4.0;
 /// multiplied incrementally as clause C.1.5.4.3 describes; the result is
 /// the same.
 ///
+/// Spec gap: the inner loop of figure C.9.c raises the step until the
+/// granule's bits fit, and the standard does not say what is to be done
+/// when they do not fit even at the largest step, `global_gain` 255. Lines
+/// far beyond full scale come to that in few bits: in random tests, from
+/// between 256 and 4096 times full scale, at low bitrates or with
+/// ancillary data that leaves the granule few bits. Should the first
+/// iteration, without scalefactors, not fit, its lines are quantised at the
+/// largest step with the values of the highest zeroed, as few as the rest
+/// need to fit (see [`truncated_step`]): a valid granule that loses the
+/// highest frequencies rather than the whole granule. With intensity
+/// stereo, that result is marked, or given a value below the bound, and
+/// its bits counted again, as any other. The loop then goes on as ever:
+/// it stops on the usual conditions or at the first iteration that does
+/// not fit, and an iteration that fits replaces the result if its excess
+/// is less.
+///
 /// # Panics
 ///
-/// If `xr` cannot be quantised even without scalefactors, which takes lines
-/// far beyond the decoder's output range, or the marks of `intensity` take
-/// more than the available bits, which takes fewer than its
+/// If the marks of `intensity` take more than the available bits, which
+/// takes fewer than its
 /// [`silent_bits`](stereo::intensity::Positions::silent_bits).
 #[cfg(any(test, feature = "unstable"))]
 pub fn outer_loop(
@@ -221,6 +238,10 @@ pub fn outer_loop(
 /// loop's first step for them kept in `unscaled` once worked out, for lines
 /// coded again with other bits. They serve where the loop starts from `xr`
 /// as they are, that is without scalefactors taken over with scfsi.
+///
+/// # Panics
+///
+/// As `outer_loop`.
 #[allow(clippy::too_many_arguments)]
 pub fn outer_loop_with(
     xr: &[f64; GRANULE_LINES],
@@ -290,18 +311,31 @@ pub fn outer_loop_with(
         let amplified = current.xr();
         // Only the first fit starts from an estimate.
         let first = (unscaled.filter(|_| start_gain.is_none())).map(|unscaled| &unscaled.estimate);
-        let granule = fit(
-            current,
-            &scalefactors,
-            block_type,
-            available_bits,
-            sampling_frequency,
-            start_gain,
-            first,
-            intensity,
-        );
-        let Some(granule) = granule else {
-            if best.is_none() && reuse.is_some() {
+        let fit_by = |search: &dyn Fn(usize) -> Option<Step>| {
+            fit(
+                current,
+                &scalefactors,
+                block_type,
+                available_bits,
+                sampling_frequency,
+                intensity,
+                search,
+            )
+        };
+        let granule = fit_by(&|huffman_bits| {
+            inner_loop_step(
+                current,
+                huffman_bits,
+                block_type,
+                sampling_frequency,
+                start_gain,
+                first,
+            )
+        });
+        let granule = match granule {
+            Some(granule) => granule,
+            None if best.is_some() => break,
+            None if reuse.is_some() => {
                 return outer_loop_with(
                     xr,
                     xmin,
@@ -313,7 +347,18 @@ pub fn outer_loop_with(
                     unscaled_cell,
                 );
             }
-            break;
+            // The first iteration, without scalefactors, does not fit even
+            // at the coarsest step: the last resort keeps the lowest lines
+            // that do.
+            None => fit_by(&|huffman_bits| {
+                Some(truncated_step(
+                    current,
+                    huffman_bits,
+                    block_type,
+                    sampling_frequency,
+                ))
+            })
+            .expect("the marks of intensity stereo fit in the available bits"),
         };
         start_gain = Some(granule.global_gain());
 
@@ -382,7 +427,7 @@ pub fn outer_loop_with(
         }
     }
     let (_, (fitted, within_allowance), scalefactors) =
-        best.expect("lines without scalefactors always quantise");
+        best.expect("the first iteration always fits");
     match saving {
         Some(saving) if within_allowance && block_type == BlockType::Normal => {
             update(&mut lines, &mut applied, &scalefactors);
@@ -659,20 +704,18 @@ fn part2_length(scalefactors: &Scalefactors) -> usize {
     scalefactors.part2_length(compress)
 }
 
-/// The inner loop for the lines `amplified` by `scalefactors`, in at most
+/// The lines amplified by `scalefactors` quantised by `search`, in at most
 /// `available_bits` with the scalefactors, marked for intensity stereo if
-/// `intensity` is given, starting as [`inner_loop_step`] does from
-/// `start_gain` or `estimate`. `None` if they do not fit.
-#[allow(clippy::too_many_arguments)]
+/// `intensity` is given. `search` is the inner loop for the lines, given the
+/// bits left for their Huffman coding. `None` if they do not fit.
 fn fit(
     lines: &Lines,
     scalefactors: &Scalefactors,
     block_type: BlockType,
     available_bits: usize,
     sampling_frequency: SamplingFrequency,
-    start_gain: Option<u8>,
-    estimate: Option<&StepEstimate>,
     intensity: Option<&stereo::intensity::Positions>,
+    search: impl Fn(usize) -> Option<Step>,
 ) -> Option<Fitted> {
     let compress = scalefactors
         .compress()
@@ -680,14 +723,7 @@ fn fit(
     let amplified = lines.xr();
     let mut huffman_bits = available_bits.checked_sub(scalefactors.part2_length(compress))?;
     loop {
-        let step = inner_loop_step(
-            lines,
-            huffman_bits,
-            block_type,
-            sampling_frequency,
-            start_gain,
-            estimate,
-        )?;
+        let step = search(huffman_bits)?;
         let Some(intensity) = intensity else {
             return Some(Fitted::Step(step, scalefactors.clone()));
         };
@@ -939,6 +975,45 @@ mod tests {
             .granule;
             assert!(total_bits(&granule) <= bits, "{bits}");
             assert!(granule.scalefactors.compress().is_some(), "{bits}");
+        }
+    }
+
+    /// Lines too loud to fit even at the largest step keep, at that step, the
+    /// values of as many of the lowest lines as fit, and none above, in long
+    /// and short blocks and with intensity stereo; with no bits at all, none.
+    #[test]
+    fn lines_too_loud_for_any_step_keep_the_lowest_that_fit() {
+        let xr = spectrum().map(|x| 1e5 * x);
+        let bands = scalefactor_bands::long_bands(FS);
+        let mut right = xr;
+        right[bands[12].start..].fill(0.0);
+        let positions = stereo::intensity::Positions::new(&xr, &right, BlockType::Normal, 12, FS);
+        let cases = [
+            (BlockType::Normal, &xr, None),
+            (BlockType::Short, &xr, None),
+            (BlockType::Normal, &right, Some(&positions)),
+        ];
+        for (block_type, xr, intensity) in cases {
+            let coarsest = quantize(xr, u8::MAX).unwrap();
+            // Intensity stereo marks take bits of their own.
+            let least = intensity.map_or(0, |positions| positions.silent_bits());
+            for bits in [0, 10, 60, 150].map(|bits| bits + least) {
+                let case = format!("{block_type:?}, {bits} bits");
+                assert!(
+                    inner_loop(xr, bits - least, block_type, FS, None).is_none(),
+                    "{case}"
+                );
+                let xmin = vec![0.0; scalefactor_bands::coding_bands(block_type, FS).len()];
+                let outcome =
+                    outer_loop(xr, &xmin, block_type, Bits::all(bits), FS, None, intensity);
+                let granule = &outcome.granule;
+                assert!(total_bits(granule) <= bits, "{case}");
+                assert!(!outcome.within_allowance, "{case}");
+                assert_eq!(granule.global_gain, u8::MAX, "{case}");
+                let kept = nonzero_end(&granule.values);
+                assert_eq!(granule.values[..kept], coarsest[..kept], "{case}");
+                assert_eq!(kept > 0, bits > least, "{case}");
+            }
         }
     }
 
