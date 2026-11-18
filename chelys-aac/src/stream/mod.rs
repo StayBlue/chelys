@@ -427,4 +427,34 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn noise_after_silence_borrows_from_the_reservoir() {
+        let config = StreamConfig {
+            sampling_frequency: SamplingFrequency::Hz44100,
+            channel_configuration: ChannelConfiguration::Mono,
+            bits_per_second: 8_000,
+            framing: Framing::Adts,
+        };
+        // Silence, which takes the shortest frames and fills the
+        // reservoir, then white noise, whose perceptual entropy asks for
+        // more than the mean.
+        let mut input = vec![0.0; 40 * FRAME_SAMPLES];
+        let mut state = 3u64;
+        input.extend((0..10 * FRAME_SAMPLES).map(|_| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            0.25 * ((state >> 11) as f64 / (1u64 << 53) as f64 - 0.5)
+        }));
+        let mut encoder = StreamEncoder::new(config);
+        let mut frames = Vec::new();
+        encoder.encode(&[&input], &mut |frame: &[u8]| frames.push(frame.len()));
+        let mean = 8_000.0 * FRAME_SAMPLES as f64 / 44_100.0 / 8.0;
+        let longest = frames[40..].iter().copied().max().unwrap();
+        assert!(
+            longest as f64 > 1.5 * mean,
+            "{longest} bytes against {mean}"
+        );
+    }
 }

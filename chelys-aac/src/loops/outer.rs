@@ -319,10 +319,16 @@ mod tests {
 
     #[test]
     fn scalefactors_stay_within_the_codebook_and_their_range() {
-        // An allowance no band can meet: the loop runs to its limits.
-        for (seed, available) in [(5, 800), (6, 4000), (7, 30_000)] {
+        let bands = GroupBands::long(SamplingFrequency::Hz44100);
+        let mut most = 0;
+        for (seed, available) in [(5, 3000), (6, 4500), (7, 6000)] {
             let spectrum = noise(seed);
-            let (channel, _) = outcome(&spectrum, available, [1e-9; MAX_BANDS]);
+            let energy = band_energy(&spectrum, bands);
+            // Allowances that two bands cannot meet, and the rest already
+            // meet, so that the loop amplifies those two to its limit.
+            let strict = |sb: usize| sb == 20 || sb == 40;
+            let xmin = std::array::from_fn(|sb| energy[sb] * if strict(sb) { 1e-30 } else { 0.5 });
+            let (channel, _) = outcome(&spectrum, available, xmin);
             assert!(channel.bits(COMMON_WINDOW) <= available);
             let (group, _) = channel.groups().next().unwrap();
             let sent: Vec<u8> = (group.sections.bands_with_scalefactors())
@@ -330,8 +336,14 @@ mod tests {
                 .map(|sb| group.scalefactors[sb])
                 .collect();
             let range = sent.iter().max().unwrap() - sent.iter().min().unwrap();
+            let differences = sent.windows(2).map(|w| w[0].abs_diff(w[1]));
+            let largest = differences.max().unwrap();
             assert!(range <= MAX_AMPLIFICATION, "{seed}: {sent:?}");
+            assert!(largest >= 40, "{seed}: {sent:?}");
+            most = most.max(largest);
         }
+        // The loop ran to its limit.
+        assert_eq!(most, MAX_AMPLIFICATION);
     }
 
     #[test]
