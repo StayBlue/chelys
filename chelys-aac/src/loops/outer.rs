@@ -21,9 +21,26 @@ pub const MAX_AMPLIFICATION: u8 = 60;
 /// `xmin`, the energy of noise the psychoacoustic model allows it (clause
 /// C.1.4, step 14), and runs the inner loop again, until no band exceeds
 /// it, or every band that could has been amplified, or the scalefactors
-/// would pass their limits (clause C.7.4.4). The scalefactors saved before
-/// the last amplification are then restored, and the channel is coded as
-/// the inner loop last quantized it with them.
+/// would pass their limits (clause C.7.4.4). The channel is then coded as
+/// the iteration whose distortion exceeds the allowance least quantized it.
+///
+/// Spec reading: this deliberately departs from figure C.7, which on
+/// stopping restores the scalefactors saved before the last amplification,
+/// and so codes the last iteration. Each iteration fits the bits, so any is
+/// a valid coding, and the one kept is that of the least excess: the sum,
+/// over the bands whose distortion exceeds their `xmin`, of the natural
+/// logarithm of the ratio, as chelys's MP3 encoder keeps. Short of bits,
+/// amplifying the bands over their allowance takes bits for their finer
+/// steps and coarsens every other band, and the last iteration can be the
+/// worst, with more bands over their allowance, and further, than the
+/// first.
+/// Graded with PEAQ (GstPEAQ 0.6.1, black box), on 8 tracks of pop music
+/// at 44.1 kHz in stereo, with `xmin` raised by 0, 3 and 6 dB (see
+/// [`XMIN_OFFSET_DB`](super::XMIN_OFFSET_DB)), restoring the last
+/// iteration gave means of -2.54, -2.24 and -2.19 at 128 kbit/s, and
+/// keeping the least excess -2.35, -2.17 and -2.15; at 192 kbit/s, keeping
+/// it gave -0.650, -0.664 and -0.682 (restoring the last, -0.690 at 6 dB),
+/// and at 64 kbit/s -3.756, -3.749 and -3.748 (-3.791).
 ///
 /// `xmin` gives each window group's bands, in the order of
 /// [`Counting::groups`].
@@ -51,9 +68,8 @@ pub const MAX_AMPLIFICATION: u8 = 60;
 /// amplified when its scalefactor is above 0, and only the bands whose
 /// MDCT energy exceeds their `xmin` are asked about: the others could be
 /// quantized to zero within their allowance, and are never amplified. As
-/// figure C.7 asks after amplifying, and restores the scalefactors saved
-/// before, a frame in whose first iteration every such band exceeds its
-/// allowance is coded with every scalefactor 0.
+/// figure C.7 asks after amplifying, a frame in whose first iteration
+/// every such band exceeds its allowance stops there.
 ///
 /// Spec reading: figure C.7 stops unless the "Amplification of all bands
 /// below upper limit" holds, which clause C.7.4.4 gives as "The difference
@@ -72,13 +88,13 @@ pub const MAX_AMPLIFICATION: u8 = 60;
 /// Spec reading: figure C.7 asks whether there is "At least one band with
 /// more than the allowed distortion" after the amplification; that is read
 /// as the distortion measured before it, as the amplification changes no
-/// distortion. Where no band had more, nothing was amplified, and
-/// restoring the scalefactors changes nothing.
+/// distortion. Where no band had more, nothing was amplified, and the
+/// iteration measured last, within every allowance, is the one kept.
 ///
 /// Spec gap: the later runs of the inner loop raise the step from the one
 /// before until the lines fit (clause C.7.4.5), and Annex C does not say
 /// what to do where they do not fit even at the largest step. The loop
-/// stops there, as at its limits, and the scalefactors saved are restored.
+/// stops there, as at its limits.
 ///
 /// Spec gap: where the lines do not fit even at the largest step without
 /// scalefactors, the first run of the inner loop leaves the highest bands
@@ -106,12 +122,18 @@ pub fn outer_loop(mut counting: Counting, xmin: &[[f64; MAX_BANDS]]) -> CodedCha
         }
     }
     let mut distortion = vec![[0.0; MAX_BANDS]; groups.len()];
-    let mut saved = counting.scalefactors.clone();
+    // The iteration of the least excess: its scalefactors, and its excess
+    // and step.
+    let mut best_scalefactors = counting.scalefactors.clone();
+    let mut best: Option<(f64, u8)> = None;
     loop {
         // Calculate the distortion for each scalefactor band.
         quantization_distortion(&counting, gain, &mut distortion);
-        // Save the scaling factors of the scalefactor bands.
-        saved.copy_from_slice(&counting.scalefactors);
+        let excess = excess(&groups, &distortion, xmin);
+        if best.is_none_or(|(least, _)| excess < least) {
+            best = Some((excess, gain));
+            best_scalefactors.copy_from_slice(&counting.scalefactors);
+        }
         // Amplify the scalefactor bands with more than the allowed
         // distortion.
         let mut violated = false;
@@ -130,22 +152,31 @@ pub fn outer_loop(mut counting: Counting, xmin: &[[f64; MAX_BANDS]]) -> CodedCha
             .flatten()
             .all(|&scalefactor| scalefactor <= MAX_AMPLIFICATION.min(gain));
         if all_amplified || !below_limit || !violated {
-            counting.scalefactors.copy_from_slice(&saved);
             break;
         }
         match inner_loop(&mut counting, gain, 1) {
             Some(step) => gain = step,
-            None => {
-                counting.scalefactors.copy_from_slice(&saved);
-                assert!(
-                    counting.count_at(gain, MAX_BANDS),
-                    "the quantization counted before fits again"
-                );
-                break;
-            }
+            None => break,
         }
     }
+    let (_, gain) = best.expect("an iteration was measured");
+    counting.scalefactors.copy_from_slice(&best_scalefactors);
     counting.into_channel(gain, MAX_BANDS)
+}
+
+/// How far the distortion of the bands exceeds their allowance: the sum,
+/// over the bands whose distortion exceeds their `xmin`, of the natural
+/// logarithm of the ratio.
+fn excess(
+    groups: &[(usize, crate::scalefactor_bands::GroupBands)],
+    distortion: &[[f64; MAX_BANDS]],
+    xmin: &[[f64; MAX_BANDS]],
+) -> f64 {
+    (groups.iter().enumerate())
+        .flat_map(|(g, &(_, bands))| (0..bands.num_swb()).map(move |sb| (g, sb)))
+        .filter(|&(g, sb)| distortion[g][sb] > xmin[g][sb])
+        .map(|(g, sb)| (distortion[g][sb] / xmin[g][sb]).ln())
+        .sum()
 }
 
 /// The distortion `error_energy(sb)` of each band of each window group
@@ -301,5 +332,31 @@ mod tests {
             let range = sent.iter().max().unwrap() - sent.iter().min().unwrap();
             assert!(range <= MAX_AMPLIFICATION, "{seed}: {sent:?}");
         }
+    }
+
+    #[test]
+    fn the_coding_kept_exceeds_the_allowance_no_more_than_the_first() {
+        let fs = SamplingFrequency::Hz44100;
+        let bands = GroupBands::long(fs);
+        let mut improved = false;
+        for (seed, available) in [(11, 600), (12, 1200), (13, 2500), (14, 4000)] {
+            let spectrum = noise(seed);
+            let energy = band_energy(&spectrum, bands);
+            let xmin = std::array::from_fn(|sb| energy[sb] * if sb < 20 { 1e-4 } else { 0.3 });
+            let (_, kept) = outcome(&spectrum, available, xmin);
+            let mut counting =
+                Counting::new(Lines::new(&spectrum), Windows::LONG_SINE, fs, available);
+            let (gain, _) = first_inner_loop(&mut counting);
+            let mut first = [[0.0; MAX_BANDS]];
+            quantization_distortion(&counting, gain, &mut first);
+            let groups = [(0, bands)];
+            let (kept, first) = (
+                excess(&groups, &kept, &[xmin]),
+                excess(&groups, &first, &[xmin]),
+            );
+            assert!(kept <= first + 1e-9, "{seed}: {kept} against {first}");
+            improved |= kept < first;
+        }
+        assert!(improved, "the loop found a coding better than the first");
     }
 }

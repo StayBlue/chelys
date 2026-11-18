@@ -176,17 +176,17 @@ fn ffmpeg_decodes_the_input_a_frame_late_at_every_sample_rate() {
 
 /// The SNR rises with the bitrate, for signals whose spectra differ:
 /// tones, a sweep over the whole band, and white noise, which no
-/// quantizer codes well at these rates. The psychoacoustic model allows
-/// the first sweep, which rises to 20 kHz, more noise at its top, where the
-/// thresholds in quiet are high, than an SNR would: at 64 kbit/s, its SNR
-/// is about 34 dB.
+/// quantizer codes well at these rates. The psychoacoustic model shapes
+/// the noise to what it finds masked rather than to the least, so that at
+/// 128 kbit/s the tones' SNR is about 43 dB and the first sweep's, which
+/// rises to 20 kHz, where the thresholds in quiet are high, about 49 dB.
 #[test]
 fn snr_rises_with_the_bitrate() {
     let sample_rate = 44_100;
     let len = 3 * sample_rate as usize;
     let signals = [
-        ("tones", [(64_000, 33.0), (128_000, 43.0), (256_000, 52.0)]),
-        ("sweep", [(64_000, 31.0), (128_000, 50.0), (256_000, 57.0)]),
+        ("tones", [(64_000, 33.0), (128_000, 41.0), (256_000, 52.0)]),
+        ("sweep", [(64_000, 40.0), (128_000, 47.0), (256_000, 57.0)]),
         ("noise", [(64_000, 0.5), (128_000, 3.5), (256_000, 11.0)]),
     ];
     for (name, thresholds) in signals {

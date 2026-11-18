@@ -35,12 +35,12 @@ const MAX_GROUPS: usize = 8;
 /// Without an offset, a quarter of the frames of pop music at 128 kbit/s
 /// in stereo ended with every band amplified after some 30 iterations,
 /// with a step some 40 dB coarser than the first and most bands over their
-/// allowance. A fixed offset is taken. Graded with PEAQ (GstPEAQ 0.6.1,
-/// black box), on 8 tracks of pop music at 44.1 kHz in stereo at
-/// 128 kbit/s, offsets of 0, 3, 6 and 9 dB gave means of -2.55, -2.24,
-/// -2.20 and -2.22; at 192 kbit/s, 0, 6 and 12 dB were within 0.015 of each
-/// other, and at 64 kbit/s within 0.005.
-pub const XMIN_OFFSET_DB: f64 = 6.0;
+/// allowance. A fixed offset is taken, the smaller of the two that grade
+/// best with PEAQ, with the outer loop keeping its iteration of least
+/// excess (see [`outer::outer_loop`] for the grades): 3 dB grades 0.024
+/// below 6 dB at 128 kbit/s and 0.018 above it at 192 kbit/s, and as
+/// 6 dB at 64 kbit/s.
+pub const XMIN_OFFSET_DB: f64 = 3.0;
 
 /// The iteration loop of one channel (figure C.6): a channel whose lines
 /// are all zero is coded as such; any other is quantized by the outer loop
