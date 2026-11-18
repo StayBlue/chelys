@@ -57,7 +57,10 @@ pub fn silent(configuration: ChannelConfiguration, len: usize) -> Vec<u8> {
     w.write(ID_END, 3);
     // byte_alignment(), to the block's first bit, which is the writer's.
     // Spec gap: the standard does not give the value of the bits that
-    // align; they are zero, as the writer leaves them.
+    // align; they are zero, as the writer leaves them. Settled by decoding
+    // with ffmpeg (black box): it decodes blocks so aligned without
+    // complaint; the conformance test is
+    // `ffmpeg_decodes_silence_at_every_sample_rate`.
     let block = w.into_bytes();
     debug_assert_eq!(block.len(), len.max(silent_len(configuration)));
     block

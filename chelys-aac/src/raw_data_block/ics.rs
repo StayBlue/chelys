@@ -23,7 +23,10 @@ const SINE_WINDOW: u32 = 0;
 /// 11.3.2), of which a channel that transmits no scalefactor band has
 /// none, and Annex C's start value of the quantiser step (C.7.2.1) is not
 /// defined for a spectrum without a line above zero. Any value decodes
-/// alike; 0 is taken.
+/// alike; 0 is taken. Settled by decoding with ffmpeg (black box): it
+/// decodes channels so coded, at every sampling frequency, to digital
+/// silence without complaint; the conformance test is
+/// `ffmpeg_decodes_silence_at_every_sample_rate`.
 const SILENT_GLOBAL_GAIN: u32 = 0;
 
 /// Writes the `ics_info()` (Table 15) of a long window that transmits no

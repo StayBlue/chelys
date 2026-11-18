@@ -77,4 +77,9 @@ pub mod internals {
 /// silence and the input follows it whole. While the encoder codes only
 /// silence, where the input falls in the decoded output cannot be seen;
 /// that is to be checked once it codes audio.
+///
+/// Decoding with ffmpeg (black box) gives each frame's 1024 samples, from
+/// the first frame on, and trims none: this many samples, the input, then
+/// [`Finished::padding`]; the conformance test is
+/// `ffmpeg_decodes_silence_at_every_sample_rate`.
 pub const DELAY: usize = 1024;

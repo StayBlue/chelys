@@ -15,7 +15,10 @@ use super::ics::{write_silent_ics_info, write_silent_individual_channel_stream};
 /// the standard does not say which tags they have, only that the elements
 /// of one kind in a raw_data_block() differ in tag and that a mono or
 /// stereo stream keeps its element's tag throughout (clause 8.2.4). Each
-/// stream here has one element, which is given the first tag.
+/// stream here has one element, which is given the first tag. Settled by
+/// decoding with ffmpeg (black box): it decodes mono and stereo streams so
+/// tagged, at every sampling frequency, without complaint; the conformance
+/// test is `ffmpeg_decodes_silence_at_every_sample_rate`.
 const ELEMENT_INSTANCE_TAG: u32 = 0;
 
 /// `ms_mask_present` (clause 12.1.2.1): no band is coded as middle and
