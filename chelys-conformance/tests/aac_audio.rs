@@ -6,6 +6,8 @@
 
 use std::f64::consts::TAU;
 
+use chelys::aac::internals::noiseless::decoder::{BitReader, Element, element};
+use chelys::aac::internals::sampling_frequency::SamplingFrequency;
 use chelys::aac::{Config, ConfigError, DELAY, Encoder, Finished, Rate, SAMPLE_RATES};
 use chelys_conformance::ffmpeg;
 
@@ -52,79 +54,33 @@ fn decode(encoded: &Encoded, channels: usize, context: &str) -> Vec<f32> {
     decoded.samples
 }
 
-/// The `window_sequence` of each channel of each frame of a stream in ADTS
-/// at `sample_rate`, as chelys writes it: read through each frame's
-/// element, a channel pair's first channel decoded to reach the second,
-/// with the decoder of noiseless coding that chelys's tests share.
-fn window_sequences(stream: &[u8], sample_rate: u32) -> Vec<Vec<u8>> {
-    use chelys::aac::internals::noiseless::decoder::{
-        BitReader, scale_factor_data, section_data, spectral_data,
-    };
-    use chelys::aac::internals::sampling_frequency::SamplingFrequency;
-    use chelys::aac::internals::scalefactor_bands::{Transform, swb_offsets};
-
+/// The element of each frame of a stream in ADTS at `sample_rate`, as
+/// chelys writes it, read with the decoder that chelys's tests share.
+fn elements(stream: &[u8], sample_rate: u32) -> Vec<Element> {
     let fs = SamplingFrequency::from_hz(sample_rate).unwrap();
-    // Reads one individual_channel_stream() without a common window, and
-    // gives its window_sequence.
-    let channel = |r: &mut BitReader| -> u8 {
-        let global_gain = r.read(8) as i32;
-        assert_eq!(r.read(1), 0, "ics_reserved_bit");
-        let window_sequence = r.read(2) as u8;
-        r.read(1); // window_shape
-        let (transform, max_sfb, lengths) = if window_sequence == 2 {
-            let max_sfb = r.read(4) as usize;
-            let grouping = r.read(7);
-            let mut lengths = vec![1u16];
-            for i in 0..7 {
-                if grouping & (1 << (6 - i)) == 0 {
-                    lengths.push(1);
-                } else {
-                    *lengths.last_mut().unwrap() += 1;
-                }
-            }
-            (Transform::Short, max_sfb, lengths)
-        } else {
-            let max_sfb = r.read(6) as usize;
-            assert_eq!(r.read(1), 0, "predictor_data_present");
-            (Transform::Long, max_sfb, vec![1])
-        };
-        let sections: Vec<_> = (lengths.iter())
-            .map(|_| section_data(r, transform, max_sfb))
-            .collect();
-        let mut last_sf = global_gain;
-        for sections in &sections {
-            scale_factor_data(r, sections, &mut last_sf);
-        }
-        assert_eq!(r.read(3), 0, "pulse, TNS and gain control flags");
-        let offsets = swb_offsets(fs, transform);
-        for (sections, &len) in sections.iter().zip(&lengths) {
-            let offsets: Vec<u16> = offsets.iter().map(|&o| o * len).collect();
-            let lines = usize::from(*offsets.last().unwrap());
-            spectral_data(r, sections, &offsets, lines);
-        }
-        window_sequence
-    };
-    let mut sequences = Vec::new();
+    let mut elements = Vec::new();
     let mut frame = stream;
     while frame.len() > 7 {
         let len = (usize::from(frame[3] & 0b11) << 11)
             | (usize::from(frame[4]) << 3)
             | usize::from(frame[5] >> 5);
         let mut r = BitReader::new(&frame[7..len]);
-        let id_syn_ele = r.read(3);
-        r.read(4); // element_instance_tag
-        sequences.push(match id_syn_ele {
-            0 => vec![channel(&mut r)],
-            1 => {
-                assert_eq!(r.read(1), 0, "common_window");
-                let left = channel(&mut r);
-                vec![left, channel(&mut r)]
-            }
-            other => panic!("element {other}"),
-        });
+        elements.push(element(&mut r, fs));
         frame = &frame[len..];
     }
-    sequences
+    elements
+}
+
+/// The `window_sequence` of each channel of each frame of a stream in ADTS
+/// at `sample_rate`.
+fn window_sequences(stream: &[u8], sample_rate: u32) -> Vec<Vec<u8>> {
+    (elements(stream, sample_rate).iter())
+        .map(|element| {
+            (element.channels.iter())
+                .map(|ics| ics.info.window_sequence)
+                .collect()
+        })
+        .collect()
 }
 
 /// Whether one of the frames whose eight short windows span input sample
@@ -672,7 +628,6 @@ fn impulses_over_a_quiet_tone_are_coded_with_short_windows() {
 #[test]
 fn short_windows_hold_back_the_noise_before_an_attack() {
     use chelys::aac::internals::channel_configuration::ChannelConfiguration;
-    use chelys::aac::internals::sampling_frequency::SamplingFrequency;
     use chelys::aac::internals::{StreamConfig, StreamEncoder};
 
     let sample_rate = 44_100;

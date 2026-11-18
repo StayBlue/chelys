@@ -45,6 +45,7 @@ mod raw_data_block;
 mod reservoir;
 mod sampling_frequency;
 mod scalefactor_bands;
+mod stereo;
 mod stream;
 mod window;
 
@@ -83,6 +84,7 @@ pub mod internals {
         reservoir,
         sampling_frequency,
         scalefactor_bands,
+        stereo,
         window,
     );
 }

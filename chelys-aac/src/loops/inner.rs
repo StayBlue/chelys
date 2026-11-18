@@ -277,18 +277,21 @@ impl<'a> Counting<'a> {
             self.x_quant[start + bands.offset(sent)..start + bands.lines()].fill(0);
             start += bands.lines();
         }
-        let max_sfb = self
-            .group_lines()
-            .map(|(bands, lines)| sections::max_sfb(lines, bands))
-            .max()
-            .unwrap_or(0);
         let ChannelCoding {
             windows,
             available_bits,
             common_window,
+            least_max_sfb,
             ..
         } = self.coding;
-        let mut least_bits = channel::bits(windows, common_window, 0);
+        let max_sfb = self
+            .group_lines()
+            .map(|(bands, lines)| sections::max_sfb(lines, bands))
+            .max()
+            .unwrap_or(0)
+            .max(least_max_sfb);
+        let element_bits = self.coding.element_bits[max_sfb];
+        let mut least_bits = channel::bits(windows, common_window, 0) + element_bits;
         self.sections.clear();
         self.counted.clear();
         let mut start = 0;
@@ -325,7 +328,8 @@ impl<'a> Counting<'a> {
         let noiseless: u32 = (self.sections.iter())
             .map(|s| s.section_data_bits() + s.spectral_data_bits())
             .sum();
-        channel::bits(windows, common_window, noiseless + scalefactor_bits) <= available_bits
+        channel::bits(windows, common_window, noiseless + scalefactor_bits) + element_bits
+            <= available_bits
     }
 
     /// `global_gain` for the sections and scalefactors counted last: the

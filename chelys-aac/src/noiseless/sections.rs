@@ -139,6 +139,58 @@ impl Sections {
             .flat_map(|section| section.start..section.end)
     }
 
+    /// The bits that [`extend`](Self::extend) adds to the sections'
+    /// `section_data()` to make them span `max_sfb` bands.
+    ///
+    /// # Panics
+    ///
+    /// If `max_sfb` is below the bands they span or beyond the group's:
+    /// a caller's error.
+    pub fn extension_bits(&self, max_sfb: usize) -> u32 {
+        let own = self.max_sfb();
+        assert!(
+            (own..=self.bands.num_swb()).contains(&max_sfb),
+            "sections of {own} bands extended to {max_sfb}"
+        );
+        let transform = self.bands.transform();
+        match self.zero_tail() {
+            _ if max_sfb == own => 0,
+            Some(start) => {
+                section_bits(transform, max_sfb - start) - section_bits(transform, own - start)
+            }
+            None => section_bits(transform, max_sfb - own),
+        }
+    }
+
+    /// Makes the sections span `max_sfb` bands, the pair's `max_sfb` where
+    /// the pair shares its window (clause 8.3.1): the bands added, which
+    /// have no lines, join a last section of `ZERO_HCB`, or make one.
+    ///
+    /// # Panics
+    ///
+    /// As [`extension_bits`](Self::extension_bits).
+    pub fn extend(&mut self, max_sfb: usize) {
+        self.extension_bits(max_sfb);
+        let own = self.max_sfb();
+        if max_sfb == own {
+            return;
+        }
+        if self.zero_tail().is_none() {
+            self.codebooks[self.section_count] = Codebook::ZERO;
+            self.section_count += 1;
+        }
+        self.ends[self.section_count - 1] = max_sfb as u8;
+        for sfb in own..max_sfb {
+            self.zero_bands |= 1 << sfb;
+        }
+    }
+
+    /// The first band of the last section, if its codebook is `ZERO_HCB`.
+    fn zero_tail(&self) -> Option<usize> {
+        let last = self.iter().last()?;
+        (last.codebook == Codebook::ZERO).then_some(last.start)
+    }
+
     /// The bits [`write_section_data`](Self::write_section_data) writes.
     pub fn section_data_bits(&self) -> u32 {
         (self.iter())
@@ -688,6 +740,39 @@ mod tests {
         let books: Vec<_> = sections.iter().map(|s| s.codebook.number()).collect();
         assert_eq!(books.len(), 1, "{books:?}");
         assert!([7, 8].contains(&books[0]));
+    }
+
+    /// Extended to a pair's max_sfb, sections decode as before, the bands
+    /// added zero, in the bits counted.
+    #[test]
+    fn sections_extend_to_a_shared_max_sfb() {
+        let mut noise = Noise::new(9);
+        for fs in SamplingFrequency::ALL {
+            for bands in [GroupBands::long(fs), GroupBands::short(fs, 3)] {
+                for _ in 0..20 {
+                    let own = noise.below(bands.num_swb() as u32 + 1) as usize;
+                    let lines = spectrum(&mut noise, bands, own);
+                    let shared = own + noise.below((bands.num_swb() - own) as u32 + 1) as usize;
+                    let mut sections = Sections::choose(&lines, bands, own).unwrap();
+                    let before = sections.section_data_bits();
+                    let added = sections.extension_bits(shared);
+                    sections.extend(shared);
+                    assert_eq!(sections.max_sfb(), shared);
+                    assert_eq!(sections.section_data_bits(), before + added);
+                    assert!((own..shared).all(|sfb| sections.is_zero_band(sfb)));
+                    let mut w = BitWriter::new();
+                    sections.write_section_data(&mut w);
+                    sections.write_spectral_data(&lines, &mut w);
+                    let bytes = w.into_bytes();
+                    let mut r = BitReader::new(&bytes);
+                    let decoded = section_data(&mut r, bands.transform(), shared);
+                    assert_eq!(
+                        spectral_data(&mut r, &decoded, &offsets(bands), lines.len()),
+                        lines
+                    );
+                }
+            }
+        }
     }
 
     #[test]

@@ -49,6 +49,16 @@ pub struct ChannelCoding {
     /// Whether the channel shares the `ics_info()` of its pair, which its
     /// `individual_channel_stream()` then does not send.
     pub common_window: bool,
+    /// The fewest bands the channel's groups span: where it shares its
+    /// pair's window, the `max_sfb` of the channel of the pair quantized
+    /// before it, as both channels send one `max_sfb`.
+    pub least_max_sfb: usize,
+    /// For each `max_sfb` the channel may send, the bits its coding adds to
+    /// its element besides its own `individual_channel_stream()`: where it
+    /// shares its pair's window, those that extend the channel quantized
+    /// before it to that `max_sfb`, and the pair's `ms_used` flags. They
+    /// are counted with the channel's bits.
+    pub element_bits: [u32; MAX_BANDS + 1],
 }
 
 impl ChannelCoding {
@@ -64,6 +74,8 @@ impl ChannelCoding {
             sampling_frequency,
             available_bits,
             common_window: false,
+            least_max_sfb: 0,
+            element_bits: [0; MAX_BANDS + 1],
         }
     }
 }

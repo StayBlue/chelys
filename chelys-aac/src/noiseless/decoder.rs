@@ -1,14 +1,17 @@
 // Copyright (c) 2026 StayBlue
 // SPDX-License-Identifier: MIT
 
-//! A decoder of `section_data()`, `scale_factor_data()` and
-//! `spectral_data()` for one window group, written from the syntax of
-//! Tables 17, 18 and 20 and clauses 9.3 and 11.3.2 apart from the encoder,
-//! for tests to decode what it writes. It shares only the codebooks.
+//! A decoder of the audio channel elements, written from the syntax of
+//! Tables 13 to 18 and 20 and from clauses 9.3, 10.3, 11.3, 12.1.3 and
+//! 12.2.3 apart from the encoder, for tests to decode what it writes: the
+//! fields of a `single_channel_element()` or `channel_pair_element()`, and
+//! the spectra they reconstruct. It shares only the codebooks and the
+//! scalefactor band tables.
 
 use super::codebooks::{Codebook, Codeword, SCALEFACTOR_CODEWORDS};
 use super::tables;
-use crate::scalefactor_bands::Transform;
+use crate::sampling_frequency::SamplingFrequency;
+use crate::scalefactor_bands::{Transform, swb_offsets};
 
 pub struct BitReader<'a> {
     bytes: &'a [u8],
@@ -81,22 +84,35 @@ pub fn section_data(
     sections
 }
 
+/// `ZERO_HCB`, `INTENSITY_HCB2` and `INTENSITY_HCB` (Table 59).
+const ZERO_HCB: u8 = 0;
+const INTENSITY_HCB2: u8 = 14;
+const INTENSITY_HCB: u8 = 15;
+
 /// The scalefactors `sf[g][sfb]` of one group (Table 18, clause 11.3.2),
-/// from `last_sf`, which they leave at the last one decoded.
+/// from `last_sf`, which they leave at the last one decoded; and in the
+/// bands of an intensity codebook, `is_position[g][sfb]` in their place,
+/// from `last_is`, likewise (clause 12.2.3). A band of `ZERO_HCB` has 0.
 pub fn scale_factor_data(
     r: &mut BitReader,
     sections: &[(u8, usize, usize)],
     last_sf: &mut i32,
+    last_is: &mut i32,
 ) -> Vec<i32> {
     let mut sf = Vec::new();
     for &(sect_cb, start, end) in sections {
         for _ in start..end {
-            if sect_cb == 0 {
+            if sect_cb == ZERO_HCB {
                 sf.push(0);
+                continue;
+            }
+            // Table 58: index_offset -60.
+            let dpcm = r.decode(&SCALEFACTOR_CODEWORDS) as i32 - 60;
+            if sect_cb == INTENSITY_HCB || sect_cb == INTENSITY_HCB2 {
+                *last_is += dpcm;
+                sf.push(*last_is);
             } else {
-                // Table 58: index_offset -60.
-                let dpcm_sf = r.decode(&SCALEFACTOR_CODEWORDS) as i32 - 60;
-                *last_sf += dpcm_sf;
+                *last_sf += dpcm;
                 assert!((0..=255).contains(last_sf));
                 sf.push(*last_sf);
             }
@@ -129,7 +145,7 @@ pub fn spectral_data(
     ];
     let mut lines = vec![0; len];
     for &(sect_cb, start, end) in sections {
-        if sect_cb == 0 || sect_cb > Codebook::ESC.number() {
+        if sect_cb == ZERO_HCB || sect_cb > Codebook::ESC.number() {
             continue;
         }
         let (unsigned, dim, lav, codewords) = books[usize::from(sect_cb) - 1];
@@ -171,6 +187,255 @@ pub fn spectral_data(
         }
     }
     lines
+}
+
+/// The fields of an `ics_info()` (Table 15) of the Low Complexity profile,
+/// with the window groups' lengths that `scale_factor_grouping` gives
+/// (clause 8.3.4).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IcsInfo {
+    pub window_sequence: u8,
+    pub window_shape: u8,
+    pub max_sfb: usize,
+    pub group_lengths: Vec<usize>,
+}
+
+impl IcsInfo {
+    pub fn transform(&self) -> Transform {
+        if self.window_sequence == 2 {
+            Transform::Short
+        } else {
+            Transform::Long
+        }
+    }
+
+    /// The offsets of the scalefactor bands of a group of `len` windows,
+    /// in its lines as they are sent (clause 8.3.5).
+    fn offsets(&self, fs: SamplingFrequency, len: usize) -> Vec<u16> {
+        (swb_offsets(fs, self.transform()).iter())
+            .map(|&o| o * len as u16)
+            .collect()
+    }
+}
+
+/// Reads an `ics_info()` (Table 15).
+pub fn ics_info(r: &mut BitReader) -> IcsInfo {
+    assert_eq!(r.read(1), 0, "ics_reserved_bit");
+    let window_sequence = r.read(2) as u8;
+    let window_shape = r.read(1) as u8;
+    if window_sequence == 2 {
+        let max_sfb = r.read(4) as usize;
+        let grouping = r.read(7);
+        let mut group_lengths = vec![1];
+        for i in 0..7 {
+            if grouping & (1 << (6 - i)) == 0 {
+                group_lengths.push(1);
+            } else {
+                *group_lengths.last_mut().expect("a group") += 1;
+            }
+        }
+        IcsInfo {
+            window_sequence,
+            window_shape,
+            max_sfb,
+            group_lengths,
+        }
+    } else {
+        let max_sfb = r.read(6) as usize;
+        assert_eq!(r.read(1), 0, "predictor_data_present");
+        IcsInfo {
+            window_sequence,
+            window_shape,
+            max_sfb,
+            group_lengths: vec![1],
+        }
+    }
+}
+
+/// An `individual_channel_stream()` (Table 16) as read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Ics {
+    pub global_gain: i32,
+    pub info: IcsInfo,
+    /// Each group's sections, as [`section_data`] gives them.
+    pub sections: Vec<Vec<(u8, usize, usize)>>,
+    /// Each group's scalefactors, as [`scale_factor_data`] gives them.
+    pub scalefactors: Vec<Vec<i32>>,
+    /// Each group's quantized lines, in the order they are sent.
+    pub lines: Vec<Vec<i32>>,
+}
+
+impl Ics {
+    /// The codebook of band `sfb` of group `g`.
+    pub fn codebook(&self, g: usize, sfb: usize) -> u8 {
+        (self.sections[g].iter())
+            .find(|&&(_, start, end)| (start..end).contains(&sfb))
+            .map_or(ZERO_HCB, |&(cb, _, _)| cb)
+    }
+}
+
+/// Reads an `individual_channel_stream()` (Table 16) of the Low Complexity
+/// profile at `fs`, with its own `ics_info()`, or that of its pair,
+/// `common`.
+pub fn individual_channel_stream(
+    r: &mut BitReader,
+    fs: SamplingFrequency,
+    common: Option<&IcsInfo>,
+) -> Ics {
+    let global_gain = r.read(8) as i32;
+    let info = match common {
+        Some(info) => info.clone(),
+        None => ics_info(r),
+    };
+    let sections: Vec<_> = (info.group_lengths.iter())
+        .map(|_| section_data(r, info.transform(), info.max_sfb))
+        .collect();
+    let (mut last_sf, mut last_is) = (global_gain, 0);
+    let scalefactors = (sections.iter())
+        .map(|sections| scale_factor_data(r, sections, &mut last_sf, &mut last_is))
+        .collect();
+    assert_eq!(r.read(3), 0, "pulse, TNS and gain control flags");
+    let lines = (sections.iter().zip(&info.group_lengths))
+        .map(|(sections, &len)| {
+            let offsets = info.offsets(fs, len);
+            let lines = usize::from(*offsets.last().expect("bands"));
+            spectral_data(r, sections, &offsets, lines)
+        })
+        .collect();
+    Ics {
+        global_gain,
+        info,
+        sections,
+        scalefactors,
+        lines,
+    }
+}
+
+/// A `single_channel_element()` or `channel_pair_element()` (Tables 13 and
+/// 14) as read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Element {
+    pub channels: Vec<Ics>,
+    pub common_window: bool,
+    pub ms_mask_present: u32,
+    /// `ms_used[g][sfb]` where `ms_mask_present` is 1.
+    pub ms_used: Vec<Vec<bool>>,
+}
+
+/// Reads an element, from its `id_syn_ele`: a `single_channel_element()`
+/// or a `channel_pair_element()` of the Low Complexity profile at `fs`.
+pub fn element(r: &mut BitReader, fs: SamplingFrequency) -> Element {
+    let id_syn_ele = r.read(3);
+    r.read(4); // element_instance_tag
+    match id_syn_ele {
+        0 => Element {
+            channels: vec![individual_channel_stream(r, fs, None)],
+            common_window: false,
+            ms_mask_present: 0,
+            ms_used: Vec::new(),
+        },
+        1 => {
+            let common_window = r.read(1) == 1;
+            let mut info = None;
+            let mut ms_mask_present = 0;
+            let mut ms_used = Vec::new();
+            if common_window {
+                let common = ics_info(r);
+                ms_mask_present = r.read(2);
+                assert_ne!(ms_mask_present, 3, "reserved");
+                if ms_mask_present == 1 {
+                    ms_used = (common.group_lengths.iter())
+                        .map(|_| (0..common.max_sfb).map(|_| r.read(1) == 1).collect())
+                        .collect();
+                }
+                info = Some(common);
+            }
+            let left = individual_channel_stream(r, fs, info.as_ref());
+            let right = individual_channel_stream(r, fs, info.as_ref());
+            Element {
+                channels: vec![left, right],
+                common_window,
+                ms_mask_present,
+                ms_used,
+            }
+        }
+        other => panic!("element {other}"),
+    }
+}
+
+impl Element {
+    /// The spectra the element reconstructs, each channel's lines group by
+    /// group in the order they are sent: inversely quantized (clause 10.3),
+    /// scaled by their scalefactors (clause 11.3.3), and of a pair, M/S
+    /// (clause 12.1.3) and intensity stereo decoded (clause 12.2.3).
+    pub fn spectra(&self, fs: SamplingFrequency) -> Vec<Vec<f64>> {
+        let mut spectra: Vec<Vec<f64>> = (self.channels.iter())
+            .map(|ics| {
+                let mut spectrum = Vec::new();
+                for (g, (lines, &len)) in ics.lines.iter().zip(&ics.info.group_lengths).enumerate()
+                {
+                    let offsets = ics.info.offsets(fs, len);
+                    for (i, &q) in lines.iter().enumerate() {
+                        let sfb = offsets.iter().rposition(|&o| usize::from(o) <= i);
+                        let scaled = match sfb {
+                            Some(sfb) if sfb < ics.info.max_sfb => {
+                                let cb = ics.codebook(g, sfb);
+                                if cb == ZERO_HCB || cb >= INTENSITY_HCB2 {
+                                    0.0
+                                } else {
+                                    let sf = ics.scalefactors[g][sfb];
+                                    let gain = (0.25 * f64::from(sf - 100)).exp2();
+                                    let x = f64::from(q.unsigned_abs()).powf(4.0 / 3.0);
+                                    f64::from(q.signum()) * x * gain
+                                }
+                            }
+                            _ => 0.0,
+                        };
+                        spectrum.push(scaled);
+                    }
+                }
+                spectrum
+            })
+            .collect();
+        if let [left, right] = &mut spectra[..] {
+            let info = &self.channels[0].info;
+            let right_ics = &self.channels[1];
+            let mut start = 0;
+            for (g, &len) in info.group_lengths.iter().enumerate() {
+                let offsets = info.offsets(fs, len);
+                for sfb in 0..info.max_sfb {
+                    let band =
+                        start + usize::from(offsets[sfb])..start + usize::from(offsets[sfb + 1]);
+                    let ms_used = self.ms_used.get(g).is_some_and(|used| used[sfb]);
+                    let is_intensity = match right_ics.codebook(g, sfb) {
+                        INTENSITY_HCB => 1.0,
+                        INTENSITY_HCB2 => -1.0,
+                        _ => 0.0,
+                    };
+                    if is_intensity != 0.0 {
+                        let invert = if self.ms_mask_present == 1 && ms_used {
+                            -1.0
+                        } else {
+                            1.0
+                        };
+                        let is_position = right_ics.scalefactors[g][sfb];
+                        let scale =
+                            is_intensity * invert * 0.5f64.powf(0.25 * f64::from(is_position));
+                        for i in band {
+                            right[i] = scale * left[i];
+                        }
+                    } else if ms_used || self.ms_mask_present == 2 {
+                        for i in band {
+                            let (l, r) = (left[i] + right[i], left[i] - right[i]);
+                            (left[i], right[i]) = (l, r);
+                        }
+                    }
+                }
+                start += usize::from(*offsets.last().expect("bands"));
+            }
+        }
+        spectra
+    }
 }
 
 /// A deterministic stream of pseudo-random numbers (xorshift), for tests to

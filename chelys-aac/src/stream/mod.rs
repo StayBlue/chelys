@@ -295,6 +295,7 @@ pub fn encode_silence(config: StreamConfig, frames: usize) -> Vec<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stereo::middle_side::MsMask;
 
     fn config(framing: Framing, bits_per_second: u32) -> StreamConfig {
         StreamConfig {
@@ -319,12 +320,13 @@ mod tests {
                 total + max_bit_reservoir / 8 + 1 >= mean_total,
                 "{framing:?}"
             );
-            // The first frames are the shortest, filling the reservoir.
-            assert_eq!(
-                frames[0].len(),
-                config.shortest_frame_len(Windows::LONG_SINE),
-                "{framing:?}"
-            );
+            // The first frames are the shortest, filling the reservoir: a
+            // pair of silent channels that share their window.
+            let silent = CodedChannel::silent(Windows::LONG_SINE, config.sampling_frequency);
+            let element = CodedElement::common_pair(silent.clone(), silent, MsMask::NONE);
+            let shortest = config.header_len() + raw_data_block::min_len(&element);
+            assert_eq!(frames[0].len(), shortest, "{framing:?}");
+            assert!(shortest < config.shortest_frame_len(Windows::LONG_SINE));
         }
     }
 
@@ -385,9 +387,10 @@ mod tests {
             }
             let mut sequences = Vec::new();
             encoder.encode(&[&input, &input], &mut |frame: &[u8]| {
-                // id_syn_ele, element_instance_tag, common_window,
-                // global_gain, ics_reserved_bit, then window_sequence.
-                sequences.push((frame[2] >> 5) & 0b11);
+                // id_syn_ele, element_instance_tag, common_window 1,
+                // ics_reserved_bit, then window_sequence.
+                assert_eq!(frame[0] & 1, 1, "common_window");
+                sequences.push((frame[1] >> 5) & 0b11);
             });
             assert_eq!(sequences.len(), 7);
             assert_eq!(sequences.contains(&2), switching, "{sequences:?}");

@@ -139,6 +139,35 @@ impl CodedChannel {
         self.groups[0].sections.max_sfb()
     }
 
+    /// The bits that [`extend`](Self::extend) adds to the channel to make
+    /// its groups span `max_sfb` bands.
+    ///
+    /// # Panics
+    ///
+    /// If `max_sfb` is below the channel's or beyond its bands: a caller's
+    /// error.
+    pub fn extension_bits(&self, max_sfb: usize) -> u32 {
+        (self.groups.iter())
+            .map(|group| group.sections.extension_bits(max_sfb))
+            .sum()
+    }
+
+    /// Makes every group of the channel span `max_sfb` bands, those of its
+    /// pair where the pair shares its window: the bands added send nothing
+    /// (see [`Sections::extend`]).
+    ///
+    /// # Panics
+    ///
+    /// As [`extension_bits`](Self::extension_bits).
+    pub fn extend(&mut self, max_sfb: usize) {
+        for group in &mut self.groups {
+            group.sections.extend(max_sfb);
+            group
+                .scalefactors
+                .resize(max_sfb.max(group.scalefactors.len()), 0);
+        }
+    }
+
     /// Each window group with its quantized lines, in the order they are
     /// sent.
     pub fn groups(&self) -> impl Iterator<Item = (&CodedGroup, &[i32])> + Clone + '_ {
