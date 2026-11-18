@@ -8,7 +8,8 @@ use std::f64::consts::TAU;
 
 use chelys::mp3::header::{Bitrate, Flags, Mode, SamplingFrequency};
 use chelys::mp3::rate::{MeanRate, Rate, VariableRate};
-use chelys::mp3::{DELAY, StreamConfig, encode_pcm_with_info_tag};
+use chelys::mp3::side_info::SideInfo;
+use chelys::mp3::{DELAY, StreamConfig, encode_pcm_with_info_tag, info_tag};
 use chelys_conformance::{Decoder, ffmpeg, lame, mpg123};
 
 /// A tone that rises in pitch, so that only one lag lines it up.
@@ -181,6 +182,114 @@ fn decoders_read_the_tag_at_every_sampling_frequency() {
                     (duration - frames_duration).abs() < 1e-3,
                     "ffmpeg, {case}: {duration} s for {frames_duration} s of frames"
                 );
+            });
+        }
+    });
+}
+
+/// At constant bitrates whose frames are too short for the whole tag but
+/// hold it without its table, in MPEG-1, at the lower sampling frequencies
+/// and in MPEG-2.5, in one channel and two, with and without the error
+/// check, the tag's frame keeps the stream's bitrate, and its flags leave
+/// out the table:
+///
+/// - mpg123 and LAME give the input exactly. Given an encoder delay 200
+///   samples longer where the extension follows the quality, they skip 200
+///   samples more, and so read the delays there and not where a tag with
+///   its table has them.
+/// - ffmpeg skips the tag's frame, and gives the duration of the frames
+///   after it, the input lagging by [`DELAY`]. Given "LAME3.100" for the
+///   encoder string where the extension follows the quality, it applies the
+///   delays and gives the input exactly, and so reads the extension there
+///   too.
+#[test]
+fn decoders_read_the_tag_without_its_table() {
+    use SamplingFrequency::*;
+    let ms = Mode::JointStereo {
+        intensity_stereo: false,
+        ms_stereo: true,
+    };
+    let cases = [
+        (Hz44100, 56, ms, false),
+        (Hz48000, 48, Mode::SingleChannel, true),
+        (Hz32000, 40, Mode::Stereo, false),
+        (Hz22050, 48, ms, true),
+        (Hz11025, 24, Mode::Stereo, false),
+        (Hz8000, 8, Mode::SingleChannel, false),
+    ];
+    std::thread::scope(|scope| {
+        for (fs, kbps, mode, crc_protected) in cases {
+            scope.spawn(move || {
+                let config = StreamConfig {
+                    rate: Rate::Constant(Bitrate::from_kbps(fs.version(), kbps).unwrap()),
+                    sampling_frequency: fs,
+                    mode,
+                    crc_protected,
+                    flags: Flags::default(),
+                };
+                let case = format!("{fs:?}, {kbps} kbit/s, {mode:?}, error check {crc_protected}");
+                let len = fs.hz() as usize * 3 / 5 + 123;
+                let input = chirp(fs, len);
+                let channels = mode.channels();
+                let stream = match channels {
+                    1 => encode_pcm_with_info_tag(&config, &[&input]),
+                    _ => encode_pcm_with_info_tag(&config, &[&input, &input]),
+                };
+                let tag_len = info_tag::header(&config).unwrap().frame_len();
+                // The bitrate_index of the tag's frame and of the next.
+                assert_eq!(stream[2] >> 4, stream[tag_len + 2] >> 4, "{case}");
+                let start = 4 + SideInfo::len_bytes(fs.version(), channels);
+                assert_eq!(&stream[start..start + 4], b"Info", "{case}");
+                assert_eq!(stream[start + 4..start + 8], [0, 0, 0, 0x0B], "{case}");
+                // The extension, after the four bytes each of the tag ID,
+                // the flags, the frame and byte counts and the quality.
+                let extension = start + 20;
+                assert_eq!(&stream[extension..extension + 6], b"chelys", "{case}");
+
+                let samples_per_frame = fs.version().samples_per_frame();
+                let frames = (len + DELAY).div_ceil(samples_per_frame);
+                let mut later = stream.clone();
+                let delays = &mut later[extension + 21..extension + 24];
+                let both = u32::from_be_bytes([0, delays[0], delays[1], delays[2]]) + (200 << 12);
+                delays.copy_from_slice(&both.to_be_bytes()[1..]);
+                for (name, decode) in [
+                    ("mpg123", mpg123::decode_mp3 as fn(&[u8]) -> _),
+                    ("LAME", lame::decode_mp3),
+                ] {
+                    let decoded = decode(&stream);
+                    assert_eq!(decoded.diagnostics, "", "{name}, {case}");
+                    let output = first_channel(&decoded.samples, channels);
+                    assert_eq!(output.len(), len, "{name}, {case}");
+                    if let Err(snrs) = lines_up(&input, &output, 0) {
+                        panic!("{name}, {case}: {snrs}");
+                    }
+                    let output = first_channel(&decode(&later).samples, channels);
+                    assert_eq!(output.len(), len - 200, "{name}, {case}, delay + 200");
+                    if let Err(snrs) = lines_up(&input, &output, -200) {
+                        panic!("{name}, {case}, delay + 200: {snrs}");
+                    }
+                }
+
+                let decoded = ffmpeg::decode_mp3(&stream);
+                assert_eq!(decoded.diagnostics, "", "ffmpeg, {case}");
+                let output = first_channel(&decoded.samples, channels);
+                assert_eq!(output.len(), frames * samples_per_frame, "ffmpeg, {case}");
+                if let Err(snrs) = lines_up(&input, &output, DELAY as isize) {
+                    panic!("ffmpeg, {case}: {snrs}");
+                }
+                let duration = ffmpeg::duration_mp3(&stream);
+                let frames_duration = (frames * samples_per_frame) as f64 / f64::from(fs.hz());
+                assert!(
+                    (duration - frames_duration).abs() < 1e-3,
+                    "ffmpeg, {case}: {duration} s for {frames_duration} s of frames"
+                );
+                let mut lame = stream.clone();
+                lame[extension..extension + 9].copy_from_slice(b"LAME3.100");
+                let output = first_channel(&ffmpeg::decode_mp3(&lame).samples, channels);
+                assert_eq!(output.len(), len, "ffmpeg, {case}, LAME3.100");
+                if let Err(snrs) = lines_up(&input, &output, 0) {
+                    panic!("ffmpeg, {case}, LAME3.100: {snrs}");
+                }
             });
         }
     });
