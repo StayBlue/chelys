@@ -79,17 +79,6 @@ impl Fft {
         Self { firsts, twiddles }
     }
 
-    /// Transforms `x` in place.
-    ///
-    /// # Panics
-    ///
-    /// If `x` is not the size the transform was made for.
-    #[cfg(test)]
-    pub fn transform(&self, x: &mut [Complex]) {
-        let input = x.to_vec();
-        self.transform_from(|i| input[i], x);
-    }
-
     /// The transform of the values `input(i)` into `x`.
     ///
     /// # Panics
@@ -287,6 +276,12 @@ impl RealFft {
 mod tests {
     use super::*;
 
+    /// The transform of `x` in place.
+    fn transform(fft: &Fft, x: &mut [Complex]) {
+        let input = x.to_vec();
+        fft.transform_from(|i| input[i], x);
+    }
+
     #[test]
     fn matches_the_direct_dft() {
         for n in [2, 8, 256] {
@@ -297,7 +292,7 @@ mod tests {
                 })
                 .collect();
             let mut fast = input.clone();
-            Fft::new(n).transform(&mut fast);
+            transform(&Fft::new(n), &mut fast);
             for (k, fast) in fast.iter().enumerate() {
                 let mut direct = Complex::default();
                 for (t, x) in input.iter().enumerate() {
@@ -321,7 +316,7 @@ mod tests {
             let input: Vec<f64> = (0..n).map(|t| ((t * 7919) % 31) as f64 - 15.0).collect();
             let mut complex: Vec<Complex> =
                 (input.iter()).map(|&re| Complex { re, im: 0.0 }).collect();
-            Fft::new(n).transform(&mut complex);
+            transform(&Fft::new(n), &mut complex);
             let mut fft = RealFft::new(n);
             let real = fft.transform(&input);
             assert_eq!(real.len(), n / 2 + 1);
