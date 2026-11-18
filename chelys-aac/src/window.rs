@@ -16,6 +16,10 @@ use chelys_core::bitstream::BitWriter;
 use crate::sampling_frequency::SamplingFrequency;
 use crate::scalefactor_bands::GroupBands;
 
+/// The SHORT_WINDOWs of an EIGHT_SHORT_SEQUENCE (Table 44), and so the most
+/// window groups of a channel, each window a group of its own.
+pub const SHORT_WINDOWS: usize = 8;
+
 /// `window_sequence` (Table 44).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WindowSequence {

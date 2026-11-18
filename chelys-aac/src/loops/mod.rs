@@ -13,11 +13,7 @@ use inner::{Counting, Lines};
 use crate::channel::{CodedChannel, FRAME_LINES};
 use crate::sampling_frequency::SamplingFrequency;
 use crate::scalefactor_bands::MAX_BANDS;
-use crate::window::Windows;
-
-/// The most window groups of a channel: the eight short windows of an
-/// EIGHT_SHORT_SEQUENCE, each a group of its own.
-const MAX_GROUPS: usize = 8;
+use crate::window::{SHORT_WINDOWS, Windows};
 
 /// The offset in dB that every allowed distortion `xmin` is raised by
 /// before the loops (clause C.7.4.4).
@@ -73,7 +69,7 @@ pub fn quantize_channel(
         available_bits,
     );
     let offset = 10f64.powf(XMIN_OFFSET_DB / 10.0);
-    let mut target = [[0.0; MAX_BANDS]; MAX_GROUPS];
+    let mut target = [[0.0; MAX_BANDS]; SHORT_WINDOWS];
     for (target, xmin) in target.iter_mut().zip(xmin) {
         *target = xmin.map(|xmin| xmin * offset);
     }

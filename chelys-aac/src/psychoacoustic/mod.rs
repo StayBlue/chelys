@@ -24,6 +24,7 @@ use crate::filterbank::PCM_SCALE;
 use crate::sampling_frequency::SamplingFrequency;
 use crate::scalefactor_bands::{GroupBands, MAX_BANDS, Transform};
 use crate::stream::FRAME_SAMPLES;
+use crate::window::SHORT_WINDOWS;
 use partitions::Row;
 
 /// The shift length `iblen` of the long FFT (clause C.1.1): a frame's
@@ -31,8 +32,6 @@ use partitions::Row;
 const LONG_IBLEN: usize = FRAME_SAMPLES;
 /// The shift length `iblen` of the short FFT.
 const SHORT_IBLEN: usize = 128;
-/// The short windows of a frame, and so its short FFTs.
-const SHORT_WINDOWS: usize = 8;
 /// The first sample of the first short window in a frame's window of
 /// `2 * LONG_IBLEN` samples, each of the others `SHORT_IBLEN` after the one
 /// before (clause 15.3.2, EIGHT_SHORT_SEQUENCE).
