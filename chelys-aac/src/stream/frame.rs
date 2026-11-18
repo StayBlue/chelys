@@ -64,7 +64,7 @@ fn overhead_bits(config: &StreamConfig) -> u32 {
 /// printed is negative in most frames of music, and far below 0 for
 /// silence (-9535 at 44.1 kHz) and steady tones (about -8980 for one of
 /// 1 kHz at half of full scale), so that `bit_allocation` is 0 (see
-/// [`LongThreshold::bit_allocation`](crate::psychoacoustic::LongThreshold::bit_allocation));
+/// [`Analysis::bit_allocation`](crate::psychoacoustic::Analysis::bit_allocation));
 /// where it is not, it is a few hundred bits. `more_bits` is then about
 /// `side_info_bits - mean_bits`, and clause C.7.3 would give such a frame
 /// only its side information whenever the reservoir has room: the first
@@ -94,7 +94,7 @@ pub fn more_bits(config: &StreamConfig, demands: &[Demand]) -> i64 {
 /// pair it is. Shares in proportion to each channel's `bit_allocation`
 /// were tried, and starved channels: the allocation is 0 in most frames of
 /// music, where the perceptual entropy is negative (see
-/// [`LongThreshold::bit_allocation`](crate::psychoacoustic::LongThreshold::bit_allocation)),
+/// [`Analysis::bit_allocation`](crate::psychoacoustic::Analysis::bit_allocation)),
 /// and a channel whose allocation was 0 beside one whose was not was left
 /// the bits of a channel without lines.
 pub fn bits_per_channel(

@@ -17,15 +17,11 @@ use crate::sampling_frequency::SamplingFrequency;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Transform {
     Long,
-    // Constructed by the groups of short windows, which block switching
-    // will use.
-    #[cfg_attr(not(any(test, feature = "unstable")), allow(dead_code))]
     Short,
 }
 
 impl Transform {
     /// The spectral lines of one window.
-    #[cfg(any(test, feature = "unstable"))]
     pub fn lines(self) -> usize {
         match self {
             Self::Long => 1024,
@@ -100,7 +96,6 @@ impl GroupBands {
     /// # Panics
     ///
     /// If `windows` is not 1 to 8: a caller's error.
-    #[cfg(any(test, feature = "unstable"))]
     pub fn short(sampling_frequency: SamplingFrequency, windows: usize) -> Self {
         assert!(
             (1..=8).contains(&windows),

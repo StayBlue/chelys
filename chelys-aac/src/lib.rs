@@ -8,12 +8,12 @@
 //! Clause and table references refer to ISO/IEC 13818-7:2006, or, where
 //! they name it, to ISO/IEC 14496-3:2019.
 //!
-//! The encoder is being built: for now it codes every frame with the long
-//! window of the sine shape, and fits each channel's lines to its share of
+//! The encoder is being built: for now it codes each channel apart,
+//! switching to eight short windows where the psychoacoustic model of
+//! Annex C finds an attack, and fits each channel's lines to its share of
 //! the frame's bits with the iteration loops of Annex C, which shape the
-//! quantization noise of each scalefactor band to what the psychoacoustic
-//! model of Annex C allows for long blocks. Block switching and stereo
-//! coding are to come.
+//! quantization noise of each scalefactor band to what the model allows.
+//! Stereo coding is to come.
 //!
 //! ```
 //! use chelys_aac::{Config, Encoder, Rate};
@@ -94,6 +94,10 @@ pub mod internals {
 /// (clause 15.3.3): the samples a frame decodes to are those of the block
 /// before its own. An [`Encoder`] ends the stream at least this far past
 /// the input, so that the decoded output holds all of it.
+///
+/// An [`Encoder`] gives each frame only once the block after it has
+/// arrived, from which the frame's windows are chosen; that delays the
+/// frames it gives, not where the input lands in the decoded output.
 ///
 /// Spec gap: the standard does not say what comes before the first block
 /// of input. It is taken as silence, so that the first frame decodes that

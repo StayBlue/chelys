@@ -197,6 +197,24 @@ mod tests {
     }
 
     #[test]
+    fn a_silent_channel_of_short_windows_sends_no_band_in_any_group() {
+        use crate::window::{Grouping, WindowSequence, WindowShape};
+        let fs = SamplingFrequency::Hz48000;
+        let grouping = Grouping::from_starts([true, false, true, true, false, false, true, true]);
+        let windows = Windows {
+            sequence: WindowSequence::EightShort { grouping },
+            shape: WindowShape::Kbd,
+        };
+        let channel = CodedChannel::silent(windows, fs);
+        assert_eq!(channel.max_sfb(), 0);
+        // global_gain, an ics_info() of 15 bits and the three flags: no
+        // group sends a section.
+        assert_eq!(channel.bits(false), 8 + 15 + 3);
+        let lens: Vec<usize> = channel.groups().map(|(_, lines)| lines.len()).collect();
+        assert_eq!(lens, [256, 128, 384, 128, 128]);
+    }
+
+    #[test]
     fn bits_count_every_part() {
         let fs = SamplingFrequency::Hz48000;
         let bands = GroupBands::long(fs);

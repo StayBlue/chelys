@@ -2,16 +2,14 @@
 // SPDX-License-Identifier: MIT
 
 //! The psychoacoustic model of clause C.1: for each channel's frame, the
-//! energy that each scalefactor band of a long window may take as
-//! quantization noise, `xmin(n)`, and the perceptual entropy, from which
-//! the bits the frame asks for follow (step 15).
-//!
-//! The model runs the long FFT on the frame's window and the eight short
-//! FFTs on its short windows, whose unpredictability the long blocks' takes
-//! (step 4). The thresholds of short blocks, and the choice between long
-//! and short blocks (step 13), are to come.
+//! energy that each scalefactor band of its long window, or of each of its
+//! short windows, may take as quantization noise, `xmin(n)`, and the
+//! perceptual entropy, from which the bits the frame asks for follow (step
+//! 15); and the choice between long and short blocks (step 13), which
+//! [`switching`] makes a frame ahead.
 
 pub mod partitions;
+pub mod switching;
 
 use std::f64::consts::PI;
 use std::ops::Range;
@@ -20,11 +18,11 @@ use std::sync::OnceLock;
 use chelys_core::fft::{Complex, RealFft};
 
 use crate::channel::FRAME_LINES;
-use crate::filterbank::PCM_SCALE;
+use crate::filterbank::{FIRST_SHORT, PCM_SCALE};
 use crate::sampling_frequency::SamplingFrequency;
 use crate::scalefactor_bands::{GroupBands, MAX_BANDS, Transform};
 use crate::stream::FRAME_SAMPLES;
-use crate::window::SHORT_WINDOWS;
+use crate::window::{SHORT_WINDOWS, WindowSequence, Windows};
 use partitions::Row;
 
 /// The shift length `iblen` of the long FFT (clause C.1.1): a frame's
@@ -32,10 +30,6 @@ use partitions::Row;
 const LONG_IBLEN: usize = FRAME_SAMPLES;
 /// The shift length `iblen` of the short FFT.
 const SHORT_IBLEN: usize = 128;
-/// The first sample of the first short window in a frame's window of
-/// `2 * LONG_IBLEN` samples, each of the others `SHORT_IBLEN` after the one
-/// before (clause 15.3.2, EIGHT_SHORT_SEQUENCE).
-const FIRST_SHORT: usize = 448;
 
 /// The lines of the long FFT whose unpredictability the long FFT gives;
 /// the short FFTs give it above (clause C.1.4, step 4).
@@ -45,12 +39,16 @@ const LONG_CW_LINES: usize = 6;
 const NMT: f64 = 6.0;
 const TMN: f64 = 18.0;
 
-/// `rpelev` of long blocks (step 11).
+/// `rpelev` of long and of short blocks (step 11).
 const RPELEV_LONG: f64 = 2.0;
+const RPELEV_SHORT: f64 = 1.0;
 
 /// `pew1` and `pew2` of long blocks (step 15).
 const PEW1_LONG: f64 = 0.3;
 const PEW2_LONG: f64 = 6.0;
+/// `pew1` and `pew2` of short blocks (step 15).
+const PEW1_SHORT: f64 = 0.6;
+const PEW2_SHORT: f64 = 24.0;
 
 /// The limit of `bit_allocation` (step 15).
 const MAX_BIT_ALLOCATION: f64 = 3000.0;
@@ -110,10 +108,9 @@ fn quiet_reference(iblen: usize) -> f64 {
     (iblen as f64 / 4.0).powi(2)
 }
 
-/// What the model computes once for each sampling frequency for long
-/// blocks.
+/// What the model computes once for each sampling frequency and FFT.
 #[derive(Debug)]
-struct LongTables {
+struct Tables {
     partitions: &'static [Row],
     /// `sprdngf(bval(bb), bval(b))` at `bb * partitions + b`.
     spreading: Vec<f64>,
@@ -125,14 +122,15 @@ struct LongTables {
     rnorm: Vec<f64>,
     /// `qsthr(b)` as an energy (step 11).
     quiet: Vec<f64>,
+    /// The scalefactor bands of one window of the FFT's transform.
     bands: GroupBands,
     /// The partitions that each scalefactor band's lines fall in.
     band_partitions: Vec<Range<usize>>,
 }
 
-impl LongTables {
-    fn new(sampling_frequency: SamplingFrequency) -> Self {
-        let partitions = partitions::table(sampling_frequency, Transform::Long);
+impl Tables {
+    fn new(sampling_frequency: SamplingFrequency, transform: Transform) -> Self {
+        let partitions = partitions::table(sampling_frequency, transform);
         let n = partitions.len();
         let mut spreading = vec![0.0; n * n];
         for (bb, from) in partitions.iter().enumerate() {
@@ -157,11 +155,15 @@ impl LongTables {
                 first..last + 1
             })
             .collect();
-        let reference = quiet_reference(LONG_IBLEN);
+        // The FFT's shift length is its window's lines.
+        let reference = quiet_reference(transform.lines());
         let quiet = (partitions.iter())
             .map(|p| reference * 10f64.powf(p.qsthr / 10.0))
             .collect();
-        let bands = GroupBands::long(sampling_frequency);
+        let bands = match transform {
+            Transform::Long => GroupBands::long(sampling_frequency),
+            Transform::Short => GroupBands::short(sampling_frequency, 1),
+        };
         let partition_of = |w: usize| {
             (partitions.iter())
                 .position(|p| p.lines().contains(&w))
@@ -181,9 +183,98 @@ impl LongTables {
         }
     }
 
-    fn get(sampling_frequency: SamplingFrequency) -> &'static Self {
-        static TABLES: [OnceLock<LongTables>; 12] = [const { OnceLock::new() }; 12];
-        TABLES[sampling_frequency.index() as usize].get_or_init(|| Self::new(sampling_frequency))
+    fn get(sampling_frequency: SamplingFrequency, transform: Transform) -> &'static Self {
+        static TABLES: [[OnceLock<Tables>; 2]; 12] = [const { [const { OnceLock::new() }; 2] }; 12];
+        let index = usize::from(transform == Transform::Short);
+        TABLES[sampling_frequency.index() as usize][index]
+            .get_or_init(|| Self::new(sampling_frequency, transform))
+    }
+
+    /// Steps 5 to 12 and the FFT's part of step 14 for one block, from the
+    /// energy `r(w)^2` and unpredictability `c(w)` of each line of its FFT,
+    /// with pre-echo control against `nb_last`, the threshold of the last
+    /// block of this FFT, which it updates, raised by `rpelev`.
+    ///
+    /// Spec gap: step 11 compares the threshold with `nb_l(b)`, "the
+    /// threshold of partition b for the last block". Both step 10 and this
+    /// step call their result `nb(b)`, so the text does not say which is
+    /// meant; the more literal reading is the
+    /// threshold this step gives, which is left in `nb(b)`. This
+    /// deliberately departs from it, and takes the threshold of step 10:
+    /// the energy threshold the last block's signal set, so that a block
+    /// after a quieter one, as at an attack, is held near the quieter one's
+    /// threshold, while a steady signal keeps its own. Taking the threshold
+    /// this step gives would let a long block's threshold rise by `rpelev`,
+    /// 3 dB, a frame at most, so that after silence a loud signal would
+    /// take some twenty frames to reach its own; and a short block's, whose
+    /// `rpelev` is 1, never rise at all but through the threshold in quiet.
+    /// The block before the first is silent, with no threshold.
+    fn threshold(
+        &self,
+        energy: &[f64],
+        unpredictability: &[f64],
+        nb_last: &mut [f64],
+        rpelev: f64,
+        out: &mut Threshold,
+    ) {
+        // Step 5: the energy and weighted unpredictability of each
+        // partition.
+        let n = self.partitions.len();
+        let mut e = [0.0; MAX_PARTITIONS];
+        let mut c = [0.0; MAX_PARTITIONS];
+        for (b, p) in self.partitions.iter().enumerate() {
+            for w in p.lines() {
+                e[b] += energy[w];
+                c[b] += energy[w] * unpredictability[w];
+            }
+        }
+
+        let mut perceptual_entropy = 0.0;
+        let mut nb = [0.0; MAX_PARTITIONS];
+        for (b, nb) in nb[..n].iter_mut().enumerate() {
+            // Step 6: spread, and normalized; the other partitions spread
+            // nothing into this one.
+            let (mut ecb, mut ct) = (0.0, 0.0);
+            for bb in self.spread_from[b].clone() {
+                let spreading = self.spreading[bb * n + b];
+                ecb += e[bb] * spreading;
+                ct += c[bb] * spreading;
+            }
+            // Spec gap: without energy `cb(b) = ct(b) / ecb(b)` is
+            // undefined; its threshold is 0 whatever the tonality, and the
+            // threshold in quiet sets it (step 11). It is taken as 0.
+            let cb = if ecb == 0.0 { 0.0 } else { ct / ecb };
+            let en = ecb * self.rnorm[b];
+            // Step 7: the tonality, within 0 and 1.
+            let tb = (-0.299 - 0.43 * cb.ln()).clamp(0.0, 1.0);
+            // Steps 8 to 10.
+            let snr = tb * TMN + (1.0 - tb) * NMT;
+            let bc = 10f64.powf(-snr / 10.0);
+            *nb = en * bc;
+        }
+        // Step 11, against the last block's nb(b) of step 10.
+        for b in 0..n {
+            let limited = nb[b].min(nb_last[b] * rpelev);
+            nb_last[b] = nb[b];
+            nb[b] = self.quiet[b].max(limited);
+            // Step 12.
+            let p = &self.partitions[b];
+            let weight = f64::from(p.w_high - p.w_low);
+            perceptual_entropy -= weight * (nb[b] / (e[b] + 1.0)).log10();
+        }
+
+        // Step 14.
+        let bands = self.bands;
+        out.bands = bands;
+        out.perceptual_entropy = perceptual_entropy;
+        for (band, range) in self.band_partitions.iter().enumerate() {
+            let lines = bands.offset(band)..bands.offset(band + 1);
+            out.epart[band] = energy[lines.clone()].iter().sum();
+            let thr = (range.clone())
+                .map(|b| nb[b] / self.partitions[b].lines().len() as f64)
+                .fold(f64::INFINITY, f64::min);
+            out.npart[band] = thr * lines.len() as f64;
+        }
     }
 }
 
@@ -275,10 +366,11 @@ impl Predictor {
     }
 }
 
-/// The threshold of a long block in each scalefactor band, on the scale
-/// of the FFT, and the perceptual entropy (steps 12 and 14).
+/// The threshold of one block, long or short, in each scalefactor band of
+/// its window, on the scale of the FFT, and its perceptual entropy (steps
+/// 12 and 14).
 #[derive(Clone, Debug, PartialEq)]
-pub struct LongThreshold {
+pub struct Threshold {
     /// `epart(n)`: the FFT's energy in each band.
     pub epart: [f64; MAX_BANDS],
     /// `npart(n)`: the noise level each band allows.
@@ -288,38 +380,134 @@ pub struct LongThreshold {
     bands: GroupBands,
 }
 
-impl LongThreshold {
+impl Threshold {
+    fn new(bands: GroupBands) -> Self {
+        Self {
+            epart: [0.0; MAX_BANDS],
+            npart: [0.0; MAX_BANDS],
+            perceptual_entropy: 0.0,
+            bands,
+        }
+    }
+
     /// `xmin(n) = npart(n) * codec_e(n) / epart(n)` (step 14): the energy
-    /// of quantization error that each band of a long window's `spectrum`
-    /// may take, where `codec_e(n)` is the energy of its MDCT lines.
+    /// of quantization error that band `n` of the block's window may take,
+    /// where `codec_e(n)` is the energy of its MDCT lines.
     ///
     /// Spec gap: a band whose FFT has no energy makes the ratio undefined.
     /// Its signal is below any threshold, as `SMR(n) = epart(n) / npart(n)`
     /// is 0, so it is allowed its whole MDCT energy, `codec_e(n)`.
-    pub fn xmin(&self, spectrum: &[f64; FRAME_LINES]) -> [f64; MAX_BANDS] {
-        let mut xmin = [0.0; MAX_BANDS];
-        for (n, xmin) in xmin[..self.bands.num_swb()].iter_mut().enumerate() {
-            let lines = &spectrum[self.bands.offset(n)..self.bands.offset(n + 1)];
-            let codec_e: f64 = lines.iter().map(|x| x * x).sum();
-            *xmin = if self.epart[n] == 0.0 {
-                codec_e
-            } else {
-                self.npart[n] * codec_e / self.epart[n]
-            };
+    pub fn xmin(&self, n: usize, codec_e: f64) -> f64 {
+        if self.epart[n] == 0.0 {
+            codec_e
+        } else {
+            self.npart[n] * codec_e / self.epart[n]
         }
-        xmin
+    }
+}
+
+/// What the model gives for a frame of one channel: the threshold of its
+/// long block and those of its eight short blocks.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Analysis {
+    pub long: Threshold,
+    pub short: [Threshold; SHORT_WINDOWS],
+}
+
+impl Analysis {
+    /// The analysis of a frame not yet analyzed, at `sampling_frequency`.
+    pub fn new(sampling_frequency: SamplingFrequency) -> Self {
+        Self {
+            long: Threshold::new(GroupBands::long(sampling_frequency)),
+            short: std::array::from_fn(|_| {
+                Threshold::new(GroupBands::short(sampling_frequency, 1))
+            }),
+        }
+    }
+
+    /// The perceptual entropy of the frame coded with `sequence`: that of
+    /// its long block, or for eight short windows, those of the eight
+    /// short blocks summed (step 15).
+    pub fn perceptual_entropy(&self, sequence: WindowSequence) -> f64 {
+        match sequence.transform() {
+            Transform::Long => self.long.perceptual_entropy,
+            Transform::Short => self.short.iter().map(|t| t.perceptual_entropy).sum(),
+        }
     }
 
     /// `bit_allocation = pew1 * PE + pew2 * sqrt(PE)`, limited to 0 to
-    /// 3000 (step 15).
+    /// 3000 (step 15), with the constants and entropy of `sequence`'s
+    /// blocks: `pew1 = 0.3` and `pew2 = 6.0` for long blocks, and `pew1 =
+    /// 0.6` and `pew2 = 24` for short ones.
     ///
     /// Spec gap: the entropy is negative where the thresholds exceed the
     /// energy, as in silence, -9535 at 44.1 kHz, and in most frames of
     /// music (see [`Model::analyze`]), where `sqrt(PE)` is undefined; the
     /// allocation is then 0, the lower limit.
-    pub fn bit_allocation(&self) -> f64 {
-        let pe = self.perceptual_entropy.max(0.0);
-        (PEW1_LONG * pe + PEW2_LONG * pe.sqrt()).min(MAX_BIT_ALLOCATION)
+    pub fn bit_allocation(&self, sequence: WindowSequence) -> f64 {
+        let (pew1, pew2) = match sequence.transform() {
+            Transform::Long => (PEW1_LONG, PEW2_LONG),
+            Transform::Short => (PEW1_SHORT, PEW2_SHORT),
+        };
+        let pe = self.perceptual_entropy(sequence).max(0.0);
+        (pew1 * pe + pew2 * pe.sqrt()).min(MAX_BIT_ALLOCATION)
+    }
+
+    /// The allowed distortion `xmin` of each band of each window group of
+    /// a frame coded with `windows`, whose lines in the order they are sent
+    /// are `spectrum`, into `xmin`, a group at a time: for a long window,
+    /// its bands' `xmin(n)` of the long block (step 14), and for eight short
+    /// windows, those of each window's short block, summed over the windows
+    /// of each group.
+    ///
+    /// Spec gap: Annex C gives `xmin(n)` for each short block, and the loops
+    /// shape the noise of a group's scalefactor band, which holds that band
+    /// of each of its windows (clause C.7.1, item 6), with one scalefactor;
+    /// it does not say what such a band is allowed. It is allowed the sum
+    /// of what each of its windows' bands is allowed, as a band of a long
+    /// window is allowed the noise of each of its lines summed (step 14):
+    /// the loops measure the distortion of the group's band as the error of
+    /// all of its lines (clause C.7.4.3). The windows grouped are those of
+    /// like energy (see [`grouping`](switching::grouping)), whose bands
+    /// are allowed alike.
+    pub fn xmin(
+        &self,
+        windows: Windows,
+        spectrum: &[f64; FRAME_LINES],
+        xmin: &mut Vec<[f64; MAX_BANDS]>,
+    ) {
+        let energy = |lines: &[f64]| -> f64 { lines.iter().map(|x| x * x).sum() };
+        xmin.clear();
+        match windows.sequence {
+            WindowSequence::EightShort { grouping } => {
+                let mut start = 0;
+                let mut first = 0;
+                for len in grouping.lengths() {
+                    let mut group = [0.0; MAX_BANDS];
+                    let bands = self.short[0].bands;
+                    for (n, xmin) in group[..bands.num_swb()].iter_mut().enumerate() {
+                        let width = bands.offset(n + 1) - bands.offset(n);
+                        let band = start + bands.offset(n) * len;
+                        for (i, threshold) in self.short[first..first + len].iter().enumerate() {
+                            let lines = &spectrum[band + i * width..][..width];
+                            *xmin += threshold.xmin(n, energy(lines));
+                        }
+                    }
+                    xmin.push(group);
+                    start += bands.lines() * len;
+                    first += len;
+                }
+            }
+            _ => {
+                let bands = self.long.bands;
+                let mut group = [0.0; MAX_BANDS];
+                for (n, xmin) in group[..bands.num_swb()].iter_mut().enumerate() {
+                    let lines = &spectrum[bands.offset(n)..bands.offset(n + 1)];
+                    *xmin = self.long.xmin(n, energy(lines));
+                }
+                xmin.push(group);
+            }
+        }
     }
 }
 
@@ -327,7 +515,8 @@ impl LongThreshold {
 /// next.
 #[derive(Debug)]
 pub struct Model {
-    long: &'static LongTables,
+    long: &'static Tables,
+    short: &'static Tables,
     /// The newest `iblen` samples of the frame before (step 1), at
     /// [`PCM_SCALE`].
     previous: Box<[f64; LONG_IBLEN]>,
@@ -337,12 +526,15 @@ pub struct Model {
     short_hann: Vec<f64>,
     long_predictor: Predictor,
     short_predictor: Predictor,
-    /// `nb(b)` of the last block, before pre-echo control (step 11).
-    nb_last: Vec<f64>,
+    /// `nb(b)` of the last long block and of the last short block, before
+    /// pre-echo control (step 11).
+    long_nb_last: Vec<f64>,
+    short_nb_last: Vec<f64>,
     // Buffers kept from one frame to the next for their memory.
     windowed: Vec<f64>,
     energy: Vec<f64>,
     c: Vec<f64>,
+    short_energy: Vec<f64>,
     short_c: Vec<f64>,
     short_c_min: Vec<f64>,
 }
@@ -353,9 +545,11 @@ impl Model {
     /// silent, as the filterbank takes them (see
     /// [`Filterbank::new`](crate::filterbank::Filterbank::new)).
     pub fn new(sampling_frequency: SamplingFrequency) -> Self {
-        let long = LongTables::get(sampling_frequency);
+        let long = Tables::get(sampling_frequency, Transform::Long);
+        let short = Tables::get(sampling_frequency, Transform::Short);
         Self {
             long,
+            short,
             previous: Box::new([0.0; LONG_IBLEN]),
             long_fft: RealFft::new(2 * LONG_IBLEN),
             short_fft: RealFft::new(2 * SHORT_IBLEN),
@@ -363,29 +557,37 @@ impl Model {
             short_hann: hann(SHORT_IBLEN),
             long_predictor: Predictor::new(LONG_CW_LINES),
             short_predictor: Predictor::new(SHORT_IBLEN + 1),
-            nb_last: vec![0.0; long.partitions.len()],
+            long_nb_last: vec![0.0; long.partitions.len()],
+            short_nb_last: vec![0.0; short.partitions.len()],
             windowed: vec![0.0; 2 * LONG_IBLEN],
             energy: vec![0.0; LONG_IBLEN],
             c: vec![0.0; LONG_IBLEN],
+            short_energy: vec![0.0; SHORT_IBLEN + 1],
             short_c: vec![0.0; SHORT_IBLEN + 1],
             short_c_min: vec![0.0; SHORT_IBLEN + 1],
         }
     }
 
     /// Analyzes the frame whose block is `block`, the channel's next 1024
-    /// samples at full scale 1.0: its window of `2 * iblen` samples, the
-    /// block before and this one (step 1), is the window of the frame's
-    /// MDCT (clause C.3.1.1), in which the psychoacoustic model's window is
-    /// thus centred (clause C.1.1).
+    /// samples at full scale 1.0, into `out`: its window of `2 * iblen`
+    /// samples, the block before and this one (step 1), is the window of
+    /// the frame's MDCT (clause C.3.1.1), in which the psychoacoustic
+    /// model's window is thus centred (clause C.1.1). The short FFTs are
+    /// those of the frame's eight short windows (clause 15.3.2), each
+    /// centred, as the long FFT is, in the window of its transform.
     ///
-    /// Spec reading: step 4 takes the unpredictability of a long block's
-    /// lines from the sixth on as "the minimum of the unpredictability of
-    /// all short FFT's", whose lines are eight times as wide. Each line of
-    /// the long FFT takes that of the short FFTs' line nearest it in
-    /// frequency, `(w + 4) / 8`. The short FFTs are those of the frame's
-    /// eight short windows (clause 15.3.2), each centred, as the long FFT
-    /// is, in the window of its transform; each is predicted from the two
-    /// before it, across frames.
+    /// The thresholds of the long and of the short blocks are computed for
+    /// every frame, as the two processes of clause C.1.1, each with its
+    /// shift length, run over the whole signal: each short block's
+    /// threshold is limited by the last short block's (step 11), across
+    /// frames, whatever the windows the frames are coded with.
+    ///
+    /// Spec gap: step 4 takes the unpredictability of a long block's lines
+    /// from the sixth on as "the minimum of the unpredictability of all
+    /// short FFT's", whose lines are eight times as wide, and does not say
+    /// which of their lines a long line takes. Each line of the long FFT
+    /// takes that of the short FFTs' line nearest it in frequency, `(w +
+    /// 4) / 8`.
     ///
     /// Spec reading: the perceptual entropy (step 12) weighs each partition
     /// by `w_high(b) - w_low(b)`, one less than its lines, where step 14
@@ -409,8 +611,12 @@ impl Model {
     /// partition would instead give silence an entropy of its own, from
     /// partitions whose threshold is below 1, as chelys's MP3 encoder found
     /// of model 2.
-    pub fn analyze(&mut self, block: &[f64; FRAME_SAMPLES]) -> LongThreshold {
-        let tables = self.long;
+    ///
+    /// Step 4 says the formula of `c(w)` "is used for each of the short
+    /// blocks with the short FFT": each short block's own unpredictability
+    /// is that of its lines, predicted from the two short blocks before it,
+    /// across frames.
+    pub fn analyze(&mut self, block: &[f64; FRAME_SAMPLES], out: &mut Analysis) {
         // Step 1: the window of the block before and this one.
         let (before, after) = self.windowed.split_at_mut(LONG_IBLEN);
         before.copy_from_slice(&*self.previous);
@@ -419,21 +625,31 @@ impl Model {
         }
         self.previous.copy_from_slice(after);
 
-        // Steps 3 and 4 for the short FFTs: the least unpredictability of
-        // each of their lines over the eight.
+        // The short blocks, steps 2 to 14 for each, and for the long block
+        // the least unpredictability of each line over the eight (step 4).
         self.short_c_min.fill(f64::INFINITY);
         let mut short_windowed = [0.0; 2 * SHORT_IBLEN];
-        for k in 0..SHORT_WINDOWS {
+        for (k, threshold) in out.short.iter_mut().enumerate() {
             let start = FIRST_SHORT + k * SHORT_IBLEN;
             let samples = &self.windowed[start..start + 2 * SHORT_IBLEN];
             for ((sw, &s), &w) in short_windowed.iter_mut().zip(samples).zip(&self.short_hann) {
                 *sw = s * w;
             }
             let x = self.short_fft.transform(&short_windowed);
+            for (energy, x) in self.short_energy.iter_mut().zip(x) {
+                *energy = x.re * x.re + x.im * x.im;
+            }
             self.short_predictor.unpredictability(x, &mut self.short_c);
             for (min, &c) in self.short_c_min.iter_mut().zip(&self.short_c) {
                 *min = min.min(c);
             }
+            self.short.threshold(
+                &self.short_energy,
+                &self.short_c,
+                &mut self.short_nb_last,
+                RPELEV_SHORT,
+                threshold,
+            );
         }
 
         // Step 2: the long FFT of the windowed samples.
@@ -450,84 +666,14 @@ impl Model {
         for (w, c) in self.c.iter_mut().enumerate().skip(LONG_CW_LINES) {
             *c = self.short_c_min[(w + 4) / 8];
         }
-
-        // Step 5: the energy and weighted unpredictability of each
-        // partition.
-        let n = tables.partitions.len();
-        let mut e = [0.0; MAX_PARTITIONS];
-        let mut c = [0.0; MAX_PARTITIONS];
-        for (b, p) in tables.partitions.iter().enumerate() {
-            for w in p.lines() {
-                e[b] += self.energy[w];
-                c[b] += self.energy[w] * self.c[w];
-            }
-        }
-
-        let mut perceptual_entropy = 0.0;
-        let mut nb = [0.0; MAX_PARTITIONS];
-        for (b, nb) in nb[..n].iter_mut().enumerate() {
-            // Step 6: spread, and normalized; the other partitions spread
-            // nothing into this one.
-            let (mut ecb, mut ct) = (0.0, 0.0);
-            for bb in tables.spread_from[b].clone() {
-                let spreading = tables.spreading[bb * n + b];
-                ecb += e[bb] * spreading;
-                ct += c[bb] * spreading;
-            }
-            // Spec gap: without energy `cb(b) = ct(b) / ecb(b)` is
-            // undefined; its threshold is 0 whatever the tonality, and the
-            // threshold in quiet sets it (step 11). It is taken as 0.
-            let cb = if ecb == 0.0 { 0.0 } else { ct / ecb };
-            let en = ecb * tables.rnorm[b];
-            // Step 7: the tonality, within 0 and 1.
-            let tb = (-0.299 - 0.43 * cb.ln()).clamp(0.0, 1.0);
-            // Steps 8 to 10.
-            let snr = tb * TMN + (1.0 - tb) * NMT;
-            let bc = 10f64.powf(-snr / 10.0);
-            *nb = en * bc;
-        }
-        // Step 11, against the last block's nb(b).
-        //
-        // Spec reading: step 11 compares the threshold with `nb_l(b)`, "the
-        // threshold of partition b for the last block". Both step 10 and
-        // this step call their result `nb(b)`; the more literal reading is
-        // the threshold this step gives, which is left in `nb(b)`. This
-        // deliberately departs from it, and takes the threshold of step 10:
-        // the energy threshold the last block's signal set, so
-        // that a block after a quieter one, as at an attack, is held near
-        // the quieter one's threshold, while a steady signal keeps its own.
-        // Taking the threshold this step gives would let a threshold rise
-        // by `rpelev`, 3 dB, a frame at most, so that after silence a loud
-        // signal would take some twenty frames to reach its own. The block
-        // before the first is silent, with no threshold.
-        for b in 0..n {
-            let limited = nb[b].min(self.nb_last[b] * RPELEV_LONG);
-            self.nb_last[b] = nb[b];
-            nb[b] = tables.quiet[b].max(limited);
-            // Step 12.
-            let p = &tables.partitions[b];
-            let weight = f64::from(p.w_high - p.w_low);
-            perceptual_entropy -= weight * (nb[b] / (e[b] + 1.0)).log10();
-        }
-
-        // Step 14.
-        let bands = tables.bands;
-        let mut epart = [0.0; MAX_BANDS];
-        let mut npart = [0.0; MAX_BANDS];
-        for (band, range) in tables.band_partitions.iter().enumerate() {
-            let lines = bands.offset(band)..bands.offset(band + 1);
-            epart[band] = self.energy[lines.clone()].iter().sum();
-            let thr = (range.clone())
-                .map(|b| nb[b] / tables.partitions[b].lines().len() as f64)
-                .fold(f64::INFINITY, f64::min);
-            npart[band] = thr * lines.len() as f64;
-        }
-        LongThreshold {
-            epart,
-            npart,
-            perceptual_entropy,
-            bands,
-        }
+        // Steps 5 to 14.
+        self.long.threshold(
+            &self.energy,
+            &self.c,
+            &mut self.long_nb_last,
+            RPELEV_LONG,
+            &mut out.long,
+        );
     }
 }
 
@@ -538,6 +684,7 @@ const MAX_PARTITIONS: usize = 72;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::window::Grouping;
 
     #[test]
     fn no_table_has_more_partitions_than_the_most() {
@@ -569,25 +716,35 @@ mod tests {
             .collect()
     }
 
-    fn run(model: &mut Model, input: &[f64]) -> Vec<LongThreshold> {
+    fn run(fs: SamplingFrequency, input: &[f64]) -> Vec<Analysis> {
+        let mut model = Model::new(fs);
         input
             .chunks_exact(FRAME_SAMPLES)
-            .map(|block| model.analyze(block.try_into().unwrap()))
+            .map(|block| {
+                let mut analysis = Analysis::new(fs);
+                model.analyze(block.try_into().unwrap(), &mut analysis);
+                analysis
+            })
             .collect()
+    }
+
+    fn long(fs: SamplingFrequency, input: &[f64]) -> Vec<Threshold> {
+        run(fs, input).into_iter().map(|a| a.long).collect()
     }
 
     #[test]
     fn silence_has_the_threshold_in_quiet_and_no_entropy_to_speak_of() {
         let fs = SamplingFrequency::Hz44100;
-        let mut model = Model::new(fs);
-        let thresholds = run(&mut model, &vec![0.0; 3 * FRAME_SAMPLES]);
-        let tables = LongTables::get(fs);
-        for threshold in &thresholds {
-            assert_eq!(threshold.epart, [0.0; MAX_BANDS]);
-            assert!(threshold.perceptual_entropy < 0.0);
-            assert_eq!(threshold.bit_allocation(), 0.0);
-            for n in 0..tables.bands.num_swb() {
-                assert!(threshold.npart[n] > 0.0);
+        for analysis in run(fs, &vec![0.0; 3 * FRAME_SAMPLES]) {
+            for threshold in std::iter::once(&analysis.long).chain(&analysis.short) {
+                assert_eq!(threshold.epart, [0.0; MAX_BANDS]);
+                assert!(threshold.perceptual_entropy < 0.0);
+                for n in 0..threshold.bands.num_swb() {
+                    assert!(threshold.npart[n] > 0.0);
+                }
+            }
+            for sequence in [WindowSequence::OnlyLong, WindowSequence::EIGHT_SHORT] {
+                assert_eq!(analysis.bit_allocation(sequence), 0.0);
             }
         }
     }
@@ -607,7 +764,7 @@ mod tests {
             })
             .collect();
         let smr = |input: &[f64]| {
-            let threshold = run(&mut Model::new(fs), input).pop().unwrap();
+            let threshold = long(fs, input).pop().unwrap();
             // Band 10, lines 40 to 47 at 48 kHz, 938 to 1125 Hz, holds
             // the tone.
             (
@@ -630,12 +787,12 @@ mod tests {
         let fs = SamplingFrequency::Hz44100;
         let mut input = vec![0.0; 4 * FRAME_SAMPLES];
         input.extend(tone(3000.0, 0.5, 4 * FRAME_SAMPLES, 44_100.0));
-        let thresholds = run(&mut Model::new(fs), &input);
+        let thresholds = long(fs, &input);
         // The frame whose window first holds the tone is held at twice the
         // last block's threshold, of silence, and so at the threshold in
         // quiet; the frames after it take their own.
         let band = 20; // lines 132 to 143, 2842 to 3101 Hz
-        let tables = LongTables::get(fs);
+        let tables = Tables::get(fs, Transform::Long);
         let quiet = (tables.band_partitions[band].clone())
             .map(|b| tables.quiet[b] / tables.partitions[b].lines().len() as f64)
             .fold(f64::INFINITY, f64::min)
@@ -653,18 +810,84 @@ mod tests {
     fn xmin_scales_npart_to_the_mdct() {
         let fs = SamplingFrequency::Hz44100;
         let input = tone(2500.0, 0.3, 3 * FRAME_SAMPLES, 44_100.0);
-        let threshold = run(&mut Model::new(fs), &input).pop().unwrap();
+        let analysis = run(fs, &input).pop().unwrap();
         let mut spectrum = [0.0; FRAME_LINES];
         spectrum[100] = 2.0;
         spectrum[101] = -1.0;
-        let xmin = threshold.xmin(&spectrum);
+        let mut xmin = Vec::new();
+        analysis.xmin(Windows::LONG_SINE, &spectrum, &mut xmin);
+        assert_eq!(xmin.len(), 1);
         let bands = GroupBands::long(fs);
         let band = (0..bands.num_swb())
             .find(|&n| bands.offset(n + 1) > 100)
             .unwrap();
+        let threshold = &analysis.long;
         let expected = threshold.npart[band] * 5.0 / threshold.epart[band];
-        assert!((xmin[band] - expected).abs() <= 1e-12 * expected);
+        assert!((xmin[0][band] - expected).abs() <= 1e-12 * expected);
         // A band without MDCT energy allows none.
-        assert_eq!(xmin[band + 5], 0.0);
+        assert_eq!(xmin[0][band + 5], 0.0);
+    }
+
+    /// A group's band is allowed what each of its windows' bands is
+    /// allowed, summed, each from its own lines, which the group sends
+    /// interleaved.
+    #[test]
+    fn a_groups_xmin_sums_its_windows() {
+        let fs = SamplingFrequency::Hz44100;
+        let input = tone(2500.0, 0.3, 3 * FRAME_SAMPLES, 44_100.0);
+        let analysis = run(fs, &input).pop().unwrap();
+        let grouping = Grouping::from_starts([true, true, false, false, true, true, true, true]);
+        let windows = Windows {
+            sequence: WindowSequence::EightShort { grouping },
+            shape: crate::window::WindowShape::Sine,
+        };
+        let spectrum: [f64; FRAME_LINES] = std::array::from_fn(|i| (i % 7) as f64 - 3.0);
+        let mut xmin = Vec::new();
+        analysis.xmin(windows, &spectrum, &mut xmin);
+        assert_eq!(xmin.len(), 6);
+        // Band 9 (lines 56 to 67 of each window, Table 46) of the second
+        // group, of windows 1 to 3, which starts at line 128.
+        let band = 128 + 3 * 56;
+        let expected: f64 = (0..3)
+            .map(|i| {
+                let lines = &spectrum[band + 12 * i..][..12];
+                let codec_e: f64 = lines.iter().map(|x| x * x).sum();
+                analysis.short[1 + i].xmin(9, codec_e)
+            })
+            .sum();
+        assert!((xmin[1][9] - expected).abs() <= 1e-12 * expected);
+        assert!(expected > 0.0);
+    }
+
+    /// Each short block sees what lies in its own window: an attack late in
+    /// the frame's block raises the entropy of the short blocks over it
+    /// alone, and that of the long block over all of them.
+    #[test]
+    fn short_blocks_place_an_attack_in_time() {
+        let fs = SamplingFrequency::Hz44100;
+        let mut input = tone(1000.0, 0.01, 4 * FRAME_SAMPLES, 44_100.0);
+        let mut state = 9u64;
+        // Noise from sample 500 of the fourth block, which of the short
+        // windows of its frame only window 7 spans: window j spans samples
+        // 128 j - 576 to 128 j - 321 of the frame's block.
+        for x in &mut input[3 * FRAME_SAMPLES + 500..] {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            *x += 0.3 * ((state >> 11) as f64 / (1u64 << 53) as f64 - 0.5);
+        }
+        let analyses = run(fs, &input);
+        let pe = |a: &Analysis, w: usize| a.short[w].perceptual_entropy;
+        let attack = &analyses[3];
+        let short: Vec<f64> = (0..8).map(|w| pe(attack, w)).collect();
+        assert!(
+            short[..7].iter().all(|&pe| pe < short[7] - 100.0),
+            "{short:?}"
+        );
+        let (before, after) = (
+            analyses[2].long.perceptual_entropy,
+            attack.long.perceptual_entropy,
+        );
+        assert!(after > before + 1000.0, "{after} against {before}");
     }
 }
