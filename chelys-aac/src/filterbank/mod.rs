@@ -28,7 +28,9 @@ const LONG_WINDOW: usize = 2 * FRAME_SAMPLES;
 /// part of the output of the IMDCT can be used directly as a 16-bit PCM
 /// audio output" (clause 8.3.6), whose full scale is 32768, where the
 /// encoder's input is at full scale 1.0 (an `i16` sample `x` is `x /
-/// 32768`). So the MDCT takes its input at that scale, and the quantizer
+/// 32768`). The output meant is taken to be the samples the IMDCT gives
+/// once windowed and overlapped and added (clause 15.3.3), the decoder's
+/// output. So the MDCT takes its input at that scale, and the quantizer
 /// (clause C.7.4), the inverse of the decoder's, gives lines that decode
 /// to it.
 const PCM_SCALE: f64 = 32_768.0;
@@ -73,6 +75,11 @@ impl Default for Filterbank {
 
 impl Filterbank {
     /// A filterbank before the first frame, whose block before is silent.
+    ///
+    /// Spec gap: the first frame's window spans "the last 1024 values of
+    /// the previous window_sequence" (clause C.3.1.1), of which there are
+    /// none. They are taken as silence, so that the first frame decodes to
+    /// silence and the input follows it whole (see [`DELAY`](crate::DELAY)).
     pub fn new() -> Self {
         Self {
             previous: Box::new([0.0; FRAME_SAMPLES]),
@@ -85,9 +92,15 @@ impl Filterbank {
     /// in the order they are sent (clause 8.3.5).
     ///
     /// The window's left half takes the shape of the frame before, or for
-    /// the first frame its own: "For the first block of the bitstream to
-    /// be decoded the window_shape of the left and right half of the window
-    /// are identical" (clause 15.3.2).
+    /// the first frame its own.
+    ///
+    /// Spec reading: Annex C says that the first half "is constrained to
+    /// use the appropriate window shape from the preceding frame" (clause
+    /// C.3.1.1), and gives no rule for the first frame, which has none. The
+    /// decoder's rule is taken, so that the encoder's window is the
+    /// decoder's: "For the first block of the bitstream to be decoded the
+    /// window_shape of the left and right half of the window are
+    /// identical" (clause 15.3.2).
     pub fn spectrum(
         &mut self,
         block: &[f64; FRAME_SAMPLES],
