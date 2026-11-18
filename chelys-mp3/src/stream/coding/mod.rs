@@ -5,11 +5,11 @@
 //! and quantises granules: by the encoding process of Annex C, or, for
 //! chelys's own tests, with one `global_gain` for every granule.
 
-#[cfg(any(test, feature = "unstable"))]
+#[cfg(feature = "unstable")]
 mod fixed_gain;
 mod model;
 
-#[cfg(any(test, feature = "unstable"))]
+#[cfg(feature = "unstable")]
 pub use fixed_gain::{encode_pcm_with_global_gain, encode_with_block_types};
 pub(super) use model::ModelCoding;
 

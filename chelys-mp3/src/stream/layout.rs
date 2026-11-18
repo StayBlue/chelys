@@ -13,11 +13,16 @@ use super::StreamConfig;
 use crate::ancillary::AncillaryQueue;
 use crate::bitstream::BitWriter;
 use crate::crc;
-use crate::granule::{BlockType, GRANULE_LINES, MAX_PART2_3_LENGTH, QuantizedGranule};
-use crate::header::{Header, Mode, PaddingSchedule};
+use crate::granule::{MAX_PART2_3_LENGTH, QuantizedGranule};
+use crate::header::{Header, Mode};
 use crate::huffman::QuadTable;
 use crate::scalefactor_bands;
 use crate::side_info::{GranuleChannel, SideInfo};
+#[cfg(any(test, feature = "unstable"))]
+use crate::{
+    granule::{BlockType, GRANULE_LINES},
+    header::PaddingSchedule,
+};
 
 /// Appends one frame (clause 2.4.1.2): the header, the `crc_check` word if
 /// the header asks for one, the side information, and then `main_data`
@@ -27,6 +32,7 @@ use crate::side_info::{GranuleChannel, SideInfo};
 /// # Panics
 ///
 /// If `main_data` does not fit in the frame.
+#[cfg(any(test, feature = "unstable"))]
 pub fn write_frame(header: &Header, side_info: &SideInfo, main_data: &[u8], out: &mut Vec<u8>) {
     let slot = write_frame_start(header, side_info, out);
     assert!(
@@ -248,6 +254,7 @@ pub(super) fn frame_contents(
 /// If the rate is not [`Rate::Constant`](crate::rate::Rate::Constant), the
 /// granules do not divide into frames for the configured channels, or a
 /// frame's granules do not fit in it.
+#[cfg(any(test, feature = "unstable"))]
 pub fn encode_granules(config: &StreamConfig, granules: &[Vec<QuantizedGranule>]) -> Vec<u8> {
     let channels = config.mode.channels();
     let per_frame = config.sampling_frequency.version().granules();
@@ -274,6 +281,7 @@ pub fn encode_granules(config: &StreamConfig, granules: &[Vec<QuantizedGranule>]
 
 /// Encodes `frames` frames of digital silence. Every granule codes to
 /// nothing, so each frame is zero-filled after its side information.
+#[cfg(any(test, feature = "unstable"))]
 pub fn encode_silence(config: &StreamConfig, frames: usize) -> Vec<u8> {
     let silent = QuantizedGranule::new(
         0,

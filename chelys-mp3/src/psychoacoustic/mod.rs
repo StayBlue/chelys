@@ -408,6 +408,7 @@ impl PsychoacousticModel {
     /// Analyses the next granule of PCM, nominally in -1.0 to 1.0, centred on
     /// the block the filterbank returns for the same granule, for long
     /// blocks.
+    #[cfg(any(test, feature = "unstable"))]
     pub fn granule(&mut self, pcm: &[f64; GRANULE_LINES]) -> Masking {
         self.analyse(pcm).0
     }

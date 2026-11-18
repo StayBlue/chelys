@@ -76,6 +76,7 @@ impl Reservoir {
 
     /// A reservoir that never holds anything: every frame's main data starts
     /// right after its side information.
+    #[cfg(any(test, feature = "unstable"))]
     pub fn disabled() -> Self {
         Self {
             bits: 0,
@@ -126,6 +127,7 @@ impl Reservoir {
 
     /// The largest number of bytes the reservoir may hold in the frame
     /// being coded.
+    #[cfg(any(test, feature = "unstable"))]
     pub fn max_bytes(&self) -> usize {
         self.max_bytes
     }

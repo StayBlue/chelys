@@ -98,6 +98,7 @@ impl Snr {
         }
     }
 
+    #[cfg(any(test, feature = "unstable"))]
     pub fn db(self) -> f64 {
         match self {
             Self::Db(db) => db,

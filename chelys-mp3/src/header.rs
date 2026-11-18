@@ -198,6 +198,7 @@ pub enum SamplingFrequency {
 
 impl SamplingFrequency {
     /// The sampling frequencies of ISO/IEC 11172-3 and 13818-3.
+    #[cfg(any(test, feature = "unstable"))]
     pub const STANDARD: [Self; 6] = [
         Self::Hz44100,
         Self::Hz48000,
@@ -331,6 +332,13 @@ impl Mode {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    not(feature = "unstable"),
+    expect(
+        dead_code,
+        reason = "the encoder writes no emphasis; the conformance tests do"
+    )
+)]
 pub enum Emphasis {
     None,
     Microseconds50_15,

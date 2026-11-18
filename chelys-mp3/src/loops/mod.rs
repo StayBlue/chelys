@@ -9,10 +9,12 @@ mod inner;
 mod outer;
 pub mod scfsi;
 
-pub use inner::{Unscaled, inner_loop, quantize, step_size};
-pub use outer::{
-    Bits, Outcome, Reuse, SAVING_NOISE_DB, Saving, excess, outer_loop, outer_loop_with,
-};
+pub use inner::Unscaled;
+#[cfg(any(test, feature = "unstable"))]
+pub use inner::{inner_loop, quantize};
+pub use outer::{Bits, Outcome, Reuse, SAVING_NOISE_DB, Saving, excess, outer_loop_with};
+#[cfg(feature = "unstable")]
+pub use {inner::step_size, outer::outer_loop};
 
 use super::header::SamplingFrequency;
 use super::stereo::IntensityPositions;

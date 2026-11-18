@@ -34,6 +34,7 @@ pub struct Bits {
 
 impl Bits {
     /// `available` bits, all of which a granule uses if it can.
+    #[cfg(any(test, feature = "unstable"))]
     pub fn all(available: usize) -> Self {
         Self {
             available,
@@ -194,6 +195,7 @@ pub const SAVING_NOISE_DB: f64 = 4.0;
 /// far beyond the decoder's output range, or the marks of `intensity` take
 /// more than the available bits, which takes fewer than its
 /// [`silent_bits`](IntensityPositions::silent_bits).
+#[cfg(any(test, feature = "unstable"))]
 pub fn outer_loop(
     xr: &[f64; GRANULE_LINES],
     xmin: &[f64],

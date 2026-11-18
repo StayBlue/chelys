@@ -38,6 +38,7 @@ fn scale(global_gain: u8) -> f64 {
 /// `ix(i) = nint((|xr(i)| / 2^((global_gain - 210) / 4))^0.75 - 0.0946)`,
 /// carrying the sign of `xr(i)`. Returns `None` if a magnitude would exceed
 /// the largest the Huffman tables can code (clause C.1.5.4.4.2).
+#[cfg(any(test, feature = "unstable"))]
 pub fn quantize(xr: &[f64; GRANULE_LINES], global_gain: u8) -> Option<[i32; GRANULE_LINES]> {
     Lines::new(xr).quantize(global_gain)
 }
@@ -207,6 +208,7 @@ const BEYOND_MAGNITUDE: i32 = 2 * MAX_MAGNITUDE as i32;
 /// loop would started from that finer step.
 ///
 /// A granule whose lines are all zero skips the loop (figure C.9.a).
+#[cfg(any(test, feature = "unstable"))]
 pub fn inner_loop(
     xr: &[f64; GRANULE_LINES],
     available_bits: usize,
@@ -224,6 +226,7 @@ pub fn inner_loop(
 }
 
 /// [`inner_loop`] for the [`Lines`] `lines`.
+#[cfg(any(test, feature = "unstable"))]
 pub fn inner_loop_lines(
     lines: &Lines,
     available_bits: usize,

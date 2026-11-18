@@ -21,11 +21,6 @@
 //! # Ok::<(), chelys_mp3::ConfigError>(())
 //! ```
 
-// Without `unstable`, the items that only `internals` and the tests use are
-// unused. With it they are public, and only private items are checked for
-// use, as before `internals` existed.
-#![cfg_attr(not(feature = "unstable"), allow(dead_code, unused_imports))]
-
 mod ancillary;
 mod bitstream;
 mod config;

@@ -12,9 +12,11 @@ mod coding;
 mod frame_encoder;
 mod layout;
 
-#[cfg(any(test, feature = "unstable"))]
+#[cfg(feature = "unstable")]
 pub use coding::{encode_pcm_with_global_gain, encode_with_block_types};
-pub use layout::{encode_granules, encode_silence, max_ancillary_bits, write_frame};
+pub use layout::max_ancillary_bits;
+#[cfg(feature = "unstable")]
+pub use layout::{encode_granules, encode_silence, write_frame};
 
 use crate::header::{Bitrate, Emphasis, Flags, Header, Mode, SamplingFrequency};
 use crate::info_tag;
@@ -39,6 +41,7 @@ impl StreamConfig {
     /// # Panics
     ///
     /// If the rate is not [`Rate::Constant`].
+    #[cfg(any(test, feature = "unstable"))]
     fn constant_bitrate(&self) -> Bitrate {
         match self.rate {
             Rate::Constant(bitrate) => bitrate,
@@ -100,6 +103,7 @@ impl StreamConfig {
 ///
 /// If the channel count does not match the configured mode, or the channels
 /// have different numbers of samples.
+#[cfg(any(test, feature = "unstable"))]
 pub fn encode_pcm(config: &StreamConfig, channels: &[&[f64]]) -> Vec<u8> {
     let mut encoder = StreamEncoder::new(*config);
     let mut out = Vec::new();
@@ -114,6 +118,7 @@ pub fn encode_pcm(config: &StreamConfig, channels: &[&[f64]]) -> Vec<u8> {
 /// # Panics
 ///
 /// As [`encode_pcm`].
+#[cfg(any(test, feature = "unstable"))]
 pub fn encode_pcm_with_info_tag(config: &StreamConfig, channels: &[&[f64]]) -> Vec<u8> {
     let mut encoder = StreamEncoder::with_info_tag(*config);
     let mut out = Vec::new();
