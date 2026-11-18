@@ -22,6 +22,9 @@ use crate::window::Windows;
 /// C.1), which the encoder does not compute yet. The inner loop runs alone,
 /// with every scalefactor 0, as clause C.7.2.1 resets them.
 ///
+/// The bits the channel leaves unused (figure C.6) are not counted here:
+/// the frame's length, spent from the bit reservoir, leaves them there.
+///
 /// # Panics
 ///
 /// If not even a channel without lines fits in `available_bits`: a

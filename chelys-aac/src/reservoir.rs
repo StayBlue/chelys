@@ -109,6 +109,13 @@ impl BitReservoir {
     /// Spec reading: clause C.7.3 leaves out `more_bits = 0`, for which
     /// both of its formulas give `mean_bits`, as the state is within 0 and
     /// `max_bit_reservoir`; that is taken.
+    ///
+    /// Spec reading: `bit_reservoir_state[frame]` is the state after the
+    /// frame (clause 8.2.3.2), which is not known until the frame is coded
+    /// with the bits made available to it. The state before it, after the
+    /// frame before, is taken: the bits the reservoir holds for it. The
+    /// bits are floored to whole bits, and to the frame's whole bytes, so
+    /// that a frame that takes them is one [`Self::spend`] takes.
     pub fn available_bits(&self, more_bits: i64) -> u32 {
         let scale = self.sample_rate as i128;
         let more = i128::from(more_bits) * scale;

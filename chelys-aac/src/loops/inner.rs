@@ -82,10 +82,12 @@ impl<'a> Lines<'a> {
     /// within its range: the smallest step at which every line can be
     /// coded.
     ///
-    /// Spec gap: the formula can give a step below the range of
-    /// `global_gain`, `common_scalefac` -100, for lines so small that they
-    /// quantize to little or nothing at that step anyway; the step is
-    /// raised to the range's.
+    /// Spec gap: for lines whose largest is below about 0.005 (at the
+    /// decoder's scale), the formula gives a step below the range of
+    /// `global_gain`, `common_scalefac` -100, which clause C.7.2.1 does not
+    /// provide for. The step is raised to the range's, the finest the
+    /// bitstream can send: the lines are coded with fewer levels than
+    /// `MAX_QUANT`, as many as that step gives them.
     fn start_gain(&self) -> u8 {
         let largest = self.scaled.iter().fold(0.0f64, |a, &x| a.max(x));
         let start = (16.0 / 3.0 * (largest / MAX_QUANT).log2()).ceil();
@@ -99,6 +101,17 @@ impl<'a> Lines<'a> {
     /// `x_quant(i) = int(mdct_scaled(i) * 2^(-3/16 * common_scalefac) +
     /// MAGIC_NUMBER)`, where `int` truncates. Magnitudes beyond
     /// [`MAX_MAGNITUDE`] are left beyond it, for counting to refuse.
+    ///
+    /// Spec reading: clause C.7.4 gives the quantizer first as `int((abs(
+    /// mdct_line) * 2^(-1/4 * (sf_decoder - SF_OFFSET)))^(3/4) +
+    /// MAGIC_NUMBER)`, the inverse of the decoder's, then, with
+    /// `sf_decoder = common_scalefac - scalefactor + SF_OFFSET`, as
+    /// `2^(-1/4 * (scalefactor - common_scalefac))`, whose sign is the
+    /// opposite of what the substitution gives, and of clauses C.7.4.1,
+    /// C.7.4.2 and C.7.4.5, and of the text after it ("a positive change
+    /// increases the magnitude of x_quant"). The second form is taken as
+    /// misprinted, and the first and clause C.7.4.2 are followed. (The
+    /// distortion of clause C.7.4.3 has the same sign as the second.)
     fn quantize(&self, global_gain: u8, x_quant: &mut [i32; FRAME_LINES]) {
         let scale = step_scale(global_gain);
         let end = self.end;
@@ -224,19 +237,26 @@ impl Counting<'_> {
 /// coding fits in `available_bits`, the bits of the channel's
 /// `individual_channel_stream()`.
 ///
-/// Spec reading: as printed, the loop changes `common_scalefac` after
-/// each count, also after the last, which fits: it ends with
-/// `common_scalefac` a step below the quantization it counted last, at a
-/// step it has not counted, whose bits may not fit. The quantization
-/// counted last is the one coded, with the `common_scalefac` it was made
-/// with, so that the bits coded are those counted. With the steps of 32,
+/// Spec reading: the pseudo code of clause C.7.4.5 changes
+/// `common_scalefac` after each count, also after the last, which fits,
+/// and so ends with it a step below the quantization it counted last, at
+/// a step it has not counted, which with bits that fall as the step grows
+/// is mostly one that does not fit. Figure C.8 adds `quantizer_change` to
+/// `common_scalefac` only where it is not 0, and so ends at the step
+/// counted last. The figure is followed: the quantization counted last is
+/// the one coded, with the `common_scalefac` it was made with, so that the
+/// bits coded are those counted. The pseudo code is followed for the rest,
+/// as the figure does not give the values of `quantizer_change` or the
+/// rule that keeps it 1 while the bits do not fit. With the steps of 32,
 /// 16, 8, 4 and 2 that come before, and bits that fall as the step grows,
-/// that is the smallest step that fits or the one above it.
+/// the step coded is the smallest that fits or the one above it.
 ///
 /// Spec reading: `common_scalefac` "must not become less than
 /// start_common_scalefac" (clause C.7.2.1), so a change that would take it
 /// lower takes it there instead. Where the first count, at the start,
 /// fits, every later step is the start again, so the loop ends there.
+/// Likewise a change that would take `global_gain` past 255, the largest
+/// scalefactor (clause 11.3.2), takes it there instead.
 ///
 /// Spec gap: Annex C does not say what to do with lines whose coding does
 /// not fit even at the largest step that `global_gain` allows, as from
