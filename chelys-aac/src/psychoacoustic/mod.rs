@@ -3,7 +3,8 @@
 
 //! The psychoacoustic model of clause C.1: for each channel's frame, the
 //! energy that each scalefactor band of a long window may take as
-//! quantization noise, `xmin(n)`, and the perceptual entropy.
+//! quantization noise, `xmin(n)`, and the perceptual entropy, from which
+//! the bits the frame asks for follow (step 15).
 //!
 //! The model runs the long FFT on the frame's window and the eight short
 //! FFTs on its short windows, whose unpredictability the long blocks' takes
@@ -47,6 +48,13 @@ const TMN: f64 = 18.0;
 
 /// `rpelev` of long blocks (step 11).
 const RPELEV_LONG: f64 = 2.0;
+
+/// `pew1` and `pew2` of long blocks (step 15).
+const PEW1_LONG: f64 = 0.3;
+const PEW2_LONG: f64 = 6.0;
+
+/// The limit of `bit_allocation` (step 15).
+const MAX_BIT_ALLOCATION: f64 = 3000.0;
 
 /// The spreading function `sprdngf(i, j)` of clause C.1.3, from `i`, the
 /// Bark value of the signal being spread, to `j`, that of the band it is
@@ -282,6 +290,17 @@ impl LongThreshold {
             };
         }
         xmin
+    }
+
+    /// `bit_allocation = pew1 * PE + pew2 * sqrt(PE)`, limited to 0 to
+    /// 3000 (step 15).
+    ///
+    /// Spec gap: the entropy is negative where the thresholds exceed the
+    /// energy, as in silence (see [`Model::analyze`]), where `sqrt(PE)` is
+    /// undefined; the allocation is then 0, the lower limit.
+    pub fn bit_allocation(&self) -> f64 {
+        let pe = self.perceptual_entropy.max(0.0);
+        (PEW1_LONG * pe + PEW2_LONG * pe.sqrt()).min(MAX_BIT_ALLOCATION)
     }
 }
 
@@ -534,6 +553,7 @@ mod tests {
         for threshold in &thresholds {
             assert_eq!(threshold.epart, [0.0; MAX_BANDS]);
             assert!(threshold.perceptual_entropy < 0.0);
+            assert_eq!(threshold.bit_allocation(), 0.0);
             for n in 0..tables.bands.num_swb() {
                 assert!(threshold.npart[n] > 0.0);
             }

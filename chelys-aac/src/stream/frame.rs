@@ -6,36 +6,99 @@
 
 use chelys_core::bitstream::BitWriter;
 
-use super::{FrameSink, StreamConfig};
+use super::{FRAME_SAMPLES, FrameSink, StreamConfig};
 use crate::adts;
-use crate::channel::CodedChannel;
+use crate::channel::{self, CodedChannel};
 use crate::config::Framing;
 use crate::raw_data_block;
+use crate::raw_data_block::element::COMMON_WINDOW;
 use crate::reservoir::BitReservoir;
+use crate::window::Windows;
 
-/// `more_bits` (clause C.7.3) of every frame.
+/// What the channels of the next frame ask of it: each channel's
+/// `bit_allocation` (clause C.1.4, step 15) and windows.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Demand {
+    pub bit_allocation: f64,
+    pub windows: Windows,
+}
+
+/// The bits of the frame that its channels' noiseless coding does not
+/// take: its header, the rest of its `raw_data_block()`, and each
+/// channel's `global_gain`, `ics_info()` and flags.
+fn side_info_bits(config: &StreamConfig, demands: &[Demand]) -> u32 {
+    let channels: u32 = (demands.iter())
+        .map(|demand| channel::bits(demand.windows, COMMON_WINDOW, 0))
+        .sum();
+    overhead_bits(config) + channels
+}
+
+/// The bits of the frame besides its channels' `individual_channel_stream()`s.
+fn overhead_bits(config: &StreamConfig) -> u32 {
+    8 * config.header_len() as u32 + raw_data_block::overhead_bits(config.channel_configuration)
+}
+
+/// `more_bits = bit_allocation - (mean_bits - side_info_bits)` (clause
+/// C.1.4, step 15): the bits the frame asks for beyond the mean, which
+/// the bit reservoir gives or takes (clause C.7.3).
 ///
-/// Spec gap: `more_bits`, the bits a frame needs beyond the mean, comes
-/// from the perceptual entropy that the psychoacoustic model computes
-/// (clause C.1.4, step 15), which the encoder does not use yet. Until it
-/// does, every frame asks for none, and is given the mean.
-const MORE_BITS: i64 = 0;
+/// Spec gap: step 15 gives `bit_allocation` for a block, which the model
+/// computes for each channel, and `more_bits` for the frame, whose bits the
+/// reservoir controls; it does not say how the channels' allocations make
+/// the frame's. They are summed, each within the limit of 3000 of its own,
+/// as each channel's loop codes its own lines (clause C.7.1).
+///
+/// Spec gap: Annex C does not define `side_info_bits`. They are taken as
+/// the bits of the frame that its channels' noiseless coding does not
+/// take, which the perceptual entropy does not count: the header, the
+/// `raw_data_block()`'s elements and end, and each channel's `global_gain`,
+/// `ics_info()` and flags. `mean_bits` is that of the stream as written,
+/// headers and all (see [`BitReservoir::new`]), rounded to a whole bit with
+/// `more_bits`.
+///
+/// Spec reading: this deliberately departs from clause C.7.3 where
+/// `more_bits` is negative, which is taken as 0. The perceptual entropy as
+/// printed is negative in most frames of music, so that `bit_allocation`
+/// is 0 (see
+/// [`LongThreshold::bit_allocation`](crate::psychoacoustic::LongThreshold::bit_allocation)),
+/// and where it is not, it is a few hundred bits; `more_bits` is then
+/// about `side_info_bits - mean_bits`. Clause C.7.3 would give such a frame
+/// only its side information, until the reservoir is full: the first
+/// three frames of a stream at 128 kbit/s in stereo, and more at lower
+/// rates, would be coded without lines, and lose their audio. Taken as 0,
+/// a frame is given the mean, and the reservoir keeps what the loops leave,
+/// for frames that ask for more.
+pub fn more_bits(config: &StreamConfig, demands: &[Demand]) -> i64 {
+    let allocation: f64 = demands.iter().map(|demand| demand.bit_allocation).sum();
+    let mean_bits = f64::from(config.bits_per_second) * FRAME_SAMPLES as f64
+        / f64::from(config.sampling_frequency.hz());
+    let side_info_bits = f64::from(side_info_bits(config, demands));
+    ((allocation - (mean_bits - side_info_bits)).round() as i64).max(0)
+}
 
 /// The bits that each channel's `individual_channel_stream()` may take in
-/// the next frame: those available to the frame (clause C.7.3), less its
-/// header and the rest of its `raw_data_block()`, shared equally.
+/// the next frame: those the reservoir makes available to the frame for
+/// its `more_bits` (clause C.7.3), less its header and the rest of its
+/// `raw_data_block()`, shared equally.
 ///
 /// Spec gap: Annex C does not say how the bits of a frame are shared
 /// between its channels, whose loops each fit one channel's lines to the
 /// bits they are given (clause C.7.1). Each channel is given an equal
 /// share; the loops of the channels after the first may take what those
-/// before them leave (see [`StreamEncoder`](super::StreamEncoder)).
-pub fn bits_per_channel(config: &StreamConfig, reservoir: &BitReservoir) -> u32 {
-    let available = reservoir.available_bits(MORE_BITS);
-    let overhead = 8 * config.header_len() as u32
-        + raw_data_block::overhead_bits(config.channel_configuration);
-    let channels = config.channel_configuration.channels() as u32;
-    available.saturating_sub(overhead) / channels
+/// before them leave (see [`StreamEncoder`](super::StreamEncoder)). Shares
+/// in proportion to each channel's `bit_allocation` were tried, and starved
+/// channels: the allocation is 0 in most frames of music, where the
+/// perceptual entropy is negative (see
+/// [`LongThreshold::bit_allocation`](crate::psychoacoustic::LongThreshold::bit_allocation)),
+/// and a channel whose allocation was 0 beside one whose was not was left
+/// the bits of a channel without lines.
+pub fn bits_per_channel(
+    config: &StreamConfig,
+    reservoir: &BitReservoir,
+    demands: &[Demand],
+) -> u32 {
+    let available = reservoir.available_bits(more_bits(config, demands));
+    available.saturating_sub(overhead_bits(config)) / demands.len() as u32
 }
 
 /// Writes the frame of `channels`, spends its bits from `reservoir`, and

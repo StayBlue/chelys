@@ -22,6 +22,7 @@ use super::reservoir::BitReservoir;
 use super::sampling_frequency::SamplingFrequency;
 use super::scalefactor_bands::MAX_BANDS;
 use super::window::Windows;
+use frame::Demand;
 
 /// The samples of each channel a frame codes (clause 8.2.1.1).
 pub const FRAME_SAMPLES: usize = 1024;
@@ -232,8 +233,9 @@ impl StreamEncoder {
     /// Codes the frame whose block starts at `start` in [`Self::pcm`], and
     /// gives it to `out`, in three steps: analyzes each channel, through
     /// its filterbank and its psychoacoustic model; has the bit reservoir
-    /// make bits available to the frame; and quantizes each channel's lines
-    /// through the iteration loops in its share of them.
+    /// make bits available to the frame for the bits the model asks for;
+    /// and quantizes each channel's lines through the iteration loops in
+    /// its share of them.
     ///
     /// The channels are quantized in order, each in its share and the bits
     /// those before it left: a channel's loops take the finest step that
@@ -249,7 +251,13 @@ impl StreamEncoder {
             analyzed.analyze(block, filterbank, model);
         }
 
-        let share = frame::bits_per_channel(&self.config, &self.reservoir);
+        let demands: Vec<Demand> = (self.analyzed.iter())
+            .map(|analyzed| Demand {
+                bit_allocation: analyzed.bit_allocation,
+                windows: analyzed.windows,
+            })
+            .collect();
+        let share = frame::bits_per_channel(&self.config, &self.reservoir, &demands);
 
         let mut left = 0;
         let channels: Vec<CodedChannel> = (self.analyzed.iter())
@@ -280,6 +288,8 @@ struct AnalyzedChannel {
     spectrum: Box<[f64; FRAME_LINES]>,
     /// The allowed distortion `xmin` of each band of each window group.
     xmin: Vec<[f64; MAX_BANDS]>,
+    /// `bit_allocation` (clause C.1.4, step 15).
+    bit_allocation: f64,
 }
 
 impl AnalyzedChannel {
@@ -288,6 +298,7 @@ impl AnalyzedChannel {
             windows: Windows::LONG_SINE,
             spectrum: Box::new([0.0; FRAME_LINES]),
             xmin: Vec::with_capacity(1),
+            bit_allocation: 0.0,
         }
     }
 
@@ -304,6 +315,7 @@ impl AnalyzedChannel {
         let threshold = model.analyze(block);
         self.xmin.clear();
         self.xmin.push(threshold.xmin(&self.spectrum));
+        self.bit_allocation = threshold.bit_allocation();
     }
 }
 
