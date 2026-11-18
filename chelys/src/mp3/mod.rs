@@ -562,7 +562,11 @@ pub fn encode_pcm_with_info_tag(config: &StreamConfig, channels: &[&[f64]]) -> V
 /// (clause 2.4.2.3: "the frame contains an additional slot to adjust the
 /// mean bitrate to the sampling frequency"); at a variable bitrate there is
 /// no mean to keep, and the bit reservoir carries what a frame does not
-/// use.
+/// use. Settled by decoding with ffmpeg, mpg123 and LAME (black box): at
+/// 44.1, 22.05 and 11.025 kHz, where a constant bitrate pads, all three
+/// decode streams of unpadded frames at a variable bitrate without
+/// complaint, and find each frame and its main data; the conformance test
+/// is `every_decoder_follows_the_bitrate_from_frame_to_frame`.
 ///
 /// The stream does not depend on how the input is divided between calls to
 /// [`encode`](Self::encode).
