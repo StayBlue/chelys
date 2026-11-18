@@ -31,6 +31,9 @@ mod encoder;
 mod raw_data_block;
 mod reservoir;
 mod sampling_frequency;
+// A tested building block that the encoder does not use yet.
+#[cfg(any(test, feature = "unstable"))]
+mod scalefactor_bands;
 mod stream;
 
 pub use chelys_core::Sample;
@@ -62,6 +65,7 @@ pub mod internals {
         raw_data_block,
         reservoir,
         sampling_frequency,
+        scalefactor_bands,
     );
 }
 
