@@ -251,6 +251,15 @@ impl Counting<'_> {
 /// 16, 8, 4 and 2 that come before, and bits that fall as the step grows,
 /// the step coded is the smallest that fits or the one above it.
 ///
+/// Spec reading: successive approximation assumes that the bits fall as
+/// the step grows, and they need not: the noiseless coding of the lines
+/// can cost more at a coarser step. Where they do not fall, the search can
+/// stop at a step above a finer one that fits, and it is followed as
+/// written. For example, at 48 kHz in mono at 6375 bit/s, the third frame
+/// of `0.8 * cos(pi * 73 * n / 1024 + 0.9)` costs 70 bits at `global_gain`
+/// 167 and 168, 71 at 169 to 172 and 69 at 173; with about 70 bits
+/// available it is coded at 173, though 167 and 168 fit.
+///
 /// Spec reading: `common_scalefac` "must not become less than
 /// start_common_scalefac" (clause C.7.2.1), so a change that would take it
 /// lower takes it there instead. Where the first count, at the start,
