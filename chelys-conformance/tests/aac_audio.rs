@@ -781,3 +781,105 @@ fn stereo_pairs_decode_each_channel_in_place() {
         }
     }
 }
+
+/// The complex amplitude of the tone of `frequency` Hz in `samples` at
+/// `sample_rate`: twice their correlation with `e^(-i w t)`, from sample
+/// `start`, as `(re, im)`.
+fn tone_amplitude(samples: &[f64], sample_rate: u32, frequency: f64, start: usize) -> (f64, f64) {
+    let w = TAU * frequency / f64::from(sample_rate);
+    let n = (samples.len() - start) as f64;
+    (samples.iter().enumerate().skip(start)).fold((0.0, 0.0), |(re, im), (t, &y)| {
+        let phase = w * (t - start) as f64;
+        (
+            re + 2.0 * y * phase.cos() / n,
+            im - 2.0 * y * phase.sin() / n,
+        )
+    })
+}
+
+/// Tones above 6 kHz, each panned its own way, one to the left, one to the
+/// right and one to both in opposite phase, decode from a pair coded in
+/// intensity stereo panned within 1 dB of the input, each channel within 3
+/// dB of its level, and in the right channel in phase or opposite as it
+/// was, at every sampling frequency whose band reaches past 9 kHz, where
+/// the tones lie in bands apart, at 0.7 bit a sample. The right channel
+/// sends bands of both intensity codebooks.
+#[test]
+fn intensity_stereo_keeps_each_tones_panning() {
+    for sample_rate in SAMPLE_RATES.into_iter().filter(|&fs| fs >= 22_050) {
+        let len = sample_rate as usize;
+        let nyquist = f64::from(sample_rate) / 2.0;
+        let top = (0.9 * nyquist).min(14_000.0);
+        // Gains of each tone in the left and right channels.
+        let tones = [
+            (6_600.0 + 0.1 * (top - 6_600.0), 0.3, 0.15),
+            (6_600.0 + 0.5 * (top - 6_600.0), 0.1, 0.3),
+            (top, 0.2, -0.2),
+        ];
+        let channel = |c: usize| -> Vec<f64> {
+            (0..len)
+                .map(|t| {
+                    let t = t as f64 / f64::from(sample_rate);
+                    // A low tone beside them, alike in both channels.
+                    let low = 0.2 * (TAU * 440.0 * t).sin();
+                    let high: f64 = (tones.iter())
+                        .map(|&(f, l, r)| [l, r][c] * (TAU * f * t).sin())
+                        .sum();
+                    low + high
+                })
+                .collect()
+        };
+        let input = [channel(0), channel(1)];
+        let context = format!("{sample_rate} Hz");
+        let bits_per_second = 14 * sample_rate / 10;
+        let encoded = encode(sample_rate, &input, bits_per_second);
+        let output = decode(&encoded, 2, &context);
+        let elements = elements(&encoded.stream, sample_rate);
+        let codebooks: Vec<u8> = (elements.iter())
+            .flat_map(|e| {
+                let right = &e.channels[1];
+                (0..right.info.group_lengths.len()).flat_map(move |g| {
+                    (0..right.info.max_sfb).map(move |sfb| right.codebook(g, sfb))
+                })
+            })
+            .collect();
+        assert!(codebooks.contains(&15), "{context}: INTENSITY_HCB");
+        assert!(codebooks.contains(&14), "{context}: INTENSITY_HCB2");
+        let decoded: Vec<Vec<f64>> = (0..2)
+            .map(|c| {
+                (output.iter().skip(c).step_by(2))
+                    .skip(DELAY)
+                    .take(len)
+                    .map(|&y| f64::from(y))
+                    .collect()
+            })
+            .collect();
+        for &(frequency, l, r) in &tones {
+            let skip = 2048;
+            let [left, right] =
+                [0, 1].map(|c| tone_amplitude(&decoded[c], sample_rate, frequency, skip));
+            let magnitude = |(re, im): (f64, f64)| (re * re + im * im).sqrt();
+            for (c, (amplitude, gain)) in [(left, l), (right, r)].into_iter().enumerate() {
+                let db = 20.0 * (magnitude(amplitude) / f64::abs(gain)).log10();
+                assert!(
+                    db.abs() < 3.0,
+                    "{context}, {frequency:.0} Hz, channel {c}: {db:.2} dB"
+                );
+            }
+            // The panning, which the positions carry within 0.75 dB.
+            let panning = 20.0 * (magnitude(right) / magnitude(left)).log10();
+            let expected = 20.0 * (r / l).abs().log10();
+            assert!(
+                (panning - expected).abs() < 1.0,
+                "{context}, {frequency:.0} Hz: {panning:.2} dB against {expected:.2} dB"
+            );
+            // The right channel's phase against the left's.
+            let product = left.0 * right.0 + left.1 * right.1;
+            assert_eq!(
+                product.signum(),
+                (l * r).signum(),
+                "{context}, {frequency:.0} Hz"
+            );
+        }
+    }
+}
