@@ -92,7 +92,7 @@ pub fn outer_loop(mut counting: Counting, xmin: &[[f64; MAX_BANDS]]) -> CodedCha
     assert_eq!(xmin.len(), groups.len(), "an xmin for each window group");
     let (mut gain, band_limit) = first_inner_loop(&mut counting);
     if band_limit < MAX_BANDS {
-        return counting.into_channel(gain);
+        return counting.into_channel(gain, band_limit);
     }
     // Whether each band's energy exceeds its xmin: those the loop is to
     // amplify, if it can.
@@ -138,14 +138,14 @@ pub fn outer_loop(mut counting: Counting, xmin: &[[f64; MAX_BANDS]]) -> CodedCha
             None => {
                 counting.scalefactors.copy_from_slice(&saved);
                 assert!(
-                    counting.fits(gain, MAX_BANDS),
+                    counting.count_at(gain, MAX_BANDS),
                     "the quantization counted before fits again"
                 );
                 break;
             }
         }
     }
-    counting.into_channel(gain)
+    counting.into_channel(gain, MAX_BANDS)
 }
 
 /// The distortion `error_energy(sb)` of each band of each window group

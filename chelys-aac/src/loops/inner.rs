@@ -188,6 +188,11 @@ pub struct Counting<'a> {
     /// The `sf_decoder` of each group's bands below `max_sfb` at the step
     /// counted last, if it fits.
     sf_decoder: Vec<Vec<u8>>,
+    /// The step and the bands sent of the count last made, if it fitted,
+    /// and the scalefactors it was made with: what the lines, sections and
+    /// `sf_decoder` above hold.
+    fitted_at: Option<(u8, usize)>,
+    fitted_scalefactors: Vec<[u8; MAX_BANDS]>,
 }
 
 impl<'a> Counting<'a> {
@@ -210,6 +215,8 @@ impl<'a> Counting<'a> {
             counted: Vec::with_capacity(groups),
             sections: Vec::with_capacity(groups),
             sf_decoder: vec![Vec::with_capacity(MAX_BANDS); groups],
+            fitted_at: None,
+            fitted_scalefactors: vec![[0; MAX_BANDS]; groups],
         }
     }
 
@@ -253,7 +260,18 @@ impl<'a> Counting<'a> {
     /// band of zeros before it repeats it (see
     /// [`scalefactors`](crate::noiseless::scalefactors)). The bits counted
     /// are those the channel is written in.
-    pub fn fits(&mut self, common_gain: u8, band_limit: usize) -> bool {
+    pub fn count_at(&mut self, common_gain: u8, band_limit: usize) -> bool {
+        self.fitted_at = None;
+        let fits = self.count(common_gain, band_limit);
+        if fits {
+            self.fitted_at = Some((common_gain, band_limit));
+            self.fitted_scalefactors.copy_from_slice(&self.scalefactors);
+        }
+        fits
+    }
+
+    /// [`Self::count_at`], but for keeping what it fitted.
+    fn count(&mut self, common_gain: u8, band_limit: usize) -> bool {
         let mut start = 0;
         for (g, bands) in self.windows.groups(self.sampling_frequency).enumerate() {
             let sent = band_limit.min(bands.num_swb());
@@ -334,9 +352,20 @@ impl<'a> Counting<'a> {
             .map(move |(start, bands)| (bands, &self.x_quant[start..start + bands.lines()]))
     }
 
-    /// The channel of the lines, sections and scalefactors counted last,
-    /// at `common_gain`, which fitted.
-    pub fn into_channel(self, common_gain: u8) -> CodedChannel {
+    /// The channel of the lines quantized at the step `common_gain` with
+    /// the scalefactors, sending the bands below `band_limit` at most, which
+    /// fit: the coding last counted, if it was made so, or else counted
+    /// again.
+    ///
+    /// # Panics
+    ///
+    /// If that coding does not fit: a caller's error.
+    pub fn into_channel(mut self, common_gain: u8, band_limit: usize) -> CodedChannel {
+        let counted = self.fitted_at == Some((common_gain, band_limit))
+            && self.fitted_scalefactors == self.scalefactors;
+        if !counted {
+            assert!(self.count_at(common_gain, band_limit), "a coding that fits");
+        }
         let global_gain = self.global_gain(common_gain);
         let groups = (self.sections.into_iter())
             .zip(self.sf_decoder)
@@ -403,7 +432,7 @@ pub fn inner_loop(counting: &mut Counting, start: u8, change: i32) -> Option<u8>
     let mut change = change;
     loop {
         let counted = gain as u8;
-        let fits = counting.fits(counted, MAX_BANDS);
+        let fits = counting.count_at(counted, MAX_BANDS);
         if fits && counted == floor {
             return Some(counted);
         }
@@ -444,7 +473,7 @@ pub fn first_inner_loop(counting: &mut Counting) -> (u8, usize) {
         return (gain, MAX_BANDS);
     }
     for band_limit in (0..MAX_BANDS).rev() {
-        if counting.fits(u8::MAX, band_limit) {
+        if counting.count_at(u8::MAX, band_limit) {
             return (u8::MAX, band_limit);
         }
     }
@@ -545,8 +574,8 @@ mod tests {
     /// The first run of the inner loop with every scalefactor 0.
     fn flat(lines: &[f64; FRAME_LINES], fs: SamplingFrequency, available: u32) -> CodedChannel {
         let mut counting = Counting::new(Lines::new(lines), Windows::LONG_SINE, fs, available);
-        let (gain, _) = first_inner_loop(&mut counting);
-        counting.into_channel(gain)
+        let (gain, band_limit) = first_inner_loop(&mut counting);
+        counting.into_channel(gain, band_limit)
     }
 
     #[test]
@@ -559,7 +588,7 @@ mod tests {
             let mut counting = Counting::new(Lines::new(&lines), Windows::LONG_SINE, fs, available);
             let start = counting.lines.start_gain();
             let smallest = (start..=u8::MAX)
-                .find(|&gain| counting.fits(gain, MAX_BANDS))
+                .find(|&gain| counting.count_at(gain, MAX_BANDS))
                 .unwrap();
             let gain = channel.global_gain();
             assert!(
@@ -601,8 +630,8 @@ mod tests {
         counting.scalefactors[0][3] = 5;
         counting.scalefactors[0][4] = 2;
         let gain = 140;
-        assert!(counting.fits(gain, MAX_BANDS));
-        let channel = counting.into_channel(gain);
+        assert!(counting.count_at(gain, MAX_BANDS));
+        let channel = counting.into_channel(gain, MAX_BANDS);
         let (group, quantized) = channel.groups().next().unwrap();
         assert_eq!(group.scalefactors[2..6], [140, 135, 138, 140]);
         // global_gain is the first band's scalefactor, the first difference
@@ -624,6 +653,20 @@ mod tests {
         counting.scalefactors[0][3] = 41;
         assert_eq!(counting.sf_decoder(41, 0, 3), Some(0));
         assert_eq!(counting.sf_decoder(40, 0, 3), None);
-        assert!(!counting.fits(40, MAX_BANDS));
+        assert!(!counting.count_at(40, MAX_BANDS));
+    }
+
+    #[test]
+    fn a_channel_is_built_from_the_scalefactors_it_is_asked_for() {
+        let fs = SamplingFrequency::Hz44100;
+        let lines = noise(9);
+        let mut counting = Counting::new(Lines::new(&lines), Windows::LONG_SINE, fs, 1 << 20);
+        assert!(counting.count_at(140, MAX_BANDS));
+        // Changed after the count, as the outer loop restores them: the
+        // channel is counted again with them.
+        counting.scalefactors[0][3] = 2;
+        let channel = counting.into_channel(140, MAX_BANDS);
+        let (group, _) = channel.groups().next().unwrap();
+        assert_eq!(group.scalefactors[2..5], [140, 138, 140]);
     }
 }
