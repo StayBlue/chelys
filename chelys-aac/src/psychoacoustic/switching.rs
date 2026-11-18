@@ -150,7 +150,11 @@ impl BlockSwitching {
 /// of a stream, which has no frame before it, may be. It is short if it has
 /// an attack, without a start frame before it: the block before it is
 /// silent (see [`Filterbank::new`](crate::filterbank::Filterbank::new)),
-/// and so is its aliasing.
+/// and so is its aliasing. Settled by decoding with ffmpeg (black box): a
+/// burst of noise at the first sample of the input, which makes the first
+/// frame short, decodes in place, at every sampling frequency, in mono and
+/// stereo; the conformance test is
+/// `attacks_are_coded_with_short_windows_at_every_sample_rate`.
 fn next_sequence(last: Option<WindowSequence>, attacks: Attacks) -> WindowSequence {
     let after_short = matches!(
         last,

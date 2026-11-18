@@ -492,6 +492,10 @@ fn castanets(sample_rate: u32, len: usize, first: usize, every: usize, seed: u64
 /// frequency, in mono and stereo; ffmpeg decodes them without complaint,
 /// with the bursts in place. The first burst, at the first sample, makes
 /// the first frame short, with no frame before it.
+///
+/// This is the evidence for the gap that the window sequence of the first
+/// frame marks as settled by decoding with ffmpeg: that the first frame
+/// may be short, with no start sequence before it.
 #[test]
 fn attacks_are_coded_with_short_windows_at_every_sample_rate() {
     for sample_rate in SAMPLE_RATES {
