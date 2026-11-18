@@ -17,6 +17,9 @@
 //! # }
 //! ```
 
+#[cfg(feature = "aac")]
+#[doc(inline)]
+pub use chelys_aac as aac;
 #[cfg(feature = "mp3")]
 #[doc(inline)]
 pub use chelys_mp3 as mp3;

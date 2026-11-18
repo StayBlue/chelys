@@ -8,13 +8,16 @@ license.workspace = true
 publish = false
 
 [dependencies]
+chelys-aac = { path = "../chelys-aac", optional = true }
 chelys-mp3 = { path = "../chelys-mp3", optional = true }
 
 [features]
 default = ["mp3"]
+# Codes only silence for now.
+aac = ["dep:chelys-aac"]
 mp3 = ["dep:chelys-mp3"]
 # Each codec's building blocks, for chelys's own conformance tests.
-unstable = ["chelys-mp3?/unstable"]
+unstable = ["chelys-aac?/unstable", "chelys-mp3?/unstable"]
 
 [[example]]
 name = "mp3_tone"

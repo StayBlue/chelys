@@ -1,0 +1,16 @@
+[package]
+name = "chelys-aac"
+description = "An AAC-LC encoder implemented from ISO/IEC 13818-7 and 14496-3."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+chelys-core = { path = "../chelys-core" }
+
+[features]
+# The encoder's building blocks, for chelys's own conformance tests: see
+# `chelys_aac::internals`.
+unstable = []

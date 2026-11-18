@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "chelys",
+    "chelys-aac",
     "chelys-cli",
     "chelys-conformance",
     "chelys-core",
@@ -10,7 +11,7 @@ members = [
 ]
 # Plain `cargo test` stays fast and hermetic; run the decoder-backed checks
 # with `cargo test --workspace` or `-p chelys-conformance`.
-default-members = ["chelys", "chelys-cli", "chelys-core", "chelys-mp3"]
+default-members = ["chelys", "chelys-aac", "chelys-cli", "chelys-core", "chelys-mp3"]
 
 [workspace.package]
 version = "0.0.1"
