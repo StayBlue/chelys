@@ -13,6 +13,30 @@ use crate::config::Framing;
 use crate::raw_data_block;
 use crate::reservoir::BitReservoir;
 
+/// `more_bits` (clause C.7.3) of every frame.
+///
+/// Spec gap: `more_bits`, the bits a frame needs beyond the mean, comes
+/// from the perceptual entropy that the psychoacoustic model computes
+/// (clause C.1.4, step 15), which the encoder does not compute yet. Until
+/// it does, every frame asks for none, and is given the mean.
+const MORE_BITS: i64 = 0;
+
+/// The bits that each channel's `individual_channel_stream()` may take in
+/// the next frame: those available to the frame (clause C.7.3), less its
+/// header and the rest of its `raw_data_block()`, shared equally.
+///
+/// Spec gap: Annex C does not say how the bits of a frame are shared
+/// between its channels, whose loops each fit one channel's lines to the
+/// bits they are given (clause C.7.1). Each channel is given an equal
+/// share, whatever its lines.
+pub fn channel_bits(config: &StreamConfig, reservoir: &BitReservoir) -> u32 {
+    let available = reservoir.available_bits(MORE_BITS);
+    let overhead = 8 * config.header_len() as u32
+        + raw_data_block::overhead_bits(config.channel_configuration);
+    let channels = config.channel_configuration.channels() as u32;
+    available.saturating_sub(overhead) / channels
+}
+
 /// Writes the frame of `channels`, spends its bits from `reservoir`, and
 /// gives it to `out`: as long as the channels take, or longer, with fill
 /// elements, where the reservoir would otherwise overflow (clause

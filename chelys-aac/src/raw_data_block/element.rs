@@ -28,7 +28,7 @@ const ELEMENT_INSTANCE_TAG: u32 = 0;
 /// and lets them be coded as middle and side (clause 12.1). While each
 /// channel is quantized apart, with its own `max_sfb`, and middle and side
 /// are not coded, the channels do not share it.
-const COMMON_WINDOW: bool = false;
+pub const COMMON_WINDOW: bool = false;
 
 /// The bits of a `single_channel_element()` besides its channel's
 /// `individual_channel_stream()`: `element_instance_tag`.

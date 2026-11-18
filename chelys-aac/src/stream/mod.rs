@@ -12,6 +12,8 @@ use super::audio_specific_config::audio_specific_config;
 use super::channel::CodedChannel;
 use super::channel_configuration::ChannelConfiguration;
 use super::config::Framing;
+use super::filterbank::Filterbank;
+use super::loops;
 use super::raw_data_block;
 use super::reservoir::BitReservoir;
 use super::sampling_frequency::SamplingFrequency;
@@ -123,6 +125,8 @@ pub struct StreamEncoder {
     /// Each channel's samples that no frame has coded yet: fewer than a
     /// block's between calls.
     pcm: Vec<Vec<f64>>,
+    /// One for each channel.
+    filterbanks: Vec<Filterbank>,
     /// The samples each channel was given.
     samples: u64,
     frames: u64,
@@ -148,6 +152,7 @@ impl StreamEncoder {
             config,
             reservoir,
             pcm: vec![Vec::with_capacity(FRAME_SAMPLES); config.channel_configuration.channels()],
+            filterbanks: vec![Filterbank::new(); config.channel_configuration.channels()],
             samples: 0,
             frames: 0,
         }
@@ -210,17 +215,27 @@ impl StreamEncoder {
     }
 
     /// Codes the frame whose block starts at `start` in [`Self::pcm`], and
-    /// gives it to `out`.
-    ///
-    /// The encoder does not analyse its input yet: every frame codes each
-    /// channel's spectrum as all zero, so the stream decodes to silence.
+    /// gives it to `out`: each channel through its filterbank, and its
+    /// lines through the iteration loops, in the bits the reservoir makes
+    /// available.
     fn encode_frame<O: FrameSink + ?Sized>(&mut self, start: usize, out: &mut O) {
-        debug_assert!(
-            self.pcm
-                .iter()
-                .all(|pcm| pcm.len() >= start + FRAME_SAMPLES)
-        );
-        let channels = self.config.silent_channels();
+        let windows = Windows::LONG_SINE;
+        let available_bits = frame::channel_bits(&self.config, &self.reservoir);
+        let channels: Vec<CodedChannel> = (self.pcm.iter())
+            .zip(&mut self.filterbanks)
+            .map(|(pcm, filterbank)| {
+                let block = pcm[start..start + FRAME_SAMPLES]
+                    .try_into()
+                    .expect("a block of samples");
+                let spectrum = filterbank.spectrum(block, windows);
+                loops::quantize_channel(
+                    &spectrum,
+                    windows,
+                    self.config.sampling_frequency,
+                    available_bits,
+                )
+            })
+            .collect();
         frame::write(&self.config, &mut self.reservoir, &channels, out);
         self.frames += 1;
     }

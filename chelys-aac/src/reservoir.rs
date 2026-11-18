@@ -94,6 +94,35 @@ impl BitReservoir {
         (shortest as usize, longest as usize)
     }
 
+    /// `available_bits` (clause C.7.3): the bits the next frame may take,
+    /// given `more_bits`, the bits beyond the mean that the psychoacoustic
+    /// model asks for it:
+    ///
+    /// `available_bits = mean_bits + min(more_bits,
+    /// bit_reservoir_state[frame])` if `more_bits > 0`, and `mean_bits +
+    /// max(more_bits, bit_reservoir_state[frame] - max_bit_reservoir)` if
+    /// `more_bits < 0`;
+    ///
+    /// in whole bits, and no more than the longest frame that
+    /// [`Self::frame_len_range`] allows, in its whole bytes.
+    ///
+    /// Spec reading: clause C.7.3 leaves out `more_bits = 0`, for which
+    /// both of its formulas give `mean_bits`, as the state is within 0 and
+    /// `max_bit_reservoir`; that is taken.
+    pub fn available_bits(&self, more_bits: i64) -> u32 {
+        let scale = self.sample_rate as i128;
+        let more = i128::from(more_bits) * scale;
+        let (state, max) = (self.state as i128, self.max as i128);
+        let extra = match more_bits {
+            1.. => more.min(state),
+            0 => 0,
+            ..0 => more.max(state - max),
+        };
+        let bits = (self.mean as i128 + extra).div_euclid(scale);
+        let (_, longest) = self.frame_len_range();
+        bits.clamp(0, 8 * longest as i128) as u32
+    }
+
     /// Takes a frame of `len` bytes, within [`Self::frame_len_range`].
     pub fn spend(&mut self, len: usize) {
         let (shortest, longest) = self.frame_len_range();
@@ -163,6 +192,38 @@ mod tests {
         assert_eq!(
             reservoir.adts_buffer_fullness(),
             (reservoir.state_bits() / 32) as u32
+        );
+    }
+
+    #[test]
+    fn available_bits_follow_more_bits_within_the_reservoir() {
+        // mean_framelength 2229.1156... bits, max_bit_reservoir 10058.
+        let mut reservoir = BitReservoir::new(Hz44100, Stereo, 96_000).unwrap();
+        // Empty, the frame may be at most 278 bytes long: 2224 bits.
+        assert_eq!(reservoir.available_bits(0), 2224);
+        assert_eq!(reservoir.available_bits(5000), 2224);
+        assert_eq!(reservoir.available_bits(-100), 2129);
+        for _ in 0..5 {
+            reservoir.spend(100);
+        }
+        // 5 * (2229.1156... - 800) bits.
+        assert_eq!(reservoir.state_bits(), 7145);
+        assert_eq!(reservoir.available_bits(0), 2229);
+        assert_eq!(reservoir.available_bits(1000), 3229);
+        // All of the reservoir: 9374.69... bits, in whole bytes.
+        assert_eq!(reservoir.available_bits(1_000_000), 8 * 1171);
+        assert_eq!(reservoir.available_bits(-1000), 1229);
+        // Negative more_bits lower it only as far as the reservoir can
+        // take what the frame leaves.
+        while reservoir.max_bits() - reservoir.state_bits() > 300 {
+            let (shortest, _) = reservoir.frame_len_range();
+            reservoir.spend(shortest.max(10));
+        }
+        let room = reservoir.max_bits() as i64 - reservoir.state_bits() as i64;
+        let available = i64::from(reservoir.available_bits(-1000));
+        assert!(
+            (available - (2229 - 1000 + 1000 - room)).abs() <= 1,
+            "{available}"
         );
     }
 

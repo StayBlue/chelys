@@ -8,15 +8,22 @@
 //! Clause and table references refer to ISO/IEC 13818-7:2006, or, where
 //! they name it, to ISO/IEC 14496-3:2019.
 //!
-//! The encoder is being built: for now each frame codes silence, whatever
-//! the input, in a stream that is valid as it will be.
+//! The encoder is being built: for now it codes every frame with the long
+//! window of the sine shape, and fits each channel's lines to its share of
+//! the frame's bits with the inner iteration loop of Annex C alone, at one
+//! quantizer step for all of them. The psychoacoustic model, which shapes
+//! the quantization noise, block switching and stereo coding are to come.
 //!
 //! ```
 //! use chelys_aac::{Config, Encoder, Rate};
 //!
 //! let config = Config::new(44_100, 2, Rate::Constant { bits_per_second: 128_000 });
 //! let mut encoder = Encoder::new(config)?;
-//! let pcm = vec![0.0f32; 2 * 44_100]; // a second of silence, interleaved
+//! // A second of a 440 Hz tone in both channels, interleaved.
+//! let pcm: Vec<f32> = (0..44_100)
+//!     .map(|t| 0.5 * (std::f32::consts::TAU * 440.0 * t as f32 / 44_100.0).sin())
+//!     .flat_map(|x| [x, x])
+//!     .collect();
 //! let mut aac = Vec::new(); // in ADTS
 //! encoder.encode_interleaved(&pcm, &mut aac);
 //! encoder.finish(&mut aac);
@@ -29,9 +36,8 @@ mod channel;
 mod channel_configuration;
 mod config;
 mod encoder;
-// A tested building block that the encoder does not use yet.
-#[cfg(any(test, feature = "unstable"))]
 mod filterbank;
+mod loops;
 mod noiseless;
 mod raw_data_block;
 mod reservoir;
@@ -68,6 +74,7 @@ pub mod internals {
         channel,
         channel_configuration,
         filterbank,
+        loops,
         noiseless,
         raw_data_block,
         reservoir,
@@ -87,9 +94,7 @@ pub mod internals {
 ///
 /// Spec gap: the standard does not say what comes before the first block
 /// of input. It is taken as silence, so that the first frame decodes to
-/// silence and the input follows it whole. While the encoder codes only
-/// silence, where the input falls in the decoded output cannot be seen;
-/// that is to be checked once it codes audio.
+/// silence and the input follows it whole.
 ///
 /// Decoding with ffmpeg (black box) gives each frame's 1024 samples, from
 /// the first frame on, and trims none: this many samples, the input, then

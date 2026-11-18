@@ -31,8 +31,10 @@ fn assert_finite<S: Sample>(samples: &[S]) {
 /// Encodes PCM as MPEG-2 AAC in the Low Complexity profile (ISO/IEC
 /// 13818-7), as it arrives.
 ///
-/// The encoder is being built: for now every frame codes each channel as
-/// silence, whatever the input, in a stream that is valid as it will be.
+/// The encoder is being built: for now it quantizes each channel at one
+/// step for all its lines, the finest that fits its share of the bits
+/// the rate gives, without a psychoacoustic model (see the [crate
+/// documentation](crate)).
 ///
 /// Output lags input: a frame is coded once its samples, and any the
 /// encoder looks ahead to, have arrived, and [`finish`](Self::finish)

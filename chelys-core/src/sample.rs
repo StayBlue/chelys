@@ -44,8 +44,10 @@ mod sealed {
 /// have, are coded as given, and a decoder that does not clip gives them
 /// back; but each codec's quantisation reaches only so far. In MP3, past
 /// some ten million times full scale a granule no longer quantises within
-/// the range of `global_gain`. The clamp keeps every finite sample far
-/// below that and far above any real signal.
+/// the range of `global_gain`; in AAC, past some hundred million times
+/// full scale the quantizer's first step (clause C.7.2.1 of ISO/IEC
+/// 13818-7) is beyond the range of its `global_gain`. The clamp keeps
+/// every finite sample far below both and far above any real signal.
 pub const MAX_MAGNITUDE: f64 = 65_536.0;
 
 /// The sample at the encoders' scale, full scale at 1.0, clamped to

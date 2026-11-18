@@ -235,3 +235,53 @@ fn an_encoder_can_move_between_threads() {
     fn send<T: Send>() {}
     send::<Encoder>();
 }
+
+/// No input at the edges of what the encoder takes makes it panic, at
+/// any sample rate, channel count or bitrate: square waves at full scale
+/// and at the clamp, the highest frequency at the clamp, noise beyond it,
+/// full-scale DC and silence, at the lowest and highest bitrates.
+#[test]
+fn inputs_at_the_edges_encode_at_every_rate() {
+    let len = 3 * 1024;
+    let square: Vec<f64> = (0..len)
+        .map(|t| if (t / 41) % 2 == 0 { 1.0 } else { -1.0 })
+        .collect();
+    let mut state = 1u64;
+    let noise: Vec<f64> = (0..len)
+        .map(|_| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            ((state >> 11) as f64 / (1u64 << 53) as f64 - 0.5) * 1e12
+        })
+        .collect();
+    let signals = [
+        square.clone(),
+        square.iter().map(|x| x * 65_536.0).collect(),
+        (0..len)
+            .map(|t| if t % 2 == 0 { 1e9 } else { -1e9 })
+            .collect(),
+        noise,
+        vec![1.0; len],
+        vec![0.0; len],
+    ];
+    for sample_rate in SAMPLE_RATES {
+        for channels in [1, 2] {
+            let Err(ConfigError::UnsupportedBitrate { min, max, .. }) =
+                Config::new(sample_rate, channels, constant(0)).check()
+            else {
+                panic!("0 bit/s is refused");
+            };
+            for bits_per_second in [min, max] {
+                let config = Config::new(sample_rate, channels, constant(bits_per_second));
+                for signal in &signals {
+                    let interleaved: Vec<f64> = signal
+                        .iter()
+                        .flat_map(|&x| std::iter::repeat_n(x, channels))
+                        .collect();
+                    encode_whole(config, &interleaved);
+                }
+            }
+        }
+    }
+}

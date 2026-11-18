@@ -13,7 +13,7 @@ chelys-mp3 = { path = "../chelys-mp3", optional = true }
 
 [features]
 default = ["mp3"]
-# Codes only silence for now.
+# Codes audio without a psychoacoustic model for now.
 aac = ["dep:chelys-aac"]
 mp3 = ["dep:chelys-mp3"]
 # Each codec's building blocks, for chelys's own conformance tests.
