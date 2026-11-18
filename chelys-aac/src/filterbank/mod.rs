@@ -80,8 +80,8 @@ impl Filterbank {
     ///
     /// Spec gap: the first frame's window spans "the last 1024 values of
     /// the previous window_sequence" (clause C.3.1.1), of which there are
-    /// none. They are taken as silence, so that the first frame decodes to
-    /// silence and the input follows it whole (see [`DELAY`](crate::DELAY)).
+    /// none. They are taken as silence, so that the first frame decodes
+    /// that silence and the input follows it whole (see [`DELAY`](crate::DELAY)).
     pub fn new() -> Self {
         Self {
             previous: Box::new([0.0; FRAME_SAMPLES]),

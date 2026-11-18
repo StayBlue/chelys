@@ -42,7 +42,9 @@ fn assert_finite<S: Sample>(samples: &[S]) {
 /// any length needs no more memory than a few frames. The stream does not
 /// depend on how the input is divided between calls. The decoded output
 /// lags the input by [`DELAY`](super::DELAY) samples, and ends with
-/// [`Finished::padding`] samples of silence.
+/// [`Finished::padding`] samples past it, all of which are to be
+/// discarded: they code silence, but decode only to near silence, as the
+/// quantization of the input next to them spreads into them.
 pub struct Encoder {
     stream: StreamEncoder,
     /// Each channel's samples of the part of a call being converted.
@@ -57,9 +59,11 @@ pub struct Finished {
     pub frames: u64,
     /// The samples each channel was given.
     pub samples: u64,
-    /// The samples of silence that the decoded output of each channel ends
-    /// with, after [`DELAY`](super::DELAY) samples and the input: the
-    /// frames' samples, `1024 * frames`, are all three together.
+    /// The samples that the decoded output of each channel ends with after
+    /// [`DELAY`](super::DELAY) samples and the input, to be discarded as
+    /// those of `DELAY` are: they code the silence that pads the input,
+    /// which decodes to near silence only. The frames' samples, `1024 *
+    /// frames`, are all three together.
     pub padding: u64,
 }
 

@@ -93,8 +93,10 @@ pub mod internals {
 /// the input, so that the decoded output holds all of it.
 ///
 /// Spec gap: the standard does not say what comes before the first block
-/// of input. It is taken as silence, so that the first frame decodes to
-/// silence and the input follows it whole. Settled by decoding with ffmpeg
+/// of input. It is taken as silence, so that the first frame decodes that
+/// silence and the input follows it whole. These samples are to be
+/// discarded: they decode to near silence only, as the quantization of
+/// the input spreads into them. Settled by decoding with ffmpeg
 /// (black box): the input lands exactly this many samples into its
 /// output, at every sampling frequency, in mono and stereo; the
 /// conformance test is
