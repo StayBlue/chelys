@@ -177,7 +177,7 @@ fn side_infos(stream: &[u8]) -> Vec<(bool, &[u8])> {
     while at + 6 <= stream.len() {
         let header = &stream[at..];
         assert_eq!(header[0], 0xFF, "no syncword at {at}");
-        let mpeg1 = header[1] >> 3 & 1 == 1;
+        let mpeg1 = (header[1] >> 3) & 1 == 1;
         let crc = if header[1] & 1 == 0 { 2 } else { 0 };
         side_infos.push((mpeg1, &header[4 + crc..]));
         at += frame_len(header);
@@ -490,7 +490,7 @@ fn modes(stream: &[u8]) -> Vec<u8> {
 
 /// The `mode_extension` of each frame of a stream.
 fn mode_extensions(stream: &[u8]) -> Vec<u8> {
-    mode_bytes(stream).iter().map(|b| b >> 4 & 0b11).collect()
+    mode_bytes(stream).iter().map(|b| (b >> 4) & 0b11).collect()
 }
 
 /// Whether each frame of a stream is coded in MS stereo: bit 1 of its
@@ -522,7 +522,7 @@ fn frame_len(header: &[u8]) -> usize {
         ],
     ];
     const HZ: [[u32; 3]; 2] = [[22_050, 24_000, 16_000], [44_100, 48_000, 32_000]];
-    let id = usize::from(header[1] >> 3 & 1);
+    let id = usize::from((header[1] >> 3) & 1);
     let kbps = KBPS[id][usize::from(header[2] >> 4)];
     let hz = HZ[id][usize::from((header[2] >> 2) & 3)];
     let slots_per_kbit = if id == 1 { 144_000 } else { 72_000 };
@@ -916,7 +916,7 @@ fn intensity_stereo_keeps_the_level_of_each_channel_at_the_lower_sampling_freque
 /// Reads `count` bits from bit `at` of `data`, most significant first.
 fn bits(data: &[u8], at: usize, count: usize) -> u32 {
     (at..at + count).fold(0, |value, bit| {
-        value << 1 | u32::from(data[bit / 8] >> (7 - bit % 8) & 1)
+        (value << 1) | u32::from((data[bit / 8] >> (7 - bit % 8)) & 1)
     })
 }
 
@@ -930,10 +930,10 @@ fn short_intensity_granules(stream: &[u8]) -> Vec<bool> {
     while at + 4 <= stream.len() {
         let header = &stream[at..];
         assert_eq!(header[0], 0xFF, "no syncword at {at}");
-        let mpeg1 = header[1] >> 3 & 1 == 1;
+        let mpeg1 = (header[1] >> 3) & 1 == 1;
         let crc = if header[1] & 1 == 0 { 2 } else { 0 };
         let side_info = &header[4 + crc..];
-        let intensity = header[3] >> 4 & 1 == 1;
+        let intensity = (header[3] >> 4) & 1 == 1;
         // The bits before the first granule's (main_data_begin, the
         // private bits and, in MPEG-1, scfsi), the bits of each granule of
         // each channel, and those before its window_switching_flag

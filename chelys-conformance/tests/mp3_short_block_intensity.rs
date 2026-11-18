@@ -14,6 +14,8 @@
 //! of each channel, against that of the same line coded in left/right
 //! stereo, tells the two apart.
 
+use std::ops::Range;
+
 use chelys::mp3::internals::header::{Bitrate, Flags, Mode, SamplingFrequency, Version};
 use chelys::mp3::internals::rate::StreamRate;
 use chelys::mp3::internals::scalefactor_bands::{self, SHORT_BANDS, SHORT_WINDOWS};
@@ -300,22 +302,26 @@ fn lines_above_the_short_bands_take_the_position_of_the_highest_band() {
 /// in ffmpeg, mpg123 and LAME.
 #[test]
 fn every_range_of_int_scalefac_compress_sends_positions_in_short_blocks() {
-    // The positions of the bands of each partition, and the
-    // scalefac_compress expected: 2 * int_scalefac_compress + 1, with
-    // intensity_scale 1.
-    let ranges: [(&[(std::ops::Range<usize>, u8)], u16); 3] = [
-        (
-            &[(0..4, 4), (4..8, 2), (8..12, 5)],
-            2 * (36 * 3 + 6 * 2 + 3) + 1,
-        ),
-        (
-            &[(0..4, 4), (4..7, 2), (7..10, 5), (10..12, 0)],
-            2 * (180 + 16 * 3 + 4 * 2 + 3) + 1,
-        ),
-        (
-            &[(0..5, 4), (5..9, 2), (9..12, 0)],
-            2 * (244 + 3 * 3 + 2) + 1,
-        ),
+    struct CompressRange {
+        /// The bands of each partition, and their position.
+        partitions: &'static [(Range<usize>, u8)],
+        /// The scalefac_compress expected: 2 * int_scalefac_compress + 1,
+        /// with intensity_scale 1.
+        compress: u16,
+    }
+    let ranges = [
+        CompressRange {
+            partitions: &[(0..4, 4), (4..8, 2), (8..12, 5)],
+            compress: 2 * (36 * 3 + 6 * 2 + 3) + 1,
+        },
+        CompressRange {
+            partitions: &[(0..4, 4), (4..7, 2), (7..10, 5), (10..12, 0)],
+            compress: 2 * (180 + 16 * 3 + 4 * 2 + 3) + 1,
+        },
+        CompressRange {
+            partitions: &[(0..5, 4), (5..9, 2), (9..12, 0)],
+            compress: 2 * (244 + 3 * 3 + 2) + 1,
+        },
     ];
     let zero_part = ZeroPart {
         start: [0; SHORT_WINDOWS],
@@ -326,7 +332,11 @@ fn every_range_of_int_scalefac_compress_sends_positions_in_short_blocks() {
         SamplingFrequency::Hz22050,
         SamplingFrequency::Hz24000,
     ] {
-        for &(partitions, expected) in &ranges {
+        for &CompressRange {
+            partitions,
+            compress: expected,
+        } in &ranges
+        {
             let mut scalefactors = [0; SCALEFACTORS];
             for (bands, position) in partitions {
                 scalefactors[SHORT_WINDOWS * bands.start..SHORT_WINDOWS * bands.end]

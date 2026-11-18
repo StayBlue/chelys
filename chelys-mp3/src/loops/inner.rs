@@ -290,7 +290,7 @@ pub fn inner_loop_step(
     });
     if let Some(mut step) = attempt(start) {
         // Finer steps while they fit.
-        while let Some(finer) = step.global_gain.checked_sub(1).and_then(&attempt) {
+        while let Some(finer) = step.global_gain.checked_sub(1).and_then(attempt) {
             step = finer;
         }
         return Some(step);

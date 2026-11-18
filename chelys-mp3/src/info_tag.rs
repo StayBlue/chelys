@@ -354,7 +354,7 @@ fn delays(stream: &Stream) -> [u8; 3] {
         .checked_sub(stream.samples + delay)
         .filter(|padding| (DECODER_DELAY..1 << 12).contains(padding))
         .expect("the stream covers the input and the decoder's delay after it");
-    let both = (delay << 12 | padding) as u32;
+    let both = ((delay << 12) | padding) as u32;
     let [_, high, middle, low] = both.to_be_bytes();
     [high, middle, low]
 }
@@ -374,7 +374,7 @@ fn misc(config: &StreamConfig) -> u8 {
         SamplingFrequency::Hz48000 => 0b10,
         _ => 0b00,
     };
-    source << 6 | stereo << 2
+    (source << 6) | (stereo << 2)
 }
 
 #[cfg(test)]

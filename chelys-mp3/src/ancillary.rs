@@ -61,7 +61,7 @@ impl AncillaryQueue {
         );
         for _ in 0..bits {
             let byte = self.bytes[0];
-            w.write(u32::from(byte >> (7 - self.taken) & 1), 1);
+            w.write(u32::from((byte >> (7 - self.taken)) & 1), 1);
             self.taken += 1;
             if self.taken == 8 {
                 self.bytes.pop_front();

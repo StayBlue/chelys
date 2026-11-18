@@ -325,7 +325,7 @@ impl Mode {
             Self::JointStereo {
                 intensity_stereo,
                 ms_stereo,
-            } => u32::from(ms_stereo) << 1 | u32::from(intensity_stereo),
+            } => (u32::from(ms_stereo) << 1) | u32::from(intensity_stereo),
             _ => 0,
         }
     }

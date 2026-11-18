@@ -153,7 +153,7 @@ const fn binary(digits: &str) -> Codeword {
     let mut bits = 0;
     let mut i = 0;
     while i < digits.len() {
-        bits = bits << 1
+        bits = (bits << 1)
             | match digits[i] {
                 b'0' => 0,
                 b'1' => 1,

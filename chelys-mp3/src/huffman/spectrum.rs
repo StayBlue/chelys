@@ -325,6 +325,13 @@ impl SpectrumCoding {
 
 /// Values counted for the choice of their coding (see
 /// [`SpectrumCoding::count`]).
+// Boxing the normal block's counts would keep the other variant small, but
+// only one or two `Counted` live at a time, beside values as large, and it
+// would cost an allocation on the common path at every step tried.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "short-lived, and boxing costs the common path an allocation per count"
+)]
 pub enum Counted {
     /// A normal block's: each partition to try, with what its coding
     /// needs counted, but its split not yet searched.
@@ -1003,7 +1010,7 @@ fn vwxy(quad: &[i32]) -> u8 {
     quad.iter().fold(0, |index, &v| {
         let magnitude = v.unsigned_abs();
         assert!(magnitude <= 1, "count1 values are limited to magnitude 1");
-        index << 1 | magnitude as u8
+        (index << 1) | magnitude as u8
     })
 }
 
@@ -1047,6 +1054,7 @@ fn write_quad(table: QuadTable, quad: &[i32], w: &mut BitWriter) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bitstream::binary_digits;
 
     fn select_table(values: &[i32]) -> u8 {
         cheapest_table(values).0
@@ -1070,7 +1078,7 @@ mod tests {
         let mut w = BitWriter::new();
         coding.write(values, bands(), &mut w);
         let len = w.bit_len();
-        let bits: String = w.into_bytes().iter().map(|b| format!("{b:08b}")).collect();
+        let bits = binary_digits(&w.into_bytes());
         bits[..len].to_owned()
     }
 

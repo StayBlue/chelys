@@ -614,6 +614,7 @@ fn half_power(halves: usize) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bitstream::binary_digits;
 
     /// Every pair of widths appears at most once, and the table holds no
     /// width above the 4 bits of `slen1` or the 3 of `slen2`.
@@ -680,7 +681,7 @@ mod tests {
         let mut w = BitWriter::new();
         scalefactors.write(compress, &mut w);
         assert_eq!(w.bit_len(), scalefactors.part2_length(compress));
-        let bits: String = w.into_bytes().iter().map(|b| format!("{b:08b}")).collect();
+        let bits = binary_digits(&w.into_bytes());
         assert_eq!(&bits[..3], "101");
         assert_eq!(&bits[3 * 11 + 2 * 9..3 * 11 + 2 * 10], "11");
     }
@@ -907,7 +908,7 @@ mod tests {
         assert_eq!(scalefactors.part2_length(compress), 7 * 2 + 7);
         let mut w = BitWriter::new();
         scalefactors.write(compress, &mut w);
-        let bits: String = w.into_bytes().iter().map(|b| format!("{b:08b}")).collect();
+        let bits = binary_digits(&w.into_bytes());
         assert_eq!(&bits[..21], "00100000000000".to_owned() + "1111111");
 
         // Position 3 would be the mark of 2 bits, and so takes 3.
@@ -918,7 +919,7 @@ mod tests {
         let mut w = BitWriter::new();
         scalefactors.write(compress, &mut w);
         assert_eq!(w.bit_len(), scalefactors.part2_length(compress));
-        let bits: String = w.into_bytes().iter().map(|b| format!("{b:08b}")).collect();
+        let bits = binary_digits(&w.into_bytes());
         let marks = 7 * slen[0] as usize..7 * (slen[0] + slen[1]) as usize;
         let mark = "1".repeat(slen[1] as usize);
         assert_eq!(bits[marks], mark.repeat(7));

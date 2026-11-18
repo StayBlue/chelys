@@ -53,6 +53,20 @@ impl BitWriter {
     }
 }
 
+/// The bytes as binary digits, most significant first, for tests to compare
+/// written bits with the fields they spell.
+#[cfg(test)]
+pub fn binary_digits(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .flat_map(|byte| {
+            (0..8)
+                .rev()
+                .map(move |i| if (byte >> i) & 1 == 1 { '1' } else { '0' })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

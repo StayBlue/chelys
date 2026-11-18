@@ -273,7 +273,7 @@ impl Case {
             None => check::ancillary(audio),
         };
         let bits: Vec<bool> = (0..8 * self.ancillary.len())
-            .map(|i| self.ancillary[i / 8] >> (7 - i % 8) & 1 == 1)
+            .map(|i| (self.ancillary[i / 8] >> (7 - i % 8)) & 1 == 1)
             .collect();
         let mut sent = 0;
         for (k, frame) in ancillary.iter().enumerate() {
@@ -308,7 +308,7 @@ impl Case {
         block_types: &mut [Option<usize>; 2],
     ) {
         let config = &self.stream_config;
-        let extension = bytes[3] >> 4 & 0b11;
+        let extension = (bytes[3] >> 4) & 0b11;
         // mode_extension: MS stereo the higher bit, intensity stereo the
         // lower (clause 2.4.2.3).
         let (ms, intensity) = (extension & 0b10 != 0, extension & 0b01 != 0);
@@ -366,7 +366,7 @@ impl Case {
         let mut at = before;
         let mut read = |count: usize| {
             let value = (at..at + count).fold(0, |value, bit| {
-                value << 1 | usize::from(side_info[bit / 8] >> (7 - bit % 8) & 1)
+                (value << 1) | usize::from((side_info[bit / 8] >> (7 - bit % 8)) & 1)
             });
             at += count;
             value

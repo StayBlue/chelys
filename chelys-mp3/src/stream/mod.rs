@@ -616,7 +616,7 @@ mod tests {
                 .collect();
             data[..8].copy_from_slice(&[0xFF, 0xFB, 0x90, 0x64, 0xFF, 0xF3, 0x48, 0xC4]);
             let bits: Vec<bool> = (0..8 * data.len())
-                .map(|i| data[i / 8] >> (7 - i % 8) & 1 == 1)
+                .map(|i| (data[i / 8] >> (7 - i % 8)) & 1 == 1)
                 .collect();
 
             let mut encoder = StreamEncoder::new(config).with_ancillary(per_frame);
@@ -714,9 +714,9 @@ mod tests {
             let mut at = 0;
             for frame in check::frames(&plain) {
                 assert_eq!(plain[at + 2] & 1, 0, "{fs:?} at {at}");
-                assert_eq!(plain[at + 3] >> 2 & 0b11, 0b00, "{fs:?} at {at}");
+                assert_eq!((plain[at + 3] >> 2) & 0b11, 0b00, "{fs:?} at {at}");
                 assert_eq!(marked[at + 2] & 1, 1, "{fs:?} at {at}");
-                assert_eq!(marked[at + 3] >> 2 & 0b11, 0b11, "{fs:?} at {at}");
+                assert_eq!((marked[at + 3] >> 2) & 0b11, 0b11, "{fs:?} at {at}");
                 marked[at + 2] &= !1;
                 marked[at + 3] &= !0b1100;
                 if crc_protected {
@@ -729,7 +729,7 @@ mod tests {
             let channels: [&[f64]; 2] = [&pcm[0], &pcm[1]];
             let tagged = encode_pcm_with_info_tag(&config(flags), &channels[..mode.channels()]);
             assert_eq!(tagged[2] & 1, 1, "{fs:?}");
-            assert_eq!(tagged[3] >> 2 & 0b11, 0b11, "{fs:?}");
+            assert_eq!((tagged[3] >> 2) & 0b11, 0b11, "{fs:?}");
         }
     }
 

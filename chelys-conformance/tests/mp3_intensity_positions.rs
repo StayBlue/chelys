@@ -21,6 +21,8 @@
 //! stereo positions and the scalefactors mark as settled by decoding with
 //! ffmpeg, mpg123 and LAME.
 
+use std::ops::Range;
+
 use chelys::mp3::internals::header::{Bitrate, Flags, Mode, SamplingFrequency};
 use chelys::mp3::internals::rate::StreamRate;
 use chelys::mp3::internals::scalefactor_bands::{self, LONG_BANDS, SHORT_WINDOWS};
@@ -243,28 +245,36 @@ fn positions_7_and_16_are_read_as_illegal() {
 /// LAME.
 #[test]
 fn every_range_of_int_scalefac_compress_sends_positions() {
-    // The positions of each partition, its bands, and the
-    // scalefac_compress expected: 2 * int_scalefac_compress + 1.
-    let ranges: [(&[(std::ops::Range<usize>, u8)], u16); 3] = [
-        (
-            &[(0..7, 4), (7..14, 2), (14..21, 5)],
-            scalefac_compress([3, 2, 3]),
-        ),
-        (
-            &[(0..6, 4), (6..12, 2), (12..18, 5), (18..21, 0)],
-            2 * (180 + 16 * 3 + 4 * 2 + 3) + intensity::SCALE,
-        ),
-        (
-            &[(0..8, 4), (8..16, 2), (16..21, 0)],
-            2 * (244 + 3 * 3 + 2) + intensity::SCALE,
-        ),
+    struct CompressRange {
+        /// The bands of each partition, and their position.
+        partitions: &'static [(Range<usize>, u8)],
+        /// The scalefac_compress expected: 2 * int_scalefac_compress + 1.
+        compress: u16,
+    }
+    let ranges = [
+        CompressRange {
+            partitions: &[(0..7, 4), (7..14, 2), (14..21, 5)],
+            compress: scalefac_compress([3, 2, 3]),
+        },
+        CompressRange {
+            partitions: &[(0..6, 4), (6..12, 2), (12..18, 5), (18..21, 0)],
+            compress: 2 * (180 + 16 * 3 + 4 * 2 + 3) + intensity::SCALE,
+        },
+        CompressRange {
+            partitions: &[(0..8, 4), (8..16, 2), (16..21, 0)],
+            compress: 2 * (244 + 3 * 3 + 2) + intensity::SCALE,
+        },
     ];
     for fs in [
         SamplingFrequency::Hz16000,
         SamplingFrequency::Hz22050,
         SamplingFrequency::Hz24000,
     ] {
-        for &(partitions, expected) in &ranges {
+        for &CompressRange {
+            partitions,
+            compress: expected,
+        } in &ranges
+        {
             let mut positions = [0; LONG_BANDS];
             for (bands, position) in partitions {
                 positions[bands.clone()].fill(*position);

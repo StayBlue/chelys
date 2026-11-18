@@ -320,7 +320,7 @@ mod tests {
     fn the_search_walks_down_while_within_and_up_until_within() {
         for count in 1..=6usize {
             for pattern in 0..1usize << count {
-                let within = |index: usize| pattern >> index & 1 == 1;
+                let within = |index: usize| (pattern >> index) & 1 == 1;
                 for start in 0..count {
                     let mut tried = Vec::new();
                     let (index, coded) = search_variable(count, start, |index| {

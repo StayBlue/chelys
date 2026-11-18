@@ -188,6 +188,7 @@ pub enum BlockType {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bitstream::binary_digits;
 
     fn written_bits(side_info: &SideInfo, channels: usize) -> Vec<u8> {
         let mut w = BitWriter::new();
@@ -241,10 +242,7 @@ mod tests {
             count1table_select: true,
         };
 
-        let bits: String = written_bits(&side_info, 1)
-            .iter()
-            .map(|b| format!("{b:08b}"))
-            .collect();
+        let bits = binary_digits(&written_bits(&side_info, 1));
         let expected = [
             "111111111",    // main_data_begin
             "10101",        // private_bits
@@ -278,10 +276,7 @@ mod tests {
             table_select: [0b10001, 0b01110],
             subblock_gain: [0b001, 0b010, 0b100],
         };
-        let bits: String = written_bits(&side_info, 1)
-            .iter()
-            .map(|b| format!("{b:08b}"))
-            .collect();
+        let bits = binary_digits(&written_bits(&side_info, 1));
         // Skip main_data_begin, private_bits, scfsi and the first four fields.
         let offset = 9 + 5 + 4 + 12 + 9 + 8 + 4;
         let expected = ["1", "11", "1", "10001", "01110", "001", "010", "100", "000"].concat();
@@ -315,10 +310,7 @@ mod tests {
         };
         side_info.granules[0] = [channel.clone(), channel];
 
-        let bits: String = written_bits(&side_info, 2)
-            .iter()
-            .map(|b| format!("{b:08b}"))
-            .collect();
+        let bits = binary_digits(&written_bits(&side_info, 2));
         let channel = [
             "101010111100", // part2_3_length
             "100100011",    // big_values

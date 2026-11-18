@@ -584,6 +584,7 @@ fn energy(lines: impl Iterator<Item = f64>) -> f64 {
 mod tests {
     use super::*;
     use crate::bitstream::BitWriter;
+    use crate::bitstream::binary_digits;
     use crate::scalefactor_bands::LONG_BANDS;
     use crate::stereo::middle_side;
 
@@ -678,7 +679,7 @@ mod tests {
         let compress = scalefactors.compress().unwrap();
         let mut w = BitWriter::new();
         scalefactors.write(compress, &mut w);
-        let bits: String = w.into_bytes().iter().map(|b| format!("{b:08b}")).collect();
+        let bits = binary_digits(&w.into_bytes());
         assert_eq!(&bits[..4 * 6], "000000001001000000000000");
         assert_eq!(&bits[4 * 6..4 * 11], "01110111011101110111");
         assert_eq!(&bits[4 * 11..4 * 11 + 3], "111");
@@ -766,7 +767,7 @@ mod tests {
         let compress = scalefactors.compress().unwrap();
         let mut w = BitWriter::new();
         scalefactors.write(compress, &mut w);
-        let bits: String = w.into_bytes().iter().map(|b| format!("{b:08b}")).collect();
+        let bits = binary_digits(&w.into_bytes());
         let sent = |index: usize| {
             let at = if index < 18 {
                 4 * index

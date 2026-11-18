@@ -65,8 +65,8 @@ fn walk(stream: &[u8], free: Option<Bitrate>) -> Vec<Frame> {
             header[0] == 0xFF && header[1] & 0xE0 == 0xE0,
             "no sync word at {at}"
         );
-        assert_eq!(header[1] >> 1 & 0b11, 0b01, "Layer III at {at}");
-        let version = match header[1] >> 3 & 1 {
+        assert_eq!((header[1] >> 1) & 0b11, 0b01, "Layer III at {at}");
+        let version = match (header[1] >> 3) & 1 {
             1 => Version::Mpeg1,
             _ => Version::Mpeg2,
         };
@@ -75,7 +75,7 @@ fn walk(stream: &[u8], free: Option<Bitrate>) -> Vec<Frame> {
             (Version::Mpeg2, true) => [22_050, 24_000, 16_000],
             (Version::Mpeg2, false) => [11_025, 12_000, 8_000],
         };
-        let hz = family[usize::from(header[2] >> 2 & 0b11)];
+        let hz = family[usize::from((header[2] >> 2) & 0b11)];
         let fs = SamplingFrequency::ALL
             .into_iter()
             .find(|fs| fs.hz() == hz)
@@ -88,7 +88,7 @@ fn walk(stream: &[u8], free: Option<Bitrate>) -> Vec<Frame> {
                 .nth(usize::from(index) - 1)
                 .expect("a bitrate of the table"),
         };
-        let padding = header[2] >> 1 & 1 == 1;
+        let padding = (header[2] >> 1) & 1 == 1;
         let len = bitrate.frame_len(fs, padding);
         let crc = if header[1] & 1 == 0 { 2 } else { 0 };
         let channels = if header[3] >> 6 == 0b11 { 1 } else { 2 };
@@ -101,7 +101,7 @@ fn walk(stream: &[u8], free: Option<Bitrate>) -> Vec<Frame> {
         let side_info = &stream[at + 4 + crc..at + 4 + crc + side_info_len];
         let bits = |from: usize, count: usize| {
             (from..from + count).fold(0, |value, bit| {
-                value << 1 | usize::from(side_info[bit / 8] >> (7 - bit % 8) & 1)
+                (value << 1) | usize::from((side_info[bit / 8] >> (7 - bit % 8)) & 1)
             })
         };
         // main_data_begin, private_bits and scfsi, then the fields of each
@@ -180,7 +180,7 @@ fn ancillary_of(stream: &[u8], frames: &[Frame]) -> Vec<Vec<bool>> {
         .iter()
         .flat_map(|f| stream[f.slot.0..f.slot.1].iter().copied())
         .collect();
-    let bit = |at: usize| slots[at / 8] >> (7 - at % 8) & 1 == 1;
+    let bit = |at: usize| (slots[at / 8] >> (7 - at % 8)) & 1 == 1;
     let ends = frames.iter().skip(1).map(|f| 8 * f.begin);
     frames
         .iter()
