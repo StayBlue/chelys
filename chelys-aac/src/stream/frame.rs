@@ -29,7 +29,7 @@ const MORE_BITS: i64 = 0;
 /// between its channels, whose loops each fit one channel's lines to the
 /// bits they are given (clause C.7.1). Each channel is given an equal
 /// share, whatever its lines.
-pub fn channel_bits(config: &StreamConfig, reservoir: &BitReservoir) -> u32 {
+pub fn bits_per_channel(config: &StreamConfig, reservoir: &BitReservoir) -> u32 {
     let available = reservoir.available_bits(MORE_BITS);
     let overhead = 8 * config.header_len() as u32
         + raw_data_block::overhead_bits(config.channel_configuration);

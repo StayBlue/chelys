@@ -118,7 +118,7 @@ impl<F: FnMut(&[u8])> FrameSink for F {
 
 /// Codes a stream from PCM as it arrives, in any lengths, a frame for each
 /// block of [`FRAME_SAMPLES`] of each channel.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct StreamEncoder {
     config: StreamConfig,
     reservoir: BitReservoir,
@@ -220,7 +220,7 @@ impl StreamEncoder {
     /// available.
     fn encode_frame<O: FrameSink + ?Sized>(&mut self, start: usize, out: &mut O) {
         let windows = Windows::LONG_SINE;
-        let available_bits = frame::channel_bits(&self.config, &self.reservoir);
+        let available_bits = frame::bits_per_channel(&self.config, &self.reservoir);
         let channels: Vec<CodedChannel> = (self.pcm.iter())
             .zip(&mut self.filterbanks)
             .map(|(pcm, filterbank)| {
