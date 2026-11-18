@@ -12,7 +12,7 @@ chelys-aac = { path = "../chelys-aac", optional = true }
 chelys-mp3 = { path = "../chelys-mp3", optional = true }
 
 [features]
-default = ["mp3"]
+default = ["aac", "mp3"]
 # Codes audio without a psychoacoustic model for now.
 aac = ["dep:chelys-aac"]
 mp3 = ["dep:chelys-mp3"]
