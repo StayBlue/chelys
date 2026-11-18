@@ -7,9 +7,9 @@
 use chelys_core::bitstream::BitWriter;
 
 use super::adts::{self, HEADER_LEN};
+use super::audio_specific_config::audio_specific_config;
 use super::channel_configuration::ChannelConfiguration;
 use super::config::Framing;
-use super::encoder::Output;
 use super::raw_data_block;
 use super::reservoir::BitReservoir;
 use super::sampling_frequency::SamplingFrequency;
@@ -50,10 +50,7 @@ impl StreamConfig {
 
     /// The highest bitrate, at which the reservoir holds a byte.
     pub fn max_bits_per_second(&self) -> u32 {
-        BitReservoir::max_bits_per_second(
-            self.sampling_frequency.hz(),
-            self.channel_configuration.channels(),
-        )
+        BitReservoir::max_bits_per_second(self.sampling_frequency, self.channel_configuration)
     }
 
     fn reservoir(&self) -> Option<BitReservoir> {
@@ -61,8 +58,8 @@ impl StreamConfig {
             return None;
         }
         BitReservoir::new(
-            self.sampling_frequency.hz(),
-            self.channel_configuration.channels(),
+            self.sampling_frequency,
+            self.channel_configuration,
             self.bits_per_second,
         )
     }
@@ -70,6 +67,40 @@ impl StreamConfig {
     /// Whether every frame of a stream so configured can be written.
     pub fn is_valid(&self) -> bool {
         self.reservoir().is_some()
+    }
+}
+
+/// Where an [`Encoder`](crate::Encoder) gives the frames it codes, one call each, in their
+/// order.
+pub trait FrameSink {
+    /// Takes a frame: an `adts_frame()` or a `raw_data_block()`, as
+    /// [`Config::framing`](crate::Config::framing) asked.
+    fn frame(&mut self, frame: &[u8]);
+}
+
+/// Appends each frame, as to a stream in ADTS.
+impl FrameSink for Vec<u8> {
+    fn frame(&mut self, frame: &[u8]) {
+        self.extend_from_slice(frame);
+    }
+}
+
+/// Calls the closure with each frame, as to keep raw frames apart:
+///
+/// ```
+/// # use chelys_aac::{Config, Encoder, Framing, Rate};
+/// let config = Config::new(48_000, 1, Rate::Constant { bits_per_second: 64_000 })
+///     .framing(Framing::Raw);
+/// let mut encoder = Encoder::new(config).unwrap();
+/// let mut frames = Vec::new();
+/// let mut out = |frame: &[u8]| frames.push(frame.to_vec());
+/// encoder.encode_interleaved(&[0i16; 4096], &mut out);
+/// encoder.finish(&mut out);
+/// assert_eq!(frames.len(), 5);
+/// ```
+impl<F: FnMut(&[u8])> FrameSink for F {
+    fn frame(&mut self, frame: &[u8]) {
+        self(frame);
     }
 }
 
@@ -96,6 +127,19 @@ impl StreamEncoder {
         }
     }
 
+    pub fn config(&self) -> &StreamConfig {
+        &self.config
+    }
+
+    /// The `AudioSpecificConfig()` of ISO/IEC 14496-3 that describes the
+    /// stream.
+    pub fn audio_specific_config(&self) -> Vec<u8> {
+        audio_specific_config(
+            self.config.sampling_frequency,
+            self.config.channel_configuration,
+        )
+    }
+
     /// The frames coded so far.
     pub fn frames(&self) -> usize {
         self.frames
@@ -106,7 +150,7 @@ impl StreamEncoder {
     ///
     /// The encoder does not analyse its input yet: every frame codes each
     /// channel's spectrum as all zero, so the stream decodes to silence.
-    pub fn encode<O: Output + ?Sized>(&mut self, block: &[&[f64]], out: &mut O) {
+    pub fn encode<O: FrameSink + ?Sized>(&mut self, block: &[&[f64]], out: &mut O) {
         debug_assert!(block.iter().all(|channel| channel.len() == FRAME_SAMPLES));
         let header_len = self.config.header_len();
         // As short as the reservoir allows: the silent channels, filled

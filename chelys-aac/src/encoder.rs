@@ -6,49 +6,14 @@
 
 use chelys_core::sample::{self, Sample};
 
-use super::audio_specific_config::audio_specific_config;
 use super::config::{Config, ConfigError};
-use super::stream::{FRAME_SAMPLES, StreamConfig, StreamEncoder};
+use super::stream::{FRAME_SAMPLES, FrameSink, StreamEncoder};
 
 /// Converts a sample to the encoder's scale, clamped to
 /// [`MAX_MAGNITUDE`](chelys_core::sample::MAX_MAGNITUDE), and reads one that
 /// is NaN or infinite as silence.
 fn convert<S: Sample>(sample: S) -> f64 {
     sample::convert(sample).unwrap_or(0.0)
-}
-
-/// Where an [`Encoder`] gives the frames it codes, one call each, in their
-/// order.
-pub trait Output {
-    /// Takes a frame: an `adts_frame()` or a `raw_data_block()`, as
-    /// [`Config::framing`] asked.
-    fn frame(&mut self, frame: &[u8]);
-}
-
-/// Appends each frame, as to a stream in ADTS.
-impl Output for Vec<u8> {
-    fn frame(&mut self, frame: &[u8]) {
-        self.extend_from_slice(frame);
-    }
-}
-
-/// Calls the closure with each frame, as to keep raw frames apart:
-///
-/// ```
-/// # use chelys_aac::{Config, Encoder, Framing, Rate};
-/// let config = Config::new(48_000, 1, Rate::Constant { bits_per_second: 64_000 })
-///     .framing(Framing::Raw);
-/// let mut encoder = Encoder::new(config).unwrap();
-/// let mut frames = Vec::new();
-/// let mut out = |frame: &[u8]| frames.push(frame.to_vec());
-/// encoder.encode_interleaved(&[0i16; 4096], &mut out);
-/// encoder.finish(&mut out);
-/// assert_eq!(frames.len(), 5);
-/// ```
-impl<F: FnMut(&[u8])> Output for F {
-    fn frame(&mut self, frame: &[u8]) {
-        self(frame);
-    }
 }
 
 /// Encodes PCM as MPEG-2 AAC in the Low Complexity profile (ISO/IEC
@@ -67,7 +32,6 @@ impl<F: FnMut(&[u8])> Output for F {
 /// silence, and one beyond 65536 times full scale is clamped there.
 pub struct Encoder {
     stream: StreamEncoder,
-    config: StreamConfig,
     /// The input of each channel, converted, that no frame has coded yet.
     pcm: Vec<Vec<f64>>,
     /// The samples each channel was given.
@@ -102,7 +66,6 @@ impl Encoder {
         let channels = config.channel_configuration.channels();
         Ok(Self {
             stream: StreamEncoder::new(config),
-            config,
             pcm: vec![Vec::new(); channels],
             given: vec![0; channels],
             next_channel: 0,
@@ -111,7 +74,7 @@ impl Encoder {
 
     /// The number of channels the input has.
     pub fn channels(&self) -> usize {
-        self.pcm.len()
+        self.stream.config().channel_configuration.channels()
     }
 
     /// The samples of each channel a frame codes: 1024.
@@ -122,10 +85,7 @@ impl Encoder {
     /// The `AudioSpecificConfig()` of ISO/IEC 14496-3 that describes the
     /// stream to a decoder of its raw frames, as an MPEG-4 file carries it.
     pub fn audio_specific_config(&self) -> Vec<u8> {
-        audio_specific_config(
-            self.config.sampling_frequency,
-            self.config.channel_configuration,
-        )
+        self.stream.audio_specific_config()
     }
 
     /// Encodes interleaved samples, one of each channel in turn, and gives
@@ -133,7 +93,7 @@ impl Encoder {
     ///
     /// The samples need not be whole sample frames: a call may end within
     /// one, and the next go on from there.
-    pub fn encode_interleaved<S: Sample, O: Output + ?Sized>(
+    pub fn encode_interleaved<S: Sample, O: FrameSink + ?Sized>(
         &mut self,
         samples: &[S],
         out: &mut O,
@@ -153,7 +113,11 @@ impl Encoder {
     /// The slices need not be of one length: a channel given more than
     /// another waits for it. Slices past the encoder's channels are
     /// ignored, and a channel without one is given nothing.
-    pub fn encode_planar<S: Sample, O: Output + ?Sized>(&mut self, channels: &[&[S]], out: &mut O) {
+    pub fn encode_planar<S: Sample, O: FrameSink + ?Sized>(
+        &mut self,
+        channels: &[&[S]],
+        out: &mut O,
+    ) {
         for ((pcm, given), samples) in self.pcm.iter_mut().zip(&mut self.given).zip(channels) {
             pcm.extend(samples.iter().map(|&s| convert(s)));
             *given += samples.len();
@@ -162,7 +126,7 @@ impl Encoder {
     }
 
     /// Codes every frame whose samples have all arrived.
-    fn encode_blocks<O: Output + ?Sized>(&mut self, out: &mut O) {
+    fn encode_blocks<O: FrameSink + ?Sized>(&mut self, out: &mut O) {
         let ready = self.pcm.iter().map(Vec::len).min().unwrap_or(0) / FRAME_SAMPLES;
         for i in 0..ready {
             let block: Vec<&[f64]> = (self.pcm.iter())
@@ -178,7 +142,7 @@ impl Encoder {
     /// Ends the stream: pads the input with silence to whole frames, at
     /// least [`DELAY`](super::DELAY) samples past it, so that the decoded
     /// output holds all of the input, and gives `out` the frames left.
-    pub fn finish<O: Output + ?Sized>(mut self, out: &mut O) -> Finished {
+    pub fn finish<O: FrameSink + ?Sized>(mut self, out: &mut O) -> Finished {
         let samples = self.given.iter().copied().max().unwrap_or(0);
         let frames = (samples + super::DELAY).div_ceil(FRAME_SAMPLES);
         let left = (frames - self.stream.frames()) * FRAME_SAMPLES;

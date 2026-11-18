@@ -5,11 +5,12 @@
 //! far each frame may fall short of the mean length, or run past it, and
 //! the state ADTS reports as `adts_buffer_fullness`.
 
+use super::channel_configuration::ChannelConfiguration;
+use super::sampling_frequency::SamplingFrequency;
+use super::stream::FRAME_SAMPLES;
+
 /// The bits of the decoder's input buffer per channel (clause 8.2.3.1).
 const BUFFER_BITS_PER_CHANNEL: u64 = 6144;
-
-/// The samples of each channel a frame codes.
-const FRAME_SAMPLES: u64 = 1024;
 
 /// The state of the bit reservoir, kept exactly: in bits times the
 /// sampling frequency, as the mean length of a frame is a fraction of a
@@ -47,10 +48,14 @@ impl BitReservoir {
     /// frame. It is taken as empty, so that the first frame is no longer
     /// than the mean, and no frame needs more bits than the rate has
     /// brought by its end.
-    pub fn new(sample_rate: u32, channels: usize, bits_per_second: u32) -> Option<Self> {
-        let sample_rate = u64::from(sample_rate);
-        let channels = channels as u64;
-        let mean = u64::from(bits_per_second) * FRAME_SAMPLES;
+    pub fn new(
+        sampling_frequency: SamplingFrequency,
+        channel_configuration: ChannelConfiguration,
+        bits_per_second: u32,
+    ) -> Option<Self> {
+        let sample_rate = u64::from(sampling_frequency.hz());
+        let channels = channel_configuration.channels() as u64;
+        let mean = u64::from(bits_per_second) * FRAME_SAMPLES as u64;
         let buffer = BUFFER_BITS_PER_CHANNEL * channels * sample_rate;
         // max_bit_reservoir = INT(buffer - mean_framelength), as in the
         // example of clause 8.2.3.2.
@@ -65,9 +70,13 @@ impl BitReservoir {
     }
 
     /// The highest bitrate whose reservoir holds a byte, by [`Self::new`].
-    pub fn max_bits_per_second(sample_rate: u32, channels: usize) -> u32 {
-        let buffer = BUFFER_BITS_PER_CHANNEL * channels as u64;
-        ((buffer - 8) * u64::from(sample_rate) / FRAME_SAMPLES) as u32
+    pub fn max_bits_per_second(
+        sampling_frequency: SamplingFrequency,
+        channel_configuration: ChannelConfiguration,
+    ) -> u32 {
+        let buffer = BUFFER_BITS_PER_CHANNEL * channel_configuration.channels() as u64;
+        let sample_rate = u64::from(sampling_frequency.hz());
+        ((buffer - 8) * sample_rate / FRAME_SAMPLES as u64) as u32
     }
 
     /// The lengths in bytes the next frame may have, from the shortest
@@ -124,18 +133,21 @@ impl BitReservoir {
 mod tests {
     use super::*;
 
+    use ChannelConfiguration::{Mono, Stereo};
+    use SamplingFrequency::{Hz8000, Hz44100, Hz48000, Hz96000};
+
     #[test]
     fn the_maximum_follows_the_example_of_the_standard() {
         // 96 kbit/s, stereo, 44.1 kHz: mean_framelength 2229.1156...,
         // max_bit_reservoir 10058 (clause 8.2.3.2).
-        let reservoir = BitReservoir::new(44_100, 2, 96_000).unwrap();
+        let reservoir = BitReservoir::new(Hz44100, Stereo, 96_000).unwrap();
         assert_eq!(reservoir.max_bits(), 10_058);
         assert_eq!(reservoir.frame_len_range(), (0, 278));
     }
 
     #[test]
     fn short_frames_fill_the_reservoir_to_its_maximum() {
-        let mut reservoir = BitReservoir::new(48_000, 1, 64_000).unwrap();
+        let mut reservoir = BitReservoir::new(Hz48000, Mono, 64_000).unwrap();
         // mean_framelength 1365.33... bits.
         let mut total = 0;
         for _ in 0..100 {
@@ -156,14 +168,14 @@ mod tests {
 
     #[test]
     fn bitrates_up_to_the_buffer_less_a_byte() {
-        for (sample_rate, channels) in [(8_000, 1), (44_100, 2), (96_000, 2)] {
-            let max = BitReservoir::max_bits_per_second(sample_rate, channels);
-            let reservoir = BitReservoir::new(sample_rate, channels, max).unwrap();
+        for (fs, channels) in [(Hz8000, Mono), (Hz44100, Stereo), (Hz96000, Stereo)] {
+            let max = BitReservoir::max_bits_per_second(fs, channels);
+            let reservoir = BitReservoir::new(fs, channels, max).unwrap();
             assert!(reservoir.max_bits() >= 8);
-            assert!(BitReservoir::new(sample_rate, channels, max + 1).is_none());
+            assert!(BitReservoir::new(fs, channels, max + 1).is_none());
             let (shortest, longest) = reservoir.frame_len_range();
             assert!(shortest <= longest);
         }
-        assert!(BitReservoir::new(8_000, 1, u32::MAX).is_none());
+        assert!(BitReservoir::new(Hz8000, Mono, u32::MAX).is_none());
     }
 }

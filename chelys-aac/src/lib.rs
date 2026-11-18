@@ -35,7 +35,8 @@ mod stream;
 
 pub use chelys_core::Sample;
 pub use config::{Config, ConfigError, Framing, Rate, SAMPLE_RATES};
-pub use encoder::{Encoder, Finished, Output};
+pub use encoder::{Encoder, Finished};
+pub use stream::FrameSink;
 
 /// The encoder's building blocks, for chelys's own conformance tests: the
 /// bitstream's fields, and ways to encode a stream that the public API

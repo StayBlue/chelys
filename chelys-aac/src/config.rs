@@ -28,7 +28,7 @@ pub enum Rate {
     Constant { bits_per_second: u32 },
 }
 
-/// How each frame is given to the [`Output`](super::Output).
+/// How each frame is given to the [`FrameSink`](super::FrameSink).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Framing {
     /// Each frame in an `adts_frame()`, whose header tells a decoder all it
