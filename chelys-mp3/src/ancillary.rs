@@ -9,7 +9,7 @@
 
 use std::collections::VecDeque;
 
-use crate::bitstream::BitWriter;
+use chelys_core::bitstream::BitWriter;
 
 /// The ancillary data queued for frames not yet coded, and how many of its
 /// bits each frame may carry.

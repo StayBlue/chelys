@@ -583,10 +583,10 @@ fn energy(lines: impl Iterator<Item = f64>) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bitstream::BitWriter;
-    use crate::bitstream::binary_digits;
     use crate::scalefactor_bands::LONG_BANDS;
     use crate::stereo::middle_side;
+    use chelys_core::bitstream::BitWriter;
+    use chelys_core::bitstream::binary_digits;
 
     /// The Layer I and II bounds, subbands 16, 12, 8 and 4, start at lines
     /// 288, 216, 144 and 72 of a long block, and 96, 72, 48 and 24 of each

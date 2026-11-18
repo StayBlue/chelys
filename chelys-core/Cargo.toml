@@ -1,0 +1,10 @@
+[package]
+name = "chelys-core"
+description = "What chelys's encoders share: the bit writer and the PCM samples they take."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]

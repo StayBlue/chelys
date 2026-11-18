@@ -24,8 +24,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "chelys-core"
+version = "0.0.1"
+
+[[package]]
 name = "chelys-mp3"
 version = "0.0.1"
+dependencies = [
+ "chelys-core",
+]
 
 [[package]]
 name = "chelys-quality"

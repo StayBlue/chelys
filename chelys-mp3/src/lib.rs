@@ -22,7 +22,6 @@
 //! ```
 
 mod ancillary;
-mod bitstream;
 mod config;
 mod crc;
 mod encoder;
@@ -41,8 +40,9 @@ mod side_info;
 mod stereo;
 mod stream;
 
+pub use chelys_core::Sample;
 pub use config::{ChannelMode, Config, ConfigError, Rate, SAMPLE_RATES, bitrates};
-pub use encoder::{Encoder, Finished, Sample};
+pub use encoder::{Encoder, Finished};
 
 /// The encoder's building blocks, for chelys's own conformance tests: the
 /// stages of Annex C, the bitstream's fields and tables, and
@@ -79,7 +79,7 @@ pub mod internals {
     );
 
     pub mod bitstream {
-        pub use crate::bitstream::*;
+        pub use chelys_core::bitstream::*;
     }
 }
 

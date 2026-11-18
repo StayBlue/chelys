@@ -7,12 +7,12 @@
 //! frequencies), with the intensity stereo positions the right channel sends
 //! in their place (clause 2.4.3.4.9.3), and preemphasis (Table B.6).
 
-use crate::bitstream::BitWriter;
 use crate::granule::BlockType;
 use crate::header::Version;
 use crate::scalefactor_bands::{LONG_BANDS, MIXED_SHORT_START, SHORT_BANDS, SHORT_WINDOWS};
 use crate::side_info::SCFSI_BANDS;
 use crate::stereo::intensity;
+use chelys_core::bitstream::BitWriter;
 
 /// The long scalefactor bands of each scfsi band: `SCFSI_STARTS[band]` up to
 /// `SCFSI_STARTS[band + 1]` (clause 2.4.2.7).
@@ -614,7 +614,7 @@ fn half_power(halves: usize) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bitstream::binary_digits;
+    use chelys_core::bitstream::binary_digits;
 
     /// Every pair of widths appears at most once, and the table holds no
     /// width above the 4 bits of `slen1` or the 3 of `slen2`.

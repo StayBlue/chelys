@@ -10,10 +10,10 @@
 //! gives them for the granule's block type.
 
 use super::{PairTable, QuadTable, pair_table};
-use crate::bitstream::BitWriter;
 use crate::granule::{BlockType, GRANULE_LINES};
 use crate::header::SamplingFrequency;
 use crate::scalefactor_bands::{Band, LONG_BANDS, MIXED_LONG_LINES};
+use chelys_core::bitstream::BitWriter;
 
 /// The largest magnitude allowed in the `big_values` partition (clause
 /// 2.4.2.7).
@@ -1054,7 +1054,7 @@ fn write_quad(table: QuadTable, quad: &[i32], w: &mut BitWriter) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bitstream::binary_digits;
+    use chelys_core::bitstream::binary_digits;
 
     fn select_table(values: &[i32]) -> u8 {
         cheapest_table(values).0

@@ -4,8 +4,8 @@
 //! Layer III side information (clauses 2.4.1.7 and 2.4.2.7, and clause
 //! 2.4.1.7 of ISO/IEC 13818-3 for the lower sampling frequencies).
 
-use crate::bitstream::BitWriter;
 use crate::header::Version;
+use chelys_core::bitstream::BitWriter;
 
 pub const SCFSI_BANDS: usize = 4;
 
@@ -188,7 +188,7 @@ pub enum BlockType {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bitstream::binary_digits;
+    use chelys_core::bitstream::binary_digits;
 
     fn written_bits(side_info: &SideInfo, channels: usize) -> Vec<u8> {
         let mut w = BitWriter::new();

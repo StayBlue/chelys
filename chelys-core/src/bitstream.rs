@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: MIT
 
 //! Most-significant-bit-first bit output, as used by the `bslbf` and `uimsbf`
-//! mnemonics (clause 2.2.6).
+//! mnemonics (clause 2.2.6 of ISO/IEC 11172-3, clause 4.6 of ISO/IEC
+//! 13818-7).
 
 #[derive(Debug, Default)]
 pub struct BitWriter {
@@ -55,7 +56,6 @@ impl BitWriter {
 
 /// The bytes as binary digits, most significant first, for tests to compare
 /// written bits with the fields they spell.
-#[cfg(test)]
 pub fn binary_digits(bytes: &[u8]) -> String {
     bytes
         .iter()

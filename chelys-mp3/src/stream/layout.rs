@@ -11,7 +11,6 @@ use std::ops::Range;
 
 use super::StreamConfig;
 use crate::ancillary::AncillaryQueue;
-use crate::bitstream::BitWriter;
 use crate::crc;
 use crate::granule::{MAX_PART2_3_LENGTH, QuantizedGranule};
 use crate::header::{Header, Mode};
@@ -23,6 +22,7 @@ use crate::{
     granule::{BlockType, GRANULE_LINES},
     header::PaddingSchedule,
 };
+use chelys_core::bitstream::BitWriter;
 
 /// Appends one frame (clause 2.4.1.2): the header, the `crc_check` word if
 /// the header asks for one, the side information, and then `main_data`

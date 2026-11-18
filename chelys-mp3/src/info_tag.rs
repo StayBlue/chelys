@@ -24,7 +24,7 @@ use super::rate::StreamRate;
 use super::side_info::SideInfo;
 use super::stream::StreamConfig;
 use super::{DELAY, crc};
-use crate::bitstream::BitWriter;
+use chelys_core::bitstream::BitWriter;
 
 /// The bytes of the tag: 120 of the Xing fields, 36 of the extension.
 const TAG_LEN: usize = 156;

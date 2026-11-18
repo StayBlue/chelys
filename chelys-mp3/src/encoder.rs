@@ -4,64 +4,22 @@
 //! The encoder as the library offers it: PCM in, the stream out, as the
 //! PCM arrives.
 
+use chelys_core::sample::{self, Sample};
+
 use super::config::{Config, ConfigError};
 use super::stream::StreamEncoder;
 
-/// A PCM sample the encoder takes: `f32` and `f64` at a nominal full scale
-/// of -1.0 to 1.0, and `i16` at its own, read as `x / 32768`.
-pub trait Sample: Copy + sealed::Sealed {}
-
-impl Sample for f32 {}
-impl Sample for f64 {}
-impl Sample for i16 {}
-
-mod sealed {
-    pub trait Sealed {
-        fn to_f64(self) -> f64;
-    }
-
-    impl Sealed for f32 {
-        fn to_f64(self) -> f64 {
-            f64::from(self)
-        }
-    }
-
-    impl Sealed for f64 {
-        fn to_f64(self) -> f64 {
-            self
-        }
-    }
-
-    impl Sealed for i16 {
-        fn to_f64(self) -> f64 {
-            f64::from(self) / 32_768.0
-        }
-    }
-}
-
-/// The magnitude past which a sample is clamped: 65536 times full scale,
-/// 96 dB above it.
-///
-/// Spec gap: the standard takes PCM within full scale, and says nothing of
-/// samples beyond it. Those somewhat beyond, as floating-point PCM may
-/// have, are coded as given, and a decoder that does not clip gives them
-/// back; but past some ten million times full scale a granule no longer
-/// quantises within the range of `global_gain`. The clamp keeps every
-/// finite sample within that range, far below that and far above any real
-/// signal. Lines that need more bits than their granule has even at the
-/// largest step, as from some hundreds of times full scale at low
-/// bitrates, lose their highest frequencies (see the outer loop).
-const MAX_MAGNITUDE: f64 = 65_536.0;
-
-/// Converts a sample to the encoder's scale.
+/// Converts a sample to the encoder's scale, clamped to
+/// [`MAX_MAGNITUDE`](chelys_core::sample::MAX_MAGNITUDE). Lines that need
+/// more bits than their granule has even at the largest step, as from some
+/// hundreds of times full scale at low bitrates, lose their highest
+/// frequencies (see the outer loop).
 ///
 /// # Panics
 ///
 /// If the sample is NaN or infinite.
 fn convert<S: Sample>(sample: S) -> f64 {
-    let x = sealed::Sealed::to_f64(sample);
-    assert!(x.is_finite(), "a sample is not a finite number: {x}");
-    x.clamp(-MAX_MAGNITUDE, MAX_MAGNITUDE)
+    sample::convert(sample).expect("a sample is not a finite number")
 }
 
 /// Encodes PCM as MPEG-1 Layer III, or at the lower sampling frequencies

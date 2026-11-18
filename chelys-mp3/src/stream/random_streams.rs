@@ -25,10 +25,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::check::{self, Frame};
 use super::{StreamConfig, max_ancillary_bits};
-use crate::bitstream::BitWriter;
 use crate::crc::crc16;
 use crate::header::{Bitrate, Mode};
 use crate::{ChannelMode, Config, DELAY, Encoder, Finished, Rate, SAMPLE_RATES, Sample, bitrates};
+use chelys_core::bitstream::BitWriter;
 
 /// The cases a plain `cargo test` runs.
 const CASES: u64 = 48;
