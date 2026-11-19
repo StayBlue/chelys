@@ -320,17 +320,15 @@ fn ffmpeg_decodes_5_1_and_7_1_at_the_ends_of_their_range() {
 }
 
 /// FAAD2 decodes the streams of 5.1 and 7.1 above as ffmpeg does, at 8
-/// kHz at twice the sampling frequency, but for those of 7.1 at the
-/// highest bitrates: it decodes no frame longer than [`FAAD_LONGEST`]
-/// bytes, and their frames are longer, up to the 6144 bits that each of
-/// the seven channels but the LFE may take. It reports an error at the
-/// first, the stream's first, and decodes nothing from it on.
+/// kHz at twice the sampling frequency: those of 7.1 at the highest
+/// bitrates too, whose frames are kept to [`FAAD_LONGEST`] bytes, the
+/// longest it decodes, where the 6144 bits that each of the seven channels
+/// but the LFE may take would let them be longer.
 #[test]
 fn faad_decodes_5_1_and_7_1_at_the_ends_of_their_range() {
     let cut_short =
         decodes_5_1_and_7_1_at_the_ends_of_their_range(faad::decode_aac, 2, Some(FAAD_LONGEST));
-    // 7.1 at the highest bitrate, with the CRC and without, at each rate.
-    assert_eq!(cut_short, 6);
+    assert_eq!(cut_short, 0);
 }
 
 /// The longest `adts_frame()` in bytes that FAAD2 decodes: 768 for each
@@ -382,8 +380,9 @@ fn padded(frame: &[u8], len: usize) -> Vec<u8> {
 /// whole and without complaint, and padded to 4609 bytes, FAAD2 reports
 /// an error at it and gives only the three frames before it. Neither frame
 /// is one the encoder writes, as a pair's frame holds 6144 bits for each
-/// channel at most; they find FAAD2's limit, which 7.1 at its highest
-/// bitrates passes.
+/// channel at most; they find FAAD2's limit, which the frames of 7.1 would
+/// pass at the highest bitrates the standard allows, and within which the
+/// encoder keeps every frame in ADTS.
 #[test]
 fn faad_decodes_no_frame_longer_than_4608_bytes() {
     let sample_rate = 48_000;

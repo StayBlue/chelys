@@ -13,6 +13,25 @@ use super::stream::FRAME_SAMPLES;
 /// 8.2.3.1).
 const BUFFER_BITS_PER_CHANNEL: u64 = 6144;
 
+/// The longest `adts_frame()` written, in bytes, its header and
+/// `adts_error_check()` included, as the reservoir counts them (see
+/// [`BitReservoir::new`]).
+///
+/// Spec reading: clauses 8.2.3.1 and 8.2.3.3 let a frame be as long as
+/// the decoder's input buffer, 6144 bits for each channel of the NCC,
+/// which is longer than 4608 bytes only in 7.1 (configuration 7, NCC 7),
+/// at 5376 bytes. FAAD2 2.11.4 (black box) decodes no ADTS frame longer
+/// than 4608 bytes, where ffmpeg does: it reports an error at the first
+/// and decodes nothing from it on. So a stream in ADTS is kept to them, a
+/// stricter subset of what the standard allows, as `ms_mask_present` 1 is
+/// sent for ffmpeg where 2 would do (see
+/// [`crate::stereo::middle_side::choose`]). Only the longest frame, and
+/// with it the highest bitrate, are lowered: the buffer,
+/// `max_bit_reservoir`, `adts_buffer_fullness` and each element's share of
+/// the buffer (see [`element_max_bits`]) stay the standard's. Raw frames
+/// keep the standard's limits.
+pub const MAX_ADTS_FRAME_LEN: usize = 4608;
+
 /// The most bits an element of `kind` may take in a frame, after its
 /// `id_syn_ele`: those of its own share of the decoder's input buffer,
 /// 6144 for a single channel and 12288 for a pair, less the 3 of its
@@ -52,12 +71,17 @@ pub struct BitReservoir {
     max: u64,
     /// `bit_reservoir_state`, times the sampling frequency.
     state: u64,
+    /// The longest frame in bytes: [`MAX_ADTS_FRAME_LEN`] in ADTS, and
+    /// `u64::MAX` for raw frames, which only the buffer limits.
+    max_frame_len: u64,
 }
 
 impl BitReservoir {
     /// The reservoir of a stream of `channel_configuration` at
-    /// `bits_per_second`, its buffer sized by the NCC, if a frame can be given its mean length within a
-    /// byte: if `max_bit_reservoir` is 8 bits at least.
+    /// `bits_per_second`, its buffer sized by the NCC, and its frames no
+    /// longer than `max_frame_len` bytes if given, if a frame can be given
+    /// its mean length within a byte: if `max_bit_reservoir` is 8 bits at
+    /// least, and the mean is a byte shorter than `max_frame_len` at least.
     ///
     /// Spec reading: the maximum bitrate (clause 8.2.3.3) is that of a
     /// frame as long as the decoder's input buffer, where
@@ -65,7 +89,8 @@ impl BitReservoir {
     /// length, which is a fraction of a bit where the rate does not divide
     /// evenly. Frames are whole bytes, so the reservoir is kept a byte at
     /// least, and the highest bitrate is below the maximum by a byte a
-    /// frame.
+    /// frame. The same byte is kept below `max_frame_len`, which lowers
+    /// the highest bitrate of 7.1 in ADTS (see [`MAX_ADTS_FRAME_LEN`]).
     ///
     /// The mean is that of the stream as it is written: a stream in ADTS
     /// counts its headers, as the decoder's input buffer holds them too
@@ -79,6 +104,7 @@ impl BitReservoir {
         sampling_frequency: SamplingFrequency,
         channel_configuration: ChannelConfiguration,
         bits_per_second: u32,
+        max_frame_len: Option<usize>,
     ) -> Option<Self> {
         let sample_rate = u64::from(sampling_frequency.hz());
         let ncc = channel_configuration.ncc() as u64;
@@ -87,37 +113,51 @@ impl BitReservoir {
         // max_bit_reservoir = INT(buffer - mean_framelength), as in the
         // example of clause 8.2.3.2.
         let max_bits = buffer.checked_sub(mean)? / sample_rate;
-        (max_bits >= 8).then_some(Self {
+        let fits =
+            max_frame_len.is_none_or(|len| mean + 8 * sample_rate <= 8 * len as u64 * sample_rate);
+        let max_frame_len = max_frame_len.map_or(u64::MAX, |len| len as u64);
+        (max_bits >= 8 && fits).then_some(Self {
             sample_rate,
             ncc,
             mean,
             max: max_bits * sample_rate,
             state: 0,
+            max_frame_len,
         })
     }
 
-    /// The highest bitrate whose reservoir holds a byte, by [`Self::new`].
+    /// The highest bitrate that [`Self::new`] takes: that of the buffer,
+    /// or of frames of `max_frame_len` bytes where they are shorter, less
+    /// a byte.
     pub fn max_bits_per_second(
         sampling_frequency: SamplingFrequency,
         channel_configuration: ChannelConfiguration,
+        max_frame_len: Option<usize>,
     ) -> u32 {
         let buffer = BUFFER_BITS_PER_CHANNEL * channel_configuration.ncc() as u64;
+        let longest = max_frame_len.map_or(buffer, |len| buffer.min(8 * len as u64));
         let sample_rate = u64::from(sampling_frequency.hz());
-        ((buffer - 8) * sample_rate / FRAME_SAMPLES as u64) as u32
+        ((longest - 8) * sample_rate / FRAME_SAMPLES as u64) as u32
     }
 
     /// The lengths in bytes the next frame may have, from the shortest
     /// that keeps the reservoir within `max_bit_reservoir` to the longest
-    /// that keeps it from running below empty (clause 8.2.3.2):
+    /// that keeps it from running below empty (clause 8.2.3.2), and is no
+    /// longer than the longest frame given to [`Self::new`]:
     ///
     /// `0 ≤ bit_reservoir_state[frame] ≤ max_bit_reservoir`, where
     /// `bit_reservoir_state[frame] = bit_reservoir_state[frame - 1] +
     /// mean_framelength - framelength[frame]`.
+    ///
+    /// The shortest is never longer than the longest: as the reservoir is
+    /// within `max_bit_reservoir`, the shortest is a mean frame at most,
+    /// rounded up to a byte, which [`Self::new`] keeps a byte shorter than
+    /// the longest frame given.
     pub fn frame_len_range(&self) -> (usize, usize) {
         let available = self.state + self.mean;
         let byte = 8 * self.sample_rate;
         let shortest = available.saturating_sub(self.max).div_ceil(byte);
-        let longest = available / byte;
+        let longest = (available / byte).min(self.max_frame_len);
         (shortest as usize, longest as usize)
     }
 
@@ -211,21 +251,21 @@ impl BitReservoir {
 mod tests {
     use super::*;
 
-    use ChannelConfiguration::{Mono, Stereo};
+    use ChannelConfiguration::{FiveOne, Mono, SevenOne, Stereo};
     use SamplingFrequency::{Hz8000, Hz44100, Hz48000, Hz96000};
 
     #[test]
     fn the_maximum_follows_the_example_of_the_standard() {
         // 96 kbit/s, stereo, 44.1 kHz: mean_framelength 2229.1156...,
         // max_bit_reservoir 10058 (clause 8.2.3.2).
-        let reservoir = BitReservoir::new(Hz44100, Stereo, 96_000).unwrap();
+        let reservoir = BitReservoir::new(Hz44100, Stereo, 96_000, None).unwrap();
         assert_eq!(reservoir.max_bits(), 10_058);
         assert_eq!(reservoir.frame_len_range(), (0, 278));
     }
 
     #[test]
     fn short_frames_fill_the_reservoir_to_its_maximum() {
-        let mut reservoir = BitReservoir::new(Hz48000, Mono, 64_000).unwrap();
+        let mut reservoir = BitReservoir::new(Hz48000, Mono, 64_000, None).unwrap();
         // mean_framelength 1365.33... bits.
         let mut total = 0;
         for _ in 0..100 {
@@ -247,7 +287,7 @@ mod tests {
     #[test]
     fn available_bits_follow_more_bits_within_the_reservoir() {
         // mean_framelength 2229.1156... bits, max_bit_reservoir 10058.
-        let mut reservoir = BitReservoir::new(Hz44100, Stereo, 96_000).unwrap();
+        let mut reservoir = BitReservoir::new(Hz44100, Stereo, 96_000, None).unwrap();
         // Empty, the frame may be at most 278 bytes long: 2224 bits.
         assert_eq!(reservoir.available_bits(0), 2224);
         assert_eq!(reservoir.available_bits(5000), 2224);
@@ -280,7 +320,7 @@ mod tests {
     fn the_bits_offered_are_a_quarter_of_those_beyond_what_is_kept() {
         // mean_framelength 2229.1156... bits, max_bit_reservoir 10058: what
         // lies beyond 8943.44... bits.
-        let mut reservoir = BitReservoir::new(Hz44100, Stereo, 96_000).unwrap();
+        let mut reservoir = BitReservoir::new(Hz44100, Stereo, 96_000, None).unwrap();
         // Empty, the frame is offered the most it may take: 278 bytes.
         assert_eq!(reservoir.offered_bits(), 2224);
         for _ in 0..6 {
@@ -313,7 +353,7 @@ mod tests {
         // Where the maximum less half a mean frame is less than half of
         // the maximum, half of it is kept: in mono at 192 kbit/s, whose
         // maximum of 1685 bits is less than half a mean frame, 842.
-        let mut reservoir = BitReservoir::new(Hz44100, Mono, 192_000).unwrap();
+        let mut reservoir = BitReservoir::new(Hz44100, Mono, 192_000, None).unwrap();
         assert_eq!(reservoir.max_bits(), 1685);
         while reservoir.max_bits() - reservoir.state_bits() > 8 {
             let (shortest, _) = reservoir.frame_len_range();
@@ -328,13 +368,82 @@ mod tests {
     #[test]
     fn bitrates_up_to_the_buffer_less_a_byte() {
         for (fs, channels) in [(Hz8000, Mono), (Hz44100, Stereo), (Hz96000, Stereo)] {
-            let max = BitReservoir::max_bits_per_second(fs, channels);
-            let reservoir = BitReservoir::new(fs, channels, max).unwrap();
+            let max = BitReservoir::max_bits_per_second(fs, channels, None);
+            let reservoir = BitReservoir::new(fs, channels, max, None).unwrap();
             assert!(reservoir.max_bits() >= 8);
-            assert!(BitReservoir::new(fs, channels, max + 1).is_none());
+            assert!(BitReservoir::new(fs, channels, max + 1, None).is_none());
             let (shortest, longest) = reservoir.frame_len_range();
             assert!(shortest <= longest);
         }
-        assert!(BitReservoir::new(Hz8000, Mono, u32::MAX).is_none());
+        assert!(BitReservoir::new(Hz8000, Mono, u32::MAX, None).is_none());
+    }
+
+    /// Spends the shortest frames the reservoir allows, filling it, and
+    /// gives the range of each frame's lengths.
+    fn fill(reservoir: &mut BitReservoir) -> Vec<(usize, usize)> {
+        (0..40)
+            .map(|_| {
+                let range = reservoir.frame_len_range();
+                reservoir.spend(range.0);
+                range
+            })
+            .collect()
+    }
+
+    #[test]
+    fn adts_frames_of_7_1_are_no_longer_than_4608_bytes() {
+        let longest = Some(MAX_ADTS_FRAME_LEN);
+        for fs in [Hz8000, Hz48000, Hz96000] {
+            let hz = u64::from(fs.hz());
+            let max = BitReservoir::max_bits_per_second(fs, SevenOne, longest);
+            assert_eq!(u64::from(max), (8 * 4608 - 8) * hz / 1024);
+            assert!(BitReservoir::new(fs, SevenOne, max + 1, longest).is_none());
+            // At the highest bitrate and at one where the buffer, 5376
+            // bytes, would let a frame be longer once the reservoir fills.
+            for bits_per_second in [max, max / 3] {
+                let mut reservoir =
+                    BitReservoir::new(fs, SevenOne, bits_per_second, longest).unwrap();
+                // The standard's reservoir, which the cap leaves as it is.
+                let buffer = 6144 * 7 - (u64::from(bits_per_second) * 1024).div_ceil(hz);
+                assert_eq!(reservoir.max_bits(), buffer);
+                for (shortest, longest) in fill(&mut reservoir) {
+                    assert!(
+                        shortest <= longest && longest <= 4608,
+                        "{shortest} {longest}"
+                    );
+                }
+                assert!(reservoir.max_bits() - reservoir.state_bits() <= 8);
+                assert_eq!(reservoir.frame_len_range().1, 4608);
+                assert!(reservoir.available_bits(1_000_000) <= 36_864);
+                assert!(reservoir.offered_bits() <= 36_864);
+                let mut raw = BitReservoir::new(fs, SevenOne, bits_per_second, None).unwrap();
+                fill(&mut raw);
+                assert!(raw.frame_len_range().1 > 4608);
+            }
+        }
+    }
+
+    #[test]
+    fn the_cap_leaves_raw_7_1_and_adts_5_1_as_they_were() {
+        for fs in [Hz8000, Hz44100, Hz48000, Hz96000] {
+            let hz = u64::from(fs.hz());
+            let raw = BitReservoir::max_bits_per_second(fs, SevenOne, None);
+            assert_eq!(u64::from(raw), (6144 * 7 - 8) * hz / 1024);
+            assert!(BitReservoir::new(fs, SevenOne, raw, None).is_some());
+            let adts = BitReservoir::max_bits_per_second(fs, FiveOne, Some(MAX_ADTS_FRAME_LEN));
+            assert_eq!(adts, BitReservoir::max_bits_per_second(fs, FiveOne, None));
+            assert_eq!(u64::from(adts), (6144 * 5 - 8) * hz / 1024);
+            for bits_per_second in [adts, adts / 3] {
+                let [mut capped, mut uncapped] = [Some(MAX_ADTS_FRAME_LEN), None].map(|longest| {
+                    BitReservoir::new(fs, FiveOne, bits_per_second, longest).unwrap()
+                });
+                assert_eq!(fill(&mut capped), fill(&mut uncapped));
+                assert_eq!(
+                    capped.available_bits(1_000_000),
+                    uncapped.available_bits(1_000_000)
+                );
+                assert_eq!(capped.offered_bits(), uncapped.offered_bits());
+            }
+        }
     }
 }

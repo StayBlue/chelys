@@ -85,16 +85,29 @@ fn errors_name_what_was_refused() {
     }
 }
 
-/// Raw frames lack the headers, so the lowest bitrate is lower.
+/// Raw frames lack the headers, so the lowest bitrate is lower; and in 7.1
+/// they may be longer than the 4608 bytes an ADTS frame is kept to, so the
+/// highest is higher.
 #[test]
 fn the_bitrate_range_depends_on_the_framing() {
-    let range = |framing| match Config::new(8_000, 1, constant(0)).framing(framing).check() {
+    let range = |channels, framing| match Config::new(8_000, channels, constant(0))
+        .framing(framing)
+        .check()
+    {
         Err(ConfigError::UnsupportedBitrate { min, max, .. }) => (min, max),
         other => panic!("{other:?}"),
     };
-    let (adts, raw) = (range(Framing::Adts), range(Framing::Raw));
+    for channels in [1, 6] {
+        let (adts, raw) = (
+            range(channels, Framing::Adts),
+            range(channels, Framing::Raw),
+        );
+        assert!(raw.0 < adts.0);
+        assert_eq!(raw.1, adts.1);
+    }
+    let (adts, raw) = (range(8, Framing::Adts), range(8, Framing::Raw));
     assert!(raw.0 < adts.0);
-    assert_eq!(raw.1, adts.1);
+    assert_eq!((adts.1, raw.1), (287_937, 335_937));
 }
 
 #[test]

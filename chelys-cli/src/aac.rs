@@ -33,16 +33,16 @@ AAC in the Low Complexity profile (AAC-LC) to stdout, each frame in ADTS.
   --bitrate KBPS     the stream's constant bitrate, ADTS headers and any CRC
                      included: a whole number within the range of the
                      sample rate and channels, at 48 kHz 5 to 287 in mono,
-                     5 to 575 in stereo, 10 to 1439 in 5.1 and 12 to 2015
+                     5 to 575 in stereo, 10 to 1439 in 5.1 and 12 to 1727
                      in 7.1, at 44.1 kHz 4 to 264, 5 to 528, 9 to 1322 and
-                     11 to 1851; the lowest from 1 in mono at 8 kHz to 24
+                     11 to 1587; the lowest from 1 in mono at 8 kHz to 24
                      in 7.1 at 96 kHz, and the highest 6144 bits a frame
-                     for each channel but the LFE; with --crc, the lowest
-                     is up to 2 higher (default 128 in mono and stereo,
-                     and 64 for each channel but the LFE in more: 192 in
-                     3 channels, 320 in 5.1, 448 in 7.1; or the highest
-                     the sample rate and channels allow where that is
-                     lower)
+                     for each channel but the LFE, or 4608 bytes in 7.1;
+                     with --crc, the lowest is up to 2 higher (default 128
+                     in mono and stereo, and 64 for each channel but the
+                     LFE in more: 192 in 3 channels, 320 in 5.1, 448 in
+                     7.1; or the highest the sample rate and channels
+                     allow where that is lower)
   --crc              protect each frame's header and the start of its audio
                      with a CRC-16 check word, 16 bits a frame (default:
                      off)
@@ -339,10 +339,10 @@ mod tests {
             ("96000", "2", "10 to 1151", "12 to 1151"),
             ("88200", "2", "9 to 1057", "11 to 1057"),
             ("48000", "6", "10 to 1439", "11 to 1439"),
-            ("48000", "8", "12 to 2015", "13 to 2015"),
+            ("48000", "8", "12 to 1727", "13 to 1727"),
             ("44100", "6", "9 to 1322", "10 to 1322"),
-            ("44100", "8", "11 to 1851", "12 to 1851"),
-            ("96000", "8", "24 to 4031", "25 to 4031"),
+            ("44100", "8", "11 to 1587", "12 to 1587"),
+            ("96000", "8", "24 to 3455", "25 to 3455"),
         ] {
             assert_eq!(range(rate, channels, &[]), without, "{rate} {channels}");
             assert_eq!(range(rate, channels, &["--crc"]), with, "{rate} {channels}");
@@ -364,7 +364,7 @@ mod tests {
             ("44100", "2", "528"),
             ("48000", "6", "10"),
             ("48000", "6", "1439"),
-            ("48000", "8", "2015"),
+            ("48000", "8", "1727"),
         ] {
             let args = [
                 "--sample-rate",
@@ -397,6 +397,6 @@ mod tests {
         assert_eq!(kbps("48000", "6"), 320);
         assert_eq!(kbps("48000", "8"), 448);
         assert_eq!(kbps("8000", "6"), 239);
-        assert_eq!(kbps("8000", "8"), 335);
+        assert_eq!(kbps("8000", "8"), 287);
     }
 }

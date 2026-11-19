@@ -269,7 +269,9 @@ pub enum ConfigError {
     /// rate, channels and framing: below the bits of the shortest frame, or
     /// above those of the decoder's input buffer, 6144 a channel, the
     /// low frequency enhancement channel not counted (clauses 8.2.3.1 and
-    /// 8.2.3.3), less a byte for the bit reservoir.
+    /// 8.2.3.3), or in ADTS those of a frame of 4608 bytes where they are
+    /// fewer, as in 7.1, the longest frame FAAD2 decodes; less a byte for
+    /// the bit reservoir.
     UnsupportedBitrate {
         bits_per_second: u32,
         min: u32,

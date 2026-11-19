@@ -155,9 +155,21 @@ impl StreamConfig {
         8 * self.shortest_frame_len(windows, 0) as u32
     }
 
-    /// The highest bitrate, at which the reservoir holds a byte.
+    /// The longest frame in bytes: [`reservoir::MAX_ADTS_FRAME_LEN`] in
+    /// ADTS, and none but the buffer's for raw frames.
+    fn max_frame_len(&self) -> Option<usize> {
+        (self.framing == Framing::Adts).then_some(reservoir::MAX_ADTS_FRAME_LEN)
+    }
+
+    /// The highest bitrate, at which the reservoir holds a byte, and a
+    /// mean frame is a byte shorter than the longest at least (see
+    /// [`BitReservoir::new`]).
     pub fn max_bits_per_second(&self) -> u32 {
-        BitReservoir::max_bits_per_second(self.sampling_frequency, self.channel_configuration)
+        BitReservoir::max_bits_per_second(
+            self.sampling_frequency,
+            self.channel_configuration,
+            self.max_frame_len(),
+        )
     }
 
     fn reservoir(&self) -> Option<BitReservoir> {
@@ -168,6 +180,7 @@ impl StreamConfig {
             self.sampling_frequency,
             self.channel_configuration,
             self.bits_per_second,
+            self.max_frame_len(),
         )
     }
 
@@ -1379,8 +1392,9 @@ mod tests {
     }
 
     /// The bitrate of a configuration ranges from that of its shortest
-    /// frame to that of its NCC's input buffer, and every frame of silence
-    /// and noise fits it at both ends, with the CRC and without.
+    /// frame to that of its NCC's input buffer, or of 4608 bytes where that
+    /// is less (see [`reservoir::MAX_ADTS_FRAME_LEN`]), and every frame of
+    /// silence and noise fits it at both ends, with the CRC and without.
     #[test]
     fn every_configuration_codes_at_both_ends_of_its_range() {
         let fs = SamplingFrequency::Hz44100;
@@ -1397,7 +1411,7 @@ mod tests {
                 };
                 let max = config.max_bits_per_second();
                 let ncc = channel_configuration.ncc() as u64;
-                assert_eq!(max as u64, (6144 * ncc - 8) * 44_100 / 1024);
+                assert_eq!(max as u64, ((6144 * ncc).min(8 * 4608) - 8) * 44_100 / 1024);
                 for bits_per_second in [config.min_bits_per_second(), max] {
                     config.bits_per_second = bits_per_second;
                     assert!(config.is_valid());
@@ -1407,6 +1421,65 @@ mod tests {
                     encoder.encode(&channels, &mut stream);
                     encoder.finish(&mut stream);
                 }
+            }
+        }
+    }
+
+    /// No frame of 7.1 in ADTS is longer than 4608 bytes (see
+    /// [`reservoir::MAX_ADTS_FRAME_LEN`]): of loud noise at the highest
+    /// bitrate at 8, 48 and 96 kHz, nor of loud noise after the silence
+    /// that fills the reservoir at 1700 kbit/s at 48 kHz, below the
+    /// highest, 1727, whose raw frames, which keep the standard's limits,
+    /// are longer. At lower bitrates, frames borrow too little from the
+    /// reservoir to reach 4608 bytes.
+    #[test]
+    fn adts_frames_of_7_1_are_no_longer_than_4608_bytes() {
+        use crate::raw_data_block::decoder::adts_frame;
+
+        let configuration = ChannelConfiguration::SevenOne;
+        let loud = |len| noise(len, 5).iter().map(|x| 3.0 * x).collect::<Vec<_>>();
+        let mut silence_then_noise = vec![0.0; 8 * FRAME_SAMPLES];
+        silence_then_noise.extend(loud(6 * FRAME_SAMPLES));
+        let at_the_highest = loud(6 * FRAME_SAMPLES);
+        for (fs, bits_per_second, input) in [
+            (SamplingFrequency::Hz8000, 0, &at_the_highest),
+            (SamplingFrequency::Hz48000, 0, &at_the_highest),
+            (SamplingFrequency::Hz96000, 0, &at_the_highest),
+            (SamplingFrequency::Hz48000, 1_700_000, &silence_then_noise),
+        ] {
+            let channels = vec![input.as_slice(); configuration.channels()];
+            let mut longest = [0; 2];
+            for (i, framing) in [Framing::Adts, Framing::Raw].into_iter().enumerate() {
+                let mut config = StreamConfig {
+                    sampling_frequency: fs,
+                    channel_configuration: configuration,
+                    bits_per_second,
+                    framing,
+                    flags: Flags::default(),
+                    crc_protected: false,
+                };
+                if bits_per_second == 0 {
+                    config.bits_per_second = StreamConfig {
+                        framing: Framing::Adts,
+                        ..config
+                    }
+                    .max_bits_per_second();
+                }
+                let mut encoder = StreamEncoder::new(config);
+                let mut sink = |frame: &[u8]| {
+                    let len = match framing {
+                        Framing::Adts => adts_frame(frame).aac_frame_length,
+                        Framing::Raw => frame.len(),
+                    };
+                    longest[i] = longest[i].max(len);
+                };
+                encoder.encode(&channels, &mut sink);
+                encoder.finish(&mut sink);
+            }
+            let [adts, raw] = longest;
+            assert!(adts <= 4608, "{fs:?} {bits_per_second}: {adts}");
+            if bits_per_second != 0 {
+                assert!(raw > 4608, "{fs:?} {bits_per_second}: {raw}");
             }
         }
     }
