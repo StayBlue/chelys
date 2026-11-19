@@ -436,7 +436,7 @@ impl<'a> Counting<'a> {
             self.pulses = pulses;
             self.sections.push(sections);
         } else {
-            (self.sections).extend(self.counted.drain(..).map(sections::Counted::choose));
+            (self.sections).extend(self.counted.drain(..).map(|counted| counted.choose()));
         }
         for g in 0..self.sf_decoder.len() {
             let mut sf_decoder = std::mem::take(&mut self.sf_decoder[g]);

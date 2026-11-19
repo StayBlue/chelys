@@ -104,7 +104,7 @@ impl Sections {
     /// The sections that [`Counted::choose`] chooses for the lines that
     /// [`count`](Self::count) counts.
     pub fn choose(lines: &[i32], bands: GroupBands, max_sfb: usize) -> Option<Self> {
-        Self::count(lines, bands, max_sfb).map(Counted::choose)
+        Self::count(lines, bands, max_sfb).map(|counted| counted.choose())
     }
 
     /// [`count`](Self::count), but for the bands `intensity` codes in
@@ -495,25 +495,29 @@ impl Counted {
     ///
     /// Spec gap: clause C.8.3 does not say which merge comes first where
     /// two save the same bits; the lower in frequency is taken.
-    pub fn choose(self) -> Sections {
+    pub fn choose(&self) -> Sections {
         let max_sfb = self.max_sfb;
         // One section for each band.
         let mut sections = [Candidate::default(); MAX_BANDS];
         for (sfb, section) in sections[..max_sfb].iter_mut().enumerate() {
             *section = self.section(sfb, sfb + 1, self.classes[sfb]);
         }
-        // merged[i]: sections i and i + 1 merged.
+        // merged[i]: sections i and i + 1 merged, and saved[i] the bits
+        // that merging them saves.
         let mut merged = [Candidate::default(); MAX_BANDS];
+        let mut saved = [0; MAX_BANDS];
+        let saving = |a: Candidate, b: Candidate, merged: Candidate| {
+            (a.bits + b.bits).saturating_sub(merged.bits)
+        };
         for i in 0..max_sfb.saturating_sub(1) {
             merged[i] = self.merge(sections[i], sections[i + 1]);
+            saved[i] = saving(sections[i], sections[i + 1], merged[i]);
         }
         let mut section_count = max_sfb;
         loop {
             let mut best: Option<(usize, u32)> = None;
-            for i in 0..section_count.saturating_sub(1) {
-                let separate = sections[i].bits + sections[i + 1].bits;
-                let saved = separate.saturating_sub(merged[i].bits);
-                if saved > best.map_or(0, |(_, saved)| saved) {
+            for (i, &saved) in saved[..section_count.saturating_sub(1)].iter().enumerate() {
+                if saved > best.map_or(0, |(_, most)| most) {
                     best = Some((i, saved));
                 }
             }
@@ -521,12 +525,15 @@ impl Counted {
             sections[i] = merged[i];
             sections.copy_within(i + 2..section_count, i + 1);
             merged.copy_within(i + 1..section_count - 1, i);
+            saved.copy_within(i + 1..section_count - 1, i);
             section_count -= 1;
             if i > 0 {
                 merged[i - 1] = self.merge(sections[i - 1], sections[i]);
+                saved[i - 1] = saving(sections[i - 1], sections[i], merged[i - 1]);
             }
             if i + 1 < section_count {
                 merged[i] = self.merge(sections[i], sections[i + 1]);
+                saved[i] = saving(sections[i], sections[i + 1], merged[i]);
             }
         }
 
@@ -540,10 +547,10 @@ impl Counted {
         };
         for (i, section) in sections[..section_count].iter().enumerate() {
             chosen.codebooks[i] = section.codebook;
-            chosen.ends[i] = section.end as u8;
+            chosen.ends[i] = section.end;
             if !section.codebook.is_intensity() {
-                chosen.spectral_bits +=
-                    self.spectral_bits(section.start, section.end, section.codebook);
+                let (start, end) = (usize::from(section.start), usize::from(section.end));
+                chosen.spectral_bits += self.spectral_bits(start, end, section.codebook);
             }
         }
         for sfb in 0..max_sfb {
@@ -566,30 +573,31 @@ impl Counted {
     }
 
     /// The section of bands `start..end` with the codebook of `class` that
-    /// costs the fewest bits, the lower on a tie; for an intensity class,
+    /// costs the fewest bits, the lower on a tie: those of its
+    /// `section_data()` and `spectral_data()`, and of the scalefactors of
+    /// its bands of zeros if the codebook sends them; for an intensity class,
     /// with its intensity codebook, which sends no lines (the positions its
     /// bands send are counted with the scalefactors).
     fn section(&self, start: usize, end: usize, class: usize) -> Candidate {
-        if let Some(codebook) = class.checked_sub(CLASSES.len()).map(intensity_codebook) {
-            return Candidate {
-                start,
-                end,
-                class,
-                codebook,
-                bits: section_bits(self.bands.transform(), end - start),
-            };
-        }
-        let (codebook, bits) = (CLASSES[class].iter())
-            .map(|&codebook| (codebook, self.bits(start, end, codebook)))
-            .min_by_key(|&(_, bits)| bits)
-            .expect("a class has a codebook");
-        Candidate {
-            start,
-            end,
-            class,
+        let header = section_bits(self.bands.transform(), end - start);
+        let candidate = |codebook, bits| Candidate {
+            start: start as u8,
+            end: end as u8,
+            class: class as u8,
             codebook,
             bits,
+        };
+        if let Some(codebook) = class.checked_sub(CLASSES.len()).map(intensity_codebook) {
+            return candidate(codebook, header);
         }
+        // The codebooks of a class differ only in their spectral bits.
+        let books = CLASSES[class];
+        let shared = header + self.repeated_bits(start, end, books[0]);
+        let (codebook, bits) = (books.iter())
+            .map(|&codebook| (codebook, shared + self.spectral_bits(start, end, codebook)))
+            .min_by_key(|&(_, bits)| bits)
+            .expect("a class has a codebook");
+        candidate(codebook, bits)
     }
 
     /// Sections `a` and `b`, neighbours, merged into one. Bands in
@@ -597,7 +605,7 @@ impl Counted {
     /// codebook: any other merge costs more than any coding.
     fn merge(&self, a: Candidate, b: Candidate) -> Candidate {
         debug_assert_eq!(a.end, b.start);
-        let intensity = |class: usize| class >= CLASSES.len();
+        let intensity = |class: u8| usize::from(class) >= CLASSES.len();
         if (intensity(a.class) || intensity(b.class)) && a.class != b.class {
             return Candidate {
                 start: a.start,
@@ -607,22 +615,19 @@ impl Counted {
                 bits: UNCODABLE,
             };
         }
-        self.section(a.start, b.end, a.class.max(b.class))
+        let class = usize::from(a.class.max(b.class));
+        self.section(usize::from(a.start), usize::from(b.end), class)
     }
 
-    /// The bits of a section of bands `start..end` with `codebook`: its
-    /// `section_data()`, its `spectral_data()`, and the scalefactors of its
-    /// bands of zeros, if the codebook sends them.
-    fn bits(&self, start: usize, end: usize, codebook: Codebook) -> u32 {
-        let scalefactors = if codebook.sends_scalefactor() {
+    /// The bits of the scalefactors of the bands of zeros among bands
+    /// `start..end`, in a section with `codebook`, if it sends them.
+    fn repeated_bits(&self, start: usize, end: usize, codebook: Codebook) -> u32 {
+        if codebook.sends_scalefactor() {
             let zero_bands = self.zero_bands_below[end] - self.zero_bands_below[start];
             u32::from(zero_bands) * scalefactors::REPEATED_BITS
         } else {
             0
-        };
-        section_bits(self.bands.transform(), end - start)
-            + self.spectral_bits(start, end, codebook)
-            + scalefactors
+        }
     }
 }
 
@@ -630,9 +635,9 @@ impl Counted {
 /// and the codebook, and its bits in all.
 #[derive(Clone, Copy, Debug)]
 struct Candidate {
-    start: usize,
-    end: usize,
-    class: usize,
+    start: u8,
+    end: u8,
+    class: u8,
     codebook: Codebook,
     bits: u32,
 }
@@ -666,7 +671,7 @@ fn intensity_codebook(class: usize) -> Codebook {
 }
 
 /// `sect_len_incr`'s bits and `sect_esc_val` (Table 17).
-fn sect_len_incr(transform: Transform) -> (u32, usize) {
+const fn sect_len_incr(transform: Transform) -> (u32, usize) {
     match transform {
         Transform::Long => (5, (1 << 5) - 1),
         Transform::Short => (3, (1 << 3) - 1),
@@ -674,10 +679,32 @@ fn sect_len_incr(transform: Transform) -> (u32, usize) {
 }
 
 /// The bits of a section of `len` bands in `section_data()`: `sect_cb`,
-/// and a `sect_len_incr` for each `sect_esc_val` bands and one more.
+/// and a `sect_len_incr` for each `sect_esc_val` bands and one more; from
+/// a table of every length.
 fn section_bits(transform: Transform, len: usize) -> u32 {
-    let (bits, esc) = sect_len_incr(transform);
-    4 + bits * (len / esc + 1) as u32
+    /// The bits of each length of section, for `sect_len_incr`'s `bits` and
+    /// `sect_esc_val` `esc`.
+    const fn table(bits: u32, esc: usize) -> [u32; MAX_BANDS + 1] {
+        let mut table = [0; MAX_BANDS + 1];
+        let mut len = 0;
+        while len <= MAX_BANDS {
+            table[len] = 4 + bits * (len / esc + 1) as u32;
+            len += 1;
+        }
+        table
+    }
+    static LONG: [u32; MAX_BANDS + 1] = {
+        let (bits, esc) = sect_len_incr(Transform::Long);
+        table(bits, esc)
+    };
+    static SHORT: [u32; MAX_BANDS + 1] = {
+        let (bits, esc) = sect_len_incr(Transform::Short);
+        table(bits, esc)
+    };
+    match transform {
+        Transform::Long => LONG[len],
+        Transform::Short => SHORT[len],
+    }
 }
 
 #[cfg(test)]
