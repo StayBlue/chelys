@@ -25,7 +25,7 @@ pub enum Rate {
     /// A constant rate: frames as long as a channel of `bits_per_second`
     /// carries, give or take what the bit reservoir lends and keeps
     /// (clause 8.2.3.2), and padded with fill where it is full. The rate
-    /// counts every byte written, ADTS headers included.
+    /// counts every byte written, ADTS headers and their CRC included.
     Constant { bits_per_second: u32 },
 }
 
@@ -53,6 +53,7 @@ pub struct Config {
     rate: Rate,
     framing: Framing,
     flags: Flags,
+    crc: bool,
 }
 
 impl Config {
@@ -67,12 +68,23 @@ impl Config {
             rate,
             framing: Framing::default(),
             flags: Flags::default(),
+            crc: false,
         }
     }
 
     /// How each frame is given: in ADTS, the default, or raw.
     pub fn framing(mut self, framing: Framing) -> Self {
         self.framing = framing;
+        self
+    }
+
+    /// Protects each ADTS frame's header and the start of its audio with a
+    /// CRC-16 check word, which decoders may check to detect errors: the
+    /// first 192 bits of each channel element and the first 128 of the
+    /// second channel of a pair, and all of any data stream element (clause
+    /// 8.1.3.2.1). The word's 16 bits count towards the rate. ADTS only.
+    pub fn crc(mut self, on: bool) -> Self {
+        self.crc = on;
         self
     }
 
@@ -127,7 +139,7 @@ impl Config {
                 channels: self.channels,
             },
         )?;
-        if self.framing == Framing::Raw && self.flags != Flags::default() {
+        if self.framing == Framing::Raw && (self.crc || self.flags != Flags::default()) {
             return Err(ConfigError::AdtsOnly);
         }
         let Rate::Constant { bits_per_second } = self.rate;
@@ -137,6 +149,7 @@ impl Config {
             bits_per_second,
             framing: self.framing,
             flags: self.flags,
+            crc_protected: self.crc,
         };
         if !config.is_valid() {
             return Err(ConfigError::UnsupportedBitrate {
@@ -166,8 +179,8 @@ pub enum ConfigError {
         min: u32,
         max: u32,
     },
-    /// A header flag was set in [`Framing::Raw`], whose frames have no
-    /// header to carry it.
+    /// The CRC or a header flag was asked for in [`Framing::Raw`], whose
+    /// frames have no ADTS header to carry them.
     AdtsOnly,
 }
 
@@ -188,7 +201,10 @@ impl fmt::Display for ConfigError {
                 f,
                 "unsupported bitrate: {bits_per_second} bit/s, not {min} to {max} bit/s"
             ),
-            Self::AdtsOnly => write!(f, "raw frames have no ADTS header to carry its flags"),
+            Self::AdtsOnly => write!(
+                f,
+                "raw frames have no ADTS header to carry its CRC or flags"
+            ),
         }
     }
 }
@@ -231,10 +247,11 @@ mod tests {
     }
 
     #[test]
-    fn raw_frames_have_no_header_for_the_flags() {
+    fn raw_frames_have_no_header_for_the_crc_or_flags() {
         assert_eq!(config(Framing::Raw).check(), Ok(()));
         assert_eq!(config(Framing::Raw).home(false).check(), Ok(()));
         for config in [
+            config(Framing::Raw).crc(true),
             config(Framing::Raw).private_bit(true),
             config(Framing::Raw).original_copy(true),
             config(Framing::Raw).home(true),

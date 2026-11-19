@@ -103,6 +103,17 @@ impl CodedElement {
         Self::fields_bits(self.channels.len(), windows.filter(|_| common)) + mask + channels
     }
 
+    /// Where a pair's second `individual_channel_stream()` starts, in bits
+    /// from the start of the element after its `id_syn_ele`; `None` for a
+    /// single channel.
+    pub fn second_channel_offset(&self) -> Option<u32> {
+        // The second stream ends the element.
+        let [_, right] = self.channels.as_slice() else {
+            return None;
+        };
+        Some(self.bits() - right.bits(self.common.is_some()))
+    }
+
     /// The bits of an element of `channels` channels besides their
     /// `individual_channel_stream()`s and `ms_used` flags: where a pair
     /// shares its `windows`, they include their `ics_info()` and
@@ -159,16 +170,18 @@ mod tests {
     #[test]
     fn single_channel_element_is_a_tag_and_a_stream() {
         let ics = ["00000000", "00000000000", "000"].concat();
-        let bits = written(&CodedElement::single(silent()));
-        assert_eq!(bits, ["0000", &ics].concat());
+        let element = CodedElement::single(silent());
+        assert_eq!(written(&element), ["0000", &ics].concat());
+        assert_eq!(element.second_channel_offset(), None);
     }
 
     #[test]
     fn channel_pair_element_has_a_window_for_each_channel() {
         let ics = ["00000000", "00000000000", "000"].concat();
-        let bits = written(&CodedElement::pair(silent(), silent()));
+        let element = CodedElement::pair(silent(), silent());
         // element_instance_tag, common_window, then the two streams.
-        assert_eq!(bits, ["0000", "0", &ics, &ics].concat());
+        assert_eq!(written(&element), ["0000", "0", &ics, &ics].concat());
+        assert_eq!(element.second_channel_offset(), Some(5 + 22));
     }
 
     #[test]
@@ -177,14 +190,14 @@ mod tests {
         let silent = CodedChannel::silent(Windows::LONG_SINE, fs);
         let ics = ["00000000", "000"].concat();
         let ics_info = "00000000000";
-        let bits = written(&CodedElement::common_pair(
-            silent.clone(),
-            silent.clone(),
-            MsMask::NONE,
-        ));
+        let element = CodedElement::common_pair(silent.clone(), silent.clone(), MsMask::NONE);
         // element_instance_tag, common_window, ics_info(),
         // ms_mask_present, then the two streams without their ics_info().
-        assert_eq!(bits, ["0000", "1", ics_info, "00", &ics, &ics].concat());
+        assert_eq!(
+            written(&element),
+            ["0000", "1", ics_info, "00", &ics, &ics].concat()
+        );
+        assert_eq!(element.second_channel_offset(), Some(5 + 11 + 2 + 11));
         // A mask of max_sfb bands of each group.
         let mut left = silent.clone();
         let mut right = silent;

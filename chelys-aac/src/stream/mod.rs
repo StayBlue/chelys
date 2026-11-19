@@ -8,7 +8,7 @@ mod element;
 mod frame;
 
 use super::DELAY;
-use super::adts::{Flags, HEADER_LEN};
+use super::adts::{self, Flags};
 use super::audio_specific_config::audio_specific_config;
 use super::channel::CodedChannel;
 use super::channel_configuration::ChannelConfiguration;
@@ -60,15 +60,26 @@ pub struct StreamConfig {
     pub framing: Framing,
     /// The flags of each ADTS header; raw frames have none.
     pub flags: Flags,
+    /// Whether each ADTS frame has an `adts_error_check()`; raw frames
+    /// have none.
+    pub crc_protected: bool,
 }
 
 impl StreamConfig {
-    /// The bytes each frame adds before its `raw_data_block()`.
-    fn header_len(&self) -> usize {
-        match self.framing {
-            Framing::Adts => HEADER_LEN,
-            Framing::Raw => 0,
-        }
+    /// The header of each frame in ADTS.
+    pub fn adts_header(&self) -> Option<adts::Header> {
+        (self.framing == Framing::Adts).then_some(adts::Header {
+            sampling_frequency: self.sampling_frequency,
+            channel_configuration: self.channel_configuration,
+            flags: self.flags,
+            protected: self.crc_protected,
+        })
+    }
+
+    /// The bytes each frame adds before its `raw_data_block()`: its header
+    /// and `adts_error_check()` in ADTS.
+    pub fn header_len(&self) -> usize {
+        self.adts_header().map_or(0, |header| header.bytes())
     }
 
     /// The shortest frame of channels with `windows`: its channels
@@ -358,6 +369,7 @@ mod tests {
             bits_per_second,
             framing,
             flags: Flags::default(),
+            crc_protected: false,
         }
     }
 
@@ -386,8 +398,19 @@ mod tests {
     }
 
     #[test]
+    fn the_crc_raises_the_lowest_bitrate_by_its_bits() {
+        // The shortest frame of a pair, 14 bytes of which 7 are the header,
+        // and with the CRC 16, at 44.1 kHz, rounded up.
+        let mut config = config(Framing::Adts, 0);
+        assert_eq!(config.min_bits_per_second(), 4824);
+        config.crc_protected = true;
+        assert_eq!(config.min_bits_per_second(), 5513);
+    }
+
+    #[test]
     fn adts_frames_give_their_length_and_the_reservoir() {
-        let config = config(Framing::Adts, 128_000);
+        let mut config = config(Framing::Adts, 128_000);
+        config.crc_protected = true;
         let frames = encode_silence(config, 200);
         let mut reservoir = config.reservoir().unwrap();
         for frame in &frames {
@@ -407,13 +430,18 @@ mod tests {
         for fs in SamplingFrequency::ALL {
             for channel_configuration in [ChannelConfiguration::Mono, ChannelConfiguration::Stereo]
             {
-                for framing in [Framing::Adts, Framing::Raw] {
+                for (framing, crc_protected) in [
+                    (Framing::Adts, false),
+                    (Framing::Adts, true),
+                    (Framing::Raw, false),
+                ] {
                     let mut config = StreamConfig {
                         sampling_frequency: fs,
                         channel_configuration,
                         bits_per_second: 0,
                         framing,
                         flags: Flags::default(),
+                        crc_protected,
                     };
                     let (min, max) = (config.min_bits_per_second(), config.max_bits_per_second());
                     for bits_per_second in [min - 1, min, max, max + 1] {
@@ -515,6 +543,7 @@ mod tests {
             bits_per_second: 0,
             framing: Framing::Adts,
             flags: Flags::default(),
+            crc_protected: false,
         };
         let min = config.min_bits_per_second();
         let mut input = vec![0.0; 12 * FRAME_SAMPLES];
@@ -547,6 +576,7 @@ mod tests {
             bits_per_second: 8_000,
             framing: Framing::Adts,
             flags: Flags::default(),
+            crc_protected: false,
         };
         // Silence, which takes the shortest frames and fills the
         // reservoir, then white noise, whose perceptual entropy asks for

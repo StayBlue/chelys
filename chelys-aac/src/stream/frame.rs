@@ -8,7 +8,6 @@ use chelys_core::bitstream::BitWriter;
 
 use super::{FRAME_SAMPLES, FrameSink, StreamConfig};
 use crate::adts;
-use crate::config::Framing;
 use crate::raw_data_block;
 use crate::raw_data_block::element::CodedElement;
 use crate::reservoir::BitReservoir;
@@ -102,19 +101,18 @@ pub fn write<O: FrameSink + ?Sized>(
         element,
         frame_len - header_len,
     );
-    match config.framing {
-        Framing::Adts => {
-            let header = adts::Header {
-                sampling_frequency: config.sampling_frequency,
-                channel_configuration: config.channel_configuration,
-                flags: config.flags,
-            };
+    match config.adts_header() {
+        Some(header) => {
             let mut w = BitWriter::new();
             header.write(&mut w, frame_len, reservoir.adts_buffer_fullness());
             let mut frame = w.into_bytes();
-            frame.extend_from_slice(&block);
+            if header.protected {
+                let crc_check = adts::crc_check(&frame, &block);
+                frame.extend_from_slice(&crc_check.to_be_bytes());
+            }
+            frame.extend_from_slice(&block.bytes);
             out.frame(&frame);
         }
-        Framing::Raw => out.frame(&block),
+        None => out.frame(&block.bytes),
     }
 }

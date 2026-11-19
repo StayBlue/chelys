@@ -561,14 +561,28 @@ pub struct Element {
 /// or a `channel_pair_element()` of the Low Complexity profile at `fs`.
 pub fn element(r: &mut BitReader, fs: SamplingFrequency) -> Element {
     let id_syn_ele = r.read(3);
+    element_after_id(r, fs, id_syn_ele).0
+}
+
+/// Reads an element whose `id_syn_ele` is read, as [`element`] does, and
+/// gives where a pair's second `individual_channel_stream()` starts in the
+/// reader.
+pub fn element_after_id(
+    r: &mut BitReader,
+    fs: SamplingFrequency,
+    id_syn_ele: u32,
+) -> (Element, Option<usize>) {
     r.read(4); // element_instance_tag
     match id_syn_ele {
-        0 => Element {
-            channels: vec![individual_channel_stream(r, fs, None, false)],
-            common_window: false,
-            ms_mask_present: 0,
-            ms_used: Vec::new(),
-        },
+        0 => (
+            Element {
+                channels: vec![individual_channel_stream(r, fs, None, false)],
+                common_window: false,
+                ms_mask_present: 0,
+                ms_used: Vec::new(),
+            },
+            None,
+        ),
         1 => {
             let common_window = r.read(1) == 1;
             let mut info = None;
@@ -586,13 +600,15 @@ pub fn element(r: &mut BitReader, fs: SamplingFrequency) -> Element {
                 info = Some(common);
             }
             let left = individual_channel_stream(r, fs, info.as_ref(), false);
+            let second = r.position();
             let right = individual_channel_stream(r, fs, info.as_ref(), true);
-            Element {
+            let element = Element {
                 channels: vec![left, right],
                 common_window,
                 ms_mask_present,
                 ms_used,
-            }
+            };
+            (element, Some(second))
         }
         other => panic!("element {other}"),
     }
