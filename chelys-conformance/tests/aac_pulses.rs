@@ -117,6 +117,13 @@ fn lines(noise: &mut Noise, end: usize, peaks: &[(usize, i32)]) -> [i32; FRAME_L
 /// decode without complaint as the same lines sent unclipped, to within
 /// the rounding of the decoder's arithmetic, and far from the lines sent
 /// clipped without their pulses.
+///
+/// This is the evidence for the reading of the standard that the clipping
+/// procedure (`noiseless::clipping`) marks as settled by decoding with
+/// ffmpeg: each `pulse_offset` after the first counts from the line of
+/// the pulse before (clause 9.3), not from the start of the band (clause
+/// C.8.2). Counted from the band, the second pulse of these streams would
+/// fall on another line.
 #[test]
 fn ffmpeg_restores_clipped_lines_as_sent_unclipped() {
     let mut noise = Noise(0x9e37_79b9_7f4a_7c15);
