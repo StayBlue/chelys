@@ -108,6 +108,22 @@ pub struct ElementEncoder {
     /// The bands of the frame being coded that a pair that shares its
     /// window codes in intensity stereo.
     intensity: Intensity,
+    /// How the second channel of the last pair that shared its window was
+    /// given its bits, for tests.
+    #[cfg(test)]
+    second_channel: std::cell::Cell<Option<SecondChannel>>,
+}
+
+/// How the second channel of a pair that shares its window was given its
+/// bits: whether the first was quantized again in fewer, the bits the
+/// first took, those the second was given, and the two channels' shares.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+struct SecondChannel {
+    retried: bool,
+    first_bits: u32,
+    available_bits: u32,
+    budgets: u32,
 }
 
 /// What a pair keeps of its middle and side channels.
@@ -141,6 +157,8 @@ impl ElementEncoder {
             ms: MsMask::NONE,
             intensity_border,
             intensity: Intensity::NONE,
+            #[cfg(test)]
+            second_channel: std::cell::Cell::new(None),
         }
     }
 
@@ -538,7 +556,9 @@ impl ElementEncoder {
                 };
                 let (mut a_channel, intensity, b_coding) = loop {
                     let a_channel = self.code(a, coding);
-                    let left = coding.available_bits - a_channel.bits(true);
+                    // What the first leaves of its share, which a retry
+                    // has lowered its bits within.
+                    let left = budget(a) - a_channel.bits(true);
                     let least_max_sfb = a_channel.max_sfb();
                     let mut b_coding = ChannelCoding {
                         least_max_sfb,
@@ -556,6 +576,13 @@ impl ElementEncoder {
                         + b_coding.element_bits[least_max_sfb];
                     let floor = self.silent_bits(a);
                     if b_least <= b_coding.available_bits || coding.available_bits <= floor {
+                        #[cfg(test)]
+                        self.second_channel.set(Some(SecondChannel {
+                            retried: coding.available_bits < budget(a),
+                            first_bits: a_channel.bits(true),
+                            available_bits: b_coding.available_bits,
+                            budgets: budget(a) + budget(b),
+                        }));
                         break (a_channel, intensity, b_coding);
                     }
                     let short = b_least - b_coding.available_bits;
@@ -908,5 +935,45 @@ mod tests {
             .map(|(group, _)| group.scalefactor_data())
             .collect();
         assert!(scalefactors::bits(0, groups).is_some());
+    }
+
+    /// Where the first channel of a pair is quantized again in fewer bits,
+    /// for the second to pay for its bands, the second is given every bit
+    /// of the two channels' shares that the first leaves, the bits taken
+    /// from the first among them: at 64 kHz and 23 kbit/s, with noise in
+    /// each channel in turn.
+    #[test]
+    fn a_retry_gives_the_second_channel_what_the_first_leaves() {
+        let fs = SamplingFrequency::Hz64000;
+        let len = 24 * FRAME_SAMPLES;
+        // Each channel noisy for 200 samples in turn.
+        let burst = |c: usize, seed: u64| -> Vec<f64> {
+            (noise(len, seed).into_iter().enumerate())
+                .map(|(t, x)| if (t / 200) % 2 == c { x } else { 0.0 })
+                .collect()
+        };
+        let input = [burst(0, 7), burst(1, 8)];
+        // The bits of each frame's element at 23 kbit/s, less the header,
+        // id_syn_ele and ID_END.
+        let bits = 23_000 * 1024 / 64_000 - 56 - 6;
+        let mut encoder = ElementEncoder::new(fs, 2, None);
+        let channels: Vec<&[f64]> = input.iter().map(Vec::as_slice).collect();
+        encoder.push(&channels);
+        encoder.prime();
+        let mut retries = 0;
+        let mut start = 0;
+        while encoder.buffered() - start >= 2 * FRAME_SAMPLES {
+            encoder.look_ahead(start + FRAME_SAMPLES, true);
+            encoder.prepare(start, true);
+            encoder.second_channel.set(None);
+            let coded = encoder.quantize(bits);
+            assert!(coded.bits() <= bits);
+            if let Some(second) = encoder.second_channel.get() {
+                assert_eq!(second.first_bits + second.available_bits, second.budgets);
+                retries += usize::from(second.retried);
+            }
+            start += FRAME_SAMPLES;
+        }
+        assert!(retries > 0, "no frame quantized its first channel again");
     }
 }
