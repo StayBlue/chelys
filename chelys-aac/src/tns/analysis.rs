@@ -28,6 +28,10 @@ const TARGET_FROM_HZ: f64 = 1500.0;
 /// they are.
 const PREDICTION_FROM_HZ: f64 = 2500.0;
 
+/// The least share of the target range's energy that the lines of the
+/// linear prediction must hold (see [`TargetRange::shape`]).
+const LEAST_PREDICTED_SHARE: f64 = 0.01;
+
 /// The threshold `t` that the prediction gain must exceed for the lines to
 /// be filtered: "A suitable threshold value is t = 1.4" (clause C.5).
 const GAIN_THRESHOLD: f64 = 1.4;
@@ -206,6 +210,22 @@ impl TargetRange {
         let range = self.line(self.bands.start)..self.line(self.bands.end);
         let mut r = [0.0; MAX_ORDER + 1];
         autocorrelation(&lines[self.prediction_from..range.end], &mut r[..=order]);
+        // Spec reading: this deliberately departs from clause C.5 where the
+        // lines the prediction is computed from, those from 2.5 kHz, hold
+        // less than a hundredth of the target range's energy, as where a
+        // tone between 1.5 and 2.5 kHz carries it: their prediction says
+        // nothing of the lines it would filter. A tone of 2131 Hz beside
+        // one of 3021 Hz, in a pair at 96 kHz and 22 kbit/s, was so shaped
+        // from its window's leakage, and decoded in blocks as quiet as 0.21
+        // of its 0.35; and a sweep at 8 kHz in mono at 8 kbit/s at an SNR
+        // of 13.6 dB, against 15.0 unshaped. Taking the prediction from 1.5
+        // kHz, which clause C.5 allows, avoided both, but graded -1.209
+        // with PEAQ (GstPEAQ 0.6.1, black box) on 8 tracks of pop music at
+        // 128 kbit/s, against -1.181.
+        let target: f64 = lines[range.clone()].iter().map(|x| x * x).sum();
+        if r[0] < LEAST_PREDICTED_SHARE * target {
+            return (WindowFilters::NONE, 1.0);
+        }
         let mut parcor = [0.0; MAX_ORDER];
         let Some(gain) = levinson_durbin(&r[..=order], &mut parcor[..order]) else {
             return (WindowFilters::NONE, 1.0);
@@ -633,6 +653,24 @@ mod tests {
         let mut silence = [0.0; FRAME_LINES];
         let tns = shape(Windows::LONG_SINE, fs, None, &mut silence);
         assert!(!tns.is_present());
+    }
+
+    /// A window whose target range holds its energy below 2.5 kHz, where
+    /// the prediction does not look, is not shaped from the little above.
+    #[test]
+    fn lines_below_the_prediction_do_not_choose_the_filter() {
+        let fs = SamplingFrequency::Hz44100;
+        let mut noise = Noise::new(89);
+        let leakage: Vec<f64> = (click(1024, 200.0, &mut noise).iter())
+            .map(|x| x * 1e-3)
+            .collect();
+        let mut lines: [f64; FRAME_LINES] = leakage.clone().try_into().unwrap();
+        assert!(shape(Windows::LONG_SINE, fs, None, &mut lines).is_present());
+        // A tone at line 100, 2.15 kHz.
+        let mut lines: [f64; FRAME_LINES] = leakage.try_into().unwrap();
+        lines[100] = 1e4;
+        lines[99] = -6e3;
+        assert!(!shape(Windows::LONG_SINE, fs, None, &mut lines).is_present());
     }
 
     /// A range cut below `TNS_MAX_BANDS` is sent as a filter of order 0
