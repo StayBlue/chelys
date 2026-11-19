@@ -1,12 +1,13 @@
 // Copyright (c) 2026 StayBlue
 // SPDX-License-Identifier: MIT
 
-//! The frame's element: its channels as they arrive, the decisions made
-//! for it each frame, and its coding in the bits the frame gives it.
+//! An element of the frame: its channels as they arrive, the decisions
+//! made for it each frame, and its coding in the bits the frame gives it.
 
 use super::FRAME_SAMPLES;
 use super::frame::Demand;
 use crate::channel::{self, CodedChannel, CodedGroup, FRAME_LINES};
+use crate::channel_configuration::ElementKind;
 use crate::filterbank::Filterbank;
 use crate::loops::{self, ChannelCoding};
 use crate::noiseless::pulses::Pulses;
@@ -117,8 +118,8 @@ impl PreparedChannel {
     }
 }
 
-/// The element of a stream: a `single_channel_element()` of one channel,
-/// or a `channel_pair_element()` of two.
+/// An element of a stream: a `single_channel_element()` of one channel, or
+/// a `channel_pair_element()` of two.
 #[derive(Debug)]
 pub struct ElementEncoder {
     sampling_frequency: SamplingFrequency,
@@ -176,13 +177,14 @@ struct MidSide {
 }
 
 impl ElementEncoder {
-    /// The element of `channels` channels at `sampling_frequency`, a pair
-    /// coded in intensity stereo above `intensity_border` Hz, if given.
+    /// The element `kind` at `sampling_frequency`, a pair coded in
+    /// intensity stereo above `intensity_border` Hz, if given.
     pub fn new(
         sampling_frequency: SamplingFrequency,
-        channels: usize,
+        kind: ElementKind,
         intensity_border: Option<f64>,
     ) -> Self {
+        let channels = kind.channels();
         Self {
             sampling_frequency,
             input_end: None,
@@ -640,6 +642,34 @@ impl ElementEncoder {
         )
     }
 
+    /// The fewest bits the frame prepared can be coded in: its fields, and
+    /// its channels without lines or temporal noise shaping, which
+    /// [`quantize`](Self::quantize) drops where they do not fit.
+    pub fn least_bits(&self) -> u32 {
+        let common = self.common_window;
+        let channels: u32 = (self.prepared.iter())
+            .map(|c| channel::bits(c.windows, common, &Pulses::NONE, &Tns::NONE, 0))
+            .sum();
+        CodedElement::fields_bits(self.channels(), self.common_windows()) + channels
+    }
+
+    /// The channels of the frame prepared that are coded with lines: those
+    /// that are not silent.
+    pub fn coded_channels(&self) -> u32 {
+        self.prepared.iter().filter(|c| !c.silent).count() as u32
+    }
+
+    /// The mean perceptual entropy of the channels of the frame prepared
+    /// that are coded with lines, or minus infinity if none is.
+    pub fn perceptual_entropy(&self) -> f64 {
+        let coded = self.prepared.iter().filter(|c| !c.silent);
+        let sum: f64 = coded.clone().map(|c| c.perceptual_entropy).sum();
+        match coded.count() {
+            0 => f64::NEG_INFINITY,
+            n => sum / n as f64,
+        }
+    }
+
     /// What the frame prepared asks of the frame.
     pub fn demand(&self) -> Demand {
         let channels: u32 = self.prepared.iter().map(|c| self.silent_bits(c)).sum();
@@ -1047,6 +1077,14 @@ mod tests {
     const INTENSITY_HCB: u8 = 15;
     const INTENSITY_HCB2: u8 = 14;
 
+    /// The element of `channels` channels.
+    fn kind(channels: usize) -> ElementKind {
+        match channels {
+            1 => ElementKind::Single,
+            _ => ElementKind::Pair,
+        }
+    }
+
     /// Codes the frames of `input`, one slice of samples for each channel,
     /// at `bits` for each frame's element, and gives each frame's element
     /// as decoded with the spectra the filterbanks gave.
@@ -1079,7 +1117,7 @@ mod tests {
         intensity_border: Option<f64>,
         block_switching: bool,
     ) -> Vec<(Element, Vec<Vec<f64>>)> {
-        let encoder = ElementEncoder::new(fs, input.len(), intensity_border);
+        let encoder = ElementEncoder::new(fs, kind(input.len()), intensity_border);
         round_trip_encoder(encoder, input, bits, block_switching)
     }
 
@@ -1109,7 +1147,7 @@ mod tests {
             let coded = encoder.quantize(bits);
             let mut w = BitWriter::new();
             w.write(u32::from(coded.is_pair()), 3);
-            coded.write(&mut w);
+            coded.write(&mut w, 0);
             assert!(coded.bits() <= bits, "{} bits in {bits}", coded.bits());
             let len = w.bit_len();
             w.write(0x7, 3);
@@ -1230,7 +1268,7 @@ mod tests {
         let pair = [clicks(5), clicks(6)];
         let (mut pulses, mut short) = (0, 0);
         for (input, bits) in [(&pair[..1], 500), (&pair[..1], 1500), (&pair[..], 3000)] {
-            let mut encoder = ElementEncoder::new(fs, input.len(), None);
+            let mut encoder = ElementEncoder::new(fs, kind(input.len()), None);
             encoder.spectrum_clipping(true);
             // round_trip_encoder checks the bits and decodes each frame.
             for (element, _) in round_trip_encoder(encoder, input, bits, true) {
@@ -1440,7 +1478,7 @@ mod tests {
         // The bits of each frame's element at 23 kbit/s, less the header,
         // id_syn_ele and ID_END.
         let bits = 23_000 * 1024 / 64_000 - 56 - 6;
-        let mut encoder = ElementEncoder::new(fs, 2, None);
+        let mut encoder = ElementEncoder::new(fs, ElementKind::Pair, None);
         let channels: Vec<&[f64]> = input.iter().map(Vec::as_slice).collect();
         encoder.push(&channels);
         encoder.prime();

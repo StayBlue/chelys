@@ -71,7 +71,13 @@ fn stream(fs: SamplingFrequency, channels: Vec<CodedChannel>) -> Vec<u8> {
     let mut stream = Vec::new();
     for channel in channels {
         let element = CodedElement::single(channel);
-        let block = raw_data_block::write(ChannelConfiguration::Mono, &element, &[], 0).bytes;
+        let block = raw_data_block::write(
+            ChannelConfiguration::Mono,
+            std::slice::from_ref(&element),
+            &[],
+            0,
+        )
+        .bytes;
         let len = 7 + block.len();
         let fields: [(u64, u32); 15] = [
             (0xFFF, 12),

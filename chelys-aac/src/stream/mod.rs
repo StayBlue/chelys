@@ -11,7 +11,7 @@ use super::DELAY;
 use super::adts::{self, Flags};
 use super::audio_specific_config::audio_specific_config;
 use super::channel::CodedChannel;
-use super::channel_configuration::ChannelConfiguration;
+use super::channel_configuration::{ChannelConfiguration, ElementKind};
 use super::config::Framing;
 use super::raw_data_block;
 use super::raw_data_block::data_stream::{self, DataStreamQueue};
@@ -91,14 +91,17 @@ impl StreamConfig {
     /// (see [`element::SHARED_ATTACKS`]), and each with its own otherwise.
     fn shortest_frame_len(&self, windows: Windows, data_bytes: usize) -> usize {
         let channel = CodedChannel::silent(windows, self.sampling_frequency);
-        let element = match self.channel_configuration {
-            ChannelConfiguration::Mono => CodedElement::single(channel),
-            ChannelConfiguration::Stereo if element::SHARED_ATTACKS => {
-                CodedElement::common_pair(channel.clone(), channel, MsMask::NONE)
-            }
-            ChannelConfiguration::Stereo => CodedElement::pair(channel.clone(), channel),
-        };
-        self.header_len() + raw_data_block::min_len(&element, data_bytes)
+        let configuration = self.channel_configuration;
+        let elements: Vec<CodedElement> = (configuration.elements().iter())
+            .map(|kind| match kind {
+                ElementKind::Single => CodedElement::single(channel.clone()),
+                ElementKind::Pair if element::SHARED_ATTACKS => {
+                    CodedElement::common_pair(channel.clone(), channel.clone(), MsMask::NONE)
+                }
+                ElementKind::Pair => CodedElement::pair(channel.clone(), channel.clone()),
+            })
+            .collect();
+        self.header_len() + raw_data_block::min_len(configuration, &elements, data_bytes)
     }
 
     /// The lowest bitrate that brings each frame the bits of the shortest,
@@ -166,13 +169,12 @@ impl StreamConfig {
     /// The lower border frequency above which a pair is coded in intensity
     /// stereo, if it is: Annex C's (see [`intensity::BORDER_HZ`]), where
     /// the stream has at most [`INTENSITY_BITS_PER_SAMPLE`] bits for each
-    /// sample of each channel.
+    /// sample of each channel of the NCC.
     fn intensity_border(&self) -> Option<f64> {
-        let channels = self.channel_configuration.channels() as f64;
+        let ncc = self.channel_configuration.ncc() as f64;
         let bits_per_sample =
-            f64::from(self.bits_per_second) / (channels * f64::from(self.sampling_frequency.hz()));
-        (channels == 2.0 && bits_per_sample <= INTENSITY_BITS_PER_SAMPLE)
-            .then_some(intensity::BORDER_HZ)
+            f64::from(self.bits_per_second) / (ncc * f64::from(self.sampling_frequency.hz()));
+        (bits_per_sample <= INTENSITY_BITS_PER_SAMPLE).then_some(intensity::BORDER_HZ)
     }
 
     /// Whether every frame of a stream so configured can be written.
@@ -222,8 +224,9 @@ impl<F: FnMut(&[u8])> FrameSink for F {
 pub struct StreamEncoder {
     config: StreamConfig,
     reservoir: BitReservoir,
-    /// The one element of each frame, which `channel_configuration` gives.
-    element: ElementEncoder,
+    /// The elements of each frame, which `channel_configuration` gives, in
+    /// order.
+    elements: Vec<ElementEncoder>,
     /// Whether frames may be coded with short windows.
     block_switching: bool,
     /// [`StreamConfig::shortest_short_frame_bits`].
@@ -254,15 +257,15 @@ impl StreamEncoder {
         let reservoir = config
             .reservoir()
             .unwrap_or_else(|| panic!("a stream that cannot be written: {config:?}"));
-        let channels = config.channel_configuration.channels();
+        let elements = (config.channel_configuration.elements().iter())
+            .map(|&kind| {
+                ElementEncoder::new(config.sampling_frequency, kind, config.intensity_border())
+            })
+            .collect();
         Self {
             config,
             reservoir,
-            element: ElementEncoder::new(
-                config.sampling_frequency,
-                channels,
-                config.intensity_border(),
-            ),
+            elements,
             block_switching: true,
             shortest_short_frame_bits: config.shortest_short_frame_bits(),
             data: DataStreamQueue::default(),
@@ -311,7 +314,9 @@ impl StreamEncoder {
     /// it in tests.
     #[cfg(any(test, feature = "unstable"))]
     pub fn without_tns(mut self) -> Self {
-        self.element.without_tns();
+        for element in &mut self.elements {
+            element.without_tns();
+        }
         self
     }
 
@@ -319,7 +324,9 @@ impl StreamEncoder {
     /// the two in tests.
     #[cfg(any(test, feature = "unstable"))]
     pub fn spectrum_clipping(mut self, on: bool) -> Self {
-        self.element.spectrum_clipping(on);
+        for element in &mut self.elements {
+            element.spectrum_clipping(on);
+        }
         self
     }
 
@@ -344,8 +351,9 @@ impl StreamEncoder {
     }
 
     /// Takes `channels`, the next samples of each channel at full scale
-    /// 1.0, and gives `out` the frames they complete, each once the block
-    /// after it has arrived.
+    /// 1.0, in the order of the elements that carry them (see
+    /// [`ChannelConfiguration::elements`]), and gives `out` the frames they
+    /// complete, each once the block after it has arrived.
     ///
     /// # Panics
     ///
@@ -354,7 +362,7 @@ impl StreamEncoder {
     pub fn encode<O: FrameSink + ?Sized>(&mut self, channels: &[&[f64]], out: &mut O) {
         assert_eq!(
             channels.len(),
-            self.element.channels(),
+            self.config.channel_configuration.channels(),
             "one slice per channel"
         );
         let len = channels[0].len();
@@ -362,23 +370,38 @@ impl StreamEncoder {
             channels.iter().all(|c| c.len() == len),
             "every channel has the same number of samples"
         );
-        self.element.push(channels);
+        let mut rest = channels;
+        for element in &mut self.elements {
+            let (own, after) = rest.split_at(element.channels());
+            element.push(own);
+            rest = after;
+        }
         self.samples += len as u64;
         self.encode_buffered(out);
+    }
+
+    /// The first element, whose buffers and models are in step with the
+    /// others'.
+    fn first(&self) -> &ElementEncoder {
+        &self.elements[0]
     }
 
     /// Codes the frames whose blocks, and the block after each, are
     /// buffered, and drops their samples.
     fn encode_buffered<O: FrameSink + ?Sized>(&mut self, out: &mut O) {
-        if !self.element.is_primed() && self.element.buffered() >= FRAME_SAMPLES {
-            self.element.prime();
+        if !self.first().is_primed() && self.first().buffered() >= FRAME_SAMPLES {
+            for element in &mut self.elements {
+                element.prime();
+            }
         }
         let mut start = 0;
-        while self.element.is_primed() && self.element.buffered() - start >= 2 * FRAME_SAMPLES {
+        while self.first().is_primed() && self.first().buffered() - start >= 2 * FRAME_SAMPLES {
             self.encode_frame(start, out);
             start += FRAME_SAMPLES;
         }
-        self.element.drain(start);
+        for element in &mut self.elements {
+            element.drain(start);
+        }
     }
 
     /// Ends the stream: pads the input with silence to whole frames, at
@@ -390,7 +413,9 @@ impl StreamEncoder {
         // Few: those of the samples held and of DELAY, and the block after
         // the last.
         let remaining = (frames - self.frames) as usize;
-        self.element.pad((remaining + 1) * FRAME_SAMPLES);
+        for element in &mut self.elements {
+            element.pad((remaining + 1) * FRAME_SAMPLES);
+        }
         self.encode_buffered(out);
         debug_assert_eq!(self.frames, frames);
         StreamEnd {
@@ -402,25 +427,74 @@ impl StreamEncoder {
 
     /// Codes the frame whose block starts at `start` in the samples
     /// buffered, the block after it following, and gives it to `out`, in
-    /// four steps: has the element's psychoacoustic models analyze the block
-    /// after it, for the attacks that choose the frame's windows; prepares
-    /// the element's channels for quantization (see
+    /// four steps: has the elements' psychoacoustic models analyze the
+    /// block after it, for the attacks that choose the frame's windows;
+    /// prepares the elements' channels for quantization (see
     /// [`ElementEncoder::prepare`]); has the bit reservoir make bits
-    /// available to the frame for the bits the model asks for; and
-    /// quantizes the element in them, less those of the data the frame
-    /// carries.
+    /// available to the frame for the bits the models ask for; and
+    /// quantizes the elements in them, less those of the data the frame
+    /// carries (see [`Self::quantize`]).
     fn encode_frame<O: FrameSink + ?Sized>(&mut self, start: usize, out: &mut O) {
-        self.element
-            .look_ahead(start + FRAME_SAMPLES, self.block_switching);
+        for element in &mut self.elements {
+            element.look_ahead(start + FRAME_SAMPLES, self.block_switching);
+        }
         let data = self.data.take_next_frame();
         let data_bits = data_stream::bits(data.len());
         let afford_short = self.affords_short(data_bits);
-        self.element.prepare(start, afford_short);
-        let demand = self.element.demand();
-        let available_bits = frame::element_bits(&self.config, &self.reservoir, &demand, data_bits);
-        let element = self.element.quantize(available_bits);
-        frame::write(&self.config, &mut self.reservoir, &element, &data, out);
+        for element in &mut self.elements {
+            element.prepare(start, afford_short);
+        }
+        let demand = self.elements.iter().map(ElementEncoder::demand).sum();
+        let available_bits =
+            frame::elements_bits(&self.config, &self.reservoir, &demand, data_bits);
+        let elements = self.quantize(available_bits);
+        frame::write(&self.config, &mut self.reservoir, &elements, &data, out);
         self.frames += 1;
+    }
+
+    /// Quantizes the frame's elements, prepared, in `available_bits`.
+    ///
+    /// Spec gap: Annex C does not say how the bits of a frame are shared
+    /// between its elements, any more than between its channels (see
+    /// [`ElementEncoder::quantize`]). Each element is given the fewest bits
+    /// it can be coded in (see [`ElementEncoder::least_bits`]), and the
+    /// bits beyond them are shared by the elements in proportion to the
+    /// channels each codes with lines, so that each channel has about an
+    /// equal share, as within an element. The elements are quantized one
+    /// after another, each in its share of the bits the elements before it
+    /// left, so that what one leaves goes to those quantized after it, in
+    /// order of their perceptual entropy (see
+    /// [`ElementEncoder::perceptual_entropy`]), the least first, as the
+    /// channels of an element are.
+    fn quantize(&mut self, available_bits: u32) -> Vec<CodedElement> {
+        let mut order: Vec<usize> = (0..self.elements.len()).collect();
+        order.sort_by(|&a, &b| {
+            let key = |e: usize| self.elements[e].perceptual_entropy();
+            key(a).total_cmp(&key(b))
+        });
+        let mut coded: Vec<Option<CodedElement>> = vec![None; self.elements.len()];
+        let mut remaining = available_bits;
+        for (k, &e) in order.iter().enumerate() {
+            let rest = &order[k..];
+            let element = &self.elements[e];
+            let budget = if rest.len() == 1 {
+                remaining
+            } else {
+                let least: u32 = rest.iter().map(|&i| self.elements[i].least_bits()).sum();
+                let channels: u32 = (rest.iter())
+                    .map(|&i| self.elements[i].coded_channels())
+                    .sum();
+                let beyond = u64::from(remaining.saturating_sub(least));
+                let share = (beyond * u64::from(element.coded_channels()))
+                    .checked_div(u64::from(channels))
+                    .unwrap_or(0);
+                element.least_bits() + share as u32
+            };
+            let element = self.elements[e].quantize(budget);
+            remaining = remaining.saturating_sub(element.bits());
+            coded[e] = Some(element);
+        }
+        coded.into_iter().map(|e| e.expect("quantized")).collect()
     }
 }
 
@@ -470,7 +544,8 @@ mod tests {
             // pair of silent channels that share their window.
             let silent = CodedChannel::silent(Windows::LONG_SINE, config.sampling_frequency);
             let element = CodedElement::common_pair(silent.clone(), silent, MsMask::NONE);
-            let shortest = config.header_len() + raw_data_block::min_len(&element, 0);
+            let shortest = config.header_len()
+                + raw_data_block::min_len(config.channel_configuration, &[element], 0);
             assert_eq!(frames[0].len(), shortest, "{framing:?}");
             assert_eq!(shortest, config.shortest_frame_len(Windows::LONG_SINE, 0));
         }
@@ -844,7 +919,7 @@ mod tests {
             let frame = adts_frame(rest);
             rest = &rest[frame.aac_frame_length..];
             let block = raw_data_block(frame.raw_data_block, SamplingFrequency::Hz48000);
-            assert!(block.element.common_window);
+            assert!(block.elements[0].element.common_window);
             let carried: usize = block.data_streams.iter().map(|d| d.bytes.len()).sum();
             assert_eq!(carried, 239);
         }

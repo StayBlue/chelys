@@ -9,7 +9,8 @@ use super::channel_configuration::ChannelConfiguration;
 use super::sampling_frequency::SamplingFrequency;
 use super::stream::FRAME_SAMPLES;
 
-/// The bits of the decoder's input buffer per channel (clause 8.2.3.1).
+/// The bits of the decoder's input buffer per channel of the NCC (clause
+/// 8.2.3.1).
 const BUFFER_BITS_PER_CHANNEL: u64 = 6144;
 
 /// The state of the bit reservoir, kept exactly: in bits times the
@@ -18,7 +19,8 @@ const BUFFER_BITS_PER_CHANNEL: u64 = 6144;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BitReservoir {
     sample_rate: u64,
-    channels: u64,
+    /// The NCC (see [`ChannelConfiguration::ncc`]).
+    ncc: u64,
     /// `mean_framelength`, times the sampling frequency.
     mean: u64,
     /// `max_bit_reservoir`, times the sampling frequency.
@@ -28,8 +30,8 @@ pub struct BitReservoir {
 }
 
 impl BitReservoir {
-    /// The reservoir of a stream of `channels` (the NCC) at
-    /// `bits_per_second`, if a frame can be given its mean length within a
+    /// The reservoir of a stream of `channel_configuration` at
+    /// `bits_per_second`, its buffer sized by the NCC, if a frame can be given its mean length within a
     /// byte: if `max_bit_reservoir` is 8 bits at least.
     ///
     /// Spec reading: the maximum bitrate (clause 8.2.3.3) is that of a
@@ -54,15 +56,15 @@ impl BitReservoir {
         bits_per_second: u32,
     ) -> Option<Self> {
         let sample_rate = u64::from(sampling_frequency.hz());
-        let channels = channel_configuration.channels() as u64;
+        let ncc = channel_configuration.ncc() as u64;
         let mean = u64::from(bits_per_second) * FRAME_SAMPLES as u64;
-        let buffer = BUFFER_BITS_PER_CHANNEL * channels * sample_rate;
+        let buffer = BUFFER_BITS_PER_CHANNEL * ncc * sample_rate;
         // max_bit_reservoir = INT(buffer - mean_framelength), as in the
         // example of clause 8.2.3.2.
         let max_bits = buffer.checked_sub(mean)? / sample_rate;
         (max_bits >= 8).then_some(Self {
             sample_rate,
-            channels,
+            ncc,
             mean,
             max: max_bits * sample_rate,
             state: 0,
@@ -74,7 +76,7 @@ impl BitReservoir {
         sampling_frequency: SamplingFrequency,
         channel_configuration: ChannelConfiguration,
     ) -> u32 {
-        let buffer = BUFFER_BITS_PER_CHANNEL * channel_configuration.channels() as u64;
+        let buffer = BUFFER_BITS_PER_CHANNEL * channel_configuration.ncc() as u64;
         let sample_rate = u64::from(sampling_frequency.hz());
         ((buffer - 8) * sample_rate / FRAME_SAMPLES as u64) as u32
     }
@@ -161,7 +163,7 @@ impl BitReservoir {
     /// raw_data_block()", as `adif_buffer_fullness` is "the state of the
     /// bit reservoir after encoding the first raw_data_block()".
     pub fn adts_buffer_fullness(&self) -> u32 {
-        (self.state / self.sample_rate / self.channels / 32) as u32
+        (self.state / self.sample_rate / self.ncc / 32) as u32
     }
 }
 

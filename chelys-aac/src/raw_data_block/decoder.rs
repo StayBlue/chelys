@@ -87,27 +87,35 @@ pub struct DataStream {
     pub bits: Range<usize>,
 }
 
-/// A `raw_data_block()` of one audio channel element as read.
+/// An audio channel element of a `raw_data_block()` as read.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Block {
+pub struct BlockElement {
+    pub id_syn_ele: u32,
     pub element: Element,
     /// The element's bits in the block, after its `id_syn_ele`.
-    pub element_bits: Range<usize>,
+    pub bits: Range<usize>,
     /// Where a pair's second `individual_channel_stream()` starts.
     pub second_channel_start: Option<usize>,
+}
+
+/// A `raw_data_block()` of audio channel elements as read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Block {
+    /// The block's audio channel elements, in order.
+    pub elements: Vec<BlockElement>,
     /// The block's `data_stream_element()`s, in order.
     pub data_streams: Vec<DataStream>,
     /// The `id_syn_ele` of each element in order, `ID_END` last.
     pub ids: Vec<u32>,
 }
 
-/// Reads a `raw_data_block()` at `fs` that holds one
-/// `single_channel_element()` or `channel_pair_element()`, any
-/// `data_stream_element()`s and `fill_element()`s, and `ID_END`, then aligns
-/// to its byte (Table 12), which must be its last.
+/// Reads a `raw_data_block()` at `fs` that holds
+/// `single_channel_element()`s and `channel_pair_element()`s, one at least,
+/// any `data_stream_element()`s and `fill_element()`s, and `ID_END`, then
+/// aligns to its byte (Table 12), which must be its last.
 pub fn raw_data_block(block: &[u8], fs: SamplingFrequency) -> Block {
     let mut r = BitReader::new(block);
-    let mut element = None;
+    let mut elements = Vec::new();
     let mut data_streams = Vec::new();
     let mut ids = Vec::new();
     loop {
@@ -116,9 +124,13 @@ pub fn raw_data_block(block: &[u8], fs: SamplingFrequency) -> Block {
         let start = r.position();
         match id {
             0 | 1 => {
-                assert!(element.is_none(), "one audio channel element");
-                let (read, second) = element_after_id(&mut r, fs, id);
-                element = Some((read, start..r.position(), second));
+                let (element, second_channel_start) = element_after_id(&mut r, fs, id);
+                elements.push(BlockElement {
+                    id_syn_ele: id,
+                    element,
+                    bits: start..r.position(),
+                    second_channel_start,
+                });
             }
             4 => {
                 let element_instance_tag = r.read(4);
@@ -159,11 +171,9 @@ pub fn raw_data_block(block: &[u8], fs: SamplingFrequency) -> Block {
         assert_eq!(r.read(1), 0, "byte_alignment()");
     }
     assert_eq!(r.position(), 8 * block.len(), "the block ends aligned");
-    let (element, element_bits, second_channel_start) = element.expect("an element");
+    assert!(!elements.is_empty(), "an audio channel element");
     Block {
-        element,
-        element_bits,
-        second_channel_start,
+        elements,
         data_streams,
         ids,
     }
@@ -185,7 +195,7 @@ mod tests {
         let fs = SamplingFrequency::Hz48000;
         let mut w = BitWriter::new();
         w.write(0, 3); // ID_SCE
-        CodedElement::single(CodedChannel::silent(Windows::LONG_SINE, fs)).write(&mut w);
+        CodedElement::single(CodedChannel::silent(Windows::LONG_SINE, fs)).write(&mut w, 0);
         // At bit 29: ID_DSE, element_instance_tag 3, data_byte_align_flag,
         // count 2, then to bit 48.
         w.write(4, 3);
@@ -209,6 +219,6 @@ mod tests {
             }]
         );
         assert_eq!(block.ids, [0, 4, 7]);
-        assert_eq!(block.element_bits, 3..29);
+        assert_eq!(block.elements[0].bits, 3..29);
     }
 }

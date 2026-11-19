@@ -155,7 +155,7 @@ mod tests {
             flags: Flags::default(),
             protected: true,
         };
-        let block = raw_data_block::write(configuration, element, &[], len);
+        let block = raw_data_block::write(configuration, std::slice::from_ref(element), &[], len);
         let mut w = BitWriter::new();
         header.write(&mut w, header.bytes() + block.bytes.len(), 0x55);
         (w.into_bytes(), block)
@@ -273,17 +273,21 @@ mod tests {
                     part
                 };
                 let mut protected = binary_digits(frame.header);
-                protected.push_str(&first(block.element_bits.clone(), 192));
-                if let Some(second) = block.second_channel_start {
-                    protected.push_str(&first(second..block.element_bits.end, 128));
+                for element in &block.elements {
+                    protected.push_str(&first(element.bits.clone(), 192));
+                    if let Some(second) = element.second_channel_start {
+                        protected.push_str(&first(second..element.bits.end, 128));
+                    }
                 }
                 for stream in &block.data_streams {
                     protected.push_str(&bits[stream.bits.clone()]);
                     data += stream.bytes.len();
                 }
                 assert_eq!(frame.crc_check, Some(crc_of(&protected)));
-                short |= block.element_bits.len() < 192;
-                long |= block.element_bits.len() > 192 + 128;
+                for element in &block.elements {
+                    short |= element.bits.len() < 192;
+                    long |= element.bits.len() > 192 + 128;
+                }
             }
             assert!(short && long, "{channel_configuration:?}");
             assert_eq!(data, 150);
@@ -427,10 +431,11 @@ mod tests {
             let frame = adts_frame(rest);
             rest = &rest[frame.aac_frame_length..];
             let block = raw_data_block(frame.raw_data_block, fs);
-            let start = block.element_bits.start;
-            let second = block.second_channel_start.unwrap();
+            let element = &block.elements[0];
+            let start = element.bits.start;
+            let second = element.second_channel_start.unwrap();
             let n = second - start;
-            if n >= 64 || block.element_bits.end - second < 192 - n {
+            if n >= 64 || element.bits.end - second < 192 - n {
                 continue;
             }
             cases += 1;

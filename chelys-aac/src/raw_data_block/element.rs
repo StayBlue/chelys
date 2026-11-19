@@ -8,20 +8,9 @@ use chelys_core::bitstream::BitWriter;
 
 use super::ics::write_individual_channel_stream;
 use crate::channel::CodedChannel;
+use crate::channel_configuration::ElementKind;
 use crate::stereo::middle_side::MsMask;
 use crate::window::Windows;
-
-/// The `element_instance_tag` of every element.
-///
-/// Spec gap: where `channel_configuration` gives the elements (Table 42),
-/// the standard does not say which tags they have, only that the elements
-/// of one kind in a raw_data_block() differ in tag and that a mono or
-/// stereo stream keeps its element's tag throughout (clause 8.2.4). Each
-/// stream here has one element, which is given the first tag. Settled by
-/// decoding with ffmpeg (black box): it decodes mono and stereo streams so
-/// tagged, at every sampling frequency, without complaint; the conformance
-/// test is `ffmpeg_decodes_silence_at_every_sample_rate`.
-const ELEMENT_INSTANCE_TAG: u32 = 0;
 
 /// The bits of a `single_channel_element()` besides its channel's
 /// `individual_channel_stream()`: `element_instance_tag`.
@@ -36,6 +25,7 @@ const CHANNEL_PAIR_ELEMENT_BITS: u32 = 4 + 1;
 /// of one channel, or a `channel_pair_element()` of two.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CodedElement {
+    kind: ElementKind,
     channels: Vec<CodedChannel>,
     /// For a pair that shares its window, `common_window` 1, the bands it
     /// codes as middle and side.
@@ -45,6 +35,7 @@ pub struct CodedElement {
 impl CodedElement {
     pub fn single(channel: CodedChannel) -> Self {
         Self {
+            kind: ElementKind::Single,
             channels: vec![channel],
             common: None,
         }
@@ -54,6 +45,7 @@ impl CodedElement {
     /// `common_window` 0.
     pub fn pair(left: CodedChannel, right: CodedChannel) -> Self {
         Self {
+            kind: ElementKind::Pair,
             channels: vec![left, right],
             common: None,
         }
@@ -73,9 +65,15 @@ impl CodedElement {
             "a common window shared by channels of different windows"
         );
         Self {
+            kind: ElementKind::Pair,
             channels: vec![left, right],
             common: Some(ms),
         }
+    }
+
+    /// Which element it is.
+    pub fn kind(&self) -> ElementKind {
+        self.kind
     }
 
     /// The element's channels.
@@ -85,7 +83,7 @@ impl CodedElement {
 
     /// Whether the element is a `channel_pair_element()`.
     pub fn is_pair(&self) -> bool {
-        self.channels.len() == 2
+        self.kind == ElementKind::Pair
     }
 
     /// The bits of the element besides its `id_syn_ele`.
@@ -126,10 +124,11 @@ impl CodedElement {
         }
     }
 
-    /// Writes the element (Table 13 or 14), after its `id_syn_ele`.
-    pub fn write(&self, w: &mut BitWriter) {
+    /// Writes the element (Table 13 or 14), after its `id_syn_ele`, with
+    /// `element_instance_tag`.
+    pub fn write(&self, w: &mut BitWriter, element_instance_tag: u32) {
         let start = w.bit_len();
-        w.write(ELEMENT_INSTANCE_TAG, 4);
+        w.write(element_instance_tag, 4);
         if self.is_pair() {
             w.write_bool(self.common.is_some());
             if let (Some(ms), Some(channel)) = (&self.common, self.channels.first()) {
@@ -157,7 +156,7 @@ mod tests {
 
     fn written(element: &CodedElement) -> String {
         let mut w = BitWriter::new();
-        element.write(&mut w);
+        element.write(&mut w, 0);
         let len = w.bit_len();
         assert_eq!(len as u32, element.bits());
         binary_digits(&w.into_bytes())[..len].to_owned()

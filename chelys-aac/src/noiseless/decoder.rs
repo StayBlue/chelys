@@ -614,6 +614,7 @@ pub fn individual_channel_stream(
 /// 14) as read.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Element {
+    pub element_instance_tag: u32,
     pub channels: Vec<Ics>,
     pub common_window: bool,
     pub ms_mask_present: u32,
@@ -636,10 +637,11 @@ pub fn element_after_id(
     fs: SamplingFrequency,
     id_syn_ele: u32,
 ) -> (Element, Option<usize>) {
-    r.read(4); // element_instance_tag
+    let element_instance_tag = r.read(4);
     match id_syn_ele {
         0 => (
             Element {
+                element_instance_tag,
                 channels: vec![individual_channel_stream(r, fs, None, false)],
                 common_window: false,
                 ms_mask_present: 0,
@@ -667,6 +669,7 @@ pub fn element_after_id(
             let second = r.position();
             let right = individual_channel_stream(r, fs, info.as_ref(), true);
             let element = Element {
+                element_instance_tag,
                 channels: vec![left, right],
                 common_window,
                 ms_mask_present,
