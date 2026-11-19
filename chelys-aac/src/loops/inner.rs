@@ -49,6 +49,25 @@ fn step_scale(sf_decoder: u8) -> f64 {
     table[usize::from(sf_decoder)]
 }
 
+/// `int(magnitude)` (clause C.7.4), the integer part of a magnitude of 0 to
+/// [`BEYOND_MAGNITUDE`]: rounded to the nearest integer by adding 2^52,
+/// which leaves it in the low bits of the sum, and lowered by 1 where that
+/// rounded up. The same as `magnitude as i32`, in operations that the
+/// compiler can vectorize.
+fn truncate(magnitude: f64) -> i32 {
+    const SHIFT: f64 = (1u64 << 52) as f64;
+    let shifted = magnitude + SHIFT;
+    let rounded_up = shifted - SHIFT > magnitude;
+    shifted.to_bits() as i32 - i32::from(rounded_up)
+}
+
+/// `x_quant` of `magnitude` (see [`truncate`]) with the sign of `x`.
+fn signed(magnitude: f64, x: f64) -> i32 {
+    // 0 or -1, which negates by a complement and an increment.
+    let sign = -i32::from(x < 0.0);
+    (truncate(magnitude) ^ sign) - sign
+}
+
 /// `|x|^(3/4)`, as `(|x| * |x|^(1/2))^(1/2)`: two square roots, which the
 /// processor computes, rather than a call to the C library's `pow`. It
 /// differs from `pow` by about the last bit.
@@ -177,8 +196,7 @@ impl<'a> Lines<'a> {
             .zip(&self.scaled[range.start..end])
             .zip(&self.spectrum[range.start..end]);
         for ((q, &scaled), &x) in lines {
-            let magnitude = (scaled * scale + MAGIC_NUMBER).min(BEYOND_MAGNITUDE) as i32;
-            *q = if x < 0.0 { -magnitude } else { magnitude };
+            *q = signed((scaled * scale + MAGIC_NUMBER).min(BEYOND_MAGNITUDE), x);
         }
         above.fill(0);
     }
@@ -209,8 +227,7 @@ pub fn band_bits(lines: &[f64], weights: &[f64], allowed: f64, scratch: &mut Ban
     let quantize = |sf_decoder: u8, x_quant: &mut [i32]| {
         let scale = step_scale(sf_decoder);
         for ((q, &scaled), &x) in x_quant.iter_mut().zip(scaled).zip(lines) {
-            let magnitude = (scaled * scale + MAGIC_NUMBER).min(BEYOND_MAGNITUDE) as i32;
-            *q = if x < 0.0 { -magnitude } else { magnitude };
+            *q = signed((scaled * scale + MAGIC_NUMBER).min(BEYOND_MAGNITUDE), x);
         }
     };
     // Whether the distortion of the lines quantized with the step of
@@ -220,8 +237,8 @@ pub fn band_bits(lines: &[f64], weights: &[f64], allowed: f64, scratch: &mut Ban
         let (scale, gain) = (step_scale(sf_decoder), decoder_gain(sf_decoder));
         let mut distortion = 0.0;
         for ((&scaled, &x), &weight) in scaled.iter().zip(lines).zip(weights) {
-            let magnitude = (scaled * scale + MAGIC_NUMBER).min(BEYOND_MAGNITUDE) as u32;
-            let requantized = powers[magnitude.min(MAX_MAGNITUDE) as usize];
+            let magnitude = truncate((scaled * scale + MAGIC_NUMBER).min(BEYOND_MAGNITUDE));
+            let requantized = powers[(magnitude as u32).min(MAX_MAGNITUDE) as usize];
             let error = x.abs() - requantized * gain;
             distortion += error * error * weight;
         }
@@ -661,6 +678,23 @@ mod tests {
                 assert!(q == 0 || q.signum() == x.signum() as i32);
             }
         }
+    }
+
+    #[test]
+    fn truncation_takes_the_integer_part() {
+        let magnitude = BEYOND_MAGNITUDE as u32;
+        for k in (0..=magnitude).map(f64::from) {
+            // k, and the neighbours of k on either side.
+            let up = f64::from_bits(k.to_bits() + 1);
+            let down = f64::from_bits(k.to_bits().saturating_sub(1));
+            for v in [k, up, k + 0.25, k + 0.5, k + 0.75, down] {
+                if (0.0..=BEYOND_MAGNITUDE).contains(&v) {
+                    assert_eq!(truncate(v), v as i32, "{v}");
+                }
+            }
+        }
+        assert_eq!(signed(3.7, -1e-9), -3);
+        assert_eq!(signed(3.7, 0.0), 3);
     }
 
     #[test]
