@@ -141,7 +141,12 @@ fn write_element(
 /// its element_instance_tag, each CPE associated with the front channel
 /// pair must have the same value ..., and each CPE associated with the back
 /// channel pair must have the same value". The first of each kind is given
-/// tag 0, the next 1, and so on.
+/// tag 0, the next 1, and so on. Settled by decoding with ffmpeg (black
+/// box): it decodes mono and stereo streams so tagged, at every sampling
+/// frequency, without complaint, and streams of channel configurations 3
+/// to 7 so tagged, each channel in its place; the conformance tests are
+/// `ffmpeg_decodes_silence_at_every_sample_rate` and
+/// `ffmpeg_maps_each_channel_of_configurations_3_to_7`.
 ///
 /// Spec reading: clause 8.2.2 says that elements with tags "must have a
 /// unique element_instance_tag in each raw_data_block()", which could be

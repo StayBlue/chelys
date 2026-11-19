@@ -95,7 +95,24 @@ impl Config {
     /// `channel_pair_element()` as "left, right": its first channel is the
     /// left, as clause 1.6.3.5 of ISO/IEC 14496-3 says outright ("the first
     /// channel element that occurs within the channel pair maps to the next
-    /// speaker listed").
+    /// speaker listed"). Settled by decoding with ffmpeg (black box): it
+    /// gives each input channel whole in one of its output channels, at its
+    /// level and sign, in the layout it names, its channels in its order:
+    ///
+    /// | `channels` | ffmpeg's layout | Its channels, from the input's |
+    /// |---|---|---|
+    /// | 3 | 3.0 | FL left, FR right, FC center |
+    /// | 4 | 4.0 | FL left, FR right, FC center, BC rear surround |
+    /// | 5 | 5.0 | FL left, FR right, FC center, BL left surround, BR right surround |
+    /// | 6 | 5.1 | FL left, FR right, FC center, LFE, BL left surround, BR right surround |
+    /// | 8 | 7.1 | FL left center, FR right center, FC center, LFE, BL left surround, BR right surround, SL left, SR right |
+    ///
+    /// ffmpeg names configuration 7 otherwise than both standards: as its
+    /// "7.1", whose front left and right, FL and FR, carry the first pair,
+    /// the left and right center front speakers of Table 42, and whose side
+    /// left and right, SL and SR, the second, its outside front speakers.
+    /// The conformance test is
+    /// `ffmpeg_maps_each_channel_of_configurations_3_to_7`.
     ///
     /// [`Encoder::new`]: super::Encoder::new
     pub fn new(sample_rate: u32, channels: usize, rate: Rate) -> Self {

@@ -147,6 +147,13 @@ fn decode_tones(sample_rate: u32, channels: usize, bits_per_second: u32) -> Mapp
 /// are all of a front pair, center, LFE, back pair and side pair: the
 /// first pair lands in FL and FR, the second in SL and SR, and the
 /// surround pair in BL and BR.
+///
+/// This is the evidence for two readings that the library marks as settled
+/// by decoding with ffmpeg: the order of the input's channels, those of
+/// the configuration's elements in order and of a pair left first
+/// (`Config::new`); and the `element_instance_tag`s, each kind of element
+/// numbered from 0 (`raw_data_block::element_instance_tags`), which ffmpeg
+/// decodes without complaint.
 #[test]
 fn ffmpeg_maps_each_channel_of_configurations_3_to_7() {
     for (channels, layout, sources) in [
