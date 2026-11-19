@@ -365,7 +365,8 @@ impl<'a> Counting<'a> {
             .max(least_max_sfb)
             .max(intensity_end);
         let element_bits = self.coding.element_bits[max_sfb];
-        let mut least_bits = channel::bits(windows, common_window, 0) + element_bits;
+        let tns = self.coding.tns;
+        let mut least_bits = channel::bits(windows, common_window, tns, 0) + element_bits;
         self.sections.clear();
         self.counted.clear();
         for (g, (start, bands)) in self.groups().enumerate() {
@@ -403,7 +404,7 @@ impl<'a> Counting<'a> {
         let noiseless: u32 = (self.sections.iter())
             .map(|s| s.section_data_bits() + s.spectral_data_bits())
             .sum();
-        channel::bits(windows, common_window, noiseless + scalefactor_bits) + element_bits
+        channel::bits(windows, common_window, tns, noiseless + scalefactor_bits) + element_bits
             <= available_bits
     }
 
@@ -457,6 +458,7 @@ impl<'a> Counting<'a> {
             self.coding.windows,
             self.coding.sampling_frequency,
             global_gain,
+            *self.coding.tns,
             self.x_quant,
             groups,
         )

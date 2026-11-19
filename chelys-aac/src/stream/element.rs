@@ -18,6 +18,7 @@ use crate::sampling_frequency::SamplingFrequency;
 use crate::scalefactor_bands::{MAX_BANDS, Transform};
 use crate::stereo::intensity::{self, Intensity};
 use crate::stereo::middle_side::{self, MsMask};
+use crate::tns::Tns;
 use crate::window::{SHORT_WINDOWS, WindowSequence, Windows};
 
 /// One channel of the element: its samples not yet coded, and what codes
@@ -60,8 +61,11 @@ impl ChannelEncoder {
 #[derive(Debug)]
 pub struct PreparedChannel {
     pub windows: Windows,
-    /// The lines of the frame's transform, in the order they are sent.
+    /// The lines of the frame's transform, in the order they are sent,
+    /// shaped by the filters of `tns`.
     pub spectrum: Box<[f64; FRAME_LINES]>,
+    /// The filters of the channel's temporal noise shaping.
+    pub tns: Tns,
     /// The allowed distortion `xmin` of each band of each window group,
     /// raised by [`XMIN_OFFSET_DB`](loops::XMIN_OFFSET_DB) as the loops take
     /// it.
@@ -80,6 +84,7 @@ impl PreparedChannel {
         Self {
             windows: Windows::LONG_SINE,
             spectrum: Box::new([0.0; FRAME_LINES]),
+            tns: Tns::NONE,
             xmin: Vec::with_capacity(SHORT_WINDOWS),
             bit_allocation: 0.0,
             perceptual_entropy: 0.0,
@@ -467,9 +472,9 @@ impl ElementEncoder {
     }
 
     /// The bits of a channel of the frame without lines, as its element
-    /// sends it.
+    /// sends it, with its temporal noise shaping.
     fn silent_bits(&self, channel: &PreparedChannel) -> u32 {
-        channel::bits(channel.windows, self.common_window, 0)
+        channel::bits(channel.windows, self.common_window, &channel.tns, 0)
     }
 
     /// What the frame prepared asks of the frame.
@@ -556,7 +561,16 @@ impl ElementEncoder {
         match order[..] {
             [only] => {
                 let prepared = &self.prepared[only];
-                let coding = ChannelCoding::single(prepared.windows, fs, budget(prepared));
+                let coding = ChannelCoding {
+                    windows: prepared.windows,
+                    sampling_frequency: fs,
+                    available_bits: budget(prepared),
+                    common_window: false,
+                    least_max_sfb: 0,
+                    element_bits: [0; MAX_BANDS + 1],
+                    intensity: None,
+                    tns: &prepared.tns,
+                };
                 CodedElement::single(self.code(prepared, coding))
             }
             [first, second] if self.common_window => {
@@ -566,8 +580,14 @@ impl ElementEncoder {
                 let num_swb = windows.groups(fs).next().expect("a group").num_swb();
                 let ms = self.ms;
                 let mut coding = ChannelCoding {
+                    windows,
+                    sampling_frequency: fs,
+                    available_bits: budget(a),
                     common_window: true,
-                    ..ChannelCoding::single(windows, fs, budget(a))
+                    least_max_sfb: 0,
+                    element_bits: [0; MAX_BANDS + 1],
+                    intensity: None,
+                    tns: &a.tns,
                 };
                 let (mut a_channel, intensity, b_coding) = loop {
                     let a_channel = self.code(a, coding);
@@ -576,9 +596,14 @@ impl ElementEncoder {
                     let left = budget(a) - a_channel.bits(true);
                     let least_max_sfb = a_channel.max_sfb();
                     let mut b_coding = ChannelCoding {
-                        least_max_sfb,
+                        windows,
+                        sampling_frequency: fs,
+                        available_bits: budget(b) + left,
                         common_window: true,
-                        ..ChannelCoding::single(windows, fs, budget(b) + left)
+                        least_max_sfb,
+                        element_bits: [0; MAX_BANDS + 1],
+                        intensity: None,
+                        tns: &b.tns,
                     };
                     for m in least_max_sfb..=num_swb {
                         b_coding.element_bits[m] =
@@ -587,7 +612,8 @@ impl ElementEncoder {
                     // The bands in intensity stereo that the left channel
                     // sends.
                     let intensity = self.intensity.below(least_max_sfb);
-                    let b_least = least_channel(windows, fs, least_max_sfb, &intensity).bits(true)
+                    let b_least = least_channel(windows, fs, least_max_sfb, &intensity, &b.tns)
+                        .bits(true)
                         + b_coding.element_bits[least_max_sfb];
                     let floor = self.silent_bits(a);
                     if b_least <= b_coding.available_bits || coding.available_bits <= floor {
@@ -624,7 +650,16 @@ impl ElementEncoder {
                 for c in [first, second] {
                     let prepared = &self.prepared[c];
                     let available = budget(prepared) + left;
-                    let coding = ChannelCoding::single(prepared.windows, fs, available);
+                    let coding = ChannelCoding {
+                        windows: prepared.windows,
+                        sampling_frequency: fs,
+                        available_bits: available,
+                        common_window: false,
+                        least_max_sfb: 0,
+                        element_bits: [0; MAX_BANDS + 1],
+                        intensity: None,
+                        tns: &prepared.tns,
+                    };
                     let channel = self.code(prepared, coding);
                     left = available - channel.bits(false);
                     channels[c] = Some(channel);
@@ -640,21 +675,23 @@ impl ElementEncoder {
     /// silent, or through the iteration loops.
     fn code(&self, prepared: &PreparedChannel, coding: ChannelCoding<'_>) -> CodedChannel {
         if prepared.silent {
-            CodedChannel::silent(prepared.windows, self.sampling_frequency)
+            CodedChannel::without_lines(prepared.windows, self.sampling_frequency, prepared.tns)
         } else {
             loops::quantize_channel(&prepared.spectrum, &prepared.xmin, coding)
         }
     }
 }
 
-/// The fewest bits a channel of `windows` can be coded in, as the second of
-/// a pair that shares its window: without lines, its groups spanning
-/// `max_sfb` bands, with the bands of `intensity`, all below it.
+/// The fewest bits a channel of `windows` shaped by `tns` can be coded in,
+/// as the second of a pair that shares its window: without lines, its
+/// groups spanning `max_sfb` bands, with the bands of `intensity`, all
+/// below it.
 fn least_channel(
     windows: Windows,
     sampling_frequency: SamplingFrequency,
     max_sfb: usize,
     intensity: &Intensity,
+    tns: &Tns,
 ) -> CodedChannel {
     let lines = [0; FRAME_LINES];
     let groups = (windows.groups(sampling_frequency).enumerate())
@@ -674,7 +711,7 @@ fn least_channel(
             }
         })
         .collect();
-    CodedChannel::new(windows, sampling_frequency, 0, lines, groups)
+    CodedChannel::new(windows, sampling_frequency, 0, *tns, lines, groups)
         .expect("positions within the codebook's reach")
 }
 
@@ -946,7 +983,7 @@ mod tests {
             sequence: WindowSequence::EightShort { grouping },
             shape: crate::window::WindowShape::Sine,
         };
-        let channel = least_channel(windows, fs, 5, &below);
+        let channel = least_channel(windows, fs, 5, &below, &Tns::NONE);
         let groups: Vec<_> = channel
             .groups()
             .map(|(group, _)| group.scalefactor_data())

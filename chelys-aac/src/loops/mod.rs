@@ -14,6 +14,7 @@ use crate::channel::{CodedChannel, FRAME_LINES};
 use crate::sampling_frequency::SamplingFrequency;
 use crate::scalefactor_bands::MAX_BANDS;
 use crate::stereo::intensity::Intensity;
+use crate::tns::Tns;
 use crate::window::Windows;
 
 /// The offset in dB that every allowed distortion `xmin` is raised by
@@ -72,11 +73,15 @@ pub struct ChannelCoding<'a> {
     /// For the right channel of a pair that shares its window, the bands it
     /// codes in intensity stereo, whose lines are to be zero.
     pub intensity: Option<&'a Intensity>,
+    /// The filters that shaped the channel's lines, which it sends.
+    pub tns: &'a Tns,
 }
 
 impl ChannelCoding<'_> {
     /// The coding of a channel of a `single_channel_element()`, or of a
-    /// pair that does not share its window, in `available_bits`.
+    /// pair that does not share its window, in `available_bits`, without
+    /// temporal noise shaping.
+    #[cfg(test)]
     pub fn single(
         windows: Windows,
         sampling_frequency: SamplingFrequency,
@@ -90,6 +95,7 @@ impl ChannelCoding<'_> {
             least_max_sfb: 0,
             element_bits: [0; MAX_BANDS + 1],
             intensity: None,
+            tns: &Tns::NONE,
         }
     }
 }

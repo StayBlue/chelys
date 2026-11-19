@@ -30,7 +30,7 @@ pub fn write_individual_channel_stream(
         w,
     );
     w.write(0, 1); // pulse_data_present
-    w.write(0, 1); // tns_data_present
+    channel.tns().write(w);
     // gain_control_data_present: gain control is not permitted in the Low
     // Complexity profile (clause 7.1.2).
     w.write(0, 1);
@@ -49,6 +49,7 @@ mod tests {
     use crate::noiseless::sections::Sections;
     use crate::sampling_frequency::SamplingFrequency;
     use crate::scalefactor_bands::GroupBands;
+    use crate::tns::Tns;
     use crate::window::Windows;
 
     fn written(channel: &CodedChannel, common_window: bool) -> String {
@@ -81,7 +82,8 @@ mod tests {
             scalefactors: vec![101],
             positions: Vec::new(),
         };
-        let channel = CodedChannel::new(Windows::LONG_SINE, fs, 100, lines, vec![group]).unwrap();
+        let channel =
+            CodedChannel::new(Windows::LONG_SINE, fs, 100, Tns::NONE, lines, vec![group]).unwrap();
         let bits = written(&channel, false);
         // global_gain 100, then ics_info() with max_sfb 1.
         assert!(bits.starts_with(&["01100100", "0", "00", "0", "000001", "0"].concat()));

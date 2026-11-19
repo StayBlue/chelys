@@ -2,11 +2,11 @@
 // SPDX-License-Identifier: MIT
 
 //! A decoder of the audio channel elements, written from the syntax of
-//! Tables 13 to 18 and 20 and from clauses 9.3, 10.3, 11.3, 12.1.3 and
-//! 12.2.3 apart from the encoder, for tests to decode what it writes: the
-//! fields of a `single_channel_element()` or `channel_pair_element()`, and
-//! the spectra they reconstruct. It shares only the codebooks and the
-//! scalefactor band tables.
+//! Tables 13 to 20 and from clauses 7.1.6, 8.3.5, 9.3, 10.3, 11.3, 12.1.3,
+//! 12.2.3 and 14.3 apart from the encoder, for tests to decode what it
+//! writes: the fields of a `single_channel_element()` or
+//! `channel_pair_element()`, and the spectra they reconstruct. It shares
+//! only the codebooks and the scalefactor band tables.
 
 use super::codebooks::{Codebook, Codeword, SCALEFACTOR_CODEWORDS};
 use super::tables;
@@ -262,11 +262,228 @@ pub fn ics_info(r: &mut BitReader) -> IcsInfo {
     }
 }
 
+/// One filter of a window's `tns_data()` (Table 19) as read: `length`,
+/// `order`, `direction`, `coef_compress` and the `order` values of `coef`,
+/// as sent, unsigned.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TnsFilter {
+    pub length: usize,
+    pub order: usize,
+    pub direction: u32,
+    pub coef_compress: u32,
+    pub coef: Vec<u32>,
+}
+
+/// One window's `tns_data()` (Table 19) as read: `coef_res` and its
+/// `n_filt` filters.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TnsWindow {
+    pub coef_res: u32,
+    pub filters: Vec<TnsFilter>,
+}
+
+/// Reads a `tns_data()` (Table 19) of the windows of `info`, with the
+/// fields' sizes of clause 14.2.1.
+pub fn tns_data(r: &mut BitReader, info: &IcsInfo) -> Vec<TnsWindow> {
+    let short = info.window_sequence == 2;
+    let num_windows = if short { 8 } else { 1 };
+    let (n_filt_bits, length_bits, order_bits) = if short { (1, 4, 3) } else { (2, 6, 5) };
+    (0..num_windows)
+        .map(|_| {
+            let n_filt = r.read(n_filt_bits);
+            let coef_res = if n_filt > 0 { r.read(1) } else { 0 };
+            let filters = (0..n_filt)
+                .map(|_| {
+                    let length = r.read(length_bits) as usize;
+                    let order = r.read(order_bits) as usize;
+                    let (mut direction, mut coef_compress, mut coef) = (0, 0, Vec::new());
+                    if order > 0 {
+                        direction = r.read(1);
+                        coef_compress = r.read(1);
+                        let bits = coef_res + 3 - coef_compress;
+                        coef = (0..order).map(|_| r.read(bits)).collect();
+                    }
+                    TnsFilter {
+                        length,
+                        order,
+                        direction,
+                        coef_compress,
+                        coef,
+                    }
+                })
+                .collect();
+            TnsWindow { coef_res, filters }
+        })
+        .collect()
+}
+
+/// `TNS_MAX_BANDS` (Table 33) and `TNS_MAX_ORDER` (clause 7.1.6) of the
+/// Low Complexity profile.
+fn tns_max(fs: SamplingFrequency, short: bool) -> (usize, usize) {
+    let bands = match (fs.hz(), short) {
+        (96_000 | 88_200, false) => 31,
+        (96_000 | 88_200, true) => 9,
+        (64_000, false) => 34,
+        (64_000, true) => 10,
+        (48_000, false) => 40,
+        (44_100, false) => 42,
+        (32_000, false) => 51,
+        (24_000 | 22_050, false) => 46,
+        (16_000 | 12_000 | 11_025, false) => 42,
+        (8_000, false) => 39,
+        (_, true) => 14,
+        (hz, _) => panic!("{hz} Hz"),
+    };
+    (bands, if short { 7 } else { 12 })
+}
+
+/// `tns_decode_coef()` of clause 14.3, transcribed: the LPC coefficients
+/// `a[0..=order]` of a filter's coefficients as sent.
+pub fn tns_decode_coef(
+    order: usize,
+    coef_res_bits: u32,
+    coef_compress: u32,
+    coef: &[u32],
+) -> Vec<f64> {
+    let sgn_mask = [0x2, 0x4, 0x8];
+    let neg_mask = [!0x3, !0x7, !0xf];
+    let coef_res2 = (coef_res_bits - coef_compress) as usize;
+    let s_mask = sgn_mask[coef_res2 - 2];
+    let n_mask = neg_mask[coef_res2 - 2];
+    let tmp: Vec<i32> = (0..order)
+        .map(|i| {
+            let c = coef[i] as i32;
+            if c & s_mask != 0 { c | n_mask } else { c }
+        })
+        .collect();
+    let pi = std::f64::consts::PI;
+    let iqfac = ((1 << (coef_res_bits - 1)) as f64 - 0.5) / (pi / 2.0);
+    let iqfac_m = ((1 << (coef_res_bits - 1)) as f64 + 0.5) / (pi / 2.0);
+    let tmp2: Vec<f64> = (tmp.iter())
+        .map(|&t| (f64::from(t) / if t >= 0 { iqfac } else { iqfac_m }).sin())
+        .collect();
+    let mut a = vec![0.0; order + 1];
+    let mut b = vec![0.0; order + 1];
+    a[0] = 1.0;
+    for m in 1..=order {
+        for i in 1..m {
+            b[i] = a[i] + tmp2[m - 1] * a[m - i];
+        }
+        a[1..m].copy_from_slice(&b[1..m]);
+        a[m] = tmp2[m - 1];
+    }
+    a
+}
+
+/// `tns_ar_filter()` of clause 14.3: `y(n) = x(n) - lpc[1] y(n-1) - ... -
+/// lpc[order] y(n-order)`, in place over `size` lines of `spectrum` from
+/// `start` by `inc`, its state 0 to start with.
+pub fn tns_ar_filter(spectrum: &mut [f64], start: usize, size: usize, inc: isize, lpc: &[f64]) {
+    let order = lpc.len() - 1;
+    let mut state = vec![0.0; order];
+    let mut n = start as isize;
+    for _ in 0..size {
+        let i = n as usize;
+        let mut y = spectrum[i];
+        for (k, s) in state.iter().enumerate() {
+            y -= lpc[k + 1] * s;
+        }
+        state.rotate_right(1);
+        if order > 0 {
+            state[0] = y;
+        }
+        spectrum[i] = y;
+        n += inc;
+    }
+}
+
+/// `tns_decode_frame()` of clause 14.3 over one channel's windows,
+/// `spec[w][k]`, one window after another in `spec`.
+pub fn tns_decode_frame(
+    spec: &mut [f64],
+    info: &IcsInfo,
+    tns: &[TnsWindow],
+    fs: SamplingFrequency,
+) {
+    let short = info.window_sequence == 2;
+    let (tns_max_bands, tns_max_order) = tns_max(fs, short);
+    let swb_offset = swb_offsets(fs, info.transform());
+    let num_swb = swb_offset.len() - 1;
+    let window_lines = if short { 128 } else { 1024 };
+    for (w, window) in tns.iter().enumerate() {
+        let spec = &mut spec[w * window_lines..(w + 1) * window_lines];
+        let mut bottom = num_swb;
+        for filter in &window.filters {
+            let top = bottom;
+            bottom = top.saturating_sub(filter.length);
+            let tns_order = filter.order.min(tns_max_order);
+            if tns_order == 0 {
+                continue;
+            }
+            let lpc = tns_decode_coef(
+                tns_order,
+                window.coef_res + 3,
+                filter.coef_compress,
+                &filter.coef,
+            );
+            let start = usize::from(swb_offset[bottom.min(tns_max_bands).min(info.max_sfb)]);
+            let end = usize::from(swb_offset[top.min(tns_max_bands).min(info.max_sfb)]);
+            if end <= start {
+                continue;
+            }
+            let size = end - start;
+            let (start, inc) = if filter.direction == 1 {
+                (end - 1, -1)
+            } else {
+                (start, 1)
+            };
+            tns_ar_filter(spec, start, size, inc, &lpc);
+        }
+    }
+}
+
+/// `quant_to_spec()` of clause 8.3.5, transcribed: the lines of a channel,
+/// `x_quant` in the order they are sent, window by window in `spec`; and,
+/// where `back`, the reverse.
+fn quant_to_spec(
+    info: &IcsInfo,
+    fs: SamplingFrequency,
+    x_quant: &mut [f64],
+    spec: &mut [f64],
+    back: bool,
+) {
+    let swb_offset = swb_offsets(fs, info.transform());
+    let window_lines = if info.window_sequence == 2 { 128 } else { 1024 };
+    let mut i = 0;
+    let mut k = 0;
+    for &len in &info.group_lengths {
+        let mut j = 0;
+        for sfb in 0..swb_offset.len() - 1 {
+            let width = usize::from(swb_offset[sfb + 1] - swb_offset[sfb]);
+            for win in 0..len {
+                for bin in 0..width {
+                    let s = &mut spec[(win + k) * window_lines + bin + j];
+                    if back {
+                        x_quant[i] = *s;
+                    } else {
+                        *s = x_quant[i];
+                    }
+                    i += 1;
+                }
+            }
+            j += width;
+        }
+        k += len;
+    }
+}
+
 /// An `individual_channel_stream()` (Table 16) as read.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Ics {
     pub global_gain: i32,
     pub info: IcsInfo,
+    /// Each window's `tns_data()` where `tns_data_present` is 1.
+    pub tns: Option<Vec<TnsWindow>>,
     /// Each group's sections, as [`section_data`] gives them.
     pub sections: Vec<Vec<(u8, usize, usize)>>,
     /// Each group's scalefactors, as [`scale_factor_data`] gives them.
@@ -309,7 +526,9 @@ pub fn individual_channel_stream(
             scale_factor_data(r, sections, &mut last_sf, &mut last_is, intensity)
         })
         .collect();
-    assert_eq!(r.read(3), 0, "pulse, TNS and gain control flags");
+    assert_eq!(r.read(1), 0, "pulse_data_present");
+    let tns = (r.read(1) == 1).then(|| tns_data(r, &info));
+    assert_eq!(r.read(1), 0, "gain_control_data_present");
     let lines = (sections.iter().zip(&info.group_lengths))
         .map(|(sections, &len)| {
             let offsets = info.offsets(fs, len);
@@ -320,6 +539,7 @@ pub fn individual_channel_stream(
     Ics {
         global_gain,
         info,
+        tns,
         sections,
         scalefactors,
         lines,
@@ -381,9 +601,25 @@ pub fn element(r: &mut BitReader, fs: SamplingFrequency) -> Element {
 impl Element {
     /// The spectra the element reconstructs, each channel's lines group by
     /// group in the order they are sent: inversely quantized (clause 10.3),
-    /// scaled by their scalefactors (clause 11.3.3), and of a pair, M/S
-    /// (clause 12.1.3) and intensity stereo decoded (clause 12.2.3).
+    /// scaled by their scalefactors (clause 11.3.3), of a pair, M/S (clause
+    /// 12.1.3) and intensity stereo decoded (clause 12.2.3), and their
+    /// temporal noise shaping decoded (clause 14.3), in that order (clause
+    /// 4, figure 2).
     pub fn spectra(&self, fs: SamplingFrequency) -> Vec<Vec<f64>> {
+        let mut spectra = self.joint_spectra(fs);
+        for (spectrum, ics) in spectra.iter_mut().zip(&self.channels) {
+            if let Some(tns) = &ics.tns {
+                let mut spec = vec![0.0; spectrum.len()];
+                quant_to_spec(&ics.info, fs, spectrum, &mut spec, false);
+                tns_decode_frame(&mut spec, &ics.info, tns, fs);
+                quant_to_spec(&ics.info, fs, spectrum, &mut spec, true);
+            }
+        }
+        spectra
+    }
+
+    /// [`spectra`](Self::spectra) before temporal noise shaping is decoded.
+    pub fn joint_spectra(&self, fs: SamplingFrequency) -> Vec<Vec<f64>> {
         let mut spectra: Vec<Vec<f64>> = (self.channels.iter())
             .map(|ics| {
                 let mut spectrum = Vec::new();

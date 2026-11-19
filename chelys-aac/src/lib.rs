@@ -47,6 +47,7 @@ mod sampling_frequency;
 mod scalefactor_bands;
 mod stereo;
 mod stream;
+mod tns;
 mod window;
 
 pub use chelys_core::Sample;
@@ -85,6 +86,7 @@ pub mod internals {
         sampling_frequency,
         scalefactor_bands,
         stereo,
+        tns,
         window,
     );
 }
