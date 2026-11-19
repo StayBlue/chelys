@@ -168,3 +168,47 @@ pub fn raw_data_block(block: &[u8], fs: SamplingFrequency) -> Block {
         ids,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use chelys_core::bitstream::BitWriter;
+
+    use super::*;
+    use crate::channel::CodedChannel;
+    use crate::raw_data_block::element::CodedElement;
+    use crate::window::Windows;
+
+    /// A data stream element that aligns its bytes, which the encoder does
+    /// not write, is aligned to the block's first bit.
+    #[test]
+    fn aligned_data_streams_skip_to_the_byte() {
+        let fs = SamplingFrequency::Hz48000;
+        let mut w = BitWriter::new();
+        w.write(0, 3); // ID_SCE
+        CodedElement::single(CodedChannel::silent(Windows::LONG_SINE, fs)).write(&mut w);
+        // At bit 29: ID_DSE, element_instance_tag 3, data_byte_align_flag,
+        // count 2, then to bit 48.
+        w.write(4, 3);
+        w.write(3, 4);
+        w.write(1, 1);
+        w.write(2, 8);
+        assert_eq!(w.bit_len(), 45);
+        w.write(0, 3);
+        w.write(0xA5, 8);
+        w.write(0x3C, 8);
+        w.write(7, 3); // ID_END
+        let bytes = w.into_bytes();
+        let block = raw_data_block(&bytes, fs);
+        assert_eq!(
+            block.data_streams,
+            [DataStream {
+                element_instance_tag: 3,
+                data_byte_align_flag: true,
+                bytes: vec![0xA5, 0x3C],
+                bits: 32..64,
+            }]
+        );
+        assert_eq!(block.ids, [0, 4, 7]);
+        assert_eq!(block.element_bits, 3..29);
+    }
+}
