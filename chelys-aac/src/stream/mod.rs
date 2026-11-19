@@ -925,6 +925,107 @@ mod tests {
         }
     }
 
+    /// The channel configurations of more than two channels.
+    const MULTICHANNEL: [ChannelConfiguration; 3] = [
+        ChannelConfiguration::Three,
+        ChannelConfiguration::Four,
+        ChannelConfiguration::Five,
+    ];
+
+    /// Each frame of a configuration holds its elements in order, each kind
+    /// tagged from 0, and each channel's tone in its own place: the input's
+    /// channels in the order of the elements that send them.
+    #[test]
+    fn each_configuration_sends_its_channels_in_its_elements_in_order() {
+        use crate::raw_data_block::decoder::raw_data_block;
+        use crate::raw_data_block::element_instance_tags;
+
+        let fs = SamplingFrequency::Hz48000;
+        for channel_configuration in MULTICHANNEL {
+            let channels = channel_configuration.channels();
+            let config = StreamConfig {
+                sampling_frequency: fs,
+                channel_configuration,
+                bits_per_second: 96_000 * channel_configuration.ncc() as u32,
+                framing: Framing::Raw,
+                flags: Flags::default(),
+                crc_protected: false,
+            };
+            // Channel c a steady tone at the centre of line 40 + 37c.
+            let line = |c: usize| 40 + 37 * c;
+            let input: Vec<Vec<f64>> = (0..channels)
+                .map(|c| {
+                    let k = line(c) as f64 + 0.5;
+                    (0..8 * FRAME_SAMPLES)
+                        .map(|t| 0.3 * (std::f64::consts::PI * k * t as f64 / 1024.0).sin())
+                        .collect()
+                })
+                .collect();
+            let input: Vec<&[f64]> = input.iter().map(Vec::as_slice).collect();
+            let mut frames = Vec::new();
+            StreamEncoder::new(config).encode(&input, &mut |frame: &[u8]| {
+                frames.push(frame.to_vec());
+            });
+            assert_eq!(frames.len(), 7);
+            let kinds = channel_configuration.elements();
+            for frame in &frames[2..] {
+                let block = raw_data_block(frame, fs);
+                let mut ids: Vec<u32> = kinds.iter().map(|k| k.id_syn_ele()).collect();
+                ids.push(7);
+                let sent: Vec<u32> = block.ids.iter().copied().filter(|&id| id != 6).collect();
+                assert_eq!(sent, ids, "{channel_configuration:?}");
+                let tags: Vec<u32> = (block.elements.iter())
+                    .map(|e| e.element.element_instance_tag)
+                    .collect();
+                let expected: Vec<u32> = element_instance_tags(channel_configuration).collect();
+                assert_eq!(tags, expected, "{channel_configuration:?}");
+                let spectra: Vec<Vec<f64>> = (block.elements.iter())
+                    .flat_map(|e| e.element.spectra(fs))
+                    .collect();
+                assert_eq!(spectra.len(), channels);
+                for (c, spectrum) in spectra.iter().enumerate() {
+                    let peak = (0..spectrum.len())
+                        .max_by(|&a, &b| spectrum[a].abs().total_cmp(&spectrum[b].abs()))
+                        .unwrap();
+                    assert_eq!(peak, line(c), "{channel_configuration:?}, channel {c}");
+                }
+            }
+        }
+    }
+
+    /// The bitrate of a configuration ranges from that of its shortest
+    /// frame to that of its NCC's input buffer, and every frame of silence
+    /// and noise fits it at both ends, with the CRC and without.
+    #[test]
+    fn every_configuration_codes_at_both_ends_of_its_range() {
+        let fs = SamplingFrequency::Hz44100;
+        for channel_configuration in MULTICHANNEL {
+            let input = noise(4 * FRAME_SAMPLES, 3);
+            for crc_protected in [false, true] {
+                let mut config = StreamConfig {
+                    sampling_frequency: fs,
+                    channel_configuration,
+                    bits_per_second: 0,
+                    framing: Framing::Adts,
+                    flags: Flags::default(),
+                    crc_protected,
+                };
+                let max = config.max_bits_per_second();
+                let ncc = channel_configuration.ncc() as u64;
+                assert_eq!(max as u64, (6144 * ncc - 8) * 44_100 / 1024);
+                for bits_per_second in [config.min_bits_per_second(), max] {
+                    config.bits_per_second = bits_per_second;
+                    assert!(config.is_valid());
+                    let channels = vec![input.as_slice(); channel_configuration.channels()];
+                    let mut encoder = StreamEncoder::new(config);
+                    let mut stream = Vec::new();
+                    encoder.encode(&channels, &mut stream);
+                    encoder.finish(&mut stream);
+                }
+            }
+        }
+    }
+
     #[test]
     #[should_panic(expected = "bytes of data streams a frame")]
     fn a_share_beyond_the_most_is_refused() {

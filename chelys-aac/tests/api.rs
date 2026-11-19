@@ -8,6 +8,9 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use chelys_aac::{Config, ConfigError, DELAY, Encoder, Framing, Rate, SAMPLE_RATES};
 
+/// The channel counts the encoder takes.
+const CHANNELS: [usize; 5] = [1, 2, 3, 4, 5];
+
 fn constant(bits_per_second: u32) -> Rate {
     Rate::Constant { bits_per_second }
 }
@@ -34,7 +37,7 @@ fn panics(f: impl FnOnce()) -> bool {
 #[test]
 fn every_sample_rate_and_channel_count_is_taken() {
     for sample_rate in SAMPLE_RATES {
-        for channels in [1, 2] {
+        for channels in CHANNELS {
             let config = Config::new(sample_rate, channels, constant(32_000 * channels as u32));
             assert_eq!(config.check(), Ok(()), "{sample_rate} Hz, {channels}");
             let encoder = Encoder::new(config).unwrap();
@@ -52,7 +55,7 @@ fn errors_name_what_was_refused() {
             Some(ConfigError::UnsupportedSampleRate { sample_rate })
         );
     }
-    for channels in [0, 3, 6, usize::MAX] {
+    for channels in [0, 6, 7, usize::MAX] {
         assert_eq!(
             Encoder::new(Config::new(44_100, channels, constant(64_000))).err(),
             Some(ConfigError::UnsupportedChannels { channels })
@@ -158,6 +161,37 @@ fn every_form_of_the_same_input_gives_the_same_stream() {
     }
 }
 
+/// Input of more channels than two gives one stream however it is divided
+/// between calls, interleaved or planar.
+#[test]
+fn every_division_of_multichannel_input_gives_the_same_stream() {
+    for channels in CHANNELS.into_iter().filter(|&c| c > 2) {
+        let config = Config::new(32_000, channels, constant(48_000 * channels as u32));
+        let input = pcm(6_000, channels);
+        let whole = encode_whole(config, &input);
+        for frames in [1, 700, 2048] {
+            let mut encoder = Encoder::new(config).unwrap();
+            let mut stream = Vec::new();
+            for part in input.chunks(channels * frames) {
+                encoder.encode_interleaved(part, &mut stream);
+            }
+            encoder.finish(&mut stream);
+            assert!(stream == whole, "{channels} channels, by {frames}");
+        }
+        let planar: Vec<Vec<f64>> = (0..channels)
+            .map(|c| input.iter().copied().skip(c).step_by(channels).collect())
+            .collect();
+        let mut encoder = Encoder::new(config).unwrap();
+        let mut stream = Vec::new();
+        for (from, to) in [(0, 1), (1, 1500), (1500, 6000)] {
+            let parts: Vec<&[f64]> = planar.iter().map(|c| &c[from..to]).collect();
+            encoder.encode_planar(&parts, &mut stream);
+        }
+        encoder.finish(&mut stream);
+        assert!(stream == whole, "{channels} channels, planar");
+    }
+}
+
 /// Samples far beyond full scale are clamped, and not a number, or an
 /// infinite one, is refused before any of the call is coded.
 #[test]
@@ -217,8 +251,8 @@ fn every_sample_type_is_taken() {
 #[test]
 fn the_audio_specific_config_names_the_stream() {
     for (index, sample_rate) in SAMPLE_RATES.into_iter().enumerate() {
-        for channels in [1, 2] {
-            let config = Config::new(sample_rate, channels, constant(16_000));
+        for channels in CHANNELS {
+            let config = Config::new(sample_rate, channels, constant(16_000 * channels as u32));
             let asc = Encoder::new(config).unwrap().audio_specific_config();
             let bits = u16::from_be_bytes([asc[0], asc[1]]);
             assert_eq!(asc.len(), 2);
@@ -239,7 +273,9 @@ fn an_encoder_can_move_between_threads() {
 /// No input at the edges of what the encoder takes makes it panic, at
 /// any sample rate, channel count or bitrate: square waves at full scale
 /// and at the clamp, the highest frequency at the clamp, noise beyond it,
-/// full-scale DC and silence, at the lowest and highest bitrates.
+/// full-scale DC and silence, at the lowest and highest bitrates, in every
+/// channel, and of more than two channels, each channel a different one of
+/// them, at the lowest, a middle and the highest sample rate.
 #[test]
 fn inputs_at_the_edges_encode_at_every_rate() {
     let len = 3 * 1024;
@@ -266,7 +302,8 @@ fn inputs_at_the_edges_encode_at_every_rate() {
         vec![0.0; len],
     ];
     for sample_rate in SAMPLE_RATES {
-        for channels in [1, 2] {
+        let multichannel = [8_000, 48_000, 96_000].contains(&sample_rate);
+        for channels in CHANNELS.into_iter().filter(|&c| c <= 2 || multichannel) {
             let Err(ConfigError::UnsupportedBitrate { min, max, .. }) =
                 Config::new(sample_rate, channels, constant(0)).check()
             else {
@@ -274,11 +311,17 @@ fn inputs_at_the_edges_encode_at_every_rate() {
             };
             for bits_per_second in [min, max] {
                 let config = Config::new(sample_rate, channels, constant(bits_per_second));
-                for signal in &signals {
-                    let interleaved: Vec<f64> = signal
-                        .iter()
-                        .flat_map(|&x| std::iter::repeat_n(x, channels))
-                        .collect();
+                for (i, signal) in signals.iter().enumerate() {
+                    let interleaved: Vec<f64> = if channels <= 2 {
+                        (signal.iter())
+                            .flat_map(|&x| std::iter::repeat_n(x, channels))
+                            .collect()
+                    } else {
+                        (0..len)
+                            .flat_map(|t| (0..channels).map(move |c| (t, c)))
+                            .map(|(t, c)| signals[(i + c) % signals.len()][t])
+                            .collect()
+                    };
                     encode_whole(config, &interleaved);
                 }
             }

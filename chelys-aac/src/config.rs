@@ -58,8 +58,28 @@ pub struct Config {
 }
 
 impl Config {
-    /// A configuration of `channels` channels, 1 (mono) or 2 (stereo), in
-    /// ADTS. [`Encoder::new`] checks it.
+    /// A configuration of `channels` channels, in ADTS: 1 (mono), 2
+    /// (stereo), 3, 4 or 5, each coded as the `channel_configuration` of
+    /// as many speakers (Table 42). [`Encoder::new`] checks it.
+    ///
+    /// The input gives the channels in the order the stream sends them:
+    /// that of the configuration's elements, and in a channel pair, left
+    /// before right.
+    ///
+    /// | `channels` | Order |
+    /// |---|---|
+    /// | 1 | center |
+    /// | 2 | left, right |
+    /// | 3 | center, left, right |
+    /// | 4 | center, left, right, rear surround |
+    /// | 5 | center, left, right, left surround, right surround |
+    ///
+    /// Spec reading: Table 42 lists each configuration's elements "in order
+    /// received", and the speakers each maps to, those of a
+    /// `channel_pair_element()` as "left, right": its first channel is the
+    /// left, as clause 1.6.3.5 of ISO/IEC 14496-3 says outright ("the first
+    /// channel element that occurs within the channel pair maps to the next
+    /// speaker listed").
     ///
     /// [`Encoder::new`]: super::Encoder::new
     pub fn new(sample_rate: u32, channels: usize, rate: Rate) -> Self {
@@ -202,7 +222,7 @@ impl Config {
 pub enum ConfigError {
     /// The sample rate is not one of [`SAMPLE_RATES`].
     UnsupportedSampleRate { sample_rate: u32 },
-    /// The channels are neither 1 nor 2.
+    /// No channel configuration has as many channels (see [`Config::new`]).
     UnsupportedChannels { channels: usize },
     /// The bitrate is outside the range, from `min` to `max`, of the sample
     /// rate, channels and framing: below the bits of the shortest frame, or

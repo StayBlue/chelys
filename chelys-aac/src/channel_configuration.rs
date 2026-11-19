@@ -39,14 +39,26 @@ pub enum ChannelConfiguration {
     Mono,
     /// 2: the left and right front speakers.
     Stereo,
+    /// 3: the center front speaker, then the left and right front
+    /// speakers.
+    Three,
+    /// 4: the center front speaker, the left and right front speakers, and
+    /// the rear surround speaker.
+    Four,
+    /// 5: the center front speaker, the left and right front speakers, and
+    /// the left and right surround rear speakers.
+    Five,
 }
 
 impl ChannelConfiguration {
-    /// The configuration of `channels` channels, 1 or 2.
+    /// The configuration of `channels` channels, from 1 to 5.
     pub fn from_channels(channels: usize) -> Option<Self> {
         match channels {
             1 => Some(Self::Mono),
             2 => Some(Self::Stereo),
+            3 => Some(Self::Three),
+            4 => Some(Self::Four),
+            5 => Some(Self::Five),
             _ => None,
         }
     }
@@ -57,6 +69,9 @@ impl ChannelConfiguration {
         match self {
             Self::Mono => 1,
             Self::Stereo => 2,
+            Self::Three => 3,
+            Self::Four => 4,
+            Self::Five => 5,
         }
     }
 
@@ -67,6 +82,9 @@ impl ChannelConfiguration {
         match self {
             Self::Mono => &[Single],
             Self::Stereo => &[Pair],
+            Self::Three => &[Single, Pair],
+            Self::Four => &[Single, Pair, Single],
+            Self::Five => &[Single, Pair, Pair],
         }
     }
 
@@ -89,12 +107,12 @@ mod tests {
 
     #[test]
     fn every_configuration_has_its_channels() {
-        for (channels, ncc) in [(1, 1), (2, 2)] {
+        for (channels, ncc) in [(1, 1), (2, 2), (3, 3), (4, 4), (5, 5)] {
             let configuration = ChannelConfiguration::from_channels(channels).unwrap();
             assert_eq!(configuration.channels(), channels);
             assert_eq!(configuration.ncc(), ncc);
         }
-        for channels in [0, 3] {
+        for channels in [0, 6, 7, 8] {
             assert_eq!(ChannelConfiguration::from_channels(channels), None);
         }
     }
