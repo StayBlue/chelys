@@ -450,7 +450,15 @@ impl<'a> Counting<'a> {
             let lines = &self.x_quant[start..start + bands.lines()];
             let intensity = intensity.map_or(IntensityBands::NONE, |i| i.bands[g]);
             let group = &mut self.counted[g];
-            if !group.count_with_largest(lines, bands, max_sfb, intensity, &self.largest[g]) {
+            // The coding cannot fit once the least bits of the bands counted
+            // exceed those left, but where clipping may lower them.
+            let budget = if clip {
+                u32::MAX
+            } else {
+                available_bits.saturating_sub(least_bits)
+            };
+            let largest = &self.largest[g];
+            if !group.count_with_largest(lines, bands, max_sfb, intensity, largest, budget) {
                 return false;
             }
             let mut least = group.least_bits();

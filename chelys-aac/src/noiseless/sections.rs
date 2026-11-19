@@ -423,11 +423,13 @@ impl Counted {
                 .max()
                 .unwrap_or(0);
         }
-        self.count_with_largest(lines, bands, max_sfb, intensity, &largest)
+        self.count_with_largest(lines, bands, max_sfb, intensity, &largest, u32::MAX)
     }
 
     /// [`count`](Self::count), given the largest magnitude of each band's
-    /// lines in `largest`.
+    /// lines in `largest`, but giving `false` too once the
+    /// [`least_bits`](Self::least_bits) of the bands counted exceed
+    /// `budget`, without counting the rest.
     pub fn count_with_largest(
         &mut self,
         lines: &[i32],
@@ -435,6 +437,7 @@ impl Counted {
         max_sfb: usize,
         intensity: IntensityBands,
         largest: &[u32],
+        budget: u32,
     ) -> bool {
         assert_eq!(lines.len(), bands.lines(), "a group's lines fill its bands");
         assert!(
@@ -474,6 +477,10 @@ impl Counted {
             .filter(|&class| class < CLASSES.len())
             .max()
             .unwrap_or(0);
+        if max_sfb > 0 {
+            // At least one section, of all the bands.
+            self.least_bits = section_bits(bands.transform(), max_sfb);
+        }
         // The first row of `bits_below` and of `zero_bands_below`, of no
         // bands, is never written, and stays 0.
         for sfb in 0..max_sfb {
@@ -482,6 +489,9 @@ impl Counted {
             let bits = if class < CLASSES.len() {
                 let (bits, least) = spectrum::bits_by_codebook(lines, class, self.top);
                 self.least_bits += least;
+                if self.least_bits > budget {
+                    return false;
+                }
                 bits
             } else {
                 // No spectrum codebook codes an intensity band.
@@ -494,10 +504,6 @@ impl Counted {
                 *row = below + bits;
             }
             self.zero_bands_below[sfb + 1] = self.zero_bands_below[sfb] + u8::from(class == 0);
-        }
-        if max_sfb > 0 {
-            // At least one section, of all the bands.
-            self.least_bits += section_bits(bands.transform(), max_sfb);
         }
         true
     }
