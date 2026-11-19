@@ -114,6 +114,14 @@ impl Config {
     /// The conformance test is
     /// `ffmpeg_maps_each_channel_of_configurations_3_to_7`.
     ///
+    /// FAAD2 (black box) also gives each input channel whole in one of its
+    /// output channels, at its level and sign, but names none of them in
+    /// its raw output, so it does not settle which channel of a pair is the
+    /// left: it gives those of 5.1 in ffmpeg's order, and those of the other
+    /// configurations in the order the stream sends them, the input's; the
+    /// conformance test is
+    /// `faad_maps_each_channel_of_configurations_3_to_7`.
+    ///
     /// [`Encoder::new`]: super::Encoder::new
     pub fn new(sample_rate: u32, channels: usize, rate: Rate) -> Self {
         Self {

@@ -20,10 +20,12 @@ use super::{ID_DSE, Protected};
 /// are part of the same data stream", and clause 8.2.1.1), and exempting
 /// data stream elements from the tags' being unique in a block (clause
 /// 8.2.2). The encoder sends one stream, which is given the first tag.
-/// Settled by decoding with ffmpeg (black box): it decodes streams whose
-/// data stream elements are so tagged, after the audio element, without
-/// complaint, and their audio the same whatever the data they carry; the
-/// conformance test is `ffmpeg_ignores_data_stream_elements`.
+/// Settled by decoding with ffmpeg and FAAD2 (black box): they decode
+/// streams whose data stream elements are so tagged, after the audio
+/// element, without complaint, and their audio the same whatever the data
+/// they carry; the conformance tests are
+/// `ffmpeg_ignores_data_stream_elements` and
+/// `faad_ignores_data_stream_elements`.
 pub const ELEMENT_INSTANCE_TAG: u32 = 0;
 
 /// The most `data_stream_byte`s one element holds: a `count` of 255 and an

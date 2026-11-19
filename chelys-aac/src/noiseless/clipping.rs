@@ -18,10 +18,11 @@
 //! the base of the previously indicated scalefactor band", but clause 9.3
 //! decodes each `pulse_offset` after the first from the line of the pulse
 //! before (`k += pulse_offset[j]`). The normative clause is followed (see
-//! [`Pulses::new`]). Settled by decoding with ffmpeg (black box): it decodes
-//! streams whose pulses are so sent, four of them 31 lines apart, as the
-//! same lines sent unclipped, at 8, 44.1 and 96 kHz; the conformance test
-//! is `ffmpeg_restores_clipped_lines_as_sent_unclipped`.
+//! [`Pulses::new`]). Settled by decoding with ffmpeg and FAAD2 (black box):
+//! they decode streams whose pulses are so sent, four of them 31 lines
+//! apart, as the same lines sent unclipped, at 8, 44.1 and 96 kHz; the
+//! conformance tests are `ffmpeg_restores_clipped_lines_as_sent_unclipped`
+//! and `faad_restores_clipped_lines_as_sent_unclipped`.
 
 use super::pulses::{MAX_AMP, MAX_OFFSET, MAX_PULSES, Pulses};
 use super::sections::{Counted, Sections};

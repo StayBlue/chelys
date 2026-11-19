@@ -133,14 +133,19 @@ pub mod internals {
 /// of input. It is taken as silence, so that the first frame decodes that
 /// silence and the input follows it whole. These samples are to be
 /// discarded: they decode to near silence only, as the quantization of
-/// the input spreads into them. Settled by decoding with ffmpeg
-/// (black box): the input lands exactly this many samples into its
-/// output, at every sampling frequency, in mono and stereo; the
-/// conformance test is
-/// `ffmpeg_decodes_the_input_a_frame_late_at_every_sample_rate`.
+/// the input spreads into them. Settled by decoding with ffmpeg and FAAD2
+/// (black box): the input lands exactly this many samples into their
+/// output, in mono and stereo, in ffmpeg's at every sampling frequency and
+/// in FAAD2's above 24 kHz; the conformance tests are
+/// `ffmpeg_decodes_the_input_a_frame_late_at_every_sample_rate` and
+/// `faad_decodes_the_input_a_frame_late_at_every_sample_rate`. At 24 kHz
+/// and below, FAAD2 differs: it gives twice the samples, at twice the
+/// sampling frequency, every other one of which gives the input 481
+/// samples later still.
 ///
-/// Decoding with ffmpeg (black box) gives each frame's 1024 samples, from
-/// the first frame on, and trims none: this many samples, the input, then
-/// [`Finished::padding`]; the conformance test is
-/// `ffmpeg_decodes_silence_at_every_sample_rate`.
+/// Decoding with ffmpeg, and with FAAD2 above 24 kHz (black box), gives
+/// each frame's 1024 samples, from the first frame on, and trims none:
+/// this many samples, the input, then [`Finished::padding`]; the
+/// conformance tests are `ffmpeg_decodes_silence_at_every_sample_rate` and
+/// `faad_decodes_silence_at_every_sample_rate`.
 pub const DELAY: usize = 1024;

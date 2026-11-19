@@ -141,12 +141,15 @@ fn write_element(
 /// its element_instance_tag, each CPE associated with the front channel
 /// pair must have the same value ..., and each CPE associated with the back
 /// channel pair must have the same value". The first of each kind is given
-/// tag 0, the next 1, and so on. Settled by decoding with ffmpeg (black
-/// box): it decodes mono and stereo streams so tagged, at every sampling
-/// frequency, without complaint, and streams of channel configurations 3
-/// to 7 so tagged, each channel in its place; the conformance tests are
-/// `ffmpeg_decodes_silence_at_every_sample_rate` and
-/// `ffmpeg_maps_each_channel_of_configurations_3_to_7`.
+/// tag 0, the next 1, and so on. Settled by decoding with ffmpeg and FAAD2
+/// (black box): they decode mono and stereo streams so tagged, at every
+/// sampling frequency, without complaint, and streams of channel
+/// configurations 3 to 7 so tagged, each channel whole in one of their
+/// output channels, each decoder in its own order; the conformance tests
+/// are `ffmpeg_decodes_silence_at_every_sample_rate`,
+/// `faad_decodes_silence_at_every_sample_rate`,
+/// `ffmpeg_maps_each_channel_of_configurations_3_to_7` and
+/// `faad_maps_each_channel_of_configurations_3_to_7`.
 ///
 /// Spec reading: clause 8.2.2 says that elements with tags "must have a
 /// unique element_instance_tag in each raw_data_block()", which could be
@@ -157,10 +160,11 @@ fn write_element(
 /// raw_data_block(), there can be from 0 to at most 16 instances of any
 /// syntactic element", which tags unique across kinds would not allow; and
 /// a `program_config_element()` tells an SCE from a CPE of the same tag by
-/// its `is_cpe` flags (clause 8.5.2). Settled by decoding with ffmpeg (black
-/// box): it decodes mono and stereo streams so tagged, at every sampling
-/// frequency, without complaint; the conformance test is
-/// `ffmpeg_decodes_silence_at_every_sample_rate`.
+/// its `is_cpe` flags (clause 8.5.2). Settled by decoding with ffmpeg and
+/// FAAD2 (black box): they decode mono and stereo streams so tagged, at
+/// every sampling frequency, without complaint; the conformance tests are
+/// `ffmpeg_decodes_silence_at_every_sample_rate` and
+/// `faad_decodes_silence_at_every_sample_rate`.
 pub fn element_instance_tags(configuration: ChannelConfiguration) -> impl Iterator<Item = u32> {
     let elements = configuration.elements();
     (0..elements.len()).map(move |i| {
@@ -228,9 +232,10 @@ pub fn write(
     // byte_alignment(), to the block's first bit, which is the writer's.
     // Spec gap: the standard does not give the value of the bits that
     // align; they are zero, as the writer leaves them. Settled by decoding
-    // with ffmpeg (black box): it decodes blocks so aligned without
-    // complaint; the conformance test is
-    // `ffmpeg_decodes_silence_at_every_sample_rate`.
+    // with ffmpeg and FAAD2 (black box): they decode blocks so aligned
+    // without complaint; the conformance tests are
+    // `ffmpeg_decodes_silence_at_every_sample_rate` and
+    // `faad_decodes_silence_at_every_sample_rate`.
     let bytes = w.into_bytes();
     debug_assert_eq!(
         bytes.len(),
