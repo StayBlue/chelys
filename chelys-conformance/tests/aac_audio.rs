@@ -1148,7 +1148,16 @@ fn temporal_noise_shaping_decodes_in_place() {
                 let encoded = encode(sample_rate, &input, bits_per_second);
                 let elements = elements(&encoded.stream, sample_rate);
                 let (long, short) = shaped_share(&elements);
-                assert!(long + short > 0.0, "{context}: no window shaped");
+                // At 96 kHz the threshold of the prediction gain is raised
+                // to 6.1, as its frames last 10.7 ms (see the encoder's
+                // `gain_threshold`), and the struck bars reach it in no
+                // window; the clicks and pulse trains still shape windows
+                // there.
+                let unshaped = name == "bars" && sample_rate == 96_000;
+                assert!(
+                    unshaped || long + short > 0.0,
+                    "{context}: no window shaped"
+                );
                 long_shaped |= long > 0.0;
                 short_shaped |= short > 0.0;
                 cut_short |= (elements.iter().flat_map(|e| &e.channels))

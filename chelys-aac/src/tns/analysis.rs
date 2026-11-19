@@ -15,6 +15,7 @@ use crate::sampling_frequency::SamplingFrequency;
 use crate::scalefactor_bands::{
     Transform, deinterleave, first_band_above, interleave, swb_offsets,
 };
+use crate::stream::FRAME_SAMPLES;
 use crate::window::{SHORT_WINDOWS, Windows};
 
 /// The lowest frequency of the target range of the filter: "A suitable
@@ -32,9 +33,15 @@ const PREDICTION_FROM_HZ: f64 = 2500.0;
 /// linear prediction must hold (see [`TargetRange::shape`]).
 const LEAST_PREDICTED_SHARE: f64 = 0.01;
 
-/// The threshold `t` that the prediction gain must exceed for the lines to
-/// be filtered: "A suitable threshold value is t = 1.4" (clause C.5).
+/// The threshold `t` that the prediction gain must exceed for the lines of
+/// a window to be filtered: "A suitable threshold value is t = 1.4"
+/// (clause C.5), which is that of a frame of [`THRESHOLD_SECONDS`] or
+/// longer (see [`gain_threshold`]).
 const GAIN_THRESHOLD: f64 = 1.4;
+
+/// The shortest frame whose windows' threshold is [`GAIN_THRESHOLD`], in
+/// seconds: a frame of 1024 samples at 22.05 kHz, 46.4 ms.
+const THRESHOLD_SECONDS: f64 = 1024.0 / 22050.0;
 
 /// The threshold `p` below which reflection coefficients are removed from
 /// the tail: "A suitable threshold for truncation is p = 0.1" (clause C.5).
@@ -112,6 +119,58 @@ impl Shaping {
     }
 }
 
+/// The threshold `t` that the prediction gain of each window of a frame at
+/// `sampling_frequency` must exceed for its lines to be filtered (clause
+/// C.5): [`GAIN_THRESHOLD`] where the frame's 1024 samples last
+/// [`THRESHOLD_SECONDS`] or longer, and where they last less, raised in
+/// inverse proportion to it: 1.4 at 22.05 kHz and below, 1.5 at 24 kHz, 2.0
+/// at 32 kHz, 2.8 at 44.1 kHz, 3.0 at 48 kHz and 6.1 at 96 kHz.
+///
+/// Spec reading: this deliberately departs from clause C.5's "suitable
+/// threshold value" of t = 1.4 in frames shorter than 46.4 ms. A filter
+/// whose gain is little above 1.4 shapes the noise little, and how much
+/// that is worth depends on how long the frame is: graded with PEAQ
+/// (GstPEAQ 0.6.1, black box) on 30 s of each of 8 tracks of pop music,
+/// resampled and graded against the excerpt resampled alike, with one
+/// threshold in every window, the Total NMR was least with t of 1.2 to 1.7
+/// at every sampling frequency from 8 to 24 kHz, rising with t from 2 up,
+/// but least with t near 2 at 32 kHz, 2.5 to 4 at 44.1 kHz, 4 to 6 at 48
+/// kHz, 4 at 64 kHz and 10, the most tried, at 96 kHz; and from 32 kHz up,
+/// the modulation difference (AvgModDiff1) fell as t rose.
+///
+/// Nor does the bitrate, the bits the filters take or the target range
+/// explain it. With t of 3, the grades fell at 16 kHz at every bitrate
+/// from 24 to 96 kbit/s, where the filters it drops from long windows take
+/// 7.8% to 1.4% of the bits, and rose at 44.1 kHz at every bitrate from 64
+/// to 192 kbit/s, where they take 8.5% to 2.1%; they rose at 44.1 kHz with
+/// the target range cut at 7.5 kHz, as it ends at 16 kHz, and fell at 16
+/// kHz with the range from 544 Hz and the prediction from 907 Hz, the
+/// share of the spectrum they take at 44.1 kHz; and neither sign changed
+/// with the loops' errors unweighed by the filters' gains (see
+/// [`NoiseGains`]).
+///
+/// Short windows take their frame's threshold, not one of their own span,
+/// 128 samples: from 128 lines and a filter of order 7, their gains stay
+/// far below a long window's, and clicks that the decoder is to restore
+/// reached 11 to 16 at 96 kHz, which the 49 of their span would leave
+/// unshaped. With thresholds of their own span, the 8 tracks at 44.1 kHz
+/// and 128 kbit/s graded -0.959, against -0.968 with their frame's; but
+/// PEAQ's frames, of 2048 samples at 48 kHz, are longer than the short
+/// windows whose shaping it would weigh.
+///
+/// Graded so, the means went from -1.019 to -0.962 at 48 kHz and 128
+/// kbit/s, -1.817 to -1.787 at 32 kHz and 128 kbit/s, -3.685 to -3.689 at
+/// 32 kHz and 64 kbit/s, and -2.775 to -2.773 at 24 kHz and 96 kbit/s,
+/// those at 22.05 kHz and below unchanged. The 8 tracks at 44.1 kHz in
+/// stereo went from -3.543, -1.002 and -0.237 at 64, 128 and 192 kbit/s to
+/// -3.537, -0.968 and -0.220; 3 tracks of rock music and their 3 windows
+/// of 3 s with the most frames coded short, from -3.563, -0.770 and -0.110
+/// to -3.558, -0.753 and -0.102.
+fn gain_threshold(sampling_frequency: SamplingFrequency) -> f64 {
+    let seconds = FRAME_SAMPLES as f64 / f64::from(sampling_frequency.hz());
+    GAIN_THRESHOLD * (THRESHOLD_SECONDS / seconds).max(1.0)
+}
+
 /// The scalefactor bands of each window of `transform` at
 /// `sampling_frequency` that its filter spans, its target range (clause
 /// C.5): from the first at 1.5 kHz or above to `TNS_MAX_BANDS`, or to the
@@ -150,6 +209,8 @@ struct TargetRange {
     prediction_from: usize,
     /// `TNS_MAX_BANDS`.
     max_bands: usize,
+    /// The threshold of the prediction gain (see [`gain_threshold`]).
+    threshold: f64,
 }
 
 impl TargetRange {
@@ -174,6 +235,7 @@ impl TargetRange {
             bands: bottom..top,
             prediction_from,
             max_bands,
+            threshold: gain_threshold(sampling_frequency),
         }
     }
 
@@ -230,7 +292,7 @@ impl TargetRange {
         let Some(gain) = levinson_durbin(&r[..=order], &mut parcor[..order]) else {
             return (WindowFilters::NONE, 1.0);
         };
-        if gain <= GAIN_THRESHOLD {
+        if gain <= self.threshold {
             return (WindowFilters::NONE, 1.0);
         }
         let mut filter = Filter::none(0);
@@ -456,6 +518,23 @@ mod tests {
     }
     use crate::scalefactor_bands::num_swb;
     use crate::window::{Grouping, WindowSequence, WindowShape};
+
+    #[test]
+    fn the_threshold_rises_where_a_frame_lasts_less_than_46_ms() {
+        use SamplingFrequency::*;
+        for fs in [Hz8000, Hz11025, Hz12000, Hz16000, Hz22050] {
+            assert_eq!(gain_threshold(fs), GAIN_THRESHOLD);
+        }
+        for (fs, t) in [
+            (Hz24000, 1.52),
+            (Hz32000, 2.03),
+            (Hz44100, 2.8),
+            (Hz96000, 6.1),
+        ] {
+            let threshold = gain_threshold(fs);
+            assert!((threshold - t).abs() < 0.01, "{fs:?}: {threshold}");
+        }
+    }
 
     #[test]
     fn indices_quantize_as_clause_c_5_has_them() {
