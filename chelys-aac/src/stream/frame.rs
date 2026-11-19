@@ -41,7 +41,7 @@ impl std::iter::Sum for Demand {
 /// The bits of the frame besides its elements, where it carries
 /// `data_bits` of data stream elements: its header, the elements'
 /// `id_syn_ele`s, the data stream elements, and `ID_END`.
-fn overhead_bits(config: &StreamConfig, data_bits: u32) -> u32 {
+fn frame_overhead_bits(config: &StreamConfig, data_bits: u32) -> u32 {
     let raw_data_block = raw_data_block::overhead_bits(config.channel_configuration);
     8 * config.header_len() as u32 + raw_data_block + data_bits
 }
@@ -83,7 +83,7 @@ fn overhead_bits(config: &StreamConfig, data_bits: u32) -> u32 {
 pub fn more_bits(config: &StreamConfig, demand: &Demand, data_bits: u32) -> i64 {
     let mean_bits = f64::from(config.bits_per_second) * FRAME_SAMPLES as f64
         / f64::from(config.sampling_frequency.hz());
-    let side_info_bits = f64::from(overhead_bits(config, data_bits) + demand.side_info_bits);
+    let side_info_bits = f64::from(frame_overhead_bits(config, data_bits) + demand.side_info_bits);
     ((demand.bit_allocation - (mean_bits - side_info_bits)).round() as i64).max(0)
 }
 
@@ -154,7 +154,7 @@ pub fn elements_bits(
 ) -> u32 {
     let asked = reservoir.available_bits(more_bits(config, demand, data_bits));
     let available = asked.max(reservoir.offered_bits());
-    available.saturating_sub(overhead_bits(config, data_bits))
+    available.saturating_sub(frame_overhead_bits(config, data_bits))
 }
 
 /// Writes the frame of `elements` and data stream elements of `data`,

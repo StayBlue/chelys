@@ -230,6 +230,8 @@ pub struct ElementEncoder {
     /// bits (see [`ChannelCoding::spectrum_clipping`]).
     spectrum_clipping: bool,
     shaping: Shaping,
+    /// The bits of the frame being coded beside its lines.
+    lineless: LinelessBits,
     /// How the second channel of the last pair that shared its window was
     /// given its bits, for tests.
     #[cfg(test)]
@@ -246,6 +248,34 @@ struct SecondChannel {
     first_bits: u32,
     available_bits: u32,
     budgets: u32,
+}
+
+/// The bits of the frame prepared beside its lines: the element's fields,
+/// and each channel coded without lines, with and without its filters of
+/// temporal noise shaping. Counted once the frame is prepared, and kept as
+/// [`ElementEncoder::unshape`] drops filters.
+#[derive(Clone, Copy, Debug, Default)]
+struct LinelessBits {
+    /// The element's fields beside its channels (see
+    /// [`CodedElement::fields_bits`]).
+    fields: u32,
+    /// Each channel without lines, with its filters as they stand.
+    channels_with_tns: [u32; 2],
+    /// Each channel without lines or filters.
+    channels_without_tns: [u32; 2],
+}
+
+impl LinelessBits {
+    /// The element's fields and its channels without lines, with their
+    /// filters as they stand.
+    fn element_with_tns(&self) -> u32 {
+        self.fields + self.channels_with_tns.iter().sum::<u32>()
+    }
+
+    /// The element's fields and its channels without lines or filters.
+    fn element_without_tns(&self) -> u32 {
+        self.fields + self.channels_without_tns.iter().sum::<u32>()
+    }
 }
 
 /// What a pair keeps of its middle and side channels.
@@ -285,6 +315,7 @@ impl ElementEncoder {
             tns: true,
             spectrum_clipping: loops::SPECTRUM_CLIPPING,
             shaping: Shaping::default(),
+            lineless: LinelessBits::default(),
             #[cfg(test)]
             second_channel: None,
         }
@@ -421,10 +452,18 @@ impl ElementEncoder {
         let padded = self
             .input_end
             .is_some_and(|end| end < start + FRAME_SAMPLES);
-        self.temporal_noise_shaping(!padded);
+        self.prepare_spectra(!padded);
+    }
+
+    /// The stages of [`prepare`](Self::prepare) after the
+    /// [spectra](Self::spectra), each channel's lines shaped by temporal
+    /// noise shaping if `shape` is set.
+    fn prepare_spectra(&mut self, shape: bool) {
+        self.temporal_noise_shaping(shape);
         self.thresholds();
         self.joint();
         self.find_silence();
+        self.count_lineless();
     }
 
     /// Each channel's windows and the lines of its block transformed with
@@ -745,27 +784,28 @@ impl ElementEncoder {
         self.common_window.then(|| self.prepared[0].windows)
     }
 
-    /// The bits of a channel of the frame without lines, as its element
-    /// sends it, with its temporal noise shaping.
-    fn silent_bits(&self, channel: &PreparedChannel) -> u32 {
-        channel::bits(
-            channel.windows,
-            self.common_window,
-            &Pulses::NONE,
-            &channel.tns,
-            0,
-        )
+    /// Counts the bits of the frame prepared beside its lines.
+    fn count_lineless(&mut self) {
+        let common = self.common_window;
+        let mut lineless = LinelessBits {
+            fields: CodedElement::fields_bits(self.channels(), self.common_windows()),
+            ..LinelessBits::default()
+        };
+        for (c, prepared) in self.prepared.iter().enumerate() {
+            let windows = prepared.windows;
+            lineless.channels_with_tns[c] =
+                channel::bits(windows, common, &Pulses::NONE, &prepared.tns, 0);
+            lineless.channels_without_tns[c] =
+                channel::bits(windows, common, &Pulses::NONE, &Tns::NONE, 0);
+        }
+        self.lineless = lineless;
     }
 
     /// The fewest bits the frame prepared can be coded in: its fields, and
     /// its channels without lines or temporal noise shaping, which
     /// [`quantize`](Self::quantize) drops where they do not fit.
     pub fn least_bits(&self) -> u32 {
-        let common = self.common_window;
-        let channels: u32 = (self.prepared.iter())
-            .map(|c| channel::bits(c.windows, common, &Pulses::NONE, &Tns::NONE, 0))
-            .sum();
-        CodedElement::fields_bits(self.channels(), self.common_windows()) + channels
+        self.lineless.element_without_tns()
     }
 
     /// The channels of the frame prepared that are coded with lines: those
@@ -791,15 +831,13 @@ impl ElementEncoder {
     /// its model's perceptual entropy is that of all its lines, of which it
     /// sends [`LFE_LINES`] at most.
     pub fn demand(&self) -> Demand {
-        let channels: u32 = self.prepared.iter().map(|c| self.silent_bits(c)).sum();
-        let fields = CodedElement::fields_bits(self.channels(), self.common_windows());
         let bit_allocation = match self.kind {
             ElementKind::Lfe => 0.0,
             _ => self.prepared.iter().map(|c| c.bit_allocation).sum(),
         };
         Demand {
             bit_allocation,
-            side_info_bits: fields + channels,
+            side_info_bits: self.lineless.element_with_tns(),
         }
     }
 
@@ -820,16 +858,14 @@ impl ElementEncoder {
     /// frames (the conformance test
     /// `a_tone_keeps_its_lines_beside_filters_it_cannot_afford`).
     pub fn quantize(&mut self, available_bits: u32) -> CodedElement {
-        let fields = CodedElement::fields_bits(self.channels(), self.common_windows());
-        let lineless: u32 = self.prepared.iter().map(|c| self.silent_bits(c)).sum();
-        if fields + lineless > available_bits {
+        if self.lineless.element_with_tns() > available_bits {
             for c in 0..self.prepared.len() {
                 self.unshape(c);
             }
         }
         for c in 0..self.prepared.len() {
             if !self.prepared[c].silent
-                && self.share(available_bits) < self.silent_bits(&self.prepared[c])
+                && self.share(available_bits) < self.lineless.channels_with_tns[c]
             {
                 self.unshape(c);
             }
@@ -851,15 +887,14 @@ impl ElementEncoder {
     /// The bits of each channel of the frame that is not silent (see
     /// [`code_element`](Self::code_element)).
     fn share(&self, available_bits: u32) -> u32 {
-        let fields = CodedElement::fields_bits(self.channels(), self.common_windows());
-        let reserved: u32 = (self.prepared.iter())
-            .filter(|c| c.silent)
-            .map(|c| self.silent_bits(c))
+        let lineless = &self.lineless;
+        let reserved: u32 = (self.prepared.iter().zip(lineless.channels_with_tns))
+            .filter(|(c, _)| c.silent)
+            .map(|(_, bits)| bits)
             .sum();
-        let coded = self.prepared.iter().filter(|c| !c.silent).count() as u32;
-        (available_bits.saturating_sub(fields))
+        (available_bits.saturating_sub(lineless.fields))
             .saturating_sub(reserved)
-            .checked_div(coded)
+            .checked_div(self.coded_channels())
             .unwrap_or(0)
     }
 
@@ -938,6 +973,7 @@ impl ElementEncoder {
         let prepared = &mut self.prepared[c];
         prepared.tns = Tns::NONE;
         prepared.gains = NoiseGains::NONE;
+        self.lineless.channels_with_tns[c] = self.lineless.channels_without_tns[c];
         self.weigh();
         self.find_silence();
     }
@@ -1004,8 +1040,13 @@ impl ElementEncoder {
     fn code_element(&mut self, available_bits: u32) -> CodedElement {
         let fs = self.sampling_frequency;
         let share = self.share(available_bits);
-        let budget = |c: &PreparedChannel| {
-            if c.silent { self.silent_bits(c) } else { share }
+        let lineless = self.lineless;
+        let budget = |c: usize| {
+            if self.prepared[c].silent {
+                lineless.channels_with_tns[c]
+            } else {
+                share
+            }
         };
         let mut order: Vec<usize> = (0..self.prepared.len()).collect();
         // A pair in intensity stereo codes its left channel first, which the
@@ -1027,8 +1068,7 @@ impl ElementEncoder {
         match order[..] {
             [only] => {
                 let prepared = &self.prepared[only];
-                let coding =
-                    ChannelCoding::new(prepared.windows, fs, budget(prepared), &prepared.tns);
+                let coding = ChannelCoding::new(prepared.windows, fs, budget(only), &prepared.tns);
                 let channel = self.code(prepared, coding);
                 match self.kind {
                     ElementKind::Lfe => CodedElement::lfe(channel),
@@ -1043,18 +1083,18 @@ impl ElementEncoder {
                 let ms = self.ms;
                 let mut coding = ChannelCoding {
                     common_window: true,
-                    ..ChannelCoding::new(windows, fs, budget(a), &a.tns)
+                    ..ChannelCoding::new(windows, fs, budget(first), &a.tns)
                 };
                 let (mut a_channel, intensity, b_coding) = loop {
                     let a_channel = self.code(a, coding);
                     // What the first leaves of its share, which a retry
                     // has lowered its bits within.
-                    let left = budget(a) - a_channel.bits(true);
+                    let left = budget(first) - a_channel.bits(true);
                     let least_max_sfb = a_channel.max_sfb();
                     let mut b_coding = ChannelCoding {
                         common_window: true,
                         least_max_sfb,
-                        ..ChannelCoding::new(windows, fs, budget(b) + left, &b.tns)
+                        ..ChannelCoding::new(windows, fs, budget(second) + left, &b.tns)
                     };
                     for m in least_max_sfb..=num_swb {
                         b_coding.element_bits[m] =
@@ -1066,7 +1106,7 @@ impl ElementEncoder {
                     let b_least = least_channel(windows, fs, least_max_sfb, &intensity, &b.tns)
                         .bits(true)
                         + b_coding.element_bits[least_max_sfb];
-                    let floor = self.silent_bits(a);
+                    let floor = lineless.channels_with_tns[first];
                     if b_least <= b_coding.available_bits || coding.available_bits <= floor {
                         break (a_channel, intensity, b_coding);
                     }
@@ -1075,10 +1115,10 @@ impl ElementEncoder {
                 };
                 #[cfg(test)]
                 let second_channel = SecondChannel {
-                    retried: coding.available_bits < budget(a),
+                    retried: coding.available_bits < budget(first),
                     first_bits: a_channel.bits(true),
                     available_bits: b_coding.available_bits,
-                    budgets: budget(a) + budget(b),
+                    budgets: budget(first) + budget(second),
                 };
                 let b_coding = ChannelCoding {
                     intensity: in_intensity.then_some(&intensity),
@@ -1104,7 +1144,7 @@ impl ElementEncoder {
                 let mut left = 0;
                 for c in [first, second] {
                     let prepared = &self.prepared[c];
-                    let available = budget(prepared) + left;
+                    let available = budget(c) + left;
                     let coding = ChannelCoding::new(prepared.windows, fs, available, &prepared.tns);
                     let channel = self.code(prepared, coding);
                     left = available - channel.bits(false);
@@ -1271,10 +1311,7 @@ mod tests {
             let original: Vec<Vec<f64>> = (encoder.prepared.iter())
                 .map(|prepared| prepared.spectrum.to_vec())
                 .collect();
-            encoder.temporal_noise_shaping(true);
-            encoder.thresholds();
-            encoder.joint();
-            encoder.find_silence();
+            encoder.prepare_spectra(true);
             let coded = encoder.quantize(bits);
             let mut w = BitWriter::new();
             w.write(u32::from(coded.is_pair()), 3);
