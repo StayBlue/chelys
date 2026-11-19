@@ -19,12 +19,13 @@
 //! frequency; the conformance test is
 //! `decoders_read_the_tag_at_every_sampling_frequency`.
 
+use super::DELAY;
 use super::header::{Bitrate, Emphasis, Header, Mode, SamplingFrequency};
 use super::rate::StreamRate;
 use super::side_info::SideInfo;
 use super::stream::StreamConfig;
-use super::{DELAY, crc};
 use chelys_core::bitstream::BitWriter;
+use chelys_core::crc;
 
 /// The bytes of the tag: 120 of the Xing fields, 36 of the extension.
 const TAG_LEN: usize = 156;

@@ -23,7 +23,6 @@
 
 mod ancillary;
 mod config;
-mod crc;
 mod encoder;
 mod filterbank;
 mod granule;
