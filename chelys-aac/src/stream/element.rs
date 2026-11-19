@@ -117,11 +117,70 @@ impl PreparedChannel {
     /// `bit_allocation`, from its lines before temporal noise shaping and
     /// `analysis`, its model's thresholds.
     fn thresholds(&mut self, analysis: &Analysis) {
-        analysis.xmin(self.windows, &self.unshaped, &mut self.xmin);
-        loops::raise_xmin(&mut self.xmin);
-        self.bit_allocation = analysis.bit_allocation(self.windows.sequence);
-        self.perceptual_entropy = analysis.perceptual_entropy(self.windows.sequence);
+        (self.bit_allocation, self.perceptual_entropy) =
+            thresholds(analysis, self.windows, &self.unshaped, &mut self.xmin);
     }
+}
+
+/// A pair's middle or side channel in the frame being coded, of the
+/// pair's windows: its lines and what each band may take as noise, which
+/// take the place of the left or right channel's in the bands coded as
+/// middle and side (see [`ElementEncoder::middle_side_bands`]).
+#[derive(Debug)]
+struct MidSideChannel {
+    /// The lines, shaped by the left and right channels' filters.
+    spectrum: Box<[f64; FRAME_LINES]>,
+    /// The lines before temporal noise shaping.
+    unshaped: Box<[f64; FRAME_LINES]>,
+    /// The weight of each line's quantization error in its band's
+    /// distortion, as for a [`PreparedChannel`].
+    weights: Box<[f64; FRAME_LINES]>,
+    /// The allowed distortion `xmin` of each band of each window group, as
+    /// for a [`PreparedChannel`].
+    xmin: Vec<[f64; MAX_BANDS]>,
+    /// `bit_allocation` (clause C.1.4, step 15).
+    bit_allocation: f64,
+    /// The perceptual entropy (clause C.1.4, steps 12 and 15).
+    perceptual_entropy: f64,
+}
+
+impl MidSideChannel {
+    fn new() -> Self {
+        Self {
+            spectrum: Box::new([0.0; FRAME_LINES]),
+            unshaped: Box::new([0.0; FRAME_LINES]),
+            weights: Box::new([1.0; FRAME_LINES]),
+            xmin: Vec::with_capacity(SHORT_WINDOWS),
+            bit_allocation: 0.0,
+            perceptual_entropy: 0.0,
+        }
+    }
+
+    /// The channel's allowed distortions, perceptual entropy and
+    /// `bit_allocation` in `windows`, from its lines before temporal noise
+    /// shaping and `analysis`, its model's thresholds.
+    fn thresholds(&mut self, windows: Windows, analysis: &Analysis) {
+        (self.bit_allocation, self.perceptual_entropy) =
+            thresholds(analysis, windows, &self.unshaped, &mut self.xmin);
+    }
+}
+
+/// From a channel's lines `unshaped` of `windows`, before temporal noise
+/// shaping, and `analysis`, its model's thresholds: the allowed distortion
+/// of each band of each window group, raised as the loops take it, in
+/// `xmin`, and the channel's `bit_allocation` and perceptual entropy.
+fn thresholds(
+    analysis: &Analysis,
+    windows: Windows,
+    unshaped: &[f64; FRAME_LINES],
+    xmin: &mut Vec<[f64; MAX_BANDS]>,
+) -> (f64, f64) {
+    analysis.xmin(windows, unshaped, xmin);
+    loops::raise_xmin(xmin);
+    (
+        analysis.bit_allocation(windows.sequence),
+        analysis.perceptual_entropy(windows.sequence),
+    )
 }
 
 /// An element of a stream: a `single_channel_element()` or
@@ -174,7 +233,7 @@ pub struct ElementEncoder {
     /// How the second channel of the last pair that shared its window was
     /// given its bits, for tests.
     #[cfg(test)]
-    second_channel: std::cell::Cell<Option<SecondChannel>>,
+    second_channel: Option<SecondChannel>,
 }
 
 /// How the second channel of a pair that shares its window was given its
@@ -193,7 +252,7 @@ struct SecondChannel {
 #[derive(Debug)]
 struct MidSide {
     model: MidSideModel,
-    channels: [PreparedChannel; 2],
+    channels: [MidSideChannel; 2],
 }
 
 impl ElementEncoder {
@@ -217,7 +276,7 @@ impl ElementEncoder {
             mid_side: (channels == 2).then(|| {
                 Box::new(MidSide {
                     model: MidSideModel::new(sampling_frequency),
-                    channels: [PreparedChannel::new(), PreparedChannel::new()],
+                    channels: [MidSideChannel::new(), MidSideChannel::new()],
                 })
             }),
             ms: MsMask::NONE,
@@ -227,7 +286,7 @@ impl ElementEncoder {
             spectrum_clipping: loops::SPECTRUM_CLIPPING,
             shaping: Shaping::default(),
             #[cfg(test)]
-            second_channel: std::cell::Cell::new(None),
+            second_channel: None,
         }
     }
 
@@ -631,16 +690,29 @@ impl ElementEncoder {
         }
         let analyses = mid_side.model.current(windows.sequence.transform());
         for (channel, analysis) in [&mut *mid, &mut *side].into_iter().zip(analyses) {
-            channel.windows = windows;
-            channel.thresholds(analysis);
+            channel.thresholds(windows, analysis);
         }
-        let channels = [&*left, &*right, &*mid, &*side];
         self.ms = middle_side::choose(
             windows,
             fs,
-            channels.map(|c| &*c.spectrum),
-            channels.map(|c| &*c.weights),
-            channels.map(|c| &c.xmin[..]),
+            [
+                &*left.spectrum,
+                &*right.spectrum,
+                &*mid.spectrum,
+                &*side.spectrum,
+            ],
+            [
+                &*left.weights,
+                &*right.weights,
+                &*mid.weights,
+                &*side.weights,
+            ],
+            [
+                &left.xmin[..],
+                &right.xmin[..],
+                &mid.xmin[..],
+                &side.xmin[..],
+            ],
             &self.intensity,
         );
         let mut lines_mid_side = 0;
@@ -929,7 +1001,7 @@ impl ElementEncoder {
     ///
     /// If `available_bits` do not pay for the element's channels without
     /// lines, with their filters: a caller's error.
-    fn code_element(&self, available_bits: u32) -> CodedElement {
+    fn code_element(&mut self, available_bits: u32) -> CodedElement {
         let fs = self.sampling_frequency;
         let share = self.share(available_bits);
         let budget = |c: &PreparedChannel| {
@@ -996,17 +1068,17 @@ impl ElementEncoder {
                         + b_coding.element_bits[least_max_sfb];
                     let floor = self.silent_bits(a);
                     if b_least <= b_coding.available_bits || coding.available_bits <= floor {
-                        #[cfg(test)]
-                        self.second_channel.set(Some(SecondChannel {
-                            retried: coding.available_bits < budget(a),
-                            first_bits: a_channel.bits(true),
-                            available_bits: b_coding.available_bits,
-                            budgets: budget(a) + budget(b),
-                        }));
                         break (a_channel, intensity, b_coding);
                     }
                     let short = b_least - b_coding.available_bits;
                     coding.available_bits = coding.available_bits.saturating_sub(short).max(floor);
+                };
+                #[cfg(test)]
+                let second_channel = SecondChannel {
+                    retried: coding.available_bits < budget(a),
+                    first_bits: a_channel.bits(true),
+                    available_bits: b_coding.available_bits,
+                    budgets: budget(a) + budget(b),
                 };
                 let b_coding = ChannelCoding {
                     intensity: in_intensity.then_some(&intensity),
@@ -1021,6 +1093,10 @@ impl ElementEncoder {
                     channels.reverse();
                 }
                 let [left, right] = channels.map(|c| c.expect("coded"));
+                #[cfg(test)]
+                {
+                    self.second_channel = Some(second_channel);
+                }
                 CodedElement::common_pair(left, right, ms)
             }
             [first, second] => {
@@ -1550,10 +1626,10 @@ mod tests {
                 };
             }
             encoder.prepare(start, true);
-            encoder.second_channel.set(None);
+            encoder.second_channel = None;
             let coded = encoder.quantize(bits);
             assert!(coded.bits() <= bits);
-            if let Some(second) = encoder.second_channel.get() {
+            if let Some(second) = encoder.second_channel {
                 assert_eq!(second.first_bits + second.available_bits, second.budgets);
                 retries += usize::from(second.retried);
             }
