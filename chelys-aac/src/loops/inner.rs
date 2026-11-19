@@ -230,11 +230,17 @@ pub fn band_bits(lines: &[f64], weights: &[f64], allowed: f64, scratch: &mut Ban
             *q = signed((scaled * scale + MAGIC_NUMBER).min(BEYOND_MAGNITUDE), x);
         }
     };
+    let largest = scaled.iter().fold(0.0f64, |a, &x| a.max(x));
     // Whether the distortion of the lines quantized with the step of
-    // `sf_decoder` is within `allowed`, from their magnitudes alone.
+    // `sf_decoder` is within `allowed`, from their magnitudes alone. Where
+    // even the largest quantizes to zero, the distortion is the energy of
+    // the lines, summed alike, which exceeds `allowed`.
     let powers = powers_four_thirds();
     let within = |sf_decoder: u8| {
         let (scale, gain) = (step_scale(sf_decoder), decoder_gain(sf_decoder));
+        if truncate((largest * scale + MAGIC_NUMBER).min(BEYOND_MAGNITUDE)) == 0 {
+            return false;
+        }
         let mut distortion = 0.0;
         for ((&scaled, &x), &weight) in scaled.iter().zip(lines).zip(weights) {
             let magnitude = truncate((scaled * scale + MAGIC_NUMBER).min(BEYOND_MAGNITUDE));
@@ -244,7 +250,6 @@ pub fn band_bits(lines: &[f64], weights: &[f64], allowed: f64, scratch: &mut Ban
         }
         distortion <= allowed
     };
-    let largest = scaled.iter().fold(0.0f64, |a, &x| a.max(x));
     let start = (16.0 / 3.0 * (largest / MAX_QUANT).log2()).ceil() + f64::from(SF_OFFSET);
     let start = start.clamp(0.0, 255.0) as u8;
     // The coarsest step within `allowed`, between `fits`, which is, and
