@@ -79,7 +79,7 @@ fn overhead_bits(config: &StreamConfig, data_bits: u32) -> u32 {
 /// and a frame in which audio sets in after the reservoir has given bits
 /// away, would be coded without lines, and lose their audio. Taken as 0, a
 /// frame is given the mean, and the reservoir keeps what the loops leave,
-/// for frames that ask for more.
+/// for frames that ask for more, up to a point (see [`elements_bits`]).
 pub fn more_bits(config: &StreamConfig, demand: &Demand, data_bits: u32) -> i64 {
     let mean_bits = f64::from(config.bits_per_second) * FRAME_SAMPLES as f64
         / f64::from(config.sampling_frequency.hz());
@@ -89,16 +89,47 @@ pub fn more_bits(config: &StreamConfig, demand: &Demand, data_bits: u32) -> i64 
 
 /// The bits that the frame's elements may take in the next frame, which
 /// carries `data_bits` of data stream elements: those the reservoir makes
-/// available to the frame for its `more_bits` (clause C.7.3), less its
-/// header, the elements' `id_syn_ele`s, the data stream elements and
-/// `ID_END`.
+/// available to the frame for its `more_bits` (clause C.7.3), or, where
+/// they are fewer, those it offers whatever the frame asks for (see
+/// [`BitReservoir::offered_bits`]), less its header, the elements'
+/// `id_syn_ele`s, the data stream elements and `ID_END`.
+///
+/// Spec gap: Annex C does not say what becomes of the bits the loops leave
+/// in a frame (figure C.6), beyond what the reservoir may hold. With
+/// `more_bits` 0, as in most frames (see [`more_bits`]), clause C.7.3 gives
+/// a frame the mean, and the loops, which stop at the finest step that
+/// fits, leave some of it; the reservoir keeps what they leave until it is
+/// full, and then every frame is filled out to keep the rate with what its
+/// loops left (clause 8.8.2.2), which codes nothing. On 8 tracks of pop
+/// music and 3 of rock at 44.1 kHz in stereo, those fill bits took 2.4%,
+/// 2.9% and 3.0% of the stream at 64, 128 and 192 kbit/s. A frame is
+/// therefore also offered what the reservoir holds beyond
+/// `max_bit_reservoir - mean_framelength`: the bits a frame leaves come
+/// back to the frames after it, and the reservoir stays about a mean frame
+/// below its maximum, for frames that ask for more. The fill bits fell to
+/// 0.5%, 0.4% and 0.4%. Graded with PEAQ (GstPEAQ 0.6.1, black box), the
+/// means of the pop tracks were -3.583, -1.087 and -0.282 at 64, 128 and
+/// 192 kbit/s, and of the rock tracks and their 3 windows of 3 s with the
+/// most frames coded short -3.579, -0.803 and -0.142, against -3.593,
+/// -1.184 and -0.310, and -3.584, -0.843 and -0.160, before. Keeping the
+/// reservoir within a quarter of a frame of its maximum graded alike,
+/// -1.088 and -0.803 at 128 kbit/s. Spending what the loops leave within
+/// the frame instead was tried too, at 128 kbit/s: trying two finer steps
+/// after the inner loop, where the bits do not fall as the step grows (see
+/// [`inner_loop`](crate::loops::inner::inner_loop)), found one that fits
+/// for about 18% of the channels and graded -1.172 and -0.864; amplifying,
+/// one at a time, the bands whose distortion lies nearest their allowance,
+/// or furthest over it, until four in a row do not fit, used the bits as
+/// well as the reservoir does but graded -1.234 and -0.948, and took more
+/// than twice as long to encode.
 pub fn elements_bits(
     config: &StreamConfig,
     reservoir: &BitReservoir,
     demand: &Demand,
     data_bits: u32,
 ) -> u32 {
-    let available = reservoir.available_bits(more_bits(config, demand, data_bits));
+    let asked = reservoir.available_bits(more_bits(config, demand, data_bits));
+    let available = asked.max(reservoir.offered_bits());
     available.saturating_sub(overhead_bits(config, data_bits))
 }
 

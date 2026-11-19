@@ -157,6 +157,19 @@ impl BitReservoir {
         bits.clamp(0, 8 * longest as i128) as u32
     }
 
+    /// The bits the next frame is offered whatever it asks for: the mean,
+    /// and what the reservoir holds beyond `max_bit_reservoir -
+    /// mean_framelength`, in whole bits, and no more than the longest frame
+    /// that [`Self::frame_len_range`] allows, in its whole bytes. A frame
+    /// that takes them all leaves the reservoir a mean frame below its
+    /// maximum, or as it was where it held less.
+    pub fn offered_bits(&self) -> u32 {
+        let keep = self.max.saturating_sub(self.mean);
+        let bits = (self.mean + self.state.saturating_sub(keep)) / self.sample_rate;
+        let (_, longest) = self.frame_len_range();
+        bits.min(8 * longest as u64) as u32
+    }
+
     /// Takes a frame of `len` bytes, within [`Self::frame_len_range`].
     pub fn spend(&mut self, len: usize) {
         let (shortest, longest) = self.frame_len_range();
@@ -259,6 +272,33 @@ mod tests {
             (available - (2229 - 1000 + 1000 - room)).abs() <= 1,
             "{available}"
         );
+    }
+
+    #[test]
+    fn the_bits_offered_are_those_beyond_a_mean_frame_below_the_maximum() {
+        // mean_framelength 2229.1156... bits, max_bit_reservoir 10058.
+        let mut reservoir = BitReservoir::new(Hz44100, Stereo, 96_000).unwrap();
+        // Empty, the frame is offered the most it may take: 278 bytes.
+        assert_eq!(reservoir.offered_bits(), 2224);
+        for _ in 0..5 {
+            reservoir.spend(100);
+        }
+        // 7145.57... bits, below 10058 - 2229.11...: the mean.
+        assert_eq!(reservoir.offered_bits(), 2229);
+        while reservoir.max_bits() - reservoir.state_bits() > 8 {
+            let (shortest, _) = reservoir.frame_len_range();
+            reservoir.spend(shortest.max(10));
+        }
+        // The mean and what the reservoir holds beyond 7828.88... bits.
+        let beyond = reservoir.state_bits() as f64 - (10_058.0 - 2229.1156);
+        let offered = f64::from(reservoir.offered_bits());
+        assert!((offered - (2229.1156 + beyond)).abs() <= 1.0, "{offered}");
+        // A frame that takes them, in whole bytes, leaves the reservoir a
+        // mean frame below its maximum, within a byte.
+        reservoir.spend(reservoir.offered_bits() as usize / 8);
+        let below = reservoir.max_bits() - reservoir.state_bits();
+        assert!((2229 - 9..=2229).contains(&below), "{below}");
+        assert!((2229..=2229 + 9).contains(&reservoir.offered_bits()));
     }
 
     #[test]

@@ -840,6 +840,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_bits_frames_leave_come_back_below_a_full_reservoir() {
+        let config = config(Framing::Adts, 128_000);
+        let reservoir = config.reservoir().unwrap();
+        // White noise, which takes all the bits it is given, but for what
+        // the loops leave of them.
+        let (left, right) = (noise(301 * FRAME_SAMPLES, 5), noise(301 * FRAME_SAMPLES, 6));
+        let mut encoder = StreamEncoder::new(config);
+        let mut fullness = Vec::new();
+        encoder.encode(&[&left, &right], &mut |frame: &[u8]| {
+            fullness.push((u32::from(frame[5] & 0b1_1111) << 6) | u32::from(frame[6] >> 2));
+        });
+        assert_eq!(fullness.len(), 300);
+        // adts_buffer_fullness of a full reservoir, and of one a mean frame
+        // below it.
+        let mean = 128_000 * FRAME_SAMPLES as u64 / 44_100;
+        let full = reservoir.max_bits() / 2 / 32;
+        let kept = (reservoir.max_bits() - mean) / 2 / 32;
+        let most = u64::from(*fullness[200..].iter().max().unwrap());
+        assert!(
+            (kept - 2..=kept + 2).contains(&most),
+            "{most} against {kept} and {full}"
+        );
+    }
+
     fn noise(len: usize, seed: u64) -> Vec<f64> {
         let mut state = seed;
         (0..len)
