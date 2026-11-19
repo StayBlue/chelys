@@ -890,3 +890,54 @@ fn intensity_stereo_keeps_each_tones_panning() {
         }
     }
 }
+
+/// A tone in the right channel alone, above 6 kHz, beside a low tone and
+/// a high one in both, decodes at its level in the right channel and all
+/// but silent in the left, at a bitrate that codes the pair in intensity
+/// stereo, and every tone at its level in each channel: the left channel's
+/// band of the lone tone holds only what its window leaks of the others,
+/// far below the right's, and is not coded in intensity stereo, whose
+/// positions do not reach so far.
+#[test]
+fn a_tone_panned_hard_right_survives_intensity_stereo() {
+    let sample_rate = 48_000;
+    let len = sample_rate as usize;
+    let fs = f64::from(sample_rate);
+    let tone = |frequency: f64, amplitude: f64, t: usize| {
+        amplitude * (TAU * frequency * t as f64 / fs).sin()
+    };
+    // Each tone with its level in the left and in the right channel.
+    let tones = [(440.0, 0.2, 0.2), (12_000.0, 0.1, 0.1), (9_000.0, 0.0, 0.5)];
+    let channel = |c: usize| -> Vec<f64> {
+        (0..len)
+            .map(|t| (tones.iter()).map(|&(f, l, r)| tone(f, [l, r][c], t)).sum())
+            .collect()
+    };
+    let input = [channel(0), channel(1)];
+    let encoded = encode(sample_rate, &input, 67_200);
+    let output = decode(&encoded, 2, "a tone hard right");
+    let in_intensity = (elements(&encoded.stream, sample_rate).iter()).any(|e| {
+        let right = &e.channels[1];
+        (0..right.info.max_sfb).any(|sfb| matches!(right.codebook(0, sfb), 14 | 15))
+    });
+    assert!(in_intensity, "bands in intensity stereo");
+    let decoded: Vec<Vec<f64>> = (0..2)
+        .map(|c| {
+            (output.iter().skip(c).step_by(2))
+                .skip(DELAY)
+                .take(len)
+                .map(|&y| f64::from(y))
+                .collect()
+        })
+        .collect();
+    let magnitude = |(re, im): (f64, f64)| (re * re + im * im).sqrt();
+    for &(frequency, l, r) in &tones {
+        for (c, expected) in [(0, l), (1, r)] {
+            let level = magnitude(tone_amplitude(&decoded[c], sample_rate, frequency, 2048));
+            assert!(
+                (level - expected).abs() < 0.1 * expected.max(0.1),
+                "{frequency} Hz, channel {c}: {level} against {expected}"
+            );
+        }
+    }
+}
