@@ -1,8 +1,9 @@
 // Copyright (c) 2026 StayBlue
 // SPDX-License-Identifier: MIT
 
-//! AAC streams of more than two channels decoded by ffmpeg: where each
-//! input channel lands among ffmpeg's output channels, and at what level.
+//! AAC streams of more than two channels decoded by ffmpeg and FAAD2:
+//! where each input channel lands among each decoder's output channels,
+//! and at what level.
 
 use std::f64::consts::TAU;
 
@@ -10,6 +11,7 @@ use chelys::aac::internals::raw_data_block::decoder::{adts_frame, raw_data_block
 use chelys::aac::internals::sampling_frequency::SamplingFrequency;
 use chelys::aac::{Config, DELAY, Encoder, Rate};
 use chelys_conformance::ffmpeg::{self, StreamInfo};
+use chelys_conformance::{Decoded, faad};
 
 /// The frequency in Hz of the tone of each input channel, in the input's
 /// order, of a configuration of `channels`: a tone of its own in each
@@ -45,7 +47,7 @@ fn tone(samples: &[f64], sample_rate: u32, frequency: f64) -> (f64, f64) {
     (s.hypot(c), c.atan2(s))
 }
 
-/// What ffmpeg gives of a stream of `channels` channels at `sample_rate`
+/// What `decode` gives of a stream of `channels` channels at `sample_rate`
 /// and `bits_per_second`, each a tone of [`frequencies`]: for each output
 /// channel, the input channel whose tone it carries, and the ratio of the
 /// levels of the other tones in it to that tone's, in dB; with the layout
@@ -70,11 +72,17 @@ const SHARED_TONES: [(f64, f64); 2] = [(5_000.0, 0.15), (9_000.0, 0.1)];
 /// channel where `shared`, which a pair codes as middle and side below 6
 /// kHz and, at a low bitrate, in intensity stereo above, the output
 /// checked to within `tolerance_db` of each tone's level.
-fn decode_tones(sample_rate: u32, channels: usize, bits_per_second: u32) -> Mapping {
-    decode_tones_with(sample_rate, channels, bits_per_second, false, 0.2)
+fn decode_tones(
+    decode: fn(&[u8]) -> Decoded,
+    sample_rate: u32,
+    channels: usize,
+    bits_per_second: u32,
+) -> Mapping {
+    decode_tones_with(decode, sample_rate, channels, bits_per_second, false, 0.2)
 }
 
 fn decode_tones_with(
+    decode: fn(&[u8]) -> Decoded,
     sample_rate: u32,
     channels: usize,
     bits_per_second: u32,
@@ -117,7 +125,7 @@ fn decode_tones_with(
         (expected, "LC".to_owned()),
         "{context}"
     );
-    let decoded = ffmpeg::decode_aac(&stream);
+    let decoded = decode(&stream);
     assert_eq!(decoded.diagnostics, "", "{context}");
     assert_eq!(
         decoded.samples.len(),
@@ -224,9 +232,43 @@ fn ffmpeg_maps_each_channel_of_configurations_3_to_7() {
             // 96 kbit/s a channel, and 32, below the 0.75 bits a sample of
             // intensity stereo.
             for per_channel in [96_000, 32_000] {
-                let mapping = decode_tones(sample_rate, channels, per_channel * ncc);
+                let mapping =
+                    decode_tones(ffmpeg::decode_aac, sample_rate, channels, per_channel * ncc);
                 let context = format!("{sample_rate} Hz, {channels} channels, {per_channel}");
                 assert_eq!(mapping.layout.0, layout, "{context}");
+                assert_eq!(mapping.sources, sources, "{context}");
+                assert!(
+                    mapping.crosstalk_db.iter().all(|&db| db < -60.0),
+                    "{context}: {:?}",
+                    mapping.crosstalk_db
+                );
+            }
+        }
+    }
+}
+
+/// FAAD2 decodes channel configurations 3 to 7 as ffmpeg does above, each
+/// input channel in exactly one output channel, at its level and sign,
+/// with the other tones more than 60 dB below it, at 48 and 44.1 kHz, at
+/// 96 and 32 kbit/s a channel; but in an order of its own: those of
+/// configurations 3, 4, 5 and 7 in the order the stream sends them, the
+/// input's, and those of 5.1 in ffmpeg's, the front pair, the center, the
+/// LFE and the surround pair.
+#[test]
+fn faad_maps_each_channel_of_configurations_3_to_7() {
+    for (channels, sources) in [
+        (3, vec![0, 1, 2]),
+        (4, vec![0, 1, 2, 3]),
+        (5, vec![0, 1, 2, 3, 4]),
+        (6, vec![1, 2, 0, 5, 3, 4]),
+        (8, vec![0, 1, 2, 3, 4, 5, 6, 7]),
+    ] {
+        let ncc = if channels > 5 { channels - 1 } else { channels } as u32;
+        for sample_rate in [48_000, 44_100] {
+            for per_channel in [96_000, 32_000] {
+                let mapping =
+                    decode_tones(faad::decode_aac, sample_rate, channels, per_channel * ncc);
+                let context = format!("{sample_rate} Hz, {channels} channels, {per_channel}");
                 assert_eq!(mapping.sources, sources, "{context}");
                 assert!(
                     mapping.crosstalk_db.iter().all(|&db| db < -60.0),
@@ -273,8 +315,140 @@ fn ffmpeg_names_the_channels_of_its_layouts() {
 /// channel with its `id_syn_ele` (clause 8.2.3.1).
 #[test]
 fn ffmpeg_decodes_5_1_and_7_1_at_the_ends_of_their_range() {
+    let cut_short = decodes_5_1_and_7_1_at_the_ends_of_their_range(ffmpeg::decode_aac, 1, None);
+    assert_eq!(cut_short, 0);
+}
+
+/// FAAD2 decodes the streams of 5.1 and 7.1 above as ffmpeg does, at 8
+/// kHz at twice the sampling frequency, but for those of 7.1 at the
+/// highest bitrates: it decodes no frame longer than [`FAAD_LONGEST`]
+/// bytes, and their frames are longer, up to the 6144 bits that each of
+/// the seven channels but the LFE may take. It reports an error at the
+/// first, the stream's first, and decodes nothing from it on.
+#[test]
+fn faad_decodes_5_1_and_7_1_at_the_ends_of_their_range() {
+    let cut_short =
+        decodes_5_1_and_7_1_at_the_ends_of_their_range(faad::decode_aac, 2, Some(FAAD_LONGEST));
+    // 7.1 at the highest bitrate, with the CRC and without, at each rate.
+    assert_eq!(cut_short, 6);
+}
+
+/// The longest `adts_frame()` in bytes that FAAD2 decodes: 768 for each
+/// of six channels, though 7.1 has seven besides its LFE (see
+/// `faad_decodes_no_frame_longer_than_4608_bytes`).
+const FAAD_LONGEST: usize = 4608;
+
+/// `frame`, an `adts_frame()` without a `crc_check`, padded to `len`
+/// bytes with fill elements as the encoder writes them: of `EXT_FILL_DATA`,
+/// 14 bytes or fewer each, before `ID_END`.
+fn padded(frame: &[u8], len: usize) -> Vec<u8> {
+    let push = |bits: &mut Vec<bool>, value: u32, n: u32| {
+        bits.extend((0..n).rev().map(|i| (value >> i) & 1 == 1));
+    };
+    assert_eq!(frame[1] & 1, 1, "protection_absent 1");
+    let block = &frame[7..];
+    let mut bits: Vec<bool> = (0..8 * block.len())
+        .map(|i| (block[i / 8] >> (7 - i % 8)) & 1 == 1)
+        .collect();
+    // The block's last 1 ends its ID_END, which follows the fill.
+    let end = bits.iter().rposition(|&bit| bit).unwrap() + 1;
+    bits.truncate(end - 3);
+    let target = 8 * (len - 7);
+    while target - bits.len() - 3 >= 8 {
+        let cnt = ((target - bits.len() - 3 - 7) / 8).min(14) as u32;
+        push(&mut bits, 0x6, 3); // ID_FIL
+        push(&mut bits, cnt, 4);
+        if cnt > 0 {
+            push(&mut bits, 0b0001, 4); // EXT_FILL_DATA
+            push(&mut bits, 0b0000, 4); // fill_nibble
+            for _ in 1..cnt {
+                push(&mut bits, 0b1010_0101, 8); // fill_byte
+            }
+        }
+    }
+    push(&mut bits, 0x7, 3); // ID_END
+    bits.resize(target, false);
+    let mut header = frame[..7].to_vec();
+    header[3] = (header[3] & !0b11) | (len >> 11) as u8;
+    header[4] = (len >> 3) as u8;
+    header[5] = (header[5] & 0b1_1111) | ((len & 0b111) << 5) as u8;
+    let bytes =
+        (bits.chunks(8)).map(|byte| byte.iter().fold(0, |b, &bit| (b << 1) | u8::from(bit)));
+    header.into_iter().chain(bytes).collect()
+}
+
+/// FAAD2 decodes no `adts_frame()` longer than 4608 bytes: a stereo stream
+/// whose fourth frame is padded with fill elements to 4608 bytes decodes
+/// whole and without complaint, and padded to 4609 bytes, FAAD2 reports
+/// an error at it and gives only the three frames before it. Neither frame
+/// is one the encoder writes, as a pair's frame holds 6144 bits for each
+/// channel at most; they find FAAD2's limit, which 7.1 at its highest
+/// bitrates passes.
+#[test]
+fn faad_decodes_no_frame_longer_than_4608_bytes() {
+    let sample_rate = 48_000;
+    let pcm: Vec<f32> = (0..8 * 1024 * 2)
+        .map(|i| 0.3 * (i as f32 * 0.05).sin())
+        .collect();
+    let config = Config::new(
+        sample_rate,
+        2,
+        Rate::Constant {
+            bits_per_second: 64_000,
+        },
+    );
+    let mut encoder = Encoder::new(config).unwrap();
+    let mut stream = Vec::new();
+    encoder.encode_interleaved(&pcm, &mut stream);
+    encoder.finish(&mut stream);
+    let mut frames = Vec::new();
+    let mut rest = stream.as_slice();
+    while !rest.is_empty() {
+        let len = adts_frame(rest).aac_frame_length;
+        frames.push(&rest[..len]);
+        rest = &rest[len..];
+    }
+    for len in [FAAD_LONGEST, FAAD_LONGEST + 1] {
+        let fourth = padded(frames[3], len);
+        let fs = SamplingFrequency::from_hz(sample_rate).unwrap();
+        let [elements, as_sent] =
+            [&fourth, frames[3]].map(|frame| raw_data_block(&frame[7..], fs).elements);
+        assert_eq!(elements, as_sent);
+        let padded: Vec<u8> = [&frames[..3], &[&fourth[..]], &frames[4..]]
+            .concat()
+            .concat();
+        let decoded = faad::decode_aac(&padded);
+        if len == FAAD_LONGEST {
+            assert_eq!(decoded.diagnostics, "", "{len} bytes");
+            assert_eq!(
+                decoded.samples.len(),
+                frames.len() * 1024 * 2,
+                "{len} bytes"
+            );
+        } else {
+            assert!(
+                decoded.diagnostics.starts_with("Error: "),
+                "{len} bytes: {:?}",
+                decoded.diagnostics
+            );
+            assert_eq!(decoded.samples.len(), 3 * 1024 * 2, "{len} bytes");
+        }
+    }
+}
+
+/// What the tests above check, with `decode`, which gives at 8 kHz
+/// `factor` times the samples of each frame, and decodes no frame longer
+/// than `longest` bytes, if given, reporting an error at the first and
+/// giving the samples of those before it only; with the streams so cut
+/// short.
+fn decodes_5_1_and_7_1_at_the_ends_of_their_range(
+    decode: fn(&[u8]) -> Decoded,
+    factor: usize,
+    longest: Option<usize>,
+) -> usize {
     use chelys::aac::ConfigError;
 
+    let mut cut_short = 0;
     for channels in [6, 8] {
         for sample_rate in [8_000, 48_000, 96_000] {
             for crc in [false, true] {
@@ -310,9 +484,15 @@ fn ffmpeg_decodes_5_1_and_7_1_at_the_ends_of_their_range() {
                     let finished = encoder.finish(&mut stream);
                     let fs = SamplingFrequency::from_hz(sample_rate).unwrap();
                     let mut rest = stream.as_slice();
+                    let mut decodable = None;
+                    let mut frames = 0;
                     while !rest.is_empty() {
                         let frame = adts_frame(rest);
                         rest = &rest[frame.aac_frame_length..];
+                        if longest.is_some_and(|longest| frame.aac_frame_length > longest) {
+                            decodable.get_or_insert(frames);
+                        }
+                        frames += 1;
                         for element in raw_data_block(frame.raw_data_block, fs).elements {
                             let bits = 3 + element.bits.len();
                             let channels = element.element.channels.len();
@@ -320,17 +500,29 @@ fn ffmpeg_decodes_5_1_and_7_1_at_the_ends_of_their_range() {
                             assert!(lfe || bits <= 6144 * channels, "{context}: {bits}");
                         }
                     }
-                    let decoded = ffmpeg::decode_aac(&stream);
-                    assert_eq!(decoded.diagnostics, "", "{context}");
+                    assert_eq!(frames, finished.frames as usize);
+                    let decoded = decode(&stream);
+                    if decodable.is_some() {
+                        cut_short += 1;
+                        assert!(
+                            decoded.diagnostics.starts_with("Error: "),
+                            "{context}: {:?}",
+                            decoded.diagnostics
+                        );
+                    } else {
+                        assert_eq!(decoded.diagnostics, "", "{context}");
+                    }
+                    let factor = if sample_rate == 8_000 { factor } else { 1 };
                     assert_eq!(
                         decoded.samples.len(),
-                        finished.frames as usize * 1024 * channels,
+                        decodable.unwrap_or(frames) * 1024 * channels * factor,
                         "{context}"
                     );
                 }
             }
         }
     }
+    cut_short
 }
 
 /// The mapping holds where each pair codes bands as middle and side and in
@@ -352,7 +544,14 @@ fn ffmpeg_maps_each_channel_of_pairs_coded_jointly() {
     ] {
         let ncc = if channels > 5 { channels - 1 } else { channels } as u32;
         for sample_rate in [48_000, 44_100] {
-            let mapping = decode_tones_with(sample_rate, channels, 32_000 * ncc, true, 0.5);
+            let mapping = decode_tones_with(
+                ffmpeg::decode_aac,
+                sample_rate,
+                channels,
+                32_000 * ncc,
+                true,
+                0.5,
+            );
             let context = format!("{sample_rate} Hz, {channels} channels");
             assert_eq!(mapping.sources, sources, "{context}");
             assert!(
@@ -368,6 +567,38 @@ fn ffmpeg_maps_each_channel_of_pairs_coded_jointly() {
                     .all(|&(ms, intensity)| ms > 100 && intensity > 100),
                 "{context}: {:?}",
                 mapping.joint
+            );
+        }
+    }
+}
+
+/// FAAD2's mapping holds where each pair codes bands as middle and side
+/// and in intensity stereo, as ffmpeg's does above, in FAAD2's order.
+#[test]
+fn faad_maps_each_channel_of_pairs_coded_jointly() {
+    for (channels, sources) in [
+        (3, vec![0, 1, 2]),
+        (4, vec![0, 1, 2, 3]),
+        (5, vec![0, 1, 2, 3, 4]),
+        (6, vec![1, 2, 0, 5, 3, 4]),
+        (8, vec![0, 1, 2, 3, 4, 5, 6, 7]),
+    ] {
+        let ncc = if channels > 5 { channels - 1 } else { channels } as u32;
+        for sample_rate in [48_000, 44_100] {
+            let mapping = decode_tones_with(
+                faad::decode_aac,
+                sample_rate,
+                channels,
+                32_000 * ncc,
+                true,
+                0.5,
+            );
+            let context = format!("{sample_rate} Hz, {channels} channels");
+            assert_eq!(mapping.sources, sources, "{context}");
+            assert!(
+                mapping.crosstalk_db.iter().all(|&db| db < -40.0),
+                "{context}: {:?}",
+                mapping.crosstalk_db
             );
         }
     }

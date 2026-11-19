@@ -3,12 +3,12 @@
 
 //! AAC streams in ADTS with the options of their headers, the CRC of
 //! `adts_error_check()` and the header's flags, and with data stream
-//! elements, as ffmpeg decodes them.
+//! elements, as ffmpeg and FAAD2 decode them.
 
 use std::f64::consts::TAU;
 
 use chelys::aac::{Config, Encoder, Finished, Rate};
-use chelys_conformance::ffmpeg;
+use chelys_conformance::{Decoded, faad, ffmpeg};
 
 /// Tones at `sample_rate`, `seconds` long, interleaved in `channels`.
 fn tones(sample_rate: u32, channels: usize, seconds: f64) -> Vec<f32> {
@@ -117,7 +117,15 @@ fn ffmpeg_skips_the_crc_unchecked() {
     )
     .crc(true);
     let (stream, _) = encode(config, 2, &tones(44_100, 2, 1.0), &[]);
-    let wrong: Vec<u8> = frames(&stream)
+    let wrong = with_wrong_crc(&stream);
+    let (right, wrong) = (ffmpeg::decode_aac(&stream), ffmpeg::decode_aac(&wrong));
+    assert_eq!(wrong.diagnostics, "");
+    assert_eq!(wrong.samples, right.samples);
+}
+
+/// `stream` with a bit of each frame's `crc_check` flipped at either end.
+fn with_wrong_crc(stream: &[u8]) -> Vec<u8> {
+    frames(stream)
         .into_iter()
         .flat_map(|frame| {
             let mut frame = frame.to_vec();
@@ -125,8 +133,59 @@ fn ffmpeg_skips_the_crc_unchecked() {
             frame[8] ^= 0x01;
             frame
         })
-        .collect();
-    let (right, wrong) = (ffmpeg::decode_aac(&stream), ffmpeg::decode_aac(&wrong));
+        .collect()
+}
+
+/// FAAD2 decodes the streams that ffmpeg does above, with the CRC and
+/// every header flag set, without complaint and as it decodes them with
+/// the CRC taken out; at 8 kHz, at twice the sampling frequency.
+#[test]
+fn faad_decodes_streams_with_the_crc_and_flags() {
+    for (sample_rate, channels, bits_per_second) in [
+        (44_100, 2, 128_000),
+        (48_000, 1, 24_000),
+        (8_000, 2, 16_000),
+    ] {
+        let context = format!("{sample_rate} Hz, {channels} channels, {bits_per_second} bit/s");
+        let config = Config::new(sample_rate, channels, Rate::Constant { bits_per_second })
+            .crc(true)
+            .private_bit(true)
+            .original_copy(true)
+            .home(true);
+        let (stream, finished) = encode(config, channels, &tones(sample_rate, channels, 1.0), &[]);
+        let factor = if sample_rate <= 24_000 { 2 } else { 1 };
+        let decoded = faad::decode_aac(&stream);
+        assert_eq!(decoded.diagnostics, "", "{context}");
+        assert_eq!(
+            decoded.samples.len(),
+            finished.frames as usize * 1024 * channels * factor,
+            "{context}"
+        );
+        assert!(decoded.samples.iter().any(|&s| s.abs() > 0.1), "{context}");
+        let plain = faad::decode_aac(&without_crc(&stream));
+        assert_eq!(plain.diagnostics, "", "{context}");
+        assert_eq!(plain.samples, decoded.samples, "{context}");
+    }
+}
+
+/// FAAD2 does not check the `crc_check` of ADTS either, and `faad` has no
+/// option to: a stream whose every `crc_check` is wrong decodes without
+/// complaint and as the stream does. So neither
+/// decoder settles which bits the CRC protects. Should a later FAAD2 check
+/// it, this test fails, and it becomes the evidence.
+#[test]
+fn faad_skips_the_crc_unchecked() {
+    let config = Config::new(
+        44_100,
+        2,
+        Rate::Constant {
+            bits_per_second: 96_000,
+        },
+    )
+    .crc(true);
+    let (stream, _) = encode(config, 2, &tones(44_100, 2, 1.0), &[]);
+    let wrong = with_wrong_crc(&stream);
+    let (right, wrong) = (faad::decode_aac(&stream), faad::decode_aac(&wrong));
     assert_eq!(wrong.diagnostics, "");
     assert_eq!(wrong.samples, right.samples);
 }
@@ -140,6 +199,17 @@ fn ffmpeg_skips_the_crc_unchecked() {
 /// leaves it.
 #[test]
 fn ffmpeg_ignores_data_stream_elements() {
+    ignores_data_stream_elements(ffmpeg::decode_aac);
+}
+
+/// FAAD2 decodes the streams with data stream elements as ffmpeg does
+/// above.
+#[test]
+fn faad_ignores_data_stream_elements() {
+    ignores_data_stream_elements(faad::decode_aac);
+}
+
+fn ignores_data_stream_elements(decode: fn(&[u8]) -> Decoded) {
     for (sample_rate, channels, bits_per_second, per_frame, crc) in [
         (44_100, 2, 320_000, 600, true),
         (48_000, 1, 64_000, 40, false),
@@ -168,8 +238,7 @@ fn ffmpeg_ignores_data_stream_elements() {
         );
         assert_ne!(zeros, imitating, "{context}");
         assert_eq!(zeros.len(), imitating.len(), "{context}");
-        let [plain, zeros, imitating] =
-            [&plain, &zeros, &imitating].map(|stream| ffmpeg::decode_aac(stream));
+        let [plain, zeros, imitating] = [&plain, &zeros, &imitating].map(|stream| decode(stream));
         for decoded in [&zeros, &imitating] {
             assert_eq!(decoded.diagnostics, "", "{context}");
             assert_eq!(decoded.samples.len(), plain.samples.len(), "{context}");

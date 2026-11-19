@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 use chelys::aac::{Config, DELAY, Encoder, Rate, SAMPLE_RATES};
+use chelys_conformance::faad;
 use chelys_conformance::ffmpeg::{self, StreamInfo};
 
 /// Some input that ends within a frame.
@@ -116,4 +117,47 @@ fn ffmpeg_reports_too_many_scalefactor_bands() {
         "ffmpeg reported: {:?}",
         decoded.diagnostics
     );
+}
+
+/// faad gives every frame's 1024 samples, from the first, as ffmpeg does,
+/// and trims none; but at 24 kHz and below, twice as many, at twice the
+/// sampling frequency, which its WAV header gives.
+#[test]
+fn faad_decodes_silence_at_every_sample_rate() {
+    for sample_rate in SAMPLE_RATES {
+        for channels in [1, 2] {
+            let context = format!("{sample_rate} Hz, {channels} channels");
+            let (stream, finished) = encode_silence(sample_rate, channels);
+            let factor = if sample_rate <= 24_000 { 2 } else { 1 };
+            assert_eq!(
+                faad::sample_rate(&stream),
+                factor * sample_rate,
+                "{context}"
+            );
+            let decoded = faad::decode_aac(&stream);
+            assert_eq!(decoded.diagnostics, "", "{context}");
+            assert_eq!(
+                decoded.samples.len(),
+                finished.frames as usize * 1024 * channels * factor as usize,
+                "{context}"
+            );
+            assert!(decoded.samples.iter().all(|&s| s == 0.0), "{context}");
+        }
+    }
+}
+
+/// Guards the oracle itself, as for ffmpeg above: faad reports the frame
+/// whose `max_sfb` is beyond the bands there are, and decodes nothing of
+/// the stream from it.
+#[test]
+fn faad_reports_too_many_scalefactor_bands() {
+    let (mut stream, _) = encode_silence(48_000, 1);
+    stream[7 + 2] |= 0b1_1111;
+    let decoded = faad::decode_aac(&stream);
+    assert!(
+        decoded.diagnostics.starts_with("Error: "),
+        "faad reported: {:?}",
+        decoded.diagnostics
+    );
+    assert!(decoded.samples.is_empty());
 }

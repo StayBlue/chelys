@@ -10,7 +10,8 @@
 //! Where the standard leaves a gap that a decoded test settled, the library
 //! says "Settled by decoding with" the decoders that settled it and names
 //! the test. That evidence was recorded with ffmpeg n9.0.2, mpg123 1.33.7
-//! and LAME 4.0 (64-bit); other versions could decode differently.
+//! and LAME 4.0 (64-bit), and for AAC with ffmpeg n9.0.2 and FAAD2 2.11.4;
+//! other versions could decode differently.
 //!
 //! Quality is graded with PEAQ (ITU-R BS.1387) as GstPEAQ computes it, also
 //! as a black box (see [`peaq`]). Its grades were recorded with GstPEAQ
@@ -21,6 +22,7 @@
 //! grades of its decoded output are compared with chelys's. The benchmark
 //! was run with LAME 4.0 (64-bit).
 
+pub mod faad;
 pub mod ffmpeg;
 pub mod lame;
 pub mod mpg123;

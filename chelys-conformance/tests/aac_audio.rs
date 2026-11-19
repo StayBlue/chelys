@@ -1,15 +1,15 @@
 // Copyright (c) 2026 StayBlue
 // SPDX-License-Identifier: MIT
 
-//! Audio through the AAC encoder, decoded by ffmpeg and compared with the
-//! input.
+//! Audio through the AAC encoder, decoded by ffmpeg, and in places by
+//! FAAD2, and compared with the input.
 
 use std::f64::consts::TAU;
 
 use chelys::aac::internals::noiseless::decoder::{BitReader, Element, element};
 use chelys::aac::internals::sampling_frequency::SamplingFrequency;
 use chelys::aac::{Config, ConfigError, DELAY, Encoder, Finished, Rate, SAMPLE_RATES};
-use chelys_conformance::ffmpeg;
+use chelys_conformance::{faad, ffmpeg};
 
 /// A stream in ADTS, with the length of each frame.
 struct Encoded {
@@ -218,6 +218,48 @@ fn ffmpeg_decodes_the_input_a_frame_late_at_every_sample_rate() {
             for (c, input) in input.iter().enumerate() {
                 let (lag, snr) = align(input, &output, channels, c);
                 assert_eq!(lag, DELAY, "{context}, channel {c}: {snr:.1} dB");
+                assert!(snr > 9.0, "{context}, channel {c}: {snr:.1} dB");
+            }
+        }
+    }
+}
+
+/// faad gives the input back as ffmpeg does, [`DELAY`] samples late, above
+/// 24 kHz. At 24 kHz and below it gives twice the samples, at twice the
+/// sampling frequency, from which every other sample, from the first,
+/// gives the input back 481 samples later still.
+#[test]
+fn faad_decodes_the_input_a_frame_late_at_every_sample_rate() {
+    for sample_rate in SAMPLE_RATES {
+        for channels in [1, 2] {
+            let context = format!("{sample_rate} Hz, {channels} channels");
+            let len = sample_rate as usize;
+            let top = (f64::from(sample_rate) / 2.0).min(16_000.0);
+            let input: Vec<Vec<f64>> = (0..channels)
+                .map(|c| sweep(sample_rate, len, 100.0 + 50.0 * c as f64, top))
+                .collect();
+            let (_, max) = bitrate_range(sample_rate, channels);
+            let bits_per_second = (sample_rate * channels as u32).min(max);
+            let encoded = encode(sample_rate, &input, bits_per_second);
+            let decoded = faad::decode_aac(&encoded.stream);
+            assert_eq!(decoded.diagnostics, "", "{context}");
+            let (factor, delay) = if sample_rate <= 24_000 {
+                (2, DELAY + 481)
+            } else {
+                (1, DELAY)
+            };
+            assert_eq!(
+                decoded.samples.len(),
+                encoded.finished.frames as usize * 1024 * channels * factor,
+                "{context}"
+            );
+            let output: Vec<f32> = (decoded.samples.chunks(channels).step_by(factor))
+                .flatten()
+                .copied()
+                .collect();
+            for (c, input) in input.iter().enumerate() {
+                let (lag, snr) = align(input, &output, channels, c);
+                assert_eq!(lag, delay, "{context}, channel {c}: {snr:.1} dB");
                 assert!(snr > 9.0, "{context}, channel {c}: {snr:.1} dB");
             }
         }

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 //! AAC streams whose channels send some of their lines with the pulse
-//! escape (`pulse_data()`), as ffmpeg decodes them.
+//! escape (`pulse_data()`), as ffmpeg, and in places FAAD2, decode them.
 
 use chelys::aac::internals::channel::{CodedChannel, CodedGroup, FRAME_LINES};
 use chelys::aac::internals::channel_configuration::ChannelConfiguration;
@@ -17,7 +17,7 @@ use chelys::aac::internals::tns::Tns;
 use chelys::aac::internals::window::Windows;
 use chelys::aac::internals::{StreamConfig, StreamEncoder};
 use chelys::aac::{DELAY, Framing};
-use chelys_conformance::ffmpeg;
+use chelys_conformance::{Decoded, faad, ffmpeg};
 
 /// A deterministic stream of pseudo-random numbers (xorshift).
 struct Noise(u64);
@@ -132,6 +132,20 @@ fn lines(noise: &mut Noise, end: usize, peaks: &[(usize, i32)]) -> [i32; FRAME_L
 /// fall on another line.
 #[test]
 fn ffmpeg_restores_clipped_lines_as_sent_unclipped() {
+    restores_clipped_lines_as_sent_unclipped(ffmpeg::decode_aac, 1);
+}
+
+/// FAAD2 restores the clipped lines as ffmpeg does above, counting each
+/// `pulse_offset` after the first from the pulse before; at 8 kHz, at
+/// twice the sampling frequency.
+#[test]
+fn faad_restores_clipped_lines_as_sent_unclipped() {
+    restores_clipped_lines_as_sent_unclipped(faad::decode_aac, 2);
+}
+
+/// What the tests above check, with `decode`, which gives at 8 kHz
+/// `factor` times the samples of each frame.
+fn restores_clipped_lines_as_sent_unclipped(decode: fn(&[u8]) -> Decoded, factor: usize) {
     let mut noise = Noise(0x9e37_79b9_7f4a_7c15);
     for fs in [
         SamplingFrequency::Hz8000,
@@ -198,12 +212,17 @@ fn ffmpeg_restores_clipped_lines_as_sent_unclipped() {
             [clipped, unclipped, dropped].map(|channels| stream(fs, channels));
         assert_ne!(clipped, unclipped);
         let [clipped, unclipped, dropped] =
-            [clipped, unclipped, dropped].map(|stream| ffmpeg::decode_aac(&stream));
+            [clipped, unclipped, dropped].map(|stream| decode(&stream));
+        let factor = if fs == SamplingFrequency::Hz8000 {
+            factor
+        } else {
+            1
+        };
         for decoded in [&clipped, &unclipped, &dropped] {
             assert_eq!(decoded.diagnostics, "", "{fs:?}");
-            assert_eq!(decoded.samples.len(), 24 * FRAME_LINES, "{fs:?}");
+            assert_eq!(decoded.samples.len(), 24 * FRAME_LINES * factor, "{fs:?}");
         }
-        let error = |decoded: &ffmpeg::Decoded| {
+        let error = |decoded: &Decoded| {
             (decoded.samples.iter())
                 .zip(&unclipped.samples)
                 .map(|(x, y)| (x - y).abs())
