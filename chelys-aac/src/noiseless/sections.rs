@@ -321,9 +321,10 @@ impl Sections {
     }
 }
 
-/// `max_sfb` for a window group's `lines` (as for [`Sections::count`]):
-/// the bands up to the highest with a line that is not zero, so that no
-/// section has to code the bands of zeros above it. Over the groups of an
+/// `max_sfb` for a window group whose bands' lines have the largest
+/// magnitudes `largest` (as for [`Counted::count_with_largest`]): the bands
+/// up to the highest with a line that is not zero, so that no section has
+/// to code the bands of zeros above it. Over the groups of an
 /// EIGHT_SHORT_SEQUENCE, `max_sfb` is the largest of theirs.
 ///
 /// Spec reading: `max_sfb` is "one greater than the highest active
@@ -332,10 +333,20 @@ impl Sections {
 /// above the highest with a line that is not zero would cost a section or
 /// a longer one, where outside `max_sfb` it costs nothing, so it is left
 /// out.
+pub fn max_sfb_of_largest(largest: &[u32]) -> usize {
+    largest
+        .iter()
+        .rposition(|&q| q != 0)
+        .map_or(0, |sfb| sfb + 1)
+}
+
+/// [`max_sfb_of_largest`] for a window group's `lines` (as for
+/// [`Sections::count`]).
 ///
 /// # Panics
 ///
 /// If there are not as many lines as the bands hold: a caller's error.
+#[cfg(any(test, feature = "unstable"))]
 pub fn max_sfb(lines: &[i32], bands: GroupBands) -> usize {
     assert_eq!(lines.len(), bands.lines(), "a group's lines fill its bands");
     lines
@@ -403,6 +414,34 @@ impl Counted {
             "max_sfb {max_sfb} exceeds num_swb {}",
             bands.num_swb()
         );
+        let mut largest = [0; MAX_BANDS];
+        for (sfb, largest) in largest[..max_sfb].iter_mut().enumerate() {
+            let lines = &lines[bands.offset(sfb)..bands.offset(sfb + 1)];
+            *largest = lines
+                .iter()
+                .map(|line| line.unsigned_abs())
+                .max()
+                .unwrap_or(0);
+        }
+        self.count_with_largest(lines, bands, max_sfb, intensity, &largest)
+    }
+
+    /// [`count`](Self::count), given the largest magnitude of each band's
+    /// lines in `largest`.
+    pub fn count_with_largest(
+        &mut self,
+        lines: &[i32],
+        bands: GroupBands,
+        max_sfb: usize,
+        intensity: IntensityBands,
+        largest: &[u32],
+    ) -> bool {
+        assert_eq!(lines.len(), bands.lines(), "a group's lines fill its bands");
+        assert!(
+            max_sfb <= bands.num_swb(),
+            "max_sfb {max_sfb} exceeds num_swb {}",
+            bands.num_swb()
+        );
         debug_assert!(
             lines[bands.offset(max_sfb)..].iter().all(|&line| line == 0),
             "lines above max_sfb are not sent"
@@ -410,14 +449,20 @@ impl Counted {
         assert!(intensity.end() <= max_sfb, "intensity bands above max_sfb");
         (self.bands, self.max_sfb, self.least_bits) = (bands, max_sfb, 0);
         for (sfb, class) in self.classes[..max_sfb].iter_mut().enumerate() {
-            let lines = &lines[bands.offset(sfb)..bands.offset(sfb + 1)];
-            let largest = lines.iter().map(|line| line.unsigned_abs()).max();
+            let largest = largest[sfb];
+            debug_assert_eq!(
+                Some(largest),
+                (lines[bands.offset(sfb)..bands.offset(sfb + 1)].iter())
+                    .map(|line| line.unsigned_abs())
+                    .max(),
+                "the largest magnitude of band {sfb}"
+            );
             *class = match intensity.codebook(sfb) {
                 Some(codebook) => {
-                    debug_assert!(largest == Some(0), "lines in an intensity band");
+                    debug_assert!(largest == 0, "lines in an intensity band");
                     intensity_class(codebook)
                 }
-                None => match self::class(largest.expect("a band holds lines")) {
+                None => match self::class(largest) {
                     Some(class) => class,
                     None => return false,
                 },

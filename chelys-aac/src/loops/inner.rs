@@ -63,9 +63,14 @@ fn truncate(magnitude: f64) -> i32 {
 
 /// `x_quant` of `magnitude` (see [`truncate`]) with the sign of `x`.
 fn signed(magnitude: f64, x: f64) -> i32 {
+    with_sign(truncate(magnitude), x)
+}
+
+/// `magnitude` with the sign of `x`.
+fn with_sign(magnitude: i32, x: f64) -> i32 {
     // 0 or -1, which negates by a complement and an increment.
     let sign = -i32::from(x < 0.0);
-    (truncate(magnitude) ^ sign) - sign
+    (magnitude ^ sign) - sign
 }
 
 /// `|x|^(3/4)`, as `(|x| * |x|^(1/2))^(1/2)`: two square roots, which the
@@ -174,7 +179,7 @@ impl<'a> Lines<'a> {
     /// C.7.4.1): with `sf_decoder = common_scalefac - scalefactor +
     /// SF_OFFSET`, `abs(mdct_line(i))^(3/4) * 2^(-3/16 * (sf_decoder -
     /// SF_OFFSET))`. Magnitudes beyond [`MAX_MAGNITUDE`] are left beyond it,
-    /// for counting to refuse.
+    /// for counting to refuse. Gives the largest magnitude.
     ///
     /// Spec reading: clause C.7.4 gives the quantizer first as `int((abs(
     /// mdct_line) * 2^(-1/4 * (sf_decoder - SF_OFFSET)))^(3/4) +
@@ -188,17 +193,22 @@ impl<'a> Lines<'a> {
     /// and clauses C.7.4.1 and C.7.4.2 are followed. The distortion of
     /// clause C.7.4.3 and its attenuation, which take the reversed sign
     /// too, are read alike (see [`outer_loop`](super::outer::outer_loop)).
-    pub fn quantize(&self, sf_decoder: u8, range: Range<usize>, x_quant: &mut [i32]) {
+    pub fn quantize(&self, sf_decoder: u8, range: Range<usize>, x_quant: &mut [i32]) -> u32 {
         let scale = step_scale(sf_decoder);
         let end = range.end.min(self.end).max(range.start);
         let (coded, above) = x_quant.split_at_mut(end - range.start);
         let lines = (coded.iter_mut())
             .zip(&self.scaled[range.start..end])
             .zip(&self.spectrum[range.start..end]);
+        // The lines above `end` are zeros.
+        let mut largest = 0;
         for ((q, &scaled), &x) in lines {
-            *q = signed((scaled * scale + MAGIC_NUMBER).min(BEYOND_MAGNITUDE), x);
+            let magnitude = truncate((scaled * scale + MAGIC_NUMBER).min(BEYOND_MAGNITUDE));
+            largest = largest.max(magnitude);
+            *q = with_sign(magnitude, x);
         }
         above.fill(0);
+        largest as u32
     }
 }
 
@@ -293,8 +303,10 @@ pub struct Counting<'a> {
     /// each window group: how many steps of the quantizer each is
     /// amplified by. All 0 to start with (clause C.7.2.1).
     pub scalefactors: Vec<[u8; MAX_BANDS]>,
-    /// The lines quantized at the step counted last.
+    /// The lines quantized at the step counted last, and the largest
+    /// magnitude of each group's bands.
     x_quant: [i32; FRAME_LINES],
+    largest: Vec<[u32; MAX_BANDS]>,
     /// Each group's lines counted at the step counted last, which each
     /// count counts into.
     counted: Vec<Counted>,
@@ -325,6 +337,7 @@ impl<'a> Counting<'a> {
             coding,
             scalefactors: vec![[0; MAX_BANDS]; groups],
             x_quant: [0; FRAME_LINES],
+            largest: vec![[0; MAX_BANDS]; groups],
             counted: (coding.windows.groups(coding.sampling_frequency))
                 .map(Counted::new)
                 .collect(),
@@ -399,10 +412,11 @@ impl<'a> Counting<'a> {
                 };
                 let band = bands.band(sb);
                 let range = start + band.start..start + band.end;
-                self.lines
-                    .quantize(sf_decoder, range.clone(), &mut self.x_quant[range]);
+                self.largest[g][sb] =
+                    (self.lines).quantize(sf_decoder, range.clone(), &mut self.x_quant[range]);
             }
             self.x_quant[start + bands.offset(sent)..start + bands.lines()].fill(0);
+            self.largest[g][sent..].fill(0);
         }
         let ChannelCoding {
             windows,
@@ -418,9 +432,8 @@ impl<'a> Counting<'a> {
                 .max()
                 .unwrap_or(0)
         });
-        let max_sfb = self
-            .group_lines()
-            .map(|(bands, lines)| sections::max_sfb(lines, bands))
+        let max_sfb = (self.largest.iter())
+            .map(|largest| sections::max_sfb_of_largest(largest))
             .max()
             .unwrap_or(0)
             .max(least_max_sfb)
@@ -437,7 +450,7 @@ impl<'a> Counting<'a> {
             let lines = &self.x_quant[start..start + bands.lines()];
             let intensity = intensity.map_or(IntensityBands::NONE, |i| i.bands[g]);
             let group = &mut self.counted[g];
-            if !group.count(lines, bands, max_sfb, intensity) {
+            if !group.count_with_largest(lines, bands, max_sfb, intensity, &self.largest[g]) {
                 return false;
             }
             let mut least = group.least_bits();
