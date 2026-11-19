@@ -23,11 +23,12 @@ AAC in the Low Complexity profile (AAC-LC) to stdout, each frame in ADTS
   --bitrate KBPS     the stream's constant bitrate, ADTS headers and any CRC
                      included: a whole number within the range of the
                      sample rate and channels, at 48 kHz 5 to 287 in mono
-                     and 6 to 575 in stereo, at 44.1 kHz 4 to 264 and 5 to
-                     528, and lower with the sample rate, to 1 to 47 and 1
-                     to 95 at 8 kHz; with --crc, the lowest may be 1 higher
-                     (default 128, or the highest the sample rate and
-                     channels allow where that is lower)
+                     and 5 to 575 in stereo, at 44.1 kHz 4 to 264 and 5 to
+                     528, from 1 to 47 and 1 to 95 at 8 kHz to 9 to 575 and
+                     10 to 1151 at 96 kHz; with --crc, the lowest is up to
+                     2 higher, at 96 kHz 10 and 12 (default 128, or the
+                     highest the sample rate and channels allow where that
+                     is lower)
   --crc              protect each frame's header and the start of its audio
                      with a CRC-16 check word, 16 bits a frame (default:
                      off)
@@ -270,6 +271,48 @@ mod tests {
             "11",
         ];
         assert!(parse(&[&args[..], &["--crc"]].concat()).is_ok());
+    }
+
+    /// The ranges the usage gives.
+    #[test]
+    fn the_usage_gives_the_ranges() {
+        let range = |rate: &str, channels: &str, crc: &[&str]| {
+            let args = [
+                &[
+                    "--sample-rate",
+                    rate,
+                    "--channels",
+                    channels,
+                    "--bitrate",
+                    "0",
+                ],
+                crc,
+            ];
+            let error = error(&args.concat());
+            error.rsplit("it takes ").next().unwrap().to_owned()
+        };
+        for (rate, channels, without, with) in [
+            ("48000", "1", "5 to 287", "5 to 287"),
+            ("48000", "2", "5 to 575", "6 to 575"),
+            ("44100", "1", "4 to 264", "5 to 264"),
+            ("44100", "2", "5 to 528", "6 to 528"),
+            ("8000", "1", "1 to 47", "1 to 47"),
+            ("8000", "2", "1 to 95", "1 to 95"),
+            ("96000", "1", "9 to 575", "10 to 575"),
+            ("96000", "2", "10 to 1151", "12 to 1151"),
+            ("88200", "2", "9 to 1057", "11 to 1057"),
+        ] {
+            assert_eq!(range(rate, channels, &[]), without, "{rate} {channels}");
+            assert_eq!(range(rate, channels, &["--crc"]), with, "{rate} {channels}");
+        }
+        for rate in SAMPLE_RATES {
+            for channels in ["1", "2"] {
+                let lowest = |crc| range(&rate.to_string(), channels, crc);
+                let low = |range: String| range.split(' ').next().unwrap().parse::<u32>().unwrap();
+                let rise = low(lowest(&["--crc"])) - low(lowest(&[]));
+                assert!(rise <= 2, "{rate} {channels}");
+            }
+        }
     }
 
     #[test]
