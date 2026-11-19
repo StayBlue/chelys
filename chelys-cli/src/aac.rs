@@ -259,6 +259,17 @@ mod tests {
             lowest(&[])
         );
         assert!(lowest(&["--crc"]).ends_with("it takes 5 to 264"));
+        // A pair, which shares its window, at the bitrate its shortest
+        // frame takes with the CRC.
+        let args = [
+            "--sample-rate",
+            "88200",
+            "--channels",
+            "2",
+            "--bitrate",
+            "11",
+        ];
+        assert!(parse(&[&args[..], &["--crc"]].concat()).is_ok());
     }
 
     #[test]

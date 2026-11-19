@@ -19,6 +19,7 @@ use super::raw_data_block::element::CodedElement;
 use super::reservoir::BitReservoir;
 use super::sampling_frequency::SamplingFrequency;
 use super::stereo::intensity;
+use super::stereo::middle_side::MsMask;
 use super::window::{WindowSequence, Windows};
 use element::ElementEncoder;
 
@@ -84,12 +85,17 @@ impl StreamConfig {
     }
 
     /// The shortest frame of channels with `windows` that carries
-    /// `data_bytes` of data streams: its channels silent, each with its own
-    /// `ics_info()`, without fill.
+    /// `data_bytes` of data streams, as the encoder writes it: its channels
+    /// silent, without fill, a pair sharing its `ics_info()` where its
+    /// channels share their attacks, and so their windows, in every frame
+    /// (see [`element::SHARED_ATTACKS`]), and each with its own otherwise.
     fn shortest_frame_len(&self, windows: Windows, data_bytes: usize) -> usize {
         let channel = CodedChannel::silent(windows, self.sampling_frequency);
         let element = match self.channel_configuration {
             ChannelConfiguration::Mono => CodedElement::single(channel),
+            ChannelConfiguration::Stereo if element::SHARED_ATTACKS => {
+                CodedElement::common_pair(channel.clone(), channel, MsMask::NONE)
+            }
             ChannelConfiguration::Stereo => CodedElement::pair(channel.clone(), channel),
         };
         self.header_len() + raw_data_block::min_len(&element, data_bytes)
@@ -426,7 +432,6 @@ pub fn encode_silence(config: StreamConfig, frames: usize) -> Vec<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stereo::middle_side::MsMask;
 
     fn config(framing: Framing, bits_per_second: u32) -> StreamConfig {
         StreamConfig {
@@ -459,18 +464,19 @@ mod tests {
             let element = CodedElement::common_pair(silent.clone(), silent, MsMask::NONE);
             let shortest = config.header_len() + raw_data_block::min_len(&element, 0);
             assert_eq!(frames[0].len(), shortest, "{framing:?}");
-            assert!(shortest < config.shortest_frame_len(Windows::LONG_SINE, 0));
+            assert_eq!(shortest, config.shortest_frame_len(Windows::LONG_SINE, 0));
         }
     }
 
     #[test]
     fn the_crc_raises_the_lowest_bitrate_by_its_bits() {
-        // The shortest frame of a pair, 14 bytes of which 7 are the header,
-        // and with the CRC 16, at 44.1 kHz, rounded up.
+        // The shortest frame of a pair that shares its window, 13 bytes of
+        // which 7 are the header, and with the CRC 15, at 44.1 kHz,
+        // rounded up.
         let mut config = config(Framing::Adts, 0);
-        assert_eq!(config.min_bits_per_second(), 4824);
+        assert_eq!(config.min_bits_per_second(), 4479);
         config.crc_protected = true;
-        assert_eq!(config.min_bits_per_second(), 5513);
+        assert_eq!(config.min_bits_per_second(), 5168);
     }
 
     #[test]
@@ -768,6 +774,35 @@ mod tests {
                     assert_eq!(end.data_stream_dropped, (20 - end.frames as usize) * max);
                 }
             }
+        }
+    }
+
+    /// A pair at 48 kHz and 96 kbit/s, with the CRC, carries 239 bytes in
+    /// every frame of noise: as many as its shortest frame, of a common
+    /// window, leaves of the 256 a frame the rate brings.
+    #[test]
+    fn a_pair_carries_what_its_common_window_leaves() {
+        use crate::raw_data_block::decoder::{adts_frame, raw_data_block};
+
+        let mut config = config(Framing::Adts, 96_000);
+        config.sampling_frequency = SamplingFrequency::Hz48000;
+        config.crc_protected = true;
+        assert_eq!(config.max_data_stream_bytes(), 239);
+        let input = noise(31 * FRAME_SAMPLES, 11);
+        let mut encoder = StreamEncoder::new(config).with_data_stream(239);
+        encoder.push_data_stream(&[0x5A; 32 * 239]);
+        let mut stream = Vec::new();
+        encoder.encode(&[&input, &input], &mut stream);
+        let end = encoder.finish(&mut stream);
+        assert_eq!((end.frames, end.data_stream_dropped), (32, 0));
+        let mut rest = stream.as_slice();
+        while !rest.is_empty() {
+            let frame = adts_frame(rest);
+            rest = &rest[frame.aac_frame_length..];
+            let block = raw_data_block(frame.raw_data_block, SamplingFrequency::Hz48000);
+            assert!(block.element.common_window);
+            let carried: usize = block.data_streams.iter().map(|d| d.bytes.len()).sum();
+            assert_eq!(carried, 239);
         }
     }
 

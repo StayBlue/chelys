@@ -1003,7 +1003,7 @@ fn least_channel(
 /// -0.476, and -3.642, -1.327 and -0.230; each channel with its own window
 /// in every frame, -3.673, -1.878 and -0.477, and -3.643, -1.336 and
 /// -0.232.
-const SHARED_ATTACKS: bool = true;
+pub(super) const SHARED_ATTACKS: bool = true;
 
 #[cfg(test)]
 mod tests {

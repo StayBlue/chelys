@@ -293,14 +293,17 @@ mod tests {
 
     #[test]
     fn a_frame_carries_at_most_what_the_rate_brings_beyond_the_shortest() {
+        // 256 bytes a frame, of which the header takes 7, or 9 with the
+        // CRC, and a pair of silent channels that share their window, with
+        // its id_syn_ele, ID_END and the data stream element's fields, 62
+        // bits, within 8 bytes with the data.
         let max = config(Framing::Adts)
             .lower()
             .unwrap()
             .max_data_stream_bytes();
-        // 256 bytes a frame, of which the header takes 7, and a pair of
-        // silent channels with its id_syn_ele, ID_END and the data stream
-        // element's fields 71 bits, within 9 bytes with the data.
-        assert_eq!(max, 256 - 7 - 9);
+        assert_eq!(max, 256 - 7 - 8);
+        let with_crc = config(Framing::Adts).crc(true).lower().unwrap();
+        assert_eq!(with_crc.max_data_stream_bytes(), 256 - 9 - 8);
         for framing in [Framing::Adts, Framing::Raw] {
             let ok = config(framing).data_stream_bytes_per_frame(max);
             assert_eq!(ok.check(), Ok(()));
