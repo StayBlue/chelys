@@ -886,15 +886,14 @@ mod tests {
         use crate::noiseless::codebooks::Codebook;
         use crate::noiseless::scalefactors;
         let mut intensity = Intensity::NONE;
-        for (g, sfb, position) in [(0, 3, 50), (0, 8, 0), (1, 3, -55), (2, 4, 10)] {
+        let most = intensity::MAX_POSITION;
+        for (g, sfb, position) in [(0, 3, most), (0, 8, 0), (1, 3, -most), (2, 4, most)] {
             intensity.bands[g].set(sfb, Some(Codebook::INTENSITY));
             intensity.positions[g][sfb] = position;
         }
         let below = intensity.below(5);
         assert_eq!(below.bands[0].end(), 4);
-        assert_eq!(below.positions[0][3], 50);
-        assert_eq!(below.positions[1][3], -10);
-        assert_eq!(below.positions[2][4], 10);
+        assert_eq!(below.bands[1].end(), 4);
         let fs = SamplingFrequency::Hz48000;
         let grouping = crate::window::Grouping::from_starts([
             true, false, true, false, true, false, false, false,

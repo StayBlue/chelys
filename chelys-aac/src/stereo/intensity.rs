@@ -28,25 +28,20 @@ impl Intensity {
         positions: [[0; MAX_BANDS]; SHORT_WINDOWS],
     };
 
-    /// The bands of each group below `max_sfb`, with their positions, each
-    /// within 60 of the one before it that is sent (see [`code`]), as the
-    /// bands left out may have bridged a greater difference.
+    /// The bands of each group below `max_sfb`, with their positions,
+    /// which, all within [`MAX_POSITION`] of 0, need no change to stay
+    /// within reach of each other.
     pub fn below(&self, max_sfb: usize) -> Self {
-        let mut below = Self::NONE;
-        let mut last = 0i32;
-        for (g, bands) in self.bands.iter().enumerate() {
-            below.bands[g] = bands.below(max_sfb);
-            for sfb in 0..below.bands[g].end() {
-                if below.bands[g].codebook(sfb).is_some() {
-                    let position = i32::from(self.positions[g][sfb]).clamp(last - 60, last + 60);
-                    below.positions[g][sfb] = position as i8;
-                    last = position;
-                }
-            }
+        Self {
+            bands: self.bands.map(|bands| bands.below(max_sfb)),
+            positions: self.positions,
         }
-        below
     }
 }
+
+/// The largest intensity stereo position sent, either way: one of 30 has
+/// the right channel 45 dB below the left (see [`code`]).
+pub const MAX_POSITION: i8 = 30;
 
 /// The lower border frequency `f0` above which Annex C codes a pair in
 /// intensity stereo: "An average value of f0 = 6 kHz is appropriate for
@@ -104,8 +99,14 @@ pub fn first_band_above(
 ///
 /// Spec gap: the positions are sent as differences that the scalefactor
 /// codebook codes from -60 to 60 (Table A.1), from 0 for the first (clause
-/// 12.2.3). Each position is limited to -60 to 60, a ratio of 90 dB
-/// between the channels, and to within 60 of the position before it.
+/// 12.2.3), which do not reach every ratio of the channels' energies. A
+/// band whose position would lie beyond [`MAX_POSITION`] either way, a
+/// ratio of 45 dB, is not coded in intensity stereo: each channel codes its
+/// own lines there. Any two positions are then within 60 of each other,
+/// whichever bands are sent. A position limited to the range instead would
+/// scale the right channel from the left channel's band by up to the
+/// excess: a tone in the right channel alone, beside the leakage of the
+/// left channel's window into its band, decoded 28 dB too quiet.
 ///
 /// Spec gap: clause C.6.2 codes the intensity signal through "the
 /// standard process for quantization and encoding", without saying what
@@ -120,7 +121,6 @@ pub fn code(
     [left_xmin, right_xmin]: [&mut [[f64; MAX_BANDS]]; 2],
 ) -> Intensity {
     let mut intensity = Intensity::NONE;
-    let mut last_position = 0i32;
     let mut start = 0;
     for (g, bands) in windows.groups(sampling_frequency).enumerate() {
         for sfb in first.min(bands.num_swb())..bands.num_swb() {
@@ -131,6 +131,11 @@ pub fn code(
             if el == 0.0 || er == 0.0 {
                 continue;
             }
+            let position = (2.0 * (el / er).log2()).round();
+            if position.abs() > f64::from(MAX_POSITION) {
+                continue;
+            }
+            let position = position as i8;
             let product: f64 = l.iter().zip(&*r).map(|(l, r)| l * r).sum();
             let (codebook, sign) = if product < 0.0 {
                 (Codebook::INTENSITY_OUT_OF_PHASE, -1.0)
@@ -143,12 +148,8 @@ pub fn code(
                 *l = (*l + sign * *r) * gain;
                 *r = 0.0;
             }
-            let ratio = 2.0 * (el / er).log2();
-            let position = (ratio.round().clamp(-60.0, 60.0) as i32)
-                .clamp(last_position - 60, last_position + 60);
-            last_position = position;
             intensity.bands[g].set(sfb, Some(codebook));
-            intensity.positions[g][sfb] = position as i8;
+            intensity.positions[g][sfb] = position;
             if er > 0.0 {
                 left_xmin[g][sfb] = left_xmin[g][sfb].min(right_xmin[g][sfb] * el / er);
             }
