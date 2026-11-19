@@ -184,3 +184,20 @@ settle it, documented as for the standards.
 
 *User, 2026-11-18, when the standards were given: the wording was proposed by
 the agent and approved by the user.*
+
+## FAAD2 as a source of evidence for AAC
+
+FAAD2's decoder (`faad`) may be used as a black-box decoder for AAC evidence,
+as ffmpeg is: run as a separate program, with only its observable output used.
+Its source code stays under "Clean room", as the AAC entry says. It is
+optional: evidence need not be checked against it, but may be, for example
+where it could disagree with ffmpeg, or where ffmpeg does not check something,
+such as the ADTS CRC. Evidence from it is documented as under "mpg123 and LAME
+as sources of evidence": say "Settled by decoding with", name every decoder the
+evidence was taken from, and name the test. Record the FAAD2 version the
+evidence was recorded with in the `chelys-conformance` crate's documentation,
+next to ffmpeg's.
+
+*User, 2026-11-19, when ffmpeg contradicted clause 12.2.3 on intensity bands
+under `ms_mask_present` 2 and was found not to check the ADTS CRC: the wording
+was proposed by the agent and approved by the user.*
