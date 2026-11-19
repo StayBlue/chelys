@@ -336,14 +336,16 @@ impl StreamEncoder {
     }
 
     /// Whether the next frame's bits, those the reservoir makes available
-    /// to it when it asks for none beyond the mean, pay for the shortest
+    /// to it when it asks for none beyond the mean, or offers it whatever it
+    /// asks for (see [`BitReservoir::offered_bits`]), pay for the shortest
     /// frame of eight short windows in every channel but a low frequency
-    /// enhancement channel, with `data_bits` of data stream elements, and so for any windows: a frame is given no
-    /// fewer when it asks for more. Near the lowest bitrate they may not,
-    /// as it is set by the frames of long windows (see
-    /// [`StreamConfig::min_bits_per_second`]).
+    /// enhancement channel, with `data_bits` of data stream elements, and
+    /// so for any windows: a frame is given no fewer when it asks for more.
+    /// Near the lowest bitrate they may not, as it is set by the frames of
+    /// long windows (see [`StreamConfig::min_bits_per_second`]).
     fn affords_short(&self, data_bits: u32) -> bool {
-        self.shortest_short_frame_bits + data_bits <= self.reservoir.available_bits(0)
+        let bits = (self.reservoir.available_bits(0)).max(self.reservoir.offered_bits());
+        self.shortest_short_frame_bits + data_bits <= bits
     }
 
     /// The `AudioSpecificConfig()` of ISO/IEC 14496-3 that describes the
@@ -863,6 +865,50 @@ mod tests {
             (kept - 2..=kept + 2).contains(&most),
             "{most} against {kept} and {full}"
         );
+    }
+
+    /// A mono stream at 44.1 kHz and 48 kbit/s, with the CRC and 124 bytes
+    /// of data streams a frame, whose mean frame does not pay for eight
+    /// short windows, codes an attack with them once the reservoir offers
+    /// the bits.
+    #[test]
+    fn an_attack_is_coded_short_in_the_bits_the_reservoir_offers() {
+        use crate::raw_data_block::decoder::{adts_frame, raw_data_block};
+
+        let fs = SamplingFrequency::Hz44100;
+        let config = StreamConfig {
+            sampling_frequency: fs,
+            channel_configuration: ChannelConfiguration::Mono,
+            bits_per_second: 48_000,
+            framing: Framing::Adts,
+            flags: Flags::default(),
+            crc_protected: true,
+        };
+        let mut encoder = StreamEncoder::new(config).with_data_stream(124);
+        let data_bits = data_stream::bits(124);
+        assert!(!encoder.affords_short(data_bits));
+        // Silence, without data, fills the reservoir; then noise sets in
+        // within block 40, with data in every frame.
+        let mut input = vec![0.0; 40 * FRAME_SAMPLES + 512];
+        input.extend(noise(4 * FRAME_SAMPLES, 7));
+        let mut stream = Vec::new();
+        encoder.encode(&[&input[..36 * FRAME_SAMPLES]], &mut stream);
+        encoder.push_data_stream(&[0x5A; 124 * 50]);
+        encoder.encode(&[&input[36 * FRAME_SAMPLES..]], &mut stream);
+        let mut rest = stream.as_slice();
+        let sequences: Vec<u32> = (0..43)
+            .map(|k| {
+                let frame = adts_frame(rest);
+                rest = &rest[frame.aac_frame_length..];
+                let block = raw_data_block(frame.raw_data_block, fs);
+                let carried: usize = block.data_streams.iter().map(|d| d.bytes.len()).sum();
+                assert!(k < 36 || carried == 124, "{k}: {carried}");
+                u32::from(block.elements[0].element.channels[0].info.window_sequence)
+            })
+            .collect();
+        // Block 40's frame is coded short, between a start and a stop.
+        assert_eq!(sequences[39..42], [1, 2, 3], "{sequences:?}");
+        assert!(sequences[..39].iter().all(|&s| s == 0), "{sequences:?}");
     }
 
     fn noise(len: usize, seed: u64) -> Vec<f64> {
