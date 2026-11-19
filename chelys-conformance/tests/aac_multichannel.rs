@@ -52,6 +52,9 @@ fn tone(samples: &[f64], sample_rate: u32, frequency: f64) -> (f64, f64) {
 /// ffprobe reports.
 struct Mapping {
     layout: (String, String),
+    /// For each pair, in order, the frames that code bands as middle and
+    /// side, and those that code bands in intensity stereo.
+    joint: Vec<(usize, usize)>,
     /// For each output channel, the input channel it carries.
     sources: Vec<usize>,
     /// For each output channel, the loudest other tone in it, in dB below
@@ -59,14 +62,41 @@ struct Mapping {
     crosstalk_db: Vec<f64>,
 }
 
+/// The tones shared: in every channel but a low frequency
+/// enhancement channel, their frequencies in Hz and amplitudes.
+const SHARED_TONES: [(f64, f64); 2] = [(5_000.0, 0.15), (9_000.0, 0.1)];
+
+/// [`decode_tones`], and with the tones of [`SHARED_TONES`] in every main
+/// channel where `shared`, which a pair codes as middle and side below 6
+/// kHz and, at a low bitrate, in intensity stereo above, the output
+/// checked to within `tolerance_db` of each tone's level.
 fn decode_tones(sample_rate: u32, channels: usize, bits_per_second: u32) -> Mapping {
+    decode_tones_with(sample_rate, channels, bits_per_second, false, 0.2)
+}
+
+fn decode_tones_with(
+    sample_rate: u32,
+    channels: usize,
+    bits_per_second: u32,
+    shared: bool,
+    tolerance_db: f64,
+) -> Mapping {
     let context = format!("{sample_rate} Hz, {channels} channels, {bits_per_second} bit/s");
     let len = 3 * sample_rate as usize + 500;
     let frequencies = frequencies(channels);
+    let lfe = matches!(channels, 6 | 8);
     let input: Vec<Vec<f64>> = (frequencies.iter().enumerate())
         .map(|(c, &f)| {
+            let main = shared && !(lfe && c == channels - 1);
             (0..len)
-                .map(|t| amplitude(c) * (TAU * f * t as f64 / f64::from(sample_rate)).sin())
+                .map(|t| {
+                    let at = |f: f64| (TAU * f * t as f64 / f64::from(sample_rate)).sin();
+                    let others: f64 = (SHARED_TONES.iter())
+                        .filter(|_| main)
+                        .map(|&(f, a)| a * at(f))
+                        .sum();
+                    amplitude(c) * at(f) + others
+                })
                 .collect()
         })
         .collect();
@@ -94,6 +124,27 @@ fn decode_tones(sample_rate: u32, channels: usize, bits_per_second: u32) -> Mapp
         finished.frames as usize * 1024 * channels,
         "{context}"
     );
+    // Which pairs code bands as middle and side, and which in intensity
+    // stereo, its codebooks INTENSITY_HCB2 and INTENSITY_HCB, 14 and 15.
+    let fs = SamplingFrequency::from_hz(sample_rate).unwrap();
+    let mut joint = Vec::new();
+    let mut rest = stream.as_slice();
+    while !rest.is_empty() {
+        let frame = adts_frame(rest);
+        rest = &rest[frame.aac_frame_length..];
+        let block = raw_data_block(frame.raw_data_block, fs);
+        let pairs = block.elements.iter().filter(|e| e.id_syn_ele == 1);
+        joint.resize(pairs.clone().count(), (0, 0));
+        for (counts, pair) in joint.iter_mut().zip(pairs) {
+            let element = &pair.element;
+            let ms = (element.ms_used.iter()).any(|group| group.contains(&true));
+            let intensity = (element.channels[1].sections.iter())
+                .flatten()
+                .any(|&(codebook, ..)| matches!(codebook, 14 | 15));
+            counts.0 += usize::from(ms);
+            counts.1 += usize::from(intensity);
+        }
+    }
     let (mut sources, mut crosstalk_db) = (Vec::new(), Vec::new());
     for o in 0..channels {
         // The output from the input's first sample, a second in, for a
@@ -113,7 +164,10 @@ fn decode_tones(sample_rate: u32, channels: usize, bits_per_second: u32) -> Mapp
         // second, which starts on a whole number of its cycles.
         let (level, phase) = tones[source];
         let level_db = 20.0 * (level / amplitude(source)).log10();
-        assert!(level_db.abs() < 0.2, "{context}: output {o}, {level_db} dB");
+        assert!(
+            level_db.abs() < tolerance_db,
+            "{context}: output {o}, {level_db} dB"
+        );
         assert!(phase.abs() < 0.01, "{context}: output {o}, phase {phase}");
         let loudest_other = (0..channels)
             .filter(|&c| c != source)
@@ -124,6 +178,7 @@ fn decode_tones(sample_rate: u32, channels: usize, bits_per_second: u32) -> Mapp
     }
     Mapping {
         layout: ffmpeg::channel_layout_aac(&stream),
+        joint,
         sources,
         crosstalk_db,
     }
@@ -132,9 +187,8 @@ fn decode_tones(sample_rate: u32, channels: usize, bits_per_second: u32) -> Mapp
 /// ffmpeg decodes channel configurations 3 to 7 as the layouts it names
 /// "3.0", "4.0", "5.0", "5.1" and "7.1", each input channel in exactly one
 /// output channel, in place, at its level and sign, with the other tones
-/// more than 60 dB below it, at 48 and 44.1 kHz, at 96 kbit/s a channel
-/// and at 32, within the bits a sample at which pairs are coded in
-/// intensity stereo above 6 kHz.
+/// more than 60 dB below it, at 48 and 44.1 kHz, at 96 and 32 kbit/s a
+/// channel.
 ///
 /// Its output channels are those of the layout, in ffmpeg's order: the
 /// front left and right first, then the center, then the LFE, then the
@@ -275,6 +329,46 @@ fn ffmpeg_decodes_5_1_and_7_1_at_the_ends_of_their_range() {
                     );
                 }
             }
+        }
+    }
+}
+
+/// The mapping holds where each pair codes bands as middle and side and in
+/// intensity stereo: with tones of 5 and 9 kHz in every main channel
+/// beside each channel's own, at 32 kbit/s a channel, within the bits a
+/// sample at which pairs are coded in intensity stereo above 6 kHz, each
+/// pair codes the first as middle and side and the second in intensity
+/// stereo in most frames, and each channel's own tone lands in its place,
+/// to within 0.5 dB of its level, with the other channels' more than 40 dB
+/// below it.
+#[test]
+fn ffmpeg_maps_each_channel_of_pairs_coded_jointly() {
+    for (channels, sources) in [
+        (3, vec![1, 2, 0]),
+        (4, vec![1, 2, 0, 3]),
+        (5, vec![1, 2, 0, 3, 4]),
+        (6, vec![1, 2, 0, 5, 3, 4]),
+        (8, vec![1, 2, 0, 7, 5, 6, 3, 4]),
+    ] {
+        let ncc = if channels > 5 { channels - 1 } else { channels } as u32;
+        for sample_rate in [48_000, 44_100] {
+            let mapping = decode_tones_with(sample_rate, channels, 32_000 * ncc, true, 0.5);
+            let context = format!("{sample_rate} Hz, {channels} channels");
+            assert_eq!(mapping.sources, sources, "{context}");
+            assert!(
+                mapping.crosstalk_db.iter().all(|&db| db < -40.0),
+                "{context}: {:?}",
+                mapping.crosstalk_db
+            );
+            // Of about 130 frames at 44.1 kHz and 140 at 48.
+            assert!(
+                mapping
+                    .joint
+                    .iter()
+                    .all(|&(ms, intensity)| ms > 100 && intensity > 100),
+                "{context}: {:?}",
+                mapping.joint
+            );
         }
     }
 }
