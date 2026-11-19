@@ -122,6 +122,9 @@ impl PreparedChannel {
 pub struct ElementEncoder {
     sampling_frequency: SamplingFrequency,
     channels: Vec<ChannelEncoder>,
+    /// Where the input ends among the samples buffered, once the stream is
+    /// padded past it.
+    input_end: Option<usize>,
     /// Each channel of the frame being coded, kept from one frame to the
     /// next for its memory.
     prepared: Vec<PreparedChannel>,
@@ -178,6 +181,7 @@ impl ElementEncoder {
     ) -> Self {
         Self {
             sampling_frequency,
+            input_end: None,
             channels: (0..channels)
                 .map(|_| ChannelEncoder::new(sampling_frequency))
                 .collect(),
@@ -224,6 +228,7 @@ impl ElementEncoder {
 
     /// Pads each channel with silence to `len` samples.
     pub fn pad(&mut self, len: usize) {
+        self.input_end = Some(self.input_end.unwrap_or(self.buffered()));
         for channel in &mut self.channels {
             channel.pcm.resize(len, 0.0);
         }
@@ -231,6 +236,7 @@ impl ElementEncoder {
 
     /// Drops the first `len` samples of each channel.
     pub fn drain(&mut self, len: usize) {
+        self.input_end = self.input_end.map(|end| end.saturating_sub(len));
         for channel in &mut self.channels {
             channel.pcm.drain(..len);
         }
@@ -314,7 +320,10 @@ impl ElementEncoder {
     /// their grouping is chosen from both (see [`switching::grouping`]).
     pub fn prepare(&mut self, start: usize, afford_short: bool) {
         self.spectra(start, afford_short);
-        self.temporal_noise_shaping();
+        let padded = self
+            .input_end
+            .is_some_and(|end| end < start + FRAME_SAMPLES);
+        self.temporal_noise_shaping(!padded);
         self.thresholds();
         self.joint();
         self.find_silence();
@@ -406,6 +415,19 @@ impl ElementEncoder {
     /// dB, against more than 10 dB unshaped (the conformance test
     /// `a_tone_beside_silence_decodes_alike_in_either_channel`).
     ///
+    /// Spec reading: this deliberately departs from clause C.5 in frames
+    /// whose block holds samples past the end of the input, the silence
+    /// that the stream is padded with (see `StreamEncoder::finish`), which
+    /// are not shaped. The input's end, a fall to silence in mid-block,
+    /// raises the prediction gain of their lines, and their filters put
+    /// noise after it, into the output past the input: in pairs of tones at
+    /// 48 kHz and a bit a sample, the output past the input took 7.8 times
+    /// the noise power of the input's last block, and 2.1 times unshaped;
+    /// a sweep at 44.1 kHz in stereo at 96 kbit/s decoded at an SNR of 46.3
+    /// dB, 50.8 dB with its last frames unshaped (the conformance tests
+    /// `stereo_pairs_decode_each_channel_in_place` and
+    /// `snr_rises_with_the_bitrate`).
+    ///
     /// Spec gap: the decoder applies the right channel's filters to its
     /// bands in intensity stereo, after it has taken them from the left
     /// channel's lines as they were sent (clause 4, figure 2), which the
@@ -414,14 +436,14 @@ impl ElementEncoder {
     /// is coded in intensity stereo, the filters of both channels end below
     /// its first band in intensity stereo: the left channel sends the
     /// bands above unfiltered, and the right channel takes them so.
-    fn temporal_noise_shaping(&mut self) {
+    fn temporal_noise_shaping(&mut self, shape: bool) {
         let fs = self.sampling_frequency;
         let top = self.intensity_from();
         for (channel, prepared) in self.channels.iter().zip(&mut self.prepared) {
             prepared.unshaped.copy_from_slice(&*prepared.spectrum);
             prepared.tns = Tns::NONE;
             let mut gains = NoiseGains::NONE;
-            if self.tns {
+            if self.tns && shape {
                 let windows = prepared.windows;
                 let bands = target_bands(fs, windows.sequence.transform(), top);
                 let analysis = channel.switching.current();
@@ -1039,7 +1061,7 @@ mod tests {
             let original: Vec<Vec<f64>> = (encoder.prepared.iter())
                 .map(|prepared| prepared.spectrum.to_vec())
                 .collect();
-            encoder.temporal_noise_shaping();
+            encoder.temporal_noise_shaping(true);
             encoder.thresholds();
             encoder.joint();
             encoder.find_silence();

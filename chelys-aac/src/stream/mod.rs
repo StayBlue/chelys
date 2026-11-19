@@ -479,6 +479,31 @@ mod tests {
     }
 
     #[test]
+    fn the_blocks_past_the_input_are_not_shaped() {
+        use crate::noiseless::decoder::{BitReader, element};
+        let config = config(Framing::Raw, 192_000);
+        // A click in each block, the last block half filled.
+        let len = 5 * FRAME_SAMPLES + FRAME_SAMPLES / 2;
+        let mut input = vec![0.0; len];
+        for at in (300..len).step_by(FRAME_SAMPLES) {
+            input[at] = 0.9;
+        }
+        let mut encoder = StreamEncoder::new(config).without_block_switching();
+        let mut shaped = Vec::new();
+        let mut sink = |frame: &[u8]| {
+            let mut r = BitReader::new(frame);
+            let element = element(&mut r, SamplingFrequency::Hz44100);
+            shaped.push(element.channels.iter().any(|c| c.tns.is_some()));
+        };
+        encoder.encode(&[&input, &input], &mut sink);
+        let end = encoder.finish(&mut sink);
+        assert_eq!(end.frames, 7);
+        // Blocks 5, the input's last, and 6, after it, hold padding.
+        assert!(shaped[1..5].iter().any(|&shaped| shaped), "{shaped:?}");
+        assert_eq!(shaped[5..], [false, false]);
+    }
+
+    #[test]
     fn a_frame_without_bits_for_short_windows_stays_long() {
         let mut config = StreamConfig {
             sampling_frequency: SamplingFrequency::Hz44100,
