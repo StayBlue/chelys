@@ -965,3 +965,214 @@ fn a_tone_panned_hard_right_survives_intensity_stereo() {
         }
     }
 }
+
+/// Transient signals for temporal noise shaping, each at `sample_rate` for
+/// `len` samples, with the samples at which its attacks set in: clicks of
+/// noise that die away within a few milliseconds over a quiet tone, as of
+/// castanets (see [`castanets`]); a train of pulses at 120 Hz, each
+/// ringing at 700 and 2400 Hz, in syllables of 0.2 s, as of speech; and
+/// notes of a struck bar every 0.4 s, inharmonic partials at 1, 2.76 and
+/// 5.4 times 880 Hz that set in at once and die away, as of a
+/// glockenspiel.
+fn transients(sample_rate: u32, len: usize) -> [(&'static str, Vec<f64>, Vec<usize>); 3] {
+    let fs = f64::from(sample_rate);
+    let (clicks, onsets) = castanets(sample_rate, len, 2000, len / 7, 5);
+    let period = (fs / 120.0) as usize;
+    let syllable = (0.2 * fs) as usize;
+    let mut pulses = vec![0.0; len];
+    let mut pulse_onsets = Vec::new();
+    for start in (0..len).step_by(2 * syllable) {
+        pulse_onsets.push(start);
+        for pulse in (start..(start + syllable).min(len)).step_by(period) {
+            for (t, y) in pulses[pulse..(pulse + period).min(len)]
+                .iter_mut()
+                .enumerate()
+            {
+                let t = t as f64 / fs;
+                let ring = 0.5 * (TAU * 700.0 * t).sin() + 0.25 * (TAU * 2400.0 * t).sin();
+                *y += 0.6 * ring * (-t * 400.0).exp();
+            }
+        }
+    }
+    let note = (0.4 * fs) as usize;
+    let partials = [(1.0, 0.5), (2.76, 0.25), (5.4, 0.12)];
+    let mut bars = vec![0.0; len];
+    let mut bar_onsets = Vec::new();
+    for start in (note / 2..len).step_by(note) {
+        bar_onsets.push(start);
+        for (t, y) in bars[start..].iter_mut().enumerate() {
+            let t = t as f64 / fs;
+            let decay = (-t * 6.0).exp();
+            *y += (partials.iter())
+                .map(|&(ratio, level)| level * (TAU * 880.0 * ratio * t).sin())
+                .sum::<f64>()
+                * decay;
+        }
+    }
+    [
+        ("clicks", clicks, onsets),
+        ("pulses", pulses, pulse_onsets),
+        ("bars", bars, bar_onsets),
+    ]
+}
+
+/// The share of the windows of `elements` whose lines temporal noise
+/// shaping filters, of long windows and of short ones.
+fn shaped_share(elements: &[Element]) -> (f64, f64) {
+    let (mut long, mut long_shaped, mut short, mut short_shaped) = (0, 0, 0, 0);
+    for ics in elements.iter().flat_map(|e| &e.channels) {
+        let short_windows = ics.info.window_sequence == 2;
+        let windows = if short_windows { 8 } else { 1 };
+        let shaped = (ics.tns.iter().flatten())
+            .filter(|w| !w.filters.is_empty())
+            .count();
+        if short_windows {
+            (short, short_shaped) = (short + windows, short_shaped + shaped);
+        } else {
+            (long, long_shaped) = (long + windows, long_shaped + shaped);
+        }
+    }
+    let share = |n: usize, of: usize| n as f64 / of.max(1) as f64;
+    (share(long_shaped, long), share(short_shaped, short))
+}
+
+/// Transient signals, coded with temporal noise shaping in long windows
+/// and short ones, decode in place, at their level and sign, at every
+/// sampling frequency, in mono and stereo, and in pairs coded in intensity
+/// stereo, whose filters end below its first band in intensity stereo with
+/// a filter of order 0 above; ffmpeg decodes the filters' `tns_data()`
+/// without complaint.
+#[test]
+fn temporal_noise_shaping_decodes_in_place() {
+    let (mut long_shaped, mut short_shaped, mut cut_short) = (false, false, false);
+    for sample_rate in [
+        8_000, 16_000, 22_050, 32_000, 44_100, 48_000, 64_000, 96_000,
+    ] {
+        for (channels, bits_per_sample) in [(1, 2.0), (2, 2.0), (2, 0.7)] {
+            let len = sample_rate as usize * 2;
+            for (name, signal, _) in transients(sample_rate, len) {
+                // Bursts of noise, which a pair in intensity stereo codes as
+                // little more than their envelope.
+                if bits_per_sample < 1.0 && name == "clicks" {
+                    continue;
+                }
+                let context = format!(
+                    "{name} at {sample_rate} Hz, {channels} channels, {bits_per_sample} bit/sample"
+                );
+                // The second channel a little later and quieter.
+                let input: Vec<Vec<f64>> = (0..channels)
+                    .map(|c| {
+                        let (lag, gain) = (37 * c, 1.0 - 0.3 * c as f64);
+                        let delayed = |t: usize| t.checked_sub(lag).map_or(0.0, |t| signal[t]);
+                        (0..len).map(|t| delayed(t) * gain).collect()
+                    })
+                    .collect();
+                let (min, max) = bitrate_range(sample_rate, channels);
+                let bits = bits_per_sample * f64::from(sample_rate) * channels as f64;
+                let bits_per_second = (bits as u32).clamp(min, max);
+                let encoded = encode(sample_rate, &input, bits_per_second);
+                let elements = elements(&encoded.stream, sample_rate);
+                let (long, short) = shaped_share(&elements);
+                assert!(long + short > 0.0, "{context}: no window shaped");
+                long_shaped |= long > 0.0;
+                short_shaped |= short > 0.0;
+                cut_short |= (elements.iter().flat_map(|e| &e.channels))
+                    .filter_map(|ics| ics.tns.as_ref())
+                    .any(|tns| tns[0].filters.len() == 2 && tns[0].filters[0].order == 0);
+                let output = decode(&encoded, channels, &context);
+                // Coded in intensity stereo, a pair gives up some of each
+                // channel's waveform.
+                let (least_snr, least_level) = if bits_per_sample < 1.0 {
+                    (3.0, 0.75)
+                } else {
+                    (6.0, 0.9)
+                };
+                for (c, input) in input.iter().enumerate() {
+                    let snr_at = |lag: usize| snr(input, &output, channels, c, lag);
+                    let at = snr_at(DELAY);
+                    assert!(at > least_snr, "{context}, channel {c}: {at:.1} dB");
+                    for lag in [
+                        DELAY - 64,
+                        DELAY - 8,
+                        DELAY - 1,
+                        DELAY + 1,
+                        DELAY + 8,
+                        DELAY + 64,
+                    ] {
+                        let off = snr_at(lag);
+                        assert!(off < at, "{context}, channel {c}: {off:.1} dB at {lag}");
+                    }
+                    let decoded: Vec<f64> = (output.iter().skip(c).step_by(channels))
+                        .map(|&y| f64::from(y))
+                        .collect();
+                    let correlation: f64 = (input.iter().zip(&decoded[DELAY..]))
+                        .map(|(x, y)| x * y)
+                        .sum();
+                    let level = correlation / input.iter().map(|x| x * x).sum::<f64>();
+                    assert!(
+                        (least_level..1.02).contains(&level),
+                        "{context}, channel {c}: level {level}"
+                    );
+                }
+            }
+        }
+    }
+    assert!(long_shaped && short_shaped && cut_short);
+}
+
+/// Temporal noise shaping holds back the quantization noise before the
+/// attacks of transient signals, which a long window spreads over its
+/// span: the error of the decoded output over the 1024 samples before each
+/// attack, short of the last 64, coded with long windows alone, is less
+/// with it than without, by 2.6 to 11.3 dB. Where the frames of the
+/// attacks are coded with short windows, which hold back most of the noise
+/// themselves (see `short_windows_hold_back_the_noise_before_an_attack`),
+/// the error is less too, by up to 8.2 dB, or about as much.
+#[test]
+fn temporal_noise_shaping_holds_back_the_noise_before_attacks() {
+    use chelys::aac::internals::channel_configuration::ChannelConfiguration;
+    use chelys::aac::internals::{StreamConfig, StreamEncoder};
+
+    for (sample_rate, bits_per_second) in [(44_100, 48_000), (44_100, 96_000), (32_000, 48_000)] {
+        let config = StreamConfig {
+            sampling_frequency: SamplingFrequency::from_hz(sample_rate).unwrap(),
+            channel_configuration: ChannelConfiguration::Mono,
+            bits_per_second,
+            framing: chelys::aac::Framing::Adts,
+        };
+        let len = 3 * sample_rate as usize;
+        for (name, input, onsets) in transients(sample_rate, len) {
+            for switching in [false, true] {
+                let context =
+                    format!("{name} at {sample_rate} Hz, {bits_per_second} bit/s, {switching}");
+                let pre_echo = |tns: bool| {
+                    let mut encoder = StreamEncoder::new(config);
+                    if !switching {
+                        encoder = encoder.without_block_switching();
+                    }
+                    if !tns {
+                        encoder = encoder.without_tns();
+                    }
+                    let mut stream = Vec::new();
+                    encoder.encode(&[&input], &mut stream);
+                    let end = encoder.finish(&mut stream);
+                    let decoded = ffmpeg::decode_aac(&stream);
+                    assert_eq!(decoded.diagnostics, "", "{context}");
+                    assert_eq!(decoded.samples.len() as u64, end.frames * 1024);
+                    let output = decoded.samples;
+                    (onsets.iter())
+                        .filter(|&&onset| onset >= 1024)
+                        .flat_map(|&onset| onset - 1024..onset - 64)
+                        .map(|t| (f64::from(output[t + DELAY]) - input[t]).powi(2))
+                        .sum::<f64>()
+                };
+                let gain = 10.0 * (pre_echo(false) / pre_echo(true)).log10();
+                let least = if switching { -1.0 } else { 2.0 };
+                assert!(
+                    gain > least,
+                    "{context}: {gain:.1} dB less error before the attacks"
+                );
+            }
+        }
+    }
+}
