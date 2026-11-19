@@ -12,6 +12,7 @@ use crate::channel::FRAME_LINES;
 use crate::loops::inner;
 use crate::sampling_frequency::SamplingFrequency;
 use crate::scalefactor_bands::MAX_BANDS;
+use crate::stereo::BandCoding;
 use crate::stereo::intensity::Intensity;
 use crate::window::{SHORT_WINDOWS, Windows};
 
@@ -101,32 +102,27 @@ pub fn choose(
     let mut ties = MsMask::NONE;
     let (mut any_left_right, mut any_mid_side) = (false, false);
     let mut scratch = inner::BandScratch::default();
-    for (g, (start, bands)) in windows.groups_with_start(sampling_frequency).enumerate() {
-        for sfb in 0..bands.num_swb() {
-            if intensity.bands[g].codebook(sfb).is_some() {
-                continue;
+    for band in super::bands(windows, sampling_frequency, MsMask::NONE, intensity) {
+        if band.coding == BandCoding::Intensity {
+            continue;
+        }
+        let (g, sfb, range) = (band.group, band.sfb, band.lines);
+        if weights[0][range.clone()] != weights[1][range.clone()] {
+            any_left_right = true;
+            continue;
+        }
+        let [l, r, m, s] = std::array::from_fn(|c| {
+            let (lines, weights) = (&lines[c][range.clone()], &weights[c][range.clone()]);
+            inner::band_bits(lines, weights, allowed[c][g][sfb], &mut scratch)
+        });
+        let (left_right, mid_side) = (l + r, m + s);
+        match mid_side.cmp(&left_right) {
+            Ordering::Equal => ties.set(g, sfb, true),
+            Ordering::Less => {
+                mask.set(g, sfb, true);
+                any_mid_side = true;
             }
-            let group = start..start + bands.lines();
-            let left_weights = &weights[0][group.clone()][bands.band(sfb)];
-            if left_weights != &weights[1][group][bands.band(sfb)] {
-                any_left_right = true;
-                continue;
-            }
-            let [l, r, m, s] = std::array::from_fn(|c| {
-                let group = start..start + bands.lines();
-                let lines = &lines[c][group.clone()][bands.band(sfb)];
-                let weights = &weights[c][group][bands.band(sfb)];
-                inner::band_bits(lines, weights, allowed[c][g][sfb], &mut scratch)
-            });
-            let (left_right, mid_side) = (l + r, m + s);
-            match mid_side.cmp(&left_right) {
-                Ordering::Equal => ties.set(g, sfb, true),
-                Ordering::Less => {
-                    mask.set(g, sfb, true);
-                    any_mid_side = true;
-                }
-                Ordering::Greater => any_left_right = true,
-            }
+            Ordering::Greater => any_left_right = true,
         }
     }
     if any_mid_side && !any_left_right {

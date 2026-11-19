@@ -20,6 +20,7 @@ use crate::sampling_frequency::SamplingFrequency;
 use crate::scalefactor_bands::{MAX_BANDS, Transform, first_band_above};
 use crate::stereo::intensity::{self, Intensity};
 use crate::stereo::middle_side::{self, MsMask};
+use crate::stereo::{self, BandCoding};
 use crate::tns::analysis::{Shaping, target_bands};
 use crate::tns::{NoiseGains, Tns};
 use crate::window::{SHORT_WINDOWS, WindowSequence, Windows};
@@ -755,20 +756,16 @@ impl ElementEncoder {
             &self.intensity,
         );
         let mut lines_mid_side = 0;
-        for (g, (start, bands)) in windows.groups_with_start(fs).enumerate() {
-            for sfb in 0..bands.num_swb() {
-                let intensity = self.intensity.bands[g].codebook(sfb).is_some();
-                if self.ms.is_used(g, sfb) && !intensity {
-                    let band = bands.band(sfb);
-                    let range = start + band.start..start + band.end;
-                    lines_mid_side += range.len();
-                    left.spectrum[range.clone()].copy_from_slice(&mid.spectrum[range.clone()]);
-                    right.spectrum[range.clone()].copy_from_slice(&side.spectrum[range.clone()]);
-                    left.weights[range.clone()].copy_from_slice(&mid.weights[range.clone()]);
-                    right.weights[range.clone()].copy_from_slice(&side.weights[range]);
-                    left.xmin[g][sfb] = mid.xmin[g][sfb];
-                    right.xmin[g][sfb] = side.xmin[g][sfb];
-                }
+        for band in stereo::bands(windows, fs, self.ms, &self.intensity) {
+            if band.coding == BandCoding::MidSide {
+                let (g, sfb, range) = (band.group, band.sfb, band.lines);
+                lines_mid_side += range.len();
+                left.spectrum[range.clone()].copy_from_slice(&mid.spectrum[range.clone()]);
+                right.spectrum[range.clone()].copy_from_slice(&side.spectrum[range.clone()]);
+                left.weights[range.clone()].copy_from_slice(&mid.weights[range.clone()]);
+                right.weights[range.clone()].copy_from_slice(&side.weights[range]);
+                left.xmin[g][sfb] = mid.xmin[g][sfb];
+                right.xmin[g][sfb] = side.xmin[g][sfb];
             }
         }
         if 2 * lines_mid_side >= FRAME_LINES {
@@ -908,24 +905,21 @@ impl ElementEncoder {
         let gains = &self.prepared[c].gains;
         let windows = channels[c].windows();
         let max_sfb = channels[c].max_sfb();
-        let mut first = 0;
-        let groups = windows.groups_with_start(fs).enumerate();
-        for (g, (start, bands)) in groups {
-            for w in 0..bands.windows() {
-                let filtered = gains.bands(first + w);
-                for sfb in filtered.start..filtered.end.min(max_sfb) {
-                    let range = bands.window_band(w, sfb);
-                    let range = start + range.start..start + range.end;
-                    let paired = self.common_window && self.ms.is_used(g, sfb);
-                    let sends = |channel: &CodedChannel| {
-                        channel.lines()[range.clone()].iter().any(|&q| q != 0)
-                    };
-                    if sends(&channels[c]) || (paired && sends(&channels[1 - c])) {
-                        return true;
-                    }
+        for band in stereo::bands(windows, fs, self.ms, &self.intensity) {
+            if band.sfb >= max_sfb {
+                continue;
+            }
+            let paired = band.coding == BandCoding::MidSide;
+            for (w, range) in band.windows() {
+                if !gains.bands(w).contains(&band.sfb) {
+                    continue;
+                }
+                let sends =
+                    |channel: &CodedChannel| channel.lines()[range.clone()].iter().any(|&q| q != 0);
+                if sends(&channels[c]) || (paired && sends(&channels[1 - c])) {
+                    return true;
                 }
             }
-            first += bands.windows();
         }
         false
     }
@@ -941,15 +935,11 @@ impl ElementEncoder {
         }
         let fs = self.sampling_frequency;
         let windows = self.prepared[c].windows;
-        let common = self.common_window;
-        for (g, (start, bands)) in windows.groups_with_start(fs).enumerate() {
-            for sfb in 0..bands.num_swb() {
-                let band = bands.band(sfb);
-                let range = start + band.start..start + band.end;
-                if common && self.intensity.bands[g].codebook(sfb).is_some() {
-                    continue;
-                }
-                if common && self.ms.is_used(g, sfb) {
+        for band in stereo::bands(windows, fs, self.ms, &self.intensity) {
+            let range = band.lines;
+            match band.coding {
+                BandCoding::Intensity => {}
+                BandCoding::MidSide => {
                     let [left, right] = &mut self.prepared[..] else {
                         unreachable!("a pair")
                     };
@@ -964,7 +954,8 @@ impl ElementEncoder {
                         left.spectrum[i] = (lr[0] + lr[1]) / 2.0;
                         right.spectrum[i] = (lr[0] - lr[1]) / 2.0;
                     }
-                } else {
+                }
+                BandCoding::Plain => {
                     let prepared = &mut self.prepared[c];
                     prepared.spectrum[range.clone()].copy_from_slice(&prepared.unshaped[range]);
                 }
@@ -987,14 +978,11 @@ impl ElementEncoder {
             gains.weights(prepared.windows, fs, &mut prepared.weights);
         }
         if let ([left, right], true) = (&mut self.prepared[..], self.common_window) {
-            for (g, (start, bands)) in left.windows.groups_with_start(fs).enumerate() {
-                for sfb in 0..bands.num_swb() {
-                    if self.ms.is_used(g, sfb) && self.intensity.bands[g].codebook(sfb).is_none() {
-                        let band = bands.band(sfb);
-                        for i in start + band.start..start + band.end {
-                            let weight = left.weights[i].max(right.weights[i]);
-                            (left.weights[i], right.weights[i]) = (weight, weight);
-                        }
+            for band in stereo::bands(left.windows, fs, self.ms, &self.intensity) {
+                if band.coding == BandCoding::MidSide {
+                    for i in band.lines {
+                        let weight = left.weights[i].max(right.weights[i]);
+                        (left.weights[i], right.weights[i]) = (weight, weight);
                     }
                 }
             }

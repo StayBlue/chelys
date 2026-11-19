@@ -10,6 +10,7 @@ use crate::noiseless::codebooks::Codebook;
 use crate::noiseless::sections::IntensityBands;
 use crate::sampling_frequency::SamplingFrequency;
 use crate::scalefactor_bands::MAX_BANDS;
+use crate::stereo::middle_side::MsMask;
 use crate::window::{SHORT_WINDOWS, Windows};
 
 /// The bands of a pair's window groups coded in intensity stereo, each
@@ -105,38 +106,36 @@ pub fn code(
     [left_xmin, right_xmin]: [&mut [[f64; MAX_BANDS]]; 2],
 ) -> Intensity {
     let mut intensity = Intensity::NONE;
-    for (g, (start, bands)) in windows.groups_with_start(sampling_frequency).enumerate() {
-        let left = &mut left[start..start + bands.lines()];
-        let right = &mut right[start..start + bands.lines()];
-        for sfb in first.min(bands.num_swb())..bands.num_swb() {
-            let (l, r) = (&mut left[bands.band(sfb)], &mut right[bands.band(sfb)]);
-            let energy = |lines: &[f64]| lines.iter().map(|x| x * x).sum::<f64>();
-            let (el, er) = (energy(l), energy(r));
-            if el == 0.0 || er == 0.0 {
-                continue;
-            }
-            let position = (2.0 * (el / er).log2()).round();
-            if position.abs() > f64::from(MAX_POSITION) {
-                continue;
-            }
-            let position = position as i8;
-            let product: f64 = l.iter().zip(&*r).map(|(l, r)| l * r).sum();
-            let (codebook, sign) = if product < 0.0 {
-                (Codebook::INTENSITY_OUT_OF_PHASE, -1.0)
-            } else {
-                (Codebook::INTENSITY, 1.0)
-            };
-            let es: f64 = l.iter().zip(&*r).map(|(l, r)| (l + sign * r).powi(2)).sum();
-            let gain = if es == 0.0 { 0.0 } else { (el / es).sqrt() };
-            for (l, r) in l.iter_mut().zip(r.iter_mut()) {
-                *l = (*l + sign * *r) * gain;
-                *r = 0.0;
-            }
-            intensity.bands[g].set(sfb, Some(codebook));
-            intensity.positions[g][sfb] = position;
-            if er > 0.0 {
-                left_xmin[g][sfb] = left_xmin[g][sfb].min(right_xmin[g][sfb] * el / er);
-            }
+    let bands = super::bands(windows, sampling_frequency, MsMask::NONE, &Intensity::NONE);
+    for band in bands.filter(|band| band.sfb >= first) {
+        let (g, sfb) = (band.group, band.sfb);
+        let (l, r) = (&mut left[band.lines.clone()], &mut right[band.lines]);
+        let energy = |lines: &[f64]| lines.iter().map(|x| x * x).sum::<f64>();
+        let (el, er) = (energy(l), energy(r));
+        if el == 0.0 || er == 0.0 {
+            continue;
+        }
+        let position = (2.0 * (el / er).log2()).round();
+        if position.abs() > f64::from(MAX_POSITION) {
+            continue;
+        }
+        let position = position as i8;
+        let product: f64 = l.iter().zip(&*r).map(|(l, r)| l * r).sum();
+        let (codebook, sign) = if product < 0.0 {
+            (Codebook::INTENSITY_OUT_OF_PHASE, -1.0)
+        } else {
+            (Codebook::INTENSITY, 1.0)
+        };
+        let es: f64 = l.iter().zip(&*r).map(|(l, r)| (l + sign * r).powi(2)).sum();
+        let gain = if es == 0.0 { 0.0 } else { (el / es).sqrt() };
+        for (l, r) in l.iter_mut().zip(r.iter_mut()) {
+            *l = (*l + sign * *r) * gain;
+            *r = 0.0;
+        }
+        intensity.bands[g].set(sfb, Some(codebook));
+        intensity.positions[g][sfb] = position;
+        if er > 0.0 {
+            left_xmin[g][sfb] = left_xmin[g][sfb].min(right_xmin[g][sfb] * el / er);
         }
     }
     intensity
