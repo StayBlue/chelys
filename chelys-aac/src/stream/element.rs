@@ -10,6 +10,7 @@ use crate::channel::{self, CodedChannel, CodedGroup, FRAME_LINES};
 use crate::filterbank::Filterbank;
 use crate::loops::{self, ChannelCoding};
 use crate::noiseless::sections::Sections;
+use crate::psychoacoustic::Analysis;
 use crate::psychoacoustic::middle_side::MidSideModel;
 use crate::psychoacoustic::switching::{self, Attacks, BlockSwitching};
 use crate::raw_data_block::element::CodedElement;
@@ -61,7 +62,9 @@ pub struct PreparedChannel {
     pub windows: Windows,
     /// The lines of the frame's transform, in the order they are sent.
     pub spectrum: Box<[f64; FRAME_LINES]>,
-    /// The allowed distortion `xmin` of each band of each window group.
+    /// The allowed distortion `xmin` of each band of each window group,
+    /// raised by [`XMIN_OFFSET_DB`](loops::XMIN_OFFSET_DB) as the loops take
+    /// it.
     pub xmin: Vec<[f64; MAX_BANDS]>,
     /// `bit_allocation` (clause C.1.4, step 15).
     pub bit_allocation: f64,
@@ -82,6 +85,16 @@ impl PreparedChannel {
             perceptual_entropy: 0.0,
             silent: true,
         }
+    }
+
+    /// The channel's allowed distortions, perceptual entropy and
+    /// `bit_allocation`, from its lines and `analysis`, its model's
+    /// thresholds.
+    fn thresholds(&mut self, analysis: &Analysis) {
+        analysis.xmin(self.windows, &self.spectrum, &mut self.xmin);
+        loops::raise_xmin(&mut self.xmin);
+        self.bit_allocation = analysis.bit_allocation(self.windows.sequence);
+        self.perceptual_entropy = analysis.perceptual_entropy(self.windows.sequence);
     }
 }
 
@@ -246,11 +259,12 @@ impl ElementEncoder {
         }
     }
 
-    /// Prepares the frame whose block is at `start`: chooses each channel's
-    /// windows, short ones only if the frame can `afford_short` them, and
-    /// whether a pair shares them; transforms each channel's block with
-    /// them in its filterbank, and from its spectrum and the model's
-    /// thresholds finds what each scalefactor band may take as noise.
+    /// Prepares the frame whose block is at `start` in stages: its
+    /// [spectra](Self::spectra), each channel's windows chosen, short ones
+    /// only if the frame can `afford_short` them, and its block transformed
+    /// with them; their [thresholds](Self::thresholds), what each
+    /// scalefactor band may take as noise; a pair's [joint](Self::joint)
+    /// coding; and which channels are [silent](Self::find_silence).
     ///
     /// A pair shares its `ics_info()`, `common_window` 1, where "each
     /// individual channel in the pair window switch together" (clause
@@ -262,13 +276,15 @@ impl ElementEncoder {
     /// alike from the same state, are the same, and where they are short,
     /// their grouping is chosen from both (see [`switching::grouping`]).
     pub fn prepare(&mut self, start: usize, afford_short: bool) {
-        self.transform(start, afford_short);
-        self.code_jointly();
+        self.spectra(start, afford_short);
+        self.thresholds();
+        self.joint();
+        self.find_silence();
     }
 
-    /// The first part of [`prepare`](Self::prepare): each channel's
-    /// windows, lines and allowances, and whether a pair shares its window.
-    fn transform(&mut self, start: usize, afford_short: bool) {
+    /// Each channel's windows and the lines of its block transformed with
+    /// them, and whether a pair shares its window.
+    fn spectra(&mut self, start: usize, afford_short: bool) {
         let mut sequences = [WindowSequence::OnlyLong; 2];
         let sequences = &mut sequences[..self.channels.len()];
         for (channel, sequence) in self.channels.iter_mut().zip(sequences.iter_mut()) {
@@ -303,10 +319,6 @@ impl ElementEncoder {
                 .expect("a block of samples");
             prepared.windows = windows;
             (channel.filterbank).spectrum(block, windows, &mut prepared.spectrum);
-            let analysis = channel.switching.current();
-            analysis.xmin(windows, &prepared.spectrum, &mut prepared.xmin);
-            prepared.bit_allocation = analysis.bit_allocation(windows.sequence);
-            prepared.perceptual_entropy = analysis.perceptual_entropy(windows.sequence);
         }
         self.common_window = match &self.prepared[..] {
             [left, right] => left.windows == right.windows,
@@ -314,19 +326,31 @@ impl ElementEncoder {
         };
     }
 
-    /// The rest of [`prepare`](Self::prepare): a pair that shares its
-    /// window coded in intensity stereo and as middle and side, and which
-    /// channels are silent, as they are coded.
-    fn code_jointly(&mut self) {
+    /// From each channel's lines and its model's thresholds, what each of
+    /// its scalefactor bands may take as noise, and its perceptual entropy
+    /// and `bit_allocation`.
+    fn thresholds(&mut self) {
+        for (channel, prepared) in self.channels.iter().zip(&mut self.prepared) {
+            prepared.thresholds(channel.switching.current());
+        }
+    }
+
+    /// A pair that shares its window coded in intensity stereo and as
+    /// middle and side.
+    fn joint(&mut self) {
         self.ms = MsMask::NONE;
         self.intensity = Intensity::NONE;
         if self.common_window {
             let short = self.prepared[0].windows.sequence.transform() == Transform::Short;
             if let (Some(border), false) = (self.intensity_border, short) {
-                self.code_intensity(border);
+                self.intensity_bands(border);
             }
-            self.code_middle_side();
+            self.middle_side_bands();
         }
+    }
+
+    /// Which channels are silent, as they are coded.
+    fn find_silence(&mut self) {
         // A right channel with bands in intensity stereo sends them, even
         // where its lines are all zero.
         let in_intensity = self.in_intensity();
@@ -352,7 +376,7 @@ impl ElementEncoder {
     /// and the left's into the right. Coded so, a one-sample impulse in one
     /// channel of a pair at 64 kHz and 96 kbit/s decoded at about half its
     /// level.
-    fn code_intensity(&mut self, border: f64) {
+    fn intensity_bands(&mut self, border: f64) {
         let fs = self.sampling_frequency;
         let [left, right] = &mut self.prepared[..] else {
             unreachable!("a pair")
@@ -385,7 +409,7 @@ impl ElementEncoder {
     /// in others. They are taken as those of the middle and side channels
     /// where those code at least half of the frame's lines, and else as
     /// those of the left and right channels.
-    fn code_middle_side(&mut self) {
+    fn middle_side_bands(&mut self) {
         let fs = self.sampling_frequency;
         let Some(mid_side) = &mut self.mid_side else {
             unreachable!("a pair")
@@ -404,25 +428,14 @@ impl ElementEncoder {
         let analyses = mid_side.model.current();
         for (channel, analysis) in [&mut *mid, &mut *side].into_iter().zip(analyses) {
             channel.windows = windows;
-            analysis.xmin(windows, &channel.spectrum, &mut channel.xmin);
-            channel.bit_allocation = analysis.bit_allocation(windows.sequence);
-            channel.perceptual_entropy = analysis.perceptual_entropy(windows.sequence);
+            channel.thresholds(analysis);
         }
-        let offset = 10f64.powf(loops::XMIN_OFFSET_DB / 10.0);
-        let raised = |channel: &PreparedChannel| {
-            let mut raised = [[0.0; MAX_BANDS]; SHORT_WINDOWS];
-            for (raised, xmin) in raised.iter_mut().zip(&channel.xmin) {
-                *raised = xmin.map(|xmin| xmin * offset);
-            }
-            raised
-        };
-        let allowed = [raised(left), raised(right), raised(mid), raised(side)];
-        let groups = left.xmin.len();
+        let channels = [&*left, &*right, &*mid, &*side];
         self.ms = middle_side::choose(
             windows,
             fs,
-            [&*left, &*right, &*mid, &*side].map(|c| &*c.spectrum),
-            allowed.each_ref().map(|allowed| &allowed[..groups]),
+            channels.map(|c| &*c.spectrum),
+            channels.map(|c| &c.xmin[..]),
             &self.intensity,
         );
         let mut lines_mid_side = 0;
@@ -723,11 +736,13 @@ mod tests {
         let mut start = 0;
         while encoder.buffered() - start >= 2 * FRAME_SAMPLES {
             encoder.look_ahead(start + FRAME_SAMPLES, true);
-            encoder.transform(start, true);
+            encoder.spectra(start, true);
             let original: Vec<Vec<f64>> = (encoder.prepared.iter())
                 .map(|prepared| prepared.spectrum.to_vec())
                 .collect();
-            encoder.code_jointly();
+            encoder.thresholds();
+            encoder.joint();
+            encoder.find_silence();
             let coded = encoder.quantize(bits);
             let mut w = BitWriter::new();
             w.write(u32::from(coded.is_pair()), 3);

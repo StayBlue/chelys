@@ -102,7 +102,7 @@ pub const MAX_AMPLIFICATION: u8 = 60;
 /// running the outer loop on what is left.
 ///
 /// The offset to every `xmin` of clause C.7.4.4 is applied before the loop
-/// (see [`quantize`](super::quantize)).
+/// (see [`raise_xmin`](super::raise_xmin)).
 ///
 /// Gives the channel and the excess of its iteration (see [`excess`]).
 pub fn outer_loop(mut counting: Counting, xmin: &[[f64; MAX_BANDS]]) -> (CodedChannel, f64) {

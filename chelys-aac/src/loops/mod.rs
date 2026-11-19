@@ -14,7 +14,7 @@ use crate::channel::{CodedChannel, FRAME_LINES};
 use crate::sampling_frequency::SamplingFrequency;
 use crate::scalefactor_bands::MAX_BANDS;
 use crate::stereo::intensity::Intensity;
-use crate::window::{SHORT_WINDOWS, Windows};
+use crate::window::Windows;
 
 /// The offset in dB that every allowed distortion `xmin` is raised by
 /// before the loops (clause C.7.4.4).
@@ -38,6 +38,15 @@ use crate::window::{SHORT_WINDOWS, Windows};
 /// below 6 dB at 128 kbit/s and 0.018 above it at 192 kbit/s, and as
 /// 6 dB at 64 kbit/s.
 pub const XMIN_OFFSET_DB: f64 = 3.0;
+
+/// Raises each allowed distortion `xmin` by [`XMIN_OFFSET_DB`], as the
+/// loops take it.
+pub fn raise_xmin(xmin: &mut [[f64; MAX_BANDS]]) {
+    let offset = 10f64.powf(XMIN_OFFSET_DB / 10.0);
+    for xmin in xmin.iter_mut().flatten() {
+        *xmin *= offset;
+    }
+}
 
 /// How the loops are to code one channel: everything they take but its
 /// lines and their allowed distortion.
@@ -88,9 +97,9 @@ impl ChannelCoding<'_> {
 /// The iteration loop of one channel (figure C.6): quantizes the lines
 /// `spectrum` by the outer loop to fit as `coding` asks, with the noise of
 /// each scalefactor band of each window group shaped to its allowed
-/// distortion `xmin`, raised by [`XMIN_OFFSET_DB`] (see
+/// distortion `xmin`, raised by [`XMIN_OFFSET_DB`] (see [`raise_xmin`] and
 /// [`outer::outer_loop`]). Gives the channel and how far its noise exceeds
-/// the raised allowance (see [`outer::excess`]).
+/// that allowance (see [`outer::excess`]).
 ///
 /// The bits the channel leaves unused (figure C.6) are not counted here:
 /// the frame's length, spent from the bit reservoir, leaves them there.
@@ -105,12 +114,7 @@ pub fn quantize(
     coding: ChannelCoding<'_>,
 ) -> (CodedChannel, f64) {
     let counting = Counting::new(Lines::new(spectrum), coding);
-    let offset = 10f64.powf(XMIN_OFFSET_DB / 10.0);
-    let mut target = [[0.0; MAX_BANDS]; SHORT_WINDOWS];
-    for (target, xmin) in target.iter_mut().zip(xmin) {
-        *target = xmin.map(|xmin| xmin * offset);
-    }
-    outer::outer_loop(counting, &target[..xmin.len()])
+    outer::outer_loop(counting, xmin)
 }
 
 /// [`quantize`] for a `single_channel_element()`'s channel, without its
