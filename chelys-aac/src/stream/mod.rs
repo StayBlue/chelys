@@ -14,6 +14,7 @@ use super::channel::CodedChannel;
 use super::channel_configuration::ChannelConfiguration;
 use super::config::Framing;
 use super::raw_data_block;
+use super::raw_data_block::data_stream::{self, DataStreamQueue};
 use super::raw_data_block::element::CodedElement;
 use super::reservoir::BitReservoir;
 use super::sampling_frequency::SamplingFrequency;
@@ -82,15 +83,16 @@ impl StreamConfig {
         self.adts_header().map_or(0, |header| header.bytes())
     }
 
-    /// The shortest frame of channels with `windows`: its channels
-    /// silent, each with its own `ics_info()`, without fill.
-    fn shortest_frame_len(&self, windows: Windows) -> usize {
+    /// The shortest frame of channels with `windows` that carries
+    /// `data_bytes` of data streams: its channels silent, each with its own
+    /// `ics_info()`, without fill.
+    fn shortest_frame_len(&self, windows: Windows, data_bytes: usize) -> usize {
         let channel = CodedChannel::silent(windows, self.sampling_frequency);
         let element = match self.channel_configuration {
             ChannelConfiguration::Mono => CodedElement::single(channel),
             ChannelConfiguration::Stereo => CodedElement::pair(channel.clone(), channel),
         };
-        self.header_len() + raw_data_block::min_len(&element)
+        self.header_len() + raw_data_block::min_len(&element, data_bytes)
     }
 
     /// The lowest bitrate that brings each frame the bits of the shortest,
@@ -98,20 +100,45 @@ impl StreamConfig {
     /// A frame that cannot afford the longer `ics_info()` of eight short
     /// windows is coded with long ones.
     pub fn min_bits_per_second(&self) -> u32 {
-        let bits = 8 * self.shortest_frame_len(Windows::LONG_SINE) as u64;
+        let bits = 8 * self.shortest_frame_len(Windows::LONG_SINE, 0) as u64;
         let sample_rate = u64::from(self.sampling_frequency.hz());
         (bits * sample_rate).div_ceil(FRAME_SAMPLES as u64) as u32
     }
 
-    /// The bits of the shortest frame of eight short windows, which a
-    /// frame must be able to take to be coded with them (see
-    /// [`StreamEncoder::affords_short`]).
+    /// The most bytes of data streams that each frame can carry: as many as
+    /// the shortest frame that carries them, that of long windows, keeps
+    /// within the whole bytes the rate brings each frame, so that the
+    /// reservoir never runs below empty (see [`Self::min_bits_per_second`]).
+    /// 0 if the stream is not [valid](Self::is_valid).
+    pub fn max_data_stream_bytes(&self) -> usize {
+        let mean = u64::from(self.bits_per_second) * FRAME_SAMPLES as u64
+            / (8 * u64::from(self.sampling_frequency.hz()));
+        let fits = |bytes| self.shortest_frame_len(Windows::LONG_SINE, bytes) as u64 <= mean;
+        // The frame grows with the bytes.
+        let (mut fitting, mut over) = (0, mean as usize + 1);
+        if !fits(fitting) {
+            return 0;
+        }
+        while over - fitting > 1 {
+            let mid = fitting + (over - fitting) / 2;
+            if fits(mid) {
+                fitting = mid;
+            } else {
+                over = mid;
+            }
+        }
+        fitting
+    }
+
+    /// The bits of the shortest frame of eight short windows, without data
+    /// streams, which a frame must be able to take with its data streams to
+    /// be coded with them (see [`StreamEncoder::affords_short`]).
     fn shortest_short_frame_bits(&self) -> u32 {
         let windows = Windows {
             sequence: WindowSequence::EIGHT_SHORT,
             ..Windows::LONG_SINE
         };
-        8 * self.shortest_frame_len(windows) as u32
+        8 * self.shortest_frame_len(windows, 0) as u32
     }
 
     /// The highest bitrate, at which the reservoir holds a byte.
@@ -195,6 +222,8 @@ pub struct StreamEncoder {
     block_switching: bool,
     /// [`StreamConfig::shortest_short_frame_bits`].
     shortest_short_frame_bits: u32,
+    /// The bytes queued for the frames' data streams.
+    data: DataStreamQueue,
     /// The samples each channel was given.
     samples: u64,
     frames: u64,
@@ -206,6 +235,9 @@ pub struct StreamEnd {
     pub frames: u64,
     /// The samples each channel was given.
     pub samples: u64,
+    /// The bytes of data streams that the last frames had no room for,
+    /// dropped.
+    pub data_stream_dropped: usize,
 }
 
 impl StreamEncoder {
@@ -227,9 +259,38 @@ impl StreamEncoder {
             ),
             block_switching: true,
             shortest_short_frame_bits: config.shortest_short_frame_bits(),
+            data: DataStreamQueue::default(),
             samples: 0,
             frames: 0,
         }
+    }
+
+    /// The encoder, with each frame carrying up to `bytes_per_frame` bytes
+    /// of those [pushed](Self::push_data_stream) in data stream elements,
+    /// which take bits from its audio.
+    ///
+    /// # Panics
+    ///
+    /// If `bytes_per_frame` is above
+    /// [`StreamConfig::max_data_stream_bytes`]: a caller's error.
+    pub fn with_data_stream(mut self, bytes_per_frame: usize) -> Self {
+        let max = self.config.max_data_stream_bytes();
+        assert!(
+            bytes_per_frame <= max,
+            "{bytes_per_frame} bytes of data streams a frame, not at most {max}"
+        );
+        self.data = DataStreamQueue::new(bytes_per_frame);
+        self
+    }
+
+    /// Queues `bytes` for the data streams of the frames coded from now on.
+    pub fn push_data_stream(&mut self, bytes: &[u8]) {
+        self.data.push(bytes);
+    }
+
+    /// The bytes queued that no frame has carried yet.
+    pub fn data_stream_pending(&self) -> usize {
+        self.data.pending()
     }
 
     /// The encoder, but coding every frame with long windows, as if no
@@ -250,12 +311,13 @@ impl StreamEncoder {
 
     /// Whether the next frame's bits, those the reservoir makes available
     /// to it when it asks for none beyond the mean, pay for the shortest
-    /// frame of eight short windows in every channel, and so for any
-    /// windows: a frame is given no fewer when it asks for more. Near the
-    /// lowest bitrate they may not, as it is set by the frames of long
-    /// windows (see [`StreamConfig::min_bits_per_second`]).
-    fn affords_short(&self) -> bool {
-        self.shortest_short_frame_bits <= self.reservoir.available_bits(0)
+    /// frame of eight short windows in every channel with `data_bits` of
+    /// data stream elements, and so for any windows: a frame is given no
+    /// fewer when it asks for more. Near the lowest bitrate they may not,
+    /// as it is set by the frames of long windows (see
+    /// [`StreamConfig::min_bits_per_second`]).
+    fn affords_short(&self, data_bits: u32) -> bool {
+        self.shortest_short_frame_bits + data_bits <= self.reservoir.available_bits(0)
     }
 
     /// The `AudioSpecificConfig()` of ISO/IEC 14496-3 that describes the
@@ -320,6 +382,7 @@ impl StreamEncoder {
         StreamEnd {
             frames: self.frames,
             samples: self.samples,
+            data_stream_dropped: self.data.pending(),
         }
     }
 
@@ -330,16 +393,19 @@ impl StreamEncoder {
     /// the element's channels for quantization (see
     /// [`ElementEncoder::prepare`]); has the bit reservoir make bits
     /// available to the frame for the bits the model asks for; and
-    /// quantizes the element in them.
+    /// quantizes the element in them, less those of the data the frame
+    /// carries.
     fn encode_frame<O: FrameSink + ?Sized>(&mut self, start: usize, out: &mut O) {
         self.element
             .look_ahead(start + FRAME_SAMPLES, self.block_switching);
-        let afford_short = self.affords_short();
+        let data = self.data.take_next_frame();
+        let data_bits = data_stream::bits(data.len());
+        let afford_short = self.affords_short(data_bits);
         self.element.prepare(start, afford_short);
         let demand = self.element.demand();
-        let available_bits = frame::element_bits(&self.config, &self.reservoir, &demand);
+        let available_bits = frame::element_bits(&self.config, &self.reservoir, &demand, data_bits);
         let element = self.element.quantize(available_bits);
-        frame::write(&self.config, &mut self.reservoir, &element, out);
+        frame::write(&self.config, &mut self.reservoir, &element, &data, out);
         self.frames += 1;
     }
 }
@@ -391,9 +457,9 @@ mod tests {
             // pair of silent channels that share their window.
             let silent = CodedChannel::silent(Windows::LONG_SINE, config.sampling_frequency);
             let element = CodedElement::common_pair(silent.clone(), silent, MsMask::NONE);
-            let shortest = config.header_len() + raw_data_block::min_len(&element);
+            let shortest = config.header_len() + raw_data_block::min_len(&element, 0);
             assert_eq!(frames[0].len(), shortest, "{framing:?}");
-            assert!(shortest < config.shortest_frame_len(Windows::LONG_SINE));
+            assert!(shortest < config.shortest_frame_len(Windows::LONG_SINE, 0));
         }
     }
 
@@ -422,7 +488,7 @@ mod tests {
             assert_eq!(length, frame.len());
             assert_eq!(fullness, reservoir.adts_buffer_fullness());
         }
-        assert!(frames.last().unwrap().len() > config.shortest_frame_len(Windows::LONG_SINE));
+        assert!(frames.last().unwrap().len() > config.shortest_frame_len(Windows::LONG_SINE, 0));
     }
 
     #[test]
@@ -598,5 +664,117 @@ mod tests {
             longest as f64 > 1.5 * mean,
             "{longest} bytes against {mean}"
         );
+    }
+
+    fn noise(len: usize, seed: u64) -> Vec<f64> {
+        let mut state = seed;
+        (0..len)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                0.25 * ((state >> 11) as f64 / (1u64 << 53) as f64 - 0.5)
+            })
+            .collect()
+    }
+
+    /// Frames carry the bytes pushed in order, each up to its share, in
+    /// raw frames and in ADTS, those pushed after the frames were coded
+    /// among them, and the rest are dropped at the end; the stream keeps
+    /// its rate.
+    #[test]
+    fn data_streams_carry_the_bytes_pushed_in_order() {
+        use crate::raw_data_block::decoder::{adts_frame, raw_data_block};
+
+        let fs = SamplingFrequency::Hz44100;
+        let input = noise(12 * FRAME_SAMPLES, 5);
+        let data: Vec<u8> = (0..20_000u32).map(|i| (i * 7 + i / 255) as u8).collect();
+        // At 320 kbit/s, two elements a frame.
+        for (framing, bits_per_second, per_frame) in
+            [(Framing::Raw, 128_000, 100), (Framing::Adts, 320_000, 600)]
+        {
+            let config = config(framing, bits_per_second);
+            let mut encoder = StreamEncoder::new(config).with_data_stream(per_frame);
+            let mut frames = Vec::new();
+            let mut sink = |frame: &[u8]| frames.push(frame.to_vec());
+            let (first, second) = data.split_at(300);
+            encoder.push_data_stream(first);
+            encoder.encode(&[&input[..6 * FRAME_SAMPLES]; 2], &mut sink);
+            encoder.push_data_stream(second);
+            encoder.encode(&[&input[6 * FRAME_SAMPLES..]; 2], &mut sink);
+            let end = encoder.finish(&mut sink);
+            // Each frame's bytes, from its data stream elements.
+            let carried: Vec<Vec<u8>> = (frames.iter())
+                .map(|frame| {
+                    let block = match framing {
+                        Framing::Adts => adts_frame(frame).raw_data_block,
+                        Framing::Raw => frame,
+                    };
+                    (raw_data_block(block, fs).data_streams.iter())
+                        .flat_map(|stream| stream.bytes.clone())
+                        .collect()
+                })
+                .collect();
+            // The first five frames, coded before the second push, carry
+            // the first push; the rest carry their share.
+            let lens: Vec<usize> = carried.iter().map(Vec::len).collect();
+            let first_lens: Vec<usize> = (0..5)
+                .map(|k| 300usize.saturating_sub(k * per_frame).min(per_frame))
+                .collect();
+            assert_eq!(lens[..5], first_lens, "{framing:?}");
+            assert!(lens[5..].iter().all(|&len| len == per_frame), "{lens:?}");
+            let carried = carried.concat();
+            assert_eq!(carried, data[..carried.len()], "{framing:?}");
+            assert_eq!(carried.len() + end.data_stream_dropped, data.len());
+            let lens: Vec<usize> = frames.iter().map(Vec::len).collect();
+            let total: usize = lens.iter().sum();
+            let mean_total = lens.len() * bits_per_second as usize * 1024 / 44_100 / 8;
+            assert!(total <= mean_total, "{framing:?}");
+        }
+    }
+
+    /// At the lowest bitrates and above, a frame of noise or silence
+    /// carries the most bytes of data streams allowed, and one more is not.
+    #[test]
+    fn the_most_data_fits_every_frame() {
+        let input = noise(10 * FRAME_SAMPLES, 9);
+        for fs in [SamplingFrequency::Hz8000, SamplingFrequency::Hz48000] {
+            for channel_configuration in [ChannelConfiguration::Mono, ChannelConfiguration::Stereo]
+            {
+                let mut config = StreamConfig {
+                    sampling_frequency: fs,
+                    channel_configuration,
+                    bits_per_second: 0,
+                    framing: Framing::Adts,
+                    flags: Flags::default(),
+                    crc_protected: true,
+                };
+                let min = config.min_bits_per_second();
+                assert_eq!(config.max_data_stream_bytes(), 0);
+                for bits_per_second in [min, min + 200, min + 5_000, 4 * min + 30_000] {
+                    config.bits_per_second = bits_per_second;
+                    let max = config.max_data_stream_bytes();
+                    // The shortest frame with them is within the mean, and
+                    // with one more byte beyond it.
+                    let mean = bits_per_second as usize * FRAME_SAMPLES / (8 * fs.hz() as usize);
+                    assert!(config.shortest_frame_len(Windows::LONG_SINE, max) <= mean);
+                    assert!(config.shortest_frame_len(Windows::LONG_SINE, max + 1) > mean);
+                    let mut encoder = StreamEncoder::new(config).with_data_stream(max);
+                    encoder.push_data_stream(&vec![0xFF; 20 * max]);
+                    let channels = vec![input.as_slice(); channel_configuration.channels()];
+                    let mut stream = Vec::new();
+                    encoder.encode(&channels, &mut stream);
+                    let end = encoder.finish(&mut stream);
+                    assert_eq!(end.data_stream_dropped, (20 - end.frames as usize) * max);
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "bytes of data streams a frame")]
+    fn a_share_beyond_the_most_is_refused() {
+        let config = config(Framing::Raw, 64_000);
+        StreamEncoder::new(config).with_data_stream(config.max_data_stream_bytes() + 1);
     }
 }

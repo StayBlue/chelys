@@ -63,6 +63,9 @@ pub struct Finished {
     /// which decodes to near silence only. The frames' samples, `1024 *
     /// frames`, are all three together.
     pub padding: u64,
+    /// The bytes of data streams that the last frames had no room for,
+    /// dropped.
+    pub data_stream_dropped: usize,
 }
 
 impl Encoder {
@@ -71,10 +74,14 @@ impl Encoder {
     /// If the configuration asks for a stream the encoder cannot write, as
     /// [`ConfigError`] lists.
     pub fn new(config: Config) -> Result<Self, ConfigError> {
-        let config = config.lower()?;
-        let channels = config.channel_configuration.channels();
+        let stream_config = config.lower()?;
+        let channels = stream_config.channel_configuration.channels();
+        let mut stream = StreamEncoder::new(stream_config);
+        if config.data_stream_bytes() > 0 {
+            stream = stream.with_data_stream(config.data_stream_bytes());
+        }
         Ok(Self {
-            stream: StreamEncoder::new(config),
+            stream,
             pcm: vec![Vec::with_capacity(FRAME_SAMPLES); channels],
         })
     }
@@ -165,6 +172,19 @@ impl Encoder {
         self.stream.encode(&channels, out);
     }
 
+    /// Queues `bytes` for the data streams of the frames coded from now on,
+    /// as many a frame as [`Config::data_stream_bytes_per_frame`] allows.
+    ///
+    /// [`Config::data_stream_bytes_per_frame`]: super::Config::data_stream_bytes_per_frame
+    pub fn push_data_stream(&mut self, bytes: &[u8]) {
+        self.stream.push_data_stream(bytes);
+    }
+
+    /// The bytes of data streams queued that no frame has carried yet.
+    pub fn data_stream_pending(&self) -> usize {
+        self.stream.data_stream_pending()
+    }
+
     /// Ends the stream: pads the input with silence to whole frames, at
     /// least [`DELAY`](super::DELAY) samples past it, so that the decoded
     /// output holds all of the input, and gives `out` the frames left.
@@ -174,6 +194,7 @@ impl Encoder {
             frames: end.frames,
             samples: end.samples,
             padding: end.frames * FRAME_SAMPLES as u64 - super::DELAY as u64 - end.samples,
+            data_stream_dropped: end.data_stream_dropped,
         }
     }
 }

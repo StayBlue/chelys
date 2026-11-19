@@ -54,6 +54,7 @@ pub struct Config {
     framing: Framing,
     flags: Flags,
     crc: bool,
+    data_stream_bytes_per_frame: usize,
 }
 
 impl Config {
@@ -69,6 +70,7 @@ impl Config {
             framing: Framing::default(),
             flags: Flags::default(),
             crc: false,
+            data_stream_bytes_per_frame: 0,
         }
     }
 
@@ -118,6 +120,27 @@ impl Config {
         self
     }
 
+    /// Gives each frame up to `bytes` bytes of data, from the bytes queued
+    /// with [`Encoder::push_data_stream`], in data stream elements (clause
+    /// 8.6) after its audio, which then has as many bits fewer, and some
+    /// more for the elements' fields: 16 bits an element, 24 from 255
+    /// bytes, and an element for each 510. A frame with less data queued
+    /// keeps the rest for audio. At most as many as the rate brings each
+    /// frame beyond the shortest.
+    ///
+    /// The elements carry one data stream, with the `element_instance_tag`
+    /// 0, its bytes unaligned (`data_byte_align_flag` 0). A decoder ignores
+    /// them, or gives their bytes, "any additional data, e.g. auxiliary
+    /// information, that is not part of the audio information itself"
+    /// (clause 8.6.2), in order; as each frame says how many it carries,
+    /// they need no framing of their own to be told from the audio.
+    ///
+    /// [`Encoder::push_data_stream`]: super::Encoder::push_data_stream
+    pub fn data_stream_bytes_per_frame(mut self, bytes: usize) -> Self {
+        self.data_stream_bytes_per_frame = bytes;
+        self
+    }
+
     /// Whether [`Encoder::new`] takes this configuration.
     ///
     /// # Errors
@@ -127,6 +150,10 @@ impl Config {
     /// [`Encoder::new`]: super::Encoder::new
     pub fn check(&self) -> Result<(), ConfigError> {
         self.lower().map(|_| ())
+    }
+
+    pub(super) fn data_stream_bytes(&self) -> usize {
+        self.data_stream_bytes_per_frame
     }
 
     /// The stream's configuration, if it is one the stream can have.
@@ -158,6 +185,13 @@ impl Config {
                 max: config.max_bits_per_second(),
             });
         }
+        let max = config.max_data_stream_bytes();
+        if self.data_stream_bytes_per_frame > max {
+            return Err(ConfigError::DataStreamTooLong {
+                bytes_per_frame: self.data_stream_bytes_per_frame,
+                max,
+            });
+        }
         Ok(config)
     }
 }
@@ -182,6 +216,9 @@ pub enum ConfigError {
     /// The CRC or a header flag was asked for in [`Framing::Raw`], whose
     /// frames have no ADTS header to carry them.
     AdtsOnly,
+    /// More bytes of data streams a frame were asked for than the rate
+    /// brings each frame beyond the shortest, `max`.
+    DataStreamTooLong { bytes_per_frame: usize, max: usize },
 }
 
 impl fmt::Display for ConfigError {
@@ -204,6 +241,14 @@ impl fmt::Display for ConfigError {
             Self::AdtsOnly => write!(
                 f,
                 "raw frames have no ADTS header to carry its CRC or flags"
+            ),
+            Self::DataStreamTooLong {
+                bytes_per_frame,
+                max,
+            } => write!(
+                f,
+                "{bytes_per_frame} bytes of data streams a frame exceed the {max} the bitrate \
+                 brings each frame beyond the shortest"
             ),
         }
     }
@@ -244,6 +289,30 @@ mod tests {
             assert_eq!(frame[2] & 0b10, 0b10);
             assert_eq!((frame[3] >> 4) & 0b11, 0b01);
         }
+    }
+
+    #[test]
+    fn a_frame_carries_at_most_what_the_rate_brings_beyond_the_shortest() {
+        let max = config(Framing::Adts)
+            .lower()
+            .unwrap()
+            .max_data_stream_bytes();
+        // 256 bytes a frame, of which the header takes 7, and a pair of
+        // silent channels with its id_syn_ele, ID_END and the data stream
+        // element's fields 71 bits, within 9 bytes with the data.
+        assert_eq!(max, 256 - 7 - 9);
+        for framing in [Framing::Adts, Framing::Raw] {
+            let ok = config(framing).data_stream_bytes_per_frame(max);
+            assert_eq!(ok.check(), Ok(()));
+        }
+        let over = config(Framing::Adts).data_stream_bytes_per_frame(max + 1);
+        assert_eq!(
+            over.check(),
+            Err(ConfigError::DataStreamTooLong {
+                bytes_per_frame: max + 1,
+                max
+            })
+        );
     }
 
     #[test]

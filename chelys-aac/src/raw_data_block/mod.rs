@@ -2,10 +2,13 @@
 // SPDX-License-Identifier: MIT
 
 //! The `raw_data_block()` (Table 12): a frame's coded channels in the
-//! elements `channel_configuration` gives (Table 42), the fill that pads it
-//! to its length, and `ID_END`, byte aligned; and the bits of it that an
+//! elements `channel_configuration` gives (Table 42), any data stream
+//! elements, the fill that pads it to its length, and `ID_END`, byte
+//! aligned, in the order of the example of clause 8.2.4,
+//! `<CPE><DSE><FIL><TERM>`; and the bits of it that an
 //! `adts_error_check()` protects.
 
+pub mod data_stream;
 /// For chelys's tests, and through `internals` for its conformance tests.
 #[cfg(any(test, feature = "unstable"))]
 pub mod decoder;
@@ -24,11 +27,13 @@ use fill::write_fill;
 /// `id_syn_ele` (Table 36).
 const ID_SCE: u32 = 0x0;
 const ID_CPE: u32 = 0x1;
+const ID_DSE: u32 = 0x4;
 const ID_FIL: u32 = 0x6;
 const ID_END: u32 = 0x7;
 
 /// The bits of a `raw_data_block()` of one element besides the element
-/// itself, fill and byte alignment: its `id_syn_ele` and `ID_END`.
+/// itself, data stream elements, fill and byte alignment: its `id_syn_ele`
+/// and `ID_END`.
 pub const OVERHEAD_BITS: u32 = 3 + 3;
 
 /// The bits of an audio channel element that an `adts_error_check()`
@@ -112,22 +117,30 @@ fn write_element(
     protected
 }
 
-/// The bytes of the shortest `raw_data_block()` of `element`: the element
+/// The bytes of the shortest `raw_data_block()` of `element` and
+/// `data_bytes` bytes of data streams: the element, data stream elements
 /// and `ID_END`, byte aligned, without fill.
-pub fn min_len(element: &CodedElement) -> usize {
-    (OVERHEAD_BITS + element.bits()).div_ceil(8) as usize
+pub fn min_len(element: &CodedElement, data_bytes: usize) -> usize {
+    (OVERHEAD_BITS + element.bits() + data_stream::bits(data_bytes)).div_ceil(8) as usize
 }
 
-/// A `raw_data_block()` of `element`, padded with fill elements to `len`
-/// bytes, or to [`min_len`] if that is longer. Fill elements are not
-/// protected (clause 8.1.3.2.1), nor is `ID_END`, nor the bits that align.
+/// A `raw_data_block()` of `element` and data stream elements of `data`,
+/// padded with fill elements to `len` bytes, or to [`min_len`] if that is
+/// longer. Fill elements are not protected (clause 8.1.3.2.1), nor is
+/// `ID_END`, nor the bits that align.
 ///
 /// # Panics
 ///
 /// If the element is not the one `configuration` gives: a caller's error.
-pub fn write(configuration: ChannelConfiguration, element: &CodedElement, len: usize) -> Block {
+pub fn write(
+    configuration: ChannelConfiguration,
+    element: &CodedElement,
+    data: &[u8],
+    len: usize,
+) -> Block {
     let mut w = BitWriter::new();
-    let protected = write_element(&mut w, configuration, element);
+    let mut protected = write_element(&mut w, configuration, element);
+    protected.extend(data_stream::write(&mut w, data));
     // Fill before ID_END to within the bits that byte alignment pads. A
     // block longer than the shortest has room for a byte of fill at least.
     let fill = (8 * len).saturating_sub(w.bit_len() + 3);
@@ -140,7 +153,7 @@ pub fn write(configuration: ChannelConfiguration, element: &CodedElement, len: u
     // complaint; the conformance test is
     // `ffmpeg_decodes_silence_at_every_sample_rate`.
     let bytes = w.into_bytes();
-    debug_assert_eq!(bytes.len(), len.max(min_len(element)));
+    debug_assert_eq!(bytes.len(), len.max(min_len(element, data.len())));
     Block { bytes, protected }
 }
 
@@ -164,34 +177,34 @@ mod tests {
     #[test]
     fn a_silent_mono_block_is_an_sce_and_end() {
         let element = silent(ChannelConfiguration::Mono);
-        let block = write(ChannelConfiguration::Mono, &element, 0).bytes;
+        let block = write(ChannelConfiguration::Mono, &element, &[], 0).bytes;
         let sce = ["0000", "00000000", "00000000000", "000"].concat();
         // ID_SCE, the element and ID_END end on a byte.
         let bits = ["000", &sce, "111"].concat();
         assert_eq!(binary_digits(&block), bits);
-        assert_eq!(min_len(&element), 4);
+        assert_eq!(min_len(&element, 0), 4);
     }
 
     #[test]
     fn a_silent_stereo_block_is_a_cpe_and_end() {
         let element = silent(ChannelConfiguration::Stereo);
-        let block = write(ChannelConfiguration::Stereo, &element, 0).bytes;
+        let block = write(ChannelConfiguration::Stereo, &element, &[], 0).bytes;
         let ics = ["00000000", "00000000000", "000"].concat();
         let cpe = ["0000", "0", &ics, &ics].concat();
         // ID_CPE, the element, ID_END, then zeros to the byte.
         let bits = ["001", &cpe, "111", "0"].concat();
         assert_eq!(binary_digits(&block), bits);
-        assert_eq!(min_len(&element), 7);
+        assert_eq!(min_len(&element, 0), 7);
     }
 
     #[test]
     fn fill_pads_a_block_to_every_longer_length() {
         for configuration in [ChannelConfiguration::Mono, ChannelConfiguration::Stereo] {
             let element = silent(configuration);
-            let shortest = min_len(&element);
-            let unfilled = write(configuration, &element, 0).bytes;
+            let shortest = min_len(&element, 0);
+            let unfilled = write(configuration, &element, &[], 0).bytes;
             for len in shortest..shortest + 600 {
-                let block = write(configuration, &element, len).bytes;
+                let block = write(configuration, &element, &[], len).bytes;
                 assert_eq!(block.len(), len, "{configuration:?}");
                 assert_eq!(block[..shortest - 1], unfilled[..shortest - 1]);
             }
@@ -204,7 +217,57 @@ mod tests {
         write(
             ChannelConfiguration::Mono,
             &silent(ChannelConfiguration::Stereo),
+            &[],
             0,
         );
+    }
+
+    /// The test decoder reads the element, the data streams' bytes after
+    /// it, the fill after them and the end, from blocks of every length,
+    /// and each data stream element's bits are protected whole.
+    #[test]
+    fn data_streams_follow_the_element() {
+        use crate::sampling_frequency::SamplingFrequency;
+        use decoder::raw_data_block;
+
+        let data: Vec<u8> = (0..700u32).map(|i| (i * 37) as u8).collect();
+        for configuration in [ChannelConfiguration::Mono, ChannelConfiguration::Stereo] {
+            let element = silent(configuration);
+            for data_len in [0, 1, 254, 255, 510, 511, 700] {
+                let data = &data[..data_len];
+                let shortest = min_len(&element, data_len);
+                for len in [0, shortest, shortest + 1, shortest + 40] {
+                    let block = write(configuration, &element, data, len);
+                    assert_eq!(block.bytes.len(), len.max(shortest));
+                    let read = raw_data_block(&block.bytes, SamplingFrequency::Hz44100);
+                    let carried: Vec<u8> = (read.data_streams.iter())
+                        .flat_map(|stream| {
+                            assert_eq!(stream.element_instance_tag, 0);
+                            assert!(!stream.data_byte_align_flag);
+                            stream.bytes.clone()
+                        })
+                        .collect();
+                    assert_eq!(carried, data);
+                    // The element, its data streams, any fill, ID_END.
+                    let streams = read.data_streams.len();
+                    assert_eq!(read.ids[0], u32::from(element.is_pair()));
+                    assert!(read.ids[1..=streams].iter().all(|&id| id == ID_DSE));
+                    assert!(
+                        read.ids[streams + 1..]
+                            .iter()
+                            .all(|&id| id == ID_FIL || id == ID_END)
+                    );
+                    assert_eq!(read.ids.last(), Some(&ID_END));
+                    let element_protected = if element.is_pair() { 2 } else { 1 };
+                    let protected: Vec<_> = (block.protected[element_protected..].iter())
+                        .map(|p| (p.bits.clone(), p.len))
+                        .collect();
+                    let expected: Vec<_> = (read.data_streams.iter())
+                        .map(|stream| (stream.bits.clone(), None))
+                        .collect();
+                    assert_eq!(protected, expected, "{data_len}, {len}");
+                }
+            }
+        }
     }
 }

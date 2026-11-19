@@ -147,7 +147,7 @@ mod tests {
             flags: Flags::default(),
             protected: true,
         };
-        let block = raw_data_block::write(configuration, element, len);
+        let block = raw_data_block::write(configuration, element, &[], len);
         let mut w = BitWriter::new();
         header.write(&mut w, header.bytes() + block.bytes.len(), 0x55);
         (w.into_bytes(), block)
@@ -213,7 +213,9 @@ mod tests {
     /// `crc_check` of each frame is that of the bits the test decoder finds
     /// in it: the headers, the first 192 bits of the element after its
     /// `id_syn_ele`, zero padded, and of a pair the first 128 of its second
-    /// stream, zero padded; elements long and short among them.
+    /// stream, zero padded, then each data stream element after its
+    /// `id_syn_ele`; elements long and short among them, and frames with
+    /// data streams and without.
     #[test]
     fn each_frame_protects_the_bits_its_elements_start_with() {
         use crate::config::Framing;
@@ -245,10 +247,11 @@ mod tests {
             };
             let channels = vec![input.as_slice(); channel_configuration.channels()];
             let mut stream = Vec::new();
-            let mut encoder = StreamEncoder::new(config);
+            let mut encoder = StreamEncoder::new(config).with_data_stream(20);
+            encoder.push_data_stream(&[0xC3; 150]);
             encoder.encode(&channels, &mut stream);
             encoder.finish(&mut stream);
-            let (mut short, mut long) = (false, false);
+            let (mut short, mut long, mut data) = (false, false, 0);
             let mut rest = stream.as_slice();
             while !rest.is_empty() {
                 let frame = adts_frame(rest);
@@ -266,11 +269,16 @@ mod tests {
                 if let Some(second) = block.second_channel_start {
                     protected.push_str(&first(second..block.element_bits.end, 128));
                 }
+                for stream in &block.data_streams {
+                    protected.push_str(&bits[stream.bits.clone()]);
+                    data += stream.bytes.len();
+                }
                 assert_eq!(frame.crc_check, Some(crc_of(&protected)));
                 short |= block.element_bits.len() < 192;
                 long |= block.element_bits.len() > 192 + 128;
             }
             assert!(short && long, "{channel_configuration:?}");
+            assert_eq!(data, 150);
         }
     }
 

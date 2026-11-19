@@ -1,8 +1,8 @@
 // Copyright (c) 2026 StayBlue
 // SPDX-License-Identifier: MIT
 
-//! A frame of coded channels, as long as the bit reservoir allows, framed
-//! as the stream asks.
+//! A frame of coded channels and the data streams it carries, as long as
+//! the bit reservoir allows, framed as the stream asks.
 
 use chelys_core::bitstream::BitWriter;
 
@@ -23,10 +23,11 @@ pub struct Demand {
     pub side_info_bits: u32,
 }
 
-/// The bits of the frame besides its element: its header, the element's
-/// `id_syn_ele`, and `ID_END`.
-fn overhead_bits(config: &StreamConfig) -> u32 {
-    8 * config.header_len() as u32 + raw_data_block::OVERHEAD_BITS
+/// The bits of the frame besides its element, where it carries `data_bits`
+/// of data stream elements: its header, the element's `id_syn_ele`, the
+/// data stream elements, and `ID_END`.
+fn overhead_bits(config: &StreamConfig, data_bits: u32) -> u32 {
+    8 * config.header_len() as u32 + raw_data_block::OVERHEAD_BITS + data_bits
 }
 
 /// `more_bits = bit_allocation - (mean_bits - side_info_bits)` (clause
@@ -42,8 +43,8 @@ fn overhead_bits(config: &StreamConfig) -> u32 {
 /// Spec gap: Annex C does not define `side_info_bits`. They are taken as
 /// the bits of the frame that its channels' noiseless coding does not
 /// take, which the perceptual entropy does not count: the header, the
-/// `raw_data_block()`'s element and end, and each channel's `global_gain`,
-/// `ics_info()` and flags. `mean_bits` is that of the stream as written,
+/// `raw_data_block()`'s element, data stream elements and end, and each
+/// channel's `global_gain`, `ics_info()` and flags. `mean_bits` is that of the stream as written,
 /// headers and all (see [`BitReservoir::new`]), rounded to a whole bit with
 /// `more_bits`.
 ///
@@ -61,44 +62,53 @@ fn overhead_bits(config: &StreamConfig) -> u32 {
 /// away, would be coded without lines, and lose their audio. Taken as 0, a
 /// frame is given the mean, and the reservoir keeps what the loops leave,
 /// for frames that ask for more.
-pub fn more_bits(config: &StreamConfig, demand: &Demand) -> i64 {
+pub fn more_bits(config: &StreamConfig, demand: &Demand, data_bits: u32) -> i64 {
     let mean_bits = f64::from(config.bits_per_second) * FRAME_SAMPLES as f64
         / f64::from(config.sampling_frequency.hz());
-    let side_info_bits = f64::from(overhead_bits(config) + demand.side_info_bits);
+    let side_info_bits = f64::from(overhead_bits(config, data_bits) + demand.side_info_bits);
     ((demand.bit_allocation - (mean_bits - side_info_bits)).round() as i64).max(0)
 }
 
-/// The bits that the frame's element may take in the next frame: those the
-/// reservoir makes available to the frame for its `more_bits` (clause
-/// C.7.3), less its header, the element's `id_syn_ele` and `ID_END`.
-pub fn element_bits(config: &StreamConfig, reservoir: &BitReservoir, demand: &Demand) -> u32 {
-    let available = reservoir.available_bits(more_bits(config, demand));
-    available.saturating_sub(overhead_bits(config))
+/// The bits that the frame's element may take in the next frame, which
+/// carries `data_bits` of data stream elements: those the reservoir makes
+/// available to the frame for its `more_bits` (clause C.7.3), less its
+/// header, the element's `id_syn_ele`, the data stream elements and
+/// `ID_END`.
+pub fn element_bits(
+    config: &StreamConfig,
+    reservoir: &BitReservoir,
+    demand: &Demand,
+    data_bits: u32,
+) -> u32 {
+    let available = reservoir.available_bits(more_bits(config, demand, data_bits));
+    available.saturating_sub(overhead_bits(config, data_bits))
 }
 
-/// Writes the frame of `element`, spends its bits from `reservoir`, and
-/// gives it to `out`: as long as the element takes, or longer, with fill
-/// elements, where the reservoir would otherwise overflow (clause
-/// 8.8.2.2).
+/// Writes the frame of `element` and data stream elements of `data`,
+/// spends its bits from `reservoir`, and gives it to `out`: as long as they
+/// take, or longer, with fill elements, where the reservoir would
+/// otherwise overflow (clause 8.8.2.2).
 ///
 /// # Panics
 ///
-/// If the element takes more bytes than the reservoir allows: a caller's
-/// error.
+/// If the element and data take more bytes than the reservoir allows: a
+/// caller's error.
 pub fn write<O: FrameSink + ?Sized>(
     config: &StreamConfig,
     reservoir: &mut BitReservoir,
     element: &CodedElement,
+    data: &[u8],
     out: &mut O,
 ) {
     let header_len = config.header_len();
     let (shortest, _) = reservoir.frame_len_range();
-    let needed = header_len + raw_data_block::min_len(element);
+    let needed = header_len + raw_data_block::min_len(element, data.len());
     let frame_len = shortest.max(needed);
     reservoir.spend(frame_len);
     let block = raw_data_block::write(
         config.channel_configuration,
         element,
+        data,
         frame_len - header_len,
     );
     match config.adts_header() {
