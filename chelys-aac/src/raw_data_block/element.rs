@@ -78,6 +78,11 @@ impl CodedElement {
         }
     }
 
+    /// The element's channels.
+    pub fn channels(&self) -> &[CodedChannel] {
+        &self.channels
+    }
+
     /// Whether the element is a `channel_pair_element()`.
     pub fn is_pair(&self) -> bool {
         self.channels.len() == 2

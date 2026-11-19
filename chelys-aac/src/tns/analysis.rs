@@ -80,8 +80,10 @@ impl Shaping {
             Transform::Long => {
                 if active[0] {
                     let (filters, gain) = range.shape(spectrum);
+                    if filters.n_filt > 0 {
+                        gains.set(0, gain, range.bands.clone());
+                    }
                     *tns.window_mut(0) = filters;
-                    gains.set(0, gain, range.bands.clone());
                 }
             }
             Transform::Short => {
@@ -91,8 +93,10 @@ impl Shaping {
                 for (w, window) in self.by_window.chunks_exact_mut(lines).enumerate() {
                     if active[w] {
                         let (filters, gain) = range.shape(window);
+                        if filters.n_filt > 0 {
+                            gains.set(w, gain, range.bands.clone());
+                        }
                         *tns.window_mut(w) = filters;
-                        gains.set(w, gain, range.bands.clone());
                     }
                 }
                 if tns.is_present() {

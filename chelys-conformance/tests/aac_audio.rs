@@ -964,6 +964,40 @@ fn a_tone_panned_hard_right_survives_intensity_stereo() {
     }
 }
 
+/// Two steady tones, one in each channel of a pair at 96 kHz and 19.5
+/// kbit/s, too few bits for the filters of temporal noise shaping and the
+/// lines of both, decode in every block: filters that would leave a
+/// channel no line are dropped.
+#[test]
+fn a_tone_keeps_its_lines_beside_filters_it_cannot_afford() {
+    let sample_rate = 96_000;
+    let fs = f64::from(sample_rate);
+    let len = 2 * sample_rate as usize;
+    let tone = |frequency: f64, level: f64| -> Vec<f64> {
+        (0..len)
+            .map(|t| level * (TAU * frequency * t as f64 / fs).sin())
+            .collect()
+    };
+    let input = [tone(2131.0, 0.5), tone(3021.0, 1.0)];
+    for bits_per_second in [19_500, 22_000] {
+        let context = format!("{bits_per_second} bit/s");
+        let encoded = encode(sample_rate, &input, bits_per_second);
+        let output = decode(&encoded, 2, &context);
+        for c in 0..2 {
+            let decoded: Vec<f64> = (output.iter().skip(c).step_by(2))
+                .map(|&y| f64::from(y))
+                .collect();
+            // Each block of the input, but the first two and the last, past
+            // the onset and before the end.
+            for block in 2..len / 1024 - 1 {
+                let samples = &decoded[DELAY + 1024 * block..][..1024];
+                let rms = (samples.iter().map(|y| y * y).sum::<f64>() / 1024.0).sqrt();
+                assert!(rms > 0.15, "{context}, channel {c}, block {block}: {rms}");
+            }
+        }
+    }
+}
+
 /// Transient signals for temporal noise shaping, each at `sample_rate` for
 /// `len` samples, with the samples at which its attacks set in: clicks of
 /// noise that die away within a few milliseconds over a quiet tone, as of

@@ -13,7 +13,6 @@ use crate::noiseless::scalefactors;
 use crate::noiseless::sections::{self, IntensityBands, Sections};
 use crate::noiseless::spectrum;
 use crate::scalefactor_bands::{GroupBands, MAX_BANDS};
-use crate::tns::Tns;
 
 use super::ChannelCoding;
 
@@ -565,17 +564,6 @@ pub fn inner_loop(counting: &mut Counting, start: u8, change: i32) -> Option<u8>
 /// of frames of channels without lines (see
 /// [`StreamConfig::min_bits_per_second`](crate::stream::StreamConfig::min_bits_per_second)).
 ///
-/// Spec gap: nor does it say what to do where the bits of the channel's
-/// temporal noise shaping leave no room even for the channel without
-/// lines. The element shapes no channel where its channels without lines
-/// would not fit in the fewest bits the frame is given (see
-/// `ElementEncoder::prepare`),
-/// but a pair's channels share its bits unevenly. Where it happens, the
-/// channel is coded without lines and without filters, which decodes alike
-/// where its lines decode to zero: a single channel, or a pair's bands
-/// coded as left and right; in a pair's bands coded as middle and side,
-/// the channel takes the other's lines unshaped.
-///
 /// # Panics
 ///
 /// If not even a channel without lines fits in the available bits: a
@@ -589,10 +577,6 @@ pub fn first_inner_loop(counting: &mut Counting) -> (u8, usize) {
         if counting.count_at(u8::MAX, band_limit) {
             return (u8::MAX, band_limit);
         }
-    }
-    counting.coding.tns = &Tns::NONE;
-    if counting.count_at(u8::MAX, 0) {
-        return (u8::MAX, 0);
     }
     panic!(
         "not even a channel without lines fits in {} bits",

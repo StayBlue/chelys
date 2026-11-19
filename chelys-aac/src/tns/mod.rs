@@ -136,6 +136,7 @@ impl WindowFilters {
 /// How far the decoder's filters raise the quantization noise of the
 /// lines of each window that they span: the mean power gain of each
 /// window's filter (see [`analysis::Shaping::shape`]), 1 where it has none.
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct NoiseGains {
     /// Each window's gain, and the bands its filter spans.
@@ -147,6 +148,12 @@ impl NoiseGains {
     pub const NONE: Self = Self {
         windows: [(1.0, 0, 0); SHORT_WINDOWS],
     };
+
+    /// The bands that window `w`'s filter spans: none where it has none.
+    pub fn bands(&self, w: usize) -> std::ops::Range<usize> {
+        let (_, from, to) = self.windows[w];
+        usize::from(from)..usize::from(to)
+    }
 
     /// Window `w`'s filter raises the noise of `bands` by `gain`.
     pub fn set(&mut self, w: usize, gain: f64, bands: std::ops::Range<usize>) {

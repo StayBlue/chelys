@@ -166,6 +166,11 @@ impl CodedChannel {
         &self.tns
     }
 
+    /// The quantized lines in the order they are sent.
+    pub fn lines(&self) -> &[i32; FRAME_LINES] {
+        &self.lines
+    }
+
     /// `max_sfb`: the scalefactor bands each group sends.
     pub fn max_sfb(&self) -> usize {
         self.groups[0].sections.max_sfb()

@@ -322,8 +322,7 @@ impl StreamEncoder {
         self.element
             .look_ahead(start + FRAME_SAMPLES, self.block_switching);
         let afford_short = self.affords_short();
-        let least_bits = frame::least_element_bits(&self.config, &self.reservoir);
-        self.element.prepare(start, afford_short, least_bits);
+        self.element.prepare(start, afford_short);
         let demand = self.element.demand();
         let available_bits = frame::element_bits(&self.config, &self.reservoir, &demand);
         let element = self.element.quantize(available_bits);
@@ -457,8 +456,9 @@ mod tests {
     #[test]
     fn tns_can_be_turned_off() {
         use crate::noiseless::decoder::{BitReader, element};
-        let config = config(Framing::Raw, 64_000);
-        // A click in each of the frames, coded with long windows.
+        let config = config(Framing::Raw, 192_000);
+        // A click in each of the frames, coded with long windows, in bits
+        // enough to code some of its lines.
         let mut input = vec![0.0; 8 * FRAME_SAMPLES];
         for frame in 0..8 {
             input[frame * FRAME_SAMPLES + 300] = 0.9;

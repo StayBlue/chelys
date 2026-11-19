@@ -73,6 +73,9 @@ pub struct PreparedChannel {
     /// distortion (see
     /// [`Lines::weighted`](crate::loops::inner::Lines::weighted)).
     pub weights: Box<[f64; FRAME_LINES]>,
+    /// How far the decoder's filters raise the noise of each window's
+    /// bands, and the bands they span.
+    pub gains: NoiseGains,
     /// The allowed distortion `xmin` of each band of each window group,
     /// raised by [`XMIN_OFFSET_DB`](loops::XMIN_OFFSET_DB) as the loops take
     /// it.
@@ -94,6 +97,7 @@ impl PreparedChannel {
             tns: Tns::NONE,
             unshaped: Box::new([0.0; FRAME_LINES]),
             weights: Box::new([1.0; FRAME_LINES]),
+            gains: NoiseGains::NONE,
             xmin: Vec::with_capacity(SHORT_WINDOWS),
             bit_allocation: 0.0,
             perceptual_entropy: 0.0,
@@ -308,9 +312,9 @@ impl ElementEncoder {
     /// (see [`SHARED_ATTACKS`]), so that their window sequences, chosen
     /// alike from the same state, are the same, and where they are short,
     /// their grouping is chosen from both (see [`switching::grouping`]).
-    pub fn prepare(&mut self, start: usize, afford_short: bool, least_bits: u32) {
+    pub fn prepare(&mut self, start: usize, afford_short: bool) {
         self.spectra(start, afford_short);
-        self.temporal_noise_shaping(least_bits);
+        self.temporal_noise_shaping();
         self.thresholds();
         self.joint();
         self.find_silence();
@@ -388,8 +392,7 @@ impl ElementEncoder {
 
     /// Each channel's lines shaped in time by the filters of temporal noise
     /// shaping (see [`Shaping::shape`]), and the filters that shaped them,
-    /// where the element's channels without lines, with their filters,
-    /// fit in `least_bits`, the fewest the frame is given.
+    /// which [`quantize`](Self::quantize) may yet drop.
     ///
     /// Spec reading: this deliberately departs from clause C.5, which
     /// shapes every window whose prediction gain exceeds the threshold,
@@ -403,12 +406,6 @@ impl ElementEncoder {
     /// dB, against more than 10 dB unshaped (the conformance test
     /// `a_tone_beside_silence_decodes_alike_in_either_channel`).
     ///
-    /// Spec gap: Annex C does not count the bits of `tns_data()` against
-    /// the frame's, which near the lowest bitrates, set by frames of
-    /// channels without lines or filters, may not pay for them. Where the
-    /// element's channels could not be coded even without lines, their
-    /// lines are not shaped.
-    ///
     /// Spec gap: the decoder applies the right channel's filters to its
     /// bands in intensity stereo, after it has taken them from the left
     /// channel's lines as they were sent (clause 4, figure 2), which the
@@ -417,7 +414,7 @@ impl ElementEncoder {
     /// is coded in intensity stereo, the filters of both channels end below
     /// its first band in intensity stereo: the left channel sends the
     /// bands above unfiltered, and the right channel takes them so.
-    fn temporal_noise_shaping(&mut self, least_bits: u32) {
+    fn temporal_noise_shaping(&mut self) {
         let fs = self.sampling_frequency;
         let top = self.intensity_from();
         for (channel, prepared) in self.channels.iter().zip(&mut self.prepared) {
@@ -432,16 +429,8 @@ impl ElementEncoder {
                 let spectrum = &mut prepared.spectrum;
                 prepared.tns = (self.shaping).shape(windows, fs, top, spectrum, active, &mut gains);
             }
+            prepared.gains = gains;
             gains.weights(prepared.windows, fs, &mut prepared.weights);
-        }
-        let fields = CodedElement::fields_bits(self.channels(), self.common_windows());
-        let channels: u32 = self.prepared.iter().map(|c| self.silent_bits(c)).sum();
-        if fields + channels > least_bits {
-            for prepared in &mut self.prepared {
-                prepared.spectrum.copy_from_slice(&*prepared.unshaped);
-                prepared.tns = Tns::NONE;
-                prepared.weights.fill(1.0);
-            }
         }
     }
 
@@ -622,8 +611,167 @@ impl ElementEncoder {
     }
 
     /// Quantizes the frame prepared in `available_bits`, the bits of the
-    /// element.
+    /// element, keeping the filters of each channel's temporal noise
+    /// shaping where it pays for them.
     ///
+    /// Spec gap: Annex C does not count the bits of `tns_data()` against
+    /// the channel's, nor say what to do where they leave its lines no room.
+    /// The filters of a channel are dropped, and its lines coded unshaped,
+    /// where the channels without lines, with their filters, do not fit in
+    /// the element's bits, or the channel's share of them (see
+    /// [`code_element`](Self::code_element)); and where, coded, the filters
+    /// shape no line that the channel sends: where its loops left all the
+    /// lines of the bands they span zero, or sent none of those bands. One
+    /// such channel, a tone of 2131 Hz at 96 kHz in a pair at 19.5 kbit/s,
+    /// whose filters took most of its bits, decoded to silence in most
+    /// frames (the conformance test
+    /// `a_tone_keeps_its_lines_beside_filters_it_cannot_afford`).
+    pub fn quantize(&mut self, available_bits: u32) -> CodedElement {
+        let fields = CodedElement::fields_bits(self.channels(), self.common_windows());
+        let lineless: u32 = self.prepared.iter().map(|c| self.silent_bits(c)).sum();
+        if fields + lineless > available_bits {
+            for c in 0..self.prepared.len() {
+                self.unshape(c);
+            }
+        }
+        for c in 0..self.prepared.len() {
+            if !self.prepared[c].silent
+                && self.share(available_bits) < self.silent_bits(&self.prepared[c])
+            {
+                self.unshape(c);
+            }
+        }
+        let element = self.code_element(available_bits);
+        let mut idle = [false; 2];
+        for (c, idle) in idle.iter_mut().enumerate().take(self.prepared.len()) {
+            *idle = self.prepared[c].tns.is_present() && !self.shapes_lines(&element, c);
+        }
+        if !idle.contains(&true) {
+            return element;
+        }
+        for c in (0..self.prepared.len()).filter(|&c| idle[c]) {
+            self.unshape(c);
+        }
+        self.code_element(available_bits)
+    }
+
+    /// The bits of each channel of the frame that is not silent (see
+    /// [`code_element`](Self::code_element)).
+    fn share(&self, available_bits: u32) -> u32 {
+        let fields = CodedElement::fields_bits(self.channels(), self.common_windows());
+        let reserved: u32 = (self.prepared.iter())
+            .filter(|c| c.silent)
+            .map(|c| self.silent_bits(c))
+            .sum();
+        let coded = self.prepared.iter().filter(|c| !c.silent).count() as u32;
+        (available_bits.saturating_sub(fields))
+            .saturating_sub(reserved)
+            .checked_div(coded)
+            .unwrap_or(0)
+    }
+
+    /// Whether channel `c`'s filters, as `element` codes it, shape any line
+    /// it sends: whether a band they span, below its `max_sfb`, has a line
+    /// that is not zero, its own or, in a band coded as middle and side,
+    /// its pair's.
+    fn shapes_lines(&self, element: &CodedElement, c: usize) -> bool {
+        let fs = self.sampling_frequency;
+        let channels = element.channels();
+        let gains = &self.prepared[c].gains;
+        let windows = channels[c].windows();
+        let max_sfb = channels[c].max_sfb();
+        let mut first = 0;
+        let groups = windows.groups_with_start(fs).enumerate();
+        for (g, (start, bands)) in groups {
+            for w in 0..bands.windows() {
+                let filtered = gains.bands(first + w);
+                for sfb in filtered.start..filtered.end.min(max_sfb) {
+                    let range = bands.window_band(w, sfb);
+                    let range = start + range.start..start + range.end;
+                    let paired = self.common_window && self.ms.is_used(g, sfb);
+                    let sends = |channel: &CodedChannel| {
+                        channel.lines()[range.clone()].iter().any(|&q| q != 0)
+                    };
+                    if sends(&channels[c]) || (paired && sends(&channels[1 - c])) {
+                        return true;
+                    }
+                }
+            }
+            first += bands.windows();
+        }
+        false
+    }
+
+    /// Drops channel `c`'s filters of temporal noise shaping, and puts its
+    /// lines as the filterbank gave them in place of the shaped ones: in a
+    /// band coded as middle and side, the middle and side of its unshaped
+    /// lines and its pair's as they are coded. The bands in intensity
+    /// stereo, which no filter spans, are left as they are.
+    fn unshape(&mut self, c: usize) {
+        if !self.prepared[c].tns.is_present() {
+            return;
+        }
+        let fs = self.sampling_frequency;
+        let windows = self.prepared[c].windows;
+        let common = self.common_window;
+        for (g, (start, bands)) in windows.groups_with_start(fs).enumerate() {
+            for sfb in 0..bands.num_swb() {
+                let band = bands.band(sfb);
+                let range = start + band.start..start + band.end;
+                if common && self.intensity.bands[g].codebook(sfb).is_some() {
+                    continue;
+                }
+                if common && self.ms.is_used(g, sfb) {
+                    let [left, right] = &mut self.prepared[..] else {
+                        unreachable!("a pair")
+                    };
+                    for i in range {
+                        let (m, s) = (left.spectrum[i], right.spectrum[i]);
+                        let mut lr = [m + s, m - s];
+                        lr[c] = if c == 0 {
+                            left.unshaped[i]
+                        } else {
+                            right.unshaped[i]
+                        };
+                        left.spectrum[i] = (lr[0] + lr[1]) / 2.0;
+                        right.spectrum[i] = (lr[0] - lr[1]) / 2.0;
+                    }
+                } else {
+                    let prepared = &mut self.prepared[c];
+                    prepared.spectrum[range.clone()].copy_from_slice(&prepared.unshaped[range]);
+                }
+            }
+        }
+        let prepared = &mut self.prepared[c];
+        prepared.tns = Tns::NONE;
+        prepared.gains = NoiseGains::NONE;
+        self.weigh();
+        self.find_silence();
+    }
+
+    /// Each channel's weights from its filters' gains, those of a band
+    /// coded as middle and side the larger of the pair's.
+    fn weigh(&mut self) {
+        let fs = self.sampling_frequency;
+        for prepared in &mut self.prepared {
+            let gains = prepared.gains;
+            gains.weights(prepared.windows, fs, &mut prepared.weights);
+        }
+        if let ([left, right], true) = (&mut self.prepared[..], self.common_window) {
+            for (g, (start, bands)) in left.windows.groups_with_start(fs).enumerate() {
+                for sfb in 0..bands.num_swb() {
+                    if self.ms.is_used(g, sfb) && self.intensity.bands[g].codebook(sfb).is_none() {
+                        let band = bands.band(sfb);
+                        for i in start + band.start..start + band.end {
+                            let weight = left.weights[i].max(right.weights[i]);
+                            (left.weights[i], right.weights[i]) = (weight, weight);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Spec gap: Annex C does not say how the bits of a frame are shared
     /// between its channels, whose loops each fit one channel's lines to the
     /// bits they are given (clause C.7.1). A silent channel is given what it
@@ -659,19 +807,10 @@ impl ElementEncoder {
     /// # Panics
     ///
     /// If `available_bits` do not pay for the element's channels without
-    /// lines: a caller's error.
-    pub fn quantize(&self, available_bits: u32) -> CodedElement {
+    /// lines, with their filters: a caller's error.
+    fn code_element(&self, available_bits: u32) -> CodedElement {
         let fs = self.sampling_frequency;
-        let fields = CodedElement::fields_bits(self.channels(), self.common_windows());
-        let reserved: u32 = (self.prepared.iter())
-            .filter(|c| c.silent)
-            .map(|c| self.silent_bits(c))
-            .sum();
-        let coded = self.prepared.iter().filter(|c| !c.silent).count() as u32;
-        let share = (available_bits.saturating_sub(fields))
-            .saturating_sub(reserved)
-            .checked_div(coded)
-            .unwrap_or(0);
+        let share = self.share(available_bits);
         let budget = |c: &PreparedChannel| {
             if c.silent { self.silent_bits(c) } else { share }
         };
@@ -900,7 +1039,7 @@ mod tests {
             let original: Vec<Vec<f64>> = (encoder.prepared.iter())
                 .map(|prepared| prepared.spectrum.to_vec())
                 .collect();
-            encoder.temporal_noise_shaping(u32::MAX);
+            encoder.temporal_noise_shaping();
             encoder.thresholds();
             encoder.joint();
             encoder.find_silence();
@@ -1215,7 +1354,7 @@ mod tests {
         let mut start = 0;
         while encoder.buffered() - start >= 2 * FRAME_SAMPLES {
             encoder.look_ahead(start + FRAME_SAMPLES, true);
-            encoder.prepare(start, true, u32::MAX);
+            encoder.prepare(start, true);
             encoder.second_channel.set(None);
             let coded = encoder.quantize(bits);
             assert!(coded.bits() <= bits);
