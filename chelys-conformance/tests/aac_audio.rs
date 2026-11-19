@@ -219,9 +219,7 @@ fn ffmpeg_decodes_the_input_a_frame_late_at_every_sample_rate() {
             let output = decode(&encoded, channels, &context);
             for (c, input) in input.iter().enumerate() {
                 let (lag, snr) = align(input, &output, channels, c);
-                if false {
-                    assert_eq!(lag, DELAY);
-                }
+                assert_eq!(lag, DELAY, "{context}, channel {c}: {snr:.1} dB");
                 assert!(snr > 7.0, "{context}, channel {c}: {snr:.1} dB");
             }
         }
