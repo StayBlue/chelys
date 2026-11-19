@@ -121,11 +121,11 @@ pub fn code(
     [left_xmin, right_xmin]: [&mut [[f64; MAX_BANDS]]; 2],
 ) -> Intensity {
     let mut intensity = Intensity::NONE;
-    let mut start = 0;
-    for (g, bands) in windows.groups(sampling_frequency).enumerate() {
+    for (g, (start, bands)) in windows.groups_with_start(sampling_frequency).enumerate() {
+        let left = &mut left[start..start + bands.lines()];
+        let right = &mut right[start..start + bands.lines()];
         for sfb in first.min(bands.num_swb())..bands.num_swb() {
-            let range = start + bands.offset(sfb)..start + bands.offset(sfb + 1);
-            let (l, r) = (&mut left[range.clone()], &mut right[range]);
+            let (l, r) = (&mut left[bands.band(sfb)], &mut right[bands.band(sfb)]);
             let energy = |lines: &[f64]| lines.iter().map(|x| x * x).sum::<f64>();
             let (el, er) = (energy(l), energy(r));
             if el == 0.0 || er == 0.0 {
@@ -154,7 +154,6 @@ pub fn code(
                 left_xmin[g][sfb] = left_xmin[g][sfb].min(right_xmin[g][sfb] * el / er);
             }
         }
-        start += bands.lines();
     }
     intensity
 }

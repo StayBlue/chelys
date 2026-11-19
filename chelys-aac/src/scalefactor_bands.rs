@@ -9,6 +9,8 @@
 //! last band, the window's line count, at the end; its length is thus
 //! `num_swb + 1`.
 
+use std::ops::Range;
+
 use crate::sampling_frequency::SamplingFrequency;
 
 /// The two transform lengths (clause 8.3.3): the 1024 lines of a
@@ -113,7 +115,6 @@ impl GroupBands {
     }
 
     /// The windows of the group: 1 for a long window.
-    #[cfg(any(test, feature = "unstable"))]
     pub fn windows(self) -> usize {
         usize::from(self.windows)
     }
@@ -131,9 +132,93 @@ impl GroupBands {
         usize::from(self.swb_offsets[sfb]) * usize::from(self.windows)
     }
 
+    /// The group's lines in band `sfb`, in the order they are sent:
+    /// `sect_sfb_offset[g][sfb]` to `sect_sfb_offset[g][sfb + 1]`.
+    pub fn band(self, sfb: usize) -> Range<usize> {
+        self.offset(sfb)..self.offset(sfb + 1)
+    }
+
+    /// The lines of band `sfb` of the group's window `w`, among the
+    /// group's lines in the order they are sent (clause 8.3.5): each band
+    /// holds that band of each of the group's windows in turn.
+    pub fn window_band(self, w: usize, sfb: usize) -> Range<usize> {
+        let window = self.window_offset(sfb)..self.window_offset(sfb + 1);
+        let start = self.offset(sfb) + w * window.len();
+        start..start + window.len()
+    }
+
+    /// `swb_offset[sfb]`: the first line of band `sfb` within each window,
+    /// in ascending frequency.
+    fn window_offset(self, sfb: usize) -> usize {
+        usize::from(self.swb_offsets[sfb])
+    }
+
     /// The group's lines: 1024, or 128 for each short window.
     pub fn lines(self) -> usize {
         self.offset(self.num_swb())
+    }
+}
+
+/// Each scalefactor band of each window of the window groups `groups`,
+/// those of one frame in turn: its lines among the frame's in the order
+/// they are sent (clause 8.3.5), and among them window by window, each
+/// window's in ascending frequency, as `spec[w][k]` holds them (the
+/// `quant_to_spec()` of clause 8.3.5).
+fn band_places(
+    groups: impl IntoIterator<Item = GroupBands>,
+) -> impl Iterator<Item = (Range<usize>, Range<usize>)> {
+    let (mut start, mut first_window) = (0, 0);
+    groups.into_iter().flat_map(move |bands| {
+        let (group_start, group_window) = (start, first_window);
+        start += bands.lines();
+        first_window += bands.windows();
+        let window_lines = bands.transform.lines();
+        (0..bands.num_swb()).flat_map(move |sfb| {
+            (0..bands.windows()).map(move |w| {
+                let sent = bands.window_band(w, sfb);
+                let window = (group_window + w) * window_lines + bands.window_offset(sfb);
+                let len = sent.len();
+                (
+                    group_start + sent.start..group_start + sent.end,
+                    window..window + len,
+                )
+            })
+        })
+    })
+}
+
+/// Puts a frame's lines `by_window`, window by window, each window's lines
+/// in ascending frequency (`spec[w][k]`, as the decoder's
+/// `quant_to_spec()` of clause 8.3.5 gives them), into `sent`, in the
+/// window groups `groups` in the order they are sent (clause 8.3.5).
+///
+/// # Panics
+///
+/// If the slices are shorter than the groups' lines: a caller's error.
+pub fn interleave<T: Copy>(
+    groups: impl IntoIterator<Item = GroupBands>,
+    by_window: &[T],
+    sent: &mut [T],
+) {
+    for (sent_band, window_band) in band_places(groups) {
+        sent[sent_band].copy_from_slice(&by_window[window_band]);
+    }
+}
+
+/// The inverse of [`interleave`]: puts a frame's lines `sent`, in the
+/// order they are sent, into `by_window`, window by window.
+///
+/// # Panics
+///
+/// As [`interleave`].
+#[cfg(test)]
+pub fn deinterleave<T: Copy>(
+    groups: impl IntoIterator<Item = GroupBands>,
+    sent: &[T],
+    by_window: &mut [T],
+) {
+    for (sent_band, window_band) in band_places(groups) {
+        by_window[window_band].copy_from_slice(&sent[sent_band]);
     }
 }
 
@@ -279,6 +364,73 @@ mod tests {
             (Transform::Long, Transform::Short)
         );
         assert_eq!((group.offset(13), group.lines()), (3 * 112, 3 * 128));
+    }
+
+    #[test]
+    fn a_window_band_lies_within_its_groups_band() {
+        // Table 46: band 1 holds lines 4 to 7 of each window.
+        let group = GroupBands::short(SamplingFrequency::Hz48000, 3);
+        assert_eq!(group.band(1), 12..24);
+        assert_eq!(group.window_band(0, 1), 12..16);
+        assert_eq!(group.window_band(2, 1), 20..24);
+        let long = GroupBands::long(SamplingFrequency::Hz48000);
+        assert_eq!((long.band(11), long.window_band(0, 11)), (48..56, 48..56));
+    }
+
+    /// `quant_to_spec()` of clause 8.3.5, transcribed.
+    fn quant_to_spec(offsets: &[u16], lengths: &[usize], x_quant: &[u32]) -> Vec<u32> {
+        let mut spec = vec![0; 1024];
+        let (mut k, mut i) = (0, 0);
+        for &len in lengths {
+            let mut j = 0;
+            for sfb in 0..offsets.len() - 1 {
+                let width = usize::from(offsets[sfb + 1] - offsets[sfb]);
+                for win in 0..len {
+                    for bin in 0..width {
+                        spec[(win + k) * 128 + bin + j] = x_quant[i];
+                        i += 1;
+                    }
+                }
+                j += width;
+            }
+            k += len;
+        }
+        spec
+    }
+
+    #[test]
+    fn lines_go_to_their_windows_and_back_as_quant_to_spec_has_them() {
+        use crate::window::{Grouping, WindowSequence, WindowShape, Windows};
+        let sent: Vec<u32> = (0..1024).collect();
+        for fs in [
+            SamplingFrequency::Hz8000,
+            SamplingFrequency::Hz44100,
+            SamplingFrequency::Hz96000,
+        ] {
+            for bits in [0u8, 0xff, 0b0110_1001] {
+                let grouping = Grouping::from_starts(std::array::from_fn(|w| bits & (1 << w) != 0));
+                let windows = Windows {
+                    sequence: WindowSequence::EightShort { grouping },
+                    shape: WindowShape::Sine,
+                };
+                let lengths: Vec<usize> = grouping.lengths().collect();
+                let offsets = swb_offsets(fs, Transform::Short);
+                let mut by_window = vec![0; 1024];
+                deinterleave(windows.groups(fs), &sent, &mut by_window);
+                assert_eq!(
+                    by_window,
+                    quant_to_spec(offsets, &lengths, &sent),
+                    "{fs:?} {bits:08b}"
+                );
+                let mut back = vec![0; 1024];
+                interleave(windows.groups(fs), &by_window, &mut back);
+                assert_eq!(back, sent);
+            }
+            // A long window's lines are in order either way.
+            let mut by_window = vec![0; 1024];
+            deinterleave(Windows::LONG_SINE.groups(fs), &sent, &mut by_window);
+            assert_eq!(by_window, sent);
+        }
     }
 
     #[test]

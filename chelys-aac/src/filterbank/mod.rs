@@ -14,7 +14,7 @@ pub mod windows;
 
 use crate::channel::FRAME_LINES;
 use crate::sampling_frequency::SamplingFrequency;
-use crate::scalefactor_bands::{GroupBands, Transform};
+use crate::scalefactor_bands::{Transform, interleave};
 use crate::stream::FRAME_SAMPLES;
 use crate::window::{SHORT_WINDOWS, WindowSequence, WindowShape, Windows};
 use mdct::Mdct;
@@ -56,9 +56,9 @@ pub const PCM_SCALE: f64 = 32_768.0;
 pub struct Filterbank {
     long: Mdct,
     short: Mdct,
-    /// The bands of one short window, by which the lines of a group of
-    /// short windows are interleaved.
-    short_bands: GroupBands,
+    /// By whose bands the lines of a group of short windows are
+    /// interleaved.
+    sampling_frequency: SamplingFrequency,
     /// The samples of the block before, at [`PCM_SCALE`].
     previous: Box<[f64; FRAME_SAMPLES]>,
     /// The windows of the frame before, `None` before the first frame.
@@ -84,7 +84,7 @@ impl Filterbank {
         Self {
             long: Mdct::new(LONG_WINDOW),
             short: Mdct::new(SHORT_WINDOW),
-            short_bands: GroupBands::short(sampling_frequency, 1),
+            sampling_frequency,
             previous: Box::new([0.0; FRAME_SAMPLES]),
             previous_windows: None,
             samples: Box::new([0.0; LONG_WINDOW]),
@@ -135,27 +135,12 @@ impl Filterbank {
         self.previous_windows = Some(windows);
 
         match windows.sequence {
-            WindowSequence::EightShort { grouping } => {
+            WindowSequence::EightShort { .. } => {
                 self.eight_short(left_shape, windows.shape);
                 // Interleave the windows' lines, group by group (clause
                 // C.8.4).
-                let bands = self.short_bands;
-                let mut out = lines.iter_mut();
-                let mut first = 0;
-                for len in grouping.lengths() {
-                    for sfb in 0..bands.num_swb() {
-                        let band = bands.offset(sfb)..bands.offset(sfb + 1);
-                        for w in first..first + len {
-                            let window = &self.by_window[w * SHORT_LINES..][..SHORT_LINES];
-                            // The band's lines first, so that the zip
-                            // takes no line past them.
-                            for (&x, out) in window[band.clone()].iter().zip(&mut out) {
-                                *out = x;
-                            }
-                        }
-                    }
-                    first += len;
-                }
+                let groups = windows.groups(self.sampling_frequency);
+                interleave(groups, &*self.by_window, lines);
             }
             sequence => {
                 self.long_window(sequence, left_shape, windows.shape);
@@ -344,27 +329,14 @@ mod tests {
             let left = |n_len: usize, n: usize| decoder_window(previous, n_len, n);
             let right = |n_len: usize, n: usize| decoder_window(shape, n_len, n);
             let z: Vec<f64> = match windows.sequence {
-                WindowSequence::EightShort { grouping } => {
+                WindowSequence::EightShort { .. } => {
                     // De-interleave (clause 8.3.5): groups in order, within
                     // each a band of every window of the group in turn.
-                    let offsets = crate::scalefactor_bands::swb_offsets(self.fs, Transform::Short);
-                    let mut by_window = [[0.0; 128]; 8];
-                    let mut i = 0;
-                    let mut first = 0;
-                    for len in grouping.lengths() {
-                        for band in offsets.windows(2) {
-                            for window in &mut by_window[first..first + len] {
-                                let band = usize::from(band[0])..usize::from(band[1]);
-                                for line in &mut window[band] {
-                                    *line = spec[i];
-                                    i += 1;
-                                }
-                            }
-                        }
-                        first += len;
-                    }
+                    let mut lines = [0.0; 1024];
+                    let groups = windows.groups(self.fs);
+                    crate::scalefactor_bands::deinterleave(groups, spec, &mut lines);
                     let mut z = vec![0.0; 2048];
-                    for (j, spec) in by_window.iter().enumerate() {
+                    for (j, spec) in lines.chunks_exact(128).enumerate() {
                         let x = imdct(spec);
                         for (n, x) in x.iter().enumerate() {
                             let w = match (j, n < 128) {

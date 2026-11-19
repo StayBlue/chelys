@@ -425,13 +425,13 @@ impl ElementEncoder {
             allowed.each_ref().map(|allowed| &allowed[..groups]),
             &self.intensity,
         );
-        let mut start = 0;
         let mut lines_mid_side = 0;
-        for (g, bands) in windows.groups(fs).enumerate() {
+        for (g, (start, bands)) in windows.groups_with_start(fs).enumerate() {
             for sfb in 0..bands.num_swb() {
                 let intensity = self.intensity.bands[g].codebook(sfb).is_some();
                 if self.ms.is_used(g, sfb) && !intensity {
-                    let range = start + bands.offset(sfb)..start + bands.offset(sfb + 1);
+                    let band = bands.band(sfb);
+                    let range = start + band.start..start + band.end;
                     lines_mid_side += range.len();
                     left.spectrum[range.clone()].copy_from_slice(&mid.spectrum[range.clone()]);
                     right.spectrum[range.clone()].copy_from_slice(&side.spectrum[range]);
@@ -439,7 +439,6 @@ impl ElementEncoder {
                     right.xmin[g][sfb] = side.xmin[g][sfb];
                 }
             }
-            start += bands.lines();
         }
         if 2 * lines_mid_side >= FRAME_LINES {
             for (coded, mid_side) in [left, right].into_iter().zip([&*mid, &*side]) {

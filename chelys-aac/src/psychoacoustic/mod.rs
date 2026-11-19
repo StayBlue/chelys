@@ -503,6 +503,7 @@ pub struct Analysis {
     /// the next over the frame's eight, from the last of the frame before,
     /// by which [`switching`] finds an attack.
     pub entropy_rise: f64,
+    sampling_frequency: SamplingFrequency,
 }
 
 impl Analysis {
@@ -514,6 +515,7 @@ impl Analysis {
                 Threshold::new(GroupBands::short(sampling_frequency, 1))
             }),
             entropy_rise: 0.0,
+            sampling_frequency,
         }
     }
 
@@ -570,35 +572,22 @@ impl Analysis {
     ) {
         let energy = |lines: &[f64]| -> f64 { lines.iter().map(|x| x * x).sum() };
         xmin.clear();
-        match windows.sequence {
-            WindowSequence::EightShort { grouping } => {
-                let mut start = 0;
-                let mut first = 0;
-                for len in grouping.lengths() {
-                    let mut group = [0.0; MAX_BANDS];
-                    let bands = self.short[0].bands;
-                    for (n, xmin) in group[..bands.num_swb()].iter_mut().enumerate() {
-                        let width = bands.offset(n + 1) - bands.offset(n);
-                        let band = start + bands.offset(n) * len;
-                        for (i, threshold) in self.short[first..first + len].iter().enumerate() {
-                            let lines = &spectrum[band + i * width..][..width];
-                            *xmin += threshold.xmin(n, energy(lines));
-                        }
-                    }
-                    xmin.push(group);
-                    start += bands.lines() * len;
-                    first += len;
+        let thresholds = match windows.sequence.transform() {
+            Transform::Long => std::slice::from_ref(&self.long),
+            Transform::Short => &self.short[..],
+        };
+        let mut first = 0;
+        for (start, bands) in windows.groups_with_start(self.sampling_frequency) {
+            let lines = &spectrum[start..start + bands.lines()];
+            let thresholds = &thresholds[first..first + bands.windows()];
+            let mut group = [0.0; MAX_BANDS];
+            for (n, xmin) in group[..bands.num_swb()].iter_mut().enumerate() {
+                for (w, threshold) in thresholds.iter().enumerate() {
+                    *xmin += threshold.xmin(n, energy(&lines[bands.window_band(w, n)]));
                 }
             }
-            _ => {
-                let bands = self.long.bands;
-                let mut group = [0.0; MAX_BANDS];
-                for (n, xmin) in group[..bands.num_swb()].iter_mut().enumerate() {
-                    let lines = &spectrum[bands.offset(n)..bands.offset(n + 1)];
-                    *xmin = self.long.xmin(n, energy(lines));
-                }
-                xmin.push(group);
-            }
+            xmin.push(group);
+            first += bands.windows();
         }
     }
 }

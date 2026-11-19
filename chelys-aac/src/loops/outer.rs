@@ -121,7 +121,7 @@ pub fn outer_loop(mut counting: Counting, xmin: &[[f64; MAX_BANDS]]) -> (CodedCh
     let spectrum = counting.lines().spectrum();
     for (g, &(start, bands)) in groups.iter().enumerate() {
         for (sb, audible) in audible[g][..bands.num_swb()].iter_mut().enumerate() {
-            let lines = &spectrum[start + bands.offset(sb)..start + bands.offset(sb + 1)];
+            let lines = &spectrum[start..start + bands.lines()][bands.band(sb)];
             let energy: f64 = lines.iter().map(|x| x * x).sum();
             *audible = energy > xmin[g][sb];
         }
@@ -196,9 +196,10 @@ fn quantization_distortion(
     for (g, ((start, bands), (_, quantized))) in
         counting.groups().zip(counting.group_lines()).enumerate()
     {
+        let spectrum = &spectrum[start..start + bands.lines()];
         for sb in 0..bands.num_swb() {
-            let range = bands.offset(sb)..bands.offset(sb + 1);
-            let lines = &spectrum[start + range.start..start + range.end];
+            let range = bands.band(sb);
+            let lines = &spectrum[range.clone()];
             let sf_decoder = counting
                 .sf_decoder(common_gain, g, sb)
                 .expect("the scalefactors quantized with are in range");

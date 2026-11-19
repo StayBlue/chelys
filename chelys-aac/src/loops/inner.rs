@@ -291,14 +291,7 @@ impl<'a> Counting<'a> {
 
     /// The window groups' bands, each with its first line in the channel.
     pub fn groups(&self) -> impl Iterator<Item = (usize, GroupBands)> + use<'a> {
-        let mut start = 0;
-        (self.coding.windows)
-            .groups(self.coding.sampling_frequency)
-            .map(move |bands| {
-                let first = start;
-                start += bands.lines();
-                (first, bands)
-            })
+        (self.coding.windows).groups_with_start(self.coding.sampling_frequency)
     }
 
     /// The scalefactor `sf_decoder` of band `sb` of group `g` at the step
@@ -337,20 +330,18 @@ impl<'a> Counting<'a> {
 
     /// [`Self::count_at`], but for keeping what it fitted.
     fn count(&mut self, common_gain: u8, band_limit: usize) -> bool {
-        let mut start = 0;
-        let groups = self.coding.windows.groups(self.coding.sampling_frequency);
-        for (g, bands) in groups.clone().enumerate() {
+        for (g, (start, bands)) in self.groups().enumerate() {
             let sent = band_limit.min(bands.num_swb());
             for sb in 0..sent {
                 let Some(sf_decoder) = self.sf_decoder(common_gain, g, sb) else {
                     return false;
                 };
-                let range = start + bands.offset(sb)..start + bands.offset(sb + 1);
+                let band = bands.band(sb);
+                let range = start + band.start..start + band.end;
                 self.lines
                     .quantize(sf_decoder, range.clone(), &mut self.x_quant[range]);
             }
             self.x_quant[start + bands.offset(sent)..start + bands.lines()].fill(0);
-            start += bands.lines();
         }
         let ChannelCoding {
             windows,
@@ -377,10 +368,8 @@ impl<'a> Counting<'a> {
         let mut least_bits = channel::bits(windows, common_window, 0) + element_bits;
         self.sections.clear();
         self.counted.clear();
-        let mut start = 0;
-        for (g, bands) in groups.enumerate() {
+        for (g, (start, bands)) in self.groups().enumerate() {
             let lines = &self.x_quant[start..start + bands.lines()];
-            start += bands.lines();
             let intensity = intensity.map_or(IntensityBands::NONE, |i| i.bands[g]);
             let Some(group) = Sections::count_with_intensity(lines, bands, max_sfb, intensity)
             else {

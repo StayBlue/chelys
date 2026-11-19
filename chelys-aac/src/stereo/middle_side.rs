@@ -80,15 +80,14 @@ pub fn choose(
     let mut ties = MsMask::NONE;
     let (mut any_left_right, mut any_mid_side) = (false, false);
     let mut scratch = inner::BandScratch::default();
-    let mut start = 0;
-    for (g, bands) in windows.groups(sampling_frequency).enumerate() {
+    for (g, (start, bands)) in windows.groups_with_start(sampling_frequency).enumerate() {
         for sfb in 0..bands.num_swb() {
             if intensity.bands[g].codebook(sfb).is_some() {
                 continue;
             }
-            let range = start + bands.offset(sfb)..start + bands.offset(sfb + 1);
             let [l, r, m, s] = std::array::from_fn(|c| {
-                inner::band_bits(&lines[c][range.clone()], allowed[c][g][sfb], &mut scratch)
+                let lines = &lines[c][start..start + bands.lines()];
+                inner::band_bits(&lines[bands.band(sfb)], allowed[c][g][sfb], &mut scratch)
             });
             let (left_right, mid_side) = (l + r, m + s);
             match mid_side.cmp(&left_right) {
@@ -100,7 +99,6 @@ pub fn choose(
                 Ordering::Greater => any_left_right = true,
             }
         }
-        start += bands.lines();
     }
     if any_mid_side && !any_left_right {
         for g in 0..SHORT_WINDOWS {

@@ -181,6 +181,19 @@ impl Windows {
         groups.into_iter().take(count)
     }
 
+    /// [`groups`](Self::groups), each with its first line among the
+    /// frame's lines in the order they are sent.
+    pub fn groups_with_start(
+        self,
+        sampling_frequency: SamplingFrequency,
+    ) -> impl Iterator<Item = (usize, GroupBands)> + Clone {
+        self.groups(sampling_frequency).scan(0, |start, bands| {
+            let first = *start;
+            *start += bands.lines();
+            Some((first, bands))
+        })
+    }
+
     /// The bits [`write_ics_info`](Self::write_ics_info) writes.
     pub fn ics_info_bits(self) -> u32 {
         match self.sequence {
