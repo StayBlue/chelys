@@ -392,6 +392,12 @@ impl<'a> Counting<'a> {
         (self.coding.windows).groups_with_start(self.coding.sampling_frequency)
     }
 
+    /// The `sf_decoder` that the lines of band `sb` of group `g` were last
+    /// quantized with, or `None` where they were set to zero.
+    pub fn quantized_at(&self, g: usize, sb: usize) -> Option<u8> {
+        u8::try_from(self.quantized_at[g][sb]).ok()
+    }
+
     /// The scalefactor `sf_decoder` of band `sb` of group `g` at the step
     /// `common_gain`, the `global_gain` of a band whose scalefactor is 0:
     /// `common_scalefac - scalefactor + SF_OFFSET` (clause C.7.4), if it is

@@ -109,9 +109,10 @@ pub fn outer_loop(mut counting: Counting, xmin: &[[f64; MAX_BANDS]]) -> (CodedCh
     let groups: Vec<_> = counting.groups().collect();
     assert_eq!(xmin.len(), groups.len(), "an xmin for each window group");
     let mut distortion = vec![[0.0; MAX_BANDS]; groups.len()];
+    let mut measured_at = vec![[None; MAX_BANDS]; groups.len()];
     let (mut gain, band_limit) = first_inner_loop(&mut counting);
     if band_limit < MAX_BANDS {
-        quantization_distortion(&counting, gain, &mut distortion);
+        quantization_distortion(&counting, gain, &mut distortion, &mut measured_at);
         let excess = excess(&groups, &distortion, xmin);
         return (counting.into_channel(gain, band_limit), excess);
     }
@@ -136,7 +137,7 @@ pub fn outer_loop(mut counting: Counting, xmin: &[[f64; MAX_BANDS]]) -> (CodedCh
     let mut best: Option<(f64, u8)> = None;
     loop {
         // Calculate the distortion for each scalefactor band.
-        quantization_distortion(&counting, gain, &mut distortion);
+        quantization_distortion(&counting, gain, &mut distortion, &mut measured_at);
         let excess = excess(&groups, &distortion, xmin);
         if best.is_none_or(|(least, _)| excess < least) {
             best = Some((excess, gain));
@@ -193,10 +194,15 @@ pub fn excess(
 /// difference between the lines and the lines the decoder reconstructs,
 /// each line's weighed as [`Lines::weighted`](super::inner::Lines::weighted)
 /// says.
+///
+/// `measured_at` holds the `sf_decoder` that each band's lines were
+/// quantized with when its distortion was measured: a band quantized with
+/// the same since, and so to the same lines, keeps its distortion.
 fn quantization_distortion(
     counting: &Counting,
     common_gain: u8,
     distortion: &mut [[f64; MAX_BANDS]],
+    measured_at: &mut [[Option<u8>; MAX_BANDS]],
 ) {
     let (spectrum, weights) = (counting.lines().spectrum(), counting.lines().weights());
     let powers = powers_four_thirds();
@@ -213,6 +219,11 @@ fn quantization_distortion(
             let sf_decoder = counting
                 .sf_decoder(common_gain, g, sb)
                 .expect("the scalefactors quantized with are in range");
+            let quantized_at = counting.quantized_at(g, sb);
+            if quantized_at.is_some() && quantized_at == measured_at[g][sb] {
+                continue;
+            }
+            measured_at[g][sb] = quantized_at;
             let gain = decoder_gain(sf_decoder);
             distortion[g][sb] = lines
                 .map(|((&x, &q), &weight)| {
@@ -327,7 +338,7 @@ mod tests {
         );
         let (gain, _) = first_inner_loop(&mut counting);
         let mut flat = [[0.0; MAX_BANDS]];
-        quantization_distortion(&counting, gain, &mut flat);
+        quantization_distortion(&counting, gain, &mut flat, &mut [[None; MAX_BANDS]]);
         let excess = |distortion: &[f64; MAX_BANDS]| -> f64 {
             (0..20).map(|sb| (distortion[sb] / xmin[sb]).ln()).sum()
         };
@@ -384,7 +395,7 @@ mod tests {
             );
             let (gain, _) = first_inner_loop(&mut counting);
             let mut first = [[0.0; MAX_BANDS]];
-            quantization_distortion(&counting, gain, &mut first);
+            quantization_distortion(&counting, gain, &mut first, &mut [[None; MAX_BANDS]]);
             let groups = [(0, bands)];
             let (kept, first) = (
                 excess(&groups, &kept, &[xmin]),
