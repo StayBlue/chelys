@@ -303,7 +303,6 @@ impl ElementEncoder {
                 .expect("a block of samples");
             prepared.windows = windows;
             (channel.filterbank).spectrum(block, windows, &mut prepared.spectrum);
-            prepared.silent = prepared.spectrum.iter().all(|&x| x == 0.0);
             let analysis = channel.switching.current();
             analysis.xmin(windows, &prepared.spectrum, &mut prepared.xmin);
             prepared.bit_allocation = analysis.bit_allocation(windows.sequence);
@@ -316,7 +315,8 @@ impl ElementEncoder {
     }
 
     /// The rest of [`prepare`](Self::prepare): a pair that shares its
-    /// window coded in intensity stereo and as middle and side.
+    /// window coded in intensity stereo and as middle and side, and which
+    /// channels are silent, as they are coded.
     fn code_jointly(&mut self) {
         self.ms = MsMask::NONE;
         self.intensity = Intensity::NONE;
@@ -327,6 +327,18 @@ impl ElementEncoder {
             }
             self.code_middle_side();
         }
+        // A right channel with bands in intensity stereo sends them, even
+        // where its lines are all zero.
+        let in_intensity = self.in_intensity();
+        for (c, prepared) in self.prepared.iter_mut().enumerate() {
+            let sends_positions = c == 1 && in_intensity;
+            prepared.silent = !sends_positions && prepared.spectrum.iter().all(|&x| x == 0.0);
+        }
+    }
+
+    /// Whether the frame's pair codes bands in intensity stereo.
+    fn in_intensity(&self) -> bool {
+        self.intensity.bands.iter().any(|bands| bands.end() > 0)
     }
 
     /// Codes the frame's pair, which shares its window, in intensity stereo
@@ -354,10 +366,6 @@ impl ElementEncoder {
             [&mut left.spectrum, &mut right.spectrum],
             [&mut left.xmin, &mut right.xmin],
         );
-        left.silent = left.spectrum.iter().all(|&x| x == 0.0);
-        // A right channel with bands in intensity stereo sends them, even
-        // where its lines are all zero.
-        right.silent = false;
     }
 
     /// Chooses the bands of the frame's pair, which shares its window, to
@@ -433,11 +441,6 @@ impl ElementEncoder {
             }
             start += bands.lines();
         }
-        left.silent = left.spectrum.iter().all(|&x| x == 0.0);
-        // A right channel with bands in intensity stereo sends them, even
-        // where its lines are all zero.
-        let intensity = self.intensity.bands.iter().any(|bands| bands.end() > 0);
-        right.silent = !intensity && right.spectrum.iter().all(|&x| x == 0.0);
         if 2 * lines_mid_side >= FRAME_LINES {
             for (coded, mid_side) in [left, right].into_iter().zip([&*mid, &*side]) {
                 coded.bit_allocation = mid_side.bit_allocation;
@@ -524,7 +527,7 @@ impl ElementEncoder {
         let mut order: Vec<usize> = (0..self.prepared.len()).collect();
         // A pair in intensity stereo codes its left channel first, which the
         // right channel's bands in intensity stereo scale.
-        let in_intensity = self.intensity.bands.iter().any(|bands| bands.end() > 0);
+        let in_intensity = self.in_intensity();
         order.sort_by(|&a, &b| {
             if in_intensity {
                 return a.cmp(&b);
