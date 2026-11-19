@@ -39,11 +39,17 @@ struct ChannelEncoder {
 }
 
 impl ChannelEncoder {
-    fn new(sampling_frequency: SamplingFrequency) -> Self {
+    /// A channel of an element of `kind`: a low frequency enhancement
+    /// channel's model finds no attacks (see [`ElementEncoder`]).
+    fn new(sampling_frequency: SamplingFrequency, kind: ElementKind) -> Self {
+        let switching = match kind {
+            ElementKind::Lfe => BlockSwitching::long_only(sampling_frequency),
+            _ => BlockSwitching::new(sampling_frequency),
+        };
         Self {
             pcm: Vec::with_capacity(2 * FRAME_SAMPLES),
             filterbank: Filterbank::new(sampling_frequency),
-            switching: BlockSwitching::new(sampling_frequency),
+            switching,
             attacks: Attacks {
                 this: false,
                 next: false,
@@ -204,7 +210,7 @@ impl ElementEncoder {
             kind,
             input_end: None,
             channels: (0..channels)
-                .map(|_| ChannelEncoder::new(sampling_frequency))
+                .map(|_| ChannelEncoder::new(sampling_frequency, kind))
                 .collect(),
             prepared: (0..channels).map(|_| PreparedChannel::new()).collect(),
             common_window: false,

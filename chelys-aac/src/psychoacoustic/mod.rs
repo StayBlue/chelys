@@ -730,6 +730,9 @@ pub struct Model {
     /// The perceptual entropy of the last eight short blocks, each in the
     /// place of its window in the frame, `None` before the first frame.
     last_short_entropies: Option<[f64; SHORT_WINDOWS]>,
+    /// Whether the thresholds of the short blocks are computed (see
+    /// [`Model::long_only`]).
+    short_thresholds: bool,
 }
 
 impl Model {
@@ -759,7 +762,18 @@ impl Model {
             short_c: vec![0.0; SHORT_IBLEN + 1],
             short_c_min: vec![0.0; SHORT_IBLEN + 1],
             last_short_entropies: None,
+            short_thresholds: true,
         }
+    }
+
+    /// The model, for a channel coded with long windows whatever the
+    /// thresholds of its short blocks: it computes only their FFTs'
+    /// unpredictability, which the long block takes (step 4), and leaves
+    /// their thresholds as they are, and the rises of their perceptual
+    /// entropy at minus infinity, so that no attack is found.
+    pub fn long_only(mut self) -> Self {
+        self.short_thresholds = false;
+        self
     }
 
     /// Analyzes the frame whose block is `block`, the channel's next 1024
@@ -843,7 +857,9 @@ impl Model {
             for (min, &c) in self.short_c_min.iter_mut().zip(&self.short_c) {
                 *min = min.min(c);
             }
-            (self.short).raw_threshold(&short.energy, &self.short_c, &mut short.threshold);
+            if self.short_thresholds {
+                (self.short).raw_threshold(&short.energy, &self.short_c, &mut short.threshold);
+            }
         }
 
         // Step 2: the long FFT of the windowed samples.
@@ -867,6 +883,19 @@ impl Model {
     /// [`blocks`](Self::blocks) left, into `out`, with the largest rise of
     /// the short blocks' entropy.
     fn finish(&mut self, out: &mut Analysis) {
+        let long = &self.long_block;
+        (self.long).finish(
+            &long.energy,
+            &long.threshold,
+            &mut self.long_nb_last,
+            RPELEV_LONG,
+            &mut out.long,
+        );
+        if !self.short_thresholds {
+            out.entropy_rise = f64::NEG_INFINITY;
+            out.entropy_step = f64::NEG_INFINITY;
+            return;
+        }
         for (short, threshold) in self.short_blocks.iter().zip(&mut out.short) {
             (self.short).finish(
                 &short.energy,
@@ -892,14 +921,6 @@ impl Model {
             last = pe;
         }
         self.last_short_entropies = Some(recent);
-        let long = &self.long_block;
-        (self.long).finish(
-            &long.energy,
-            &long.threshold,
-            &mut self.long_nb_last,
-            RPELEV_LONG,
-            &mut out.long,
-        );
     }
 }
 

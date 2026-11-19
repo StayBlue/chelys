@@ -182,6 +182,16 @@ impl BlockSwitching {
         }
     }
 
+    /// [`new`](Self::new), for a channel coded with long windows whatever
+    /// its attacks, whose model analyzes its long blocks alone, and finds
+    /// none (see [`Model::long_only`]).
+    pub fn long_only(sampling_frequency: SamplingFrequency) -> Self {
+        Self {
+            model: Model::new(sampling_frequency).long_only(),
+            ..Self::new(sampling_frequency)
+        }
+    }
+
     /// Analyzes the next block of the channel, at full scale 1.0, and gives
     /// whether the frame before it, whose windows are to be chosen next,
     /// and this one have attacks; or `None` for the first block, before
