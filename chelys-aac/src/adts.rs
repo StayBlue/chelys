@@ -113,6 +113,14 @@ impl Header {
 /// `adts_variable_header()` and then those of the block that
 /// `adts_error_check()` protects, in order (clause 8.1.3.2.1; see
 /// [`Block::protected`]).
+///
+/// No decoder settled which bits it protects: ffmpeg (black box) decodes
+/// streams with the word where Table 5 puts it as it decodes them without,
+/// but does not check it, even when asked to check CRCs, and decodes a
+/// stream whose every word is wrong without complaint; the conformance
+/// tests are `ffmpeg_decodes_streams_with_the_crc_and_flags` and
+/// `ffmpeg_skips_the_crc_unchecked`. The bits rest on the reading of the
+/// clause and on this crate's tests.
 pub fn crc_check(header: &[u8], block: &Block) -> u16 {
     assert_eq!(header.len(), HEADER_LEN, "the bytes of a header");
     let register = crc::crc16(header.iter().copied());
