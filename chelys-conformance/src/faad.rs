@@ -20,7 +20,9 @@
 //! - It does not check the `crc_check` of ADTS, and has no option to (see
 //!   `faad_skips_the_crc_unchecked`).
 //! - It decodes no `adts_frame()` longer than 4608 bytes (see
-//!   `faad_decodes_no_frame_longer_than_4608_bytes`).
+//!   `faad_decodes_no_frame_longer_than_4608_bytes`), to which the encoder
+//!   keeps every frame in ADTS, those of 7.1 shorter than the standard
+//!   allows.
 //! - It gives the channels of 5.1 in ffmpeg's order, and those of the other
 //!   channel configurations in the order the stream sends them (see
 //!   `faad_maps_each_channel_of_configurations_3_to_7`).

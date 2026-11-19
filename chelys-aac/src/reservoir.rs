@@ -29,7 +29,10 @@ const BUFFER_BITS_PER_CHANNEL: u64 = 6144;
 /// with it the highest bitrate, are lowered: the buffer,
 /// `max_bit_reservoir`, `adts_buffer_fullness` and each element's share of
 /// the buffer (see [`element_max_bits`]) stay the standard's. Raw frames
-/// keep the standard's limits.
+/// keep the standard's limits. The conformance tests are
+/// `faad_decodes_no_frame_longer_than_4608_bytes`, which finds FAAD2's
+/// limit, and `faad_decodes_5_1_and_7_1_at_the_ends_of_their_range`, in
+/// which FAAD2 decodes every stream of 7.1 at its highest bitrates.
 pub const MAX_ADTS_FRAME_LEN: usize = 4608;
 
 /// The most bits an element of `kind` may take in a frame, after its
