@@ -57,17 +57,13 @@ fn power_three_quarters(x: f64) -> f64 {
     (x * x.sqrt()).sqrt()
 }
 
-/// `|x|^(4/3)` of each magnitude the codebooks code: the decoder's
-/// inverse quantization (clause 10.3), for the distortion of the outer
-/// loop.
-pub(super) fn power_four_thirds(magnitude: u32) -> f64 {
-    static TABLE: std::sync::OnceLock<Vec<f64>> = std::sync::OnceLock::new();
-    let table = TABLE.get_or_init(|| {
-        (0..=MAX_MAGNITUDE)
-            .map(|q| f64::from(q).powf(4.0 / 3.0))
-            .collect()
-    });
-    table[magnitude as usize]
+/// `|x|^(4/3)` of each magnitude the codebooks code, by magnitude: the
+/// decoder's inverse quantization (clause 10.3), for the distortion of the
+/// outer loop. A table, which loops take once.
+pub(super) fn powers_four_thirds() -> &'static [f64; MAX_MAGNITUDE as usize + 1] {
+    static TABLE: std::sync::OnceLock<[f64; MAX_MAGNITUDE as usize + 1]> =
+        std::sync::OnceLock::new();
+    TABLE.get_or_init(|| std::array::from_fn(|q| (q as f64).powf(4.0 / 3.0)))
 }
 
 /// `2^(1/4 * (sf_decoder - SF_OFFSET))`: the decoder's gain of a band with
@@ -217,15 +213,19 @@ pub fn band_bits(lines: &[f64], weights: &[f64], allowed: f64, scratch: &mut Ban
             *q = if x < 0.0 { -magnitude } else { magnitude };
         }
     };
-    let distortion = |sf_decoder: u8, x_quant: &mut [i32]| {
-        quantize(sf_decoder, x_quant);
-        let gain = decoder_gain(sf_decoder);
-        (lines.iter().zip(&*x_quant).zip(weights))
-            .map(|((&x, &q), &weight)| {
-                let error = x.abs() - power_four_thirds(q.unsigned_abs().min(MAX_MAGNITUDE)) * gain;
-                error * error * weight
-            })
-            .sum::<f64>()
+    // Whether the distortion of the lines quantized with the step of
+    // `sf_decoder` is within `allowed`, from their magnitudes alone.
+    let powers = powers_four_thirds();
+    let within = |sf_decoder: u8| {
+        let (scale, gain) = (step_scale(sf_decoder), decoder_gain(sf_decoder));
+        let mut distortion = 0.0;
+        for ((&scaled, &x), &weight) in scaled.iter().zip(lines).zip(weights) {
+            let magnitude = (scaled * scale + MAGIC_NUMBER).min(BEYOND_MAGNITUDE) as u32;
+            let requantized = powers[magnitude.min(MAX_MAGNITUDE) as usize];
+            let error = x.abs() - requantized * gain;
+            distortion += error * error * weight;
+        }
+        distortion <= allowed
     };
     let largest = scaled.iter().fold(0.0f64, |a, &x| a.max(x));
     let start = (16.0 / 3.0 * (largest / MAX_QUANT).log2()).ceil() + f64::from(SF_OFFSET);
@@ -233,10 +233,10 @@ pub fn band_bits(lines: &[f64], weights: &[f64], allowed: f64, scratch: &mut Ban
     // The coarsest step within `allowed`, between `fits`, which is, and
     // `exceeds`, which is not.
     let (mut fits, mut exceeds) = (start, u16::from(u8::MAX) + 1);
-    if distortion(start, x_quant) <= allowed {
+    if within(start) {
         while exceeds - u16::from(fits) > 1 {
             let middle = ((u16::from(fits) + exceeds) / 2) as u8;
-            if distortion(middle, x_quant) <= allowed {
+            if within(middle) {
                 fits = middle;
             } else {
                 exceeds = u16::from(middle);

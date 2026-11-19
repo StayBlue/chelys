@@ -5,7 +5,7 @@
 //! figure C.7), which amplifies the scalefactor bands whose quantization
 //! noise exceeds what the psychoacoustic model allows them.
 
-use super::inner::{Counting, decoder_gain, first_inner_loop, inner_loop, power_four_thirds};
+use super::inner::{Counting, decoder_gain, first_inner_loop, inner_loop, powers_four_thirds};
 use crate::channel::CodedChannel;
 use crate::scalefactor_bands::MAX_BANDS;
 
@@ -199,6 +199,7 @@ fn quantization_distortion(
     distortion: &mut [[f64; MAX_BANDS]],
 ) {
     let (spectrum, weights) = (counting.lines().spectrum(), counting.lines().weights());
+    let powers = powers_four_thirds();
     for (g, ((start, bands), (_, quantized))) in
         counting.groups().zip(counting.group_lines()).enumerate()
     {
@@ -215,7 +216,7 @@ fn quantization_distortion(
             let gain = decoder_gain(sf_decoder);
             distortion[g][sb] = lines
                 .map(|((&x, &q), &weight)| {
-                    let error = x.abs() - power_four_thirds(q.unsigned_abs()) * gain;
+                    let error = x.abs() - powers[q.unsigned_abs() as usize] * gain;
                     error * error * weight
                 })
                 .sum();
@@ -279,8 +280,9 @@ mod tests {
             let range = bands.offset(sb)..bands.offset(sb + 1);
             distortion[0][sb] = (spectrum[range.clone()].iter().zip(&lines[range]))
                 .map(|(&x, &q)| {
-                    let decoded =
-                        power_four_thirds(q.unsigned_abs()) * gain * f64::from(q.signum());
+                    let decoded = powers_four_thirds()[q.unsigned_abs() as usize]
+                        * gain
+                        * f64::from(q.signum());
                     (x - decoded).powi(2)
                 })
                 .sum();
