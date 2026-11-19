@@ -203,8 +203,13 @@ fn pair_block(
         for (energy, x) in block.energy.iter_mut().zip(&block.x) {
             *energy = x.re * x.re + x.im * x.im;
         }
+    }
+    tables.energies(
+        [&mid.energy, &side.energy],
+        [&mut mid.threshold, &mut side.threshold],
+    );
+    for block in [&mut *mid, &mut *side] {
         let threshold = &mut block.threshold;
-        tables.energy(&block.energy, threshold);
         // The lesser cb(b) has the greater tonality (step 7), and so the
         // lesser power ratio bc(b) (steps 8 and 9): the same as steps 7 to
         // 10 give from it.

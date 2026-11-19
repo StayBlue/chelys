@@ -119,12 +119,15 @@ fn quiet_reference(iblen: usize) -> f64 {
 #[derive(Debug)]
 struct Tables {
     partitions: &'static [Row],
-    /// `sprdngf(bval(bb), bval(b))` at `bb * partitions + b`.
+    /// For each partition `b`, the first of the partitions `bb` that
+    /// spread into it, and where `spreading` holds their
+    /// `sprdngf(bval(bb), bval(b))`: those that are not 0, which lie
+    /// together about `b`, as the function falls with the distance either
+    /// way.
+    spread_from: Vec<(usize, Range<usize>)>,
+    /// The values of the spreading function that `spread_from` locates,
+    /// those into each partition together, in the order of `bb`.
     spreading: Vec<f64>,
-    /// The partitions `bb` that spread into each partition `b`: those
-    /// whose `sprdngf(bval(bb), bval(b))` is not 0, which lie together
-    /// about `b`, as the function falls with the distance either way.
-    spread_from: Vec<Range<usize>>,
     /// `rnorm(b)` (step 6).
     rnorm: Vec<f64>,
     /// `qsthr(b)` as an energy (step 11).
@@ -148,6 +151,7 @@ impl Tables {
         let rnorm = (0..n)
             .map(|b| 1.0 / (0..n).map(|bb| spreading[bb * n + b]).sum::<f64>())
             .collect();
+        let mut spread_into = Vec::new();
         let spread_from = (0..n)
             .map(|b| {
                 let spreads = |bb: &usize| spreading[bb * n + b] != 0.0;
@@ -159,7 +163,9 @@ impl Tables {
                     .find(spreads)
                     .expect("a partition spreads into itself");
                 debug_assert!((first..=last).all(|bb| spreads(&bb)));
-                first..last + 1
+                let start = spread_into.len();
+                spread_into.extend((first..=last).map(|bb| spreading[bb * n + b]));
+                (first, start..spread_into.len())
             })
             .collect();
         // The FFT's shift length is its window's lines.
@@ -181,8 +187,8 @@ impl Tables {
             .collect();
         Self {
             partitions,
-            spreading,
             spread_from,
+            spreading: spread_into,
             rnorm,
             quiet,
             bands,
@@ -197,33 +203,50 @@ impl Tables {
             .get_or_init(|| Self::new(sampling_frequency, transform))
     }
 
-    /// `values` convolved with the spreading function (step 6): for each
-    /// partition, the sum of each partition's value spread into it; the
-    /// other partitions spread nothing into it.
-    fn spread(&self, values: &[f64; MAX_PARTITIONS]) -> [f64; MAX_PARTITIONS] {
-        let n = self.partitions.len();
-        let mut spread = [0.0; MAX_PARTITIONS];
-        for (b, spread) in spread[..n].iter_mut().enumerate() {
-            for bb in self.spread_from[b].clone() {
-                *spread += values[bb] * self.spreading[bb * n + b];
+    /// Two partitions' values convolved with the spreading function (step
+    /// 6), together: for each partition, the sum of each partition's value
+    /// spread into it; the other partitions spread nothing into it.
+    fn spread(&self, values: [&[f64; MAX_PARTITIONS]; 2]) -> [[f64; MAX_PARTITIONS]; 2] {
+        let mut spread = [[0.0; MAX_PARTITIONS]; 2];
+        for (b, (first, range)) in self.spread_from.iter().enumerate() {
+            let spreading = &self.spreading[range.clone()];
+            let (a, c) = (&values[0][*first..], &values[1][*first..]);
+            let (mut x, mut y) = (0.0, 0.0);
+            for ((&sprdngf, &a), &c) in spreading.iter().zip(a).zip(c) {
+                x += a * sprdngf;
+                y += c * sprdngf;
             }
+            (spread[0][b], spread[1][b]) = (x, y);
         }
         spread
     }
 
     /// Step 5's energy `e(b)` of each partition, from the energy `r(w)^2`
-    /// of each line of the block's FFT, and step 6's spread and normalized
-    /// energy `en(b)`, into `block`; and the spread energy `ecb(b)`.
-    fn energy(&self, energy: &[f64], block: &mut BlockThreshold) -> [f64; MAX_PARTITIONS] {
+    /// of each line of the block's FFT, into `block`.
+    fn partition_energy(&self, energy: &[f64], block: &mut BlockThreshold) {
         block.e = [0.0; MAX_PARTITIONS];
         for (b, p) in self.partitions.iter().enumerate() {
             block.e[b] = energy[p.lines()].iter().sum();
         }
-        let ecb = self.spread(&block.e);
+    }
+
+    /// Step 6's spread and normalized energy `en(b)` of each partition, from
+    /// the spread energy `ecb(b)`, into `block`.
+    fn normalize(&self, ecb: &[f64; MAX_PARTITIONS], block: &mut BlockThreshold) {
         for (b, en) in block.en[..self.partitions.len()].iter_mut().enumerate() {
             *en = ecb[b] * self.rnorm[b];
         }
-        ecb
+    }
+
+    /// Steps 5 and 6 for two blocks, from the energy `r(w)^2` of each line
+    /// of their FFTs, into `blocks`: each partition's energy `e(b)` and its
+    /// spread and normalized energy `en(b)`.
+    fn energies(&self, energies: [&[f64]; 2], [a, b]: [&mut BlockThreshold; 2]) {
+        self.partition_energy(energies[0], a);
+        self.partition_energy(energies[1], b);
+        let [a_ecb, b_ecb] = self.spread([&a.e, &b.e]);
+        self.normalize(&a_ecb, a);
+        self.normalize(&b_ecb, b);
     }
 
     /// Steps 5 to 10 for one block, from the energy `r(w)^2` and
@@ -231,7 +254,7 @@ impl Tables {
     /// partitions' energies, their tonality, as `cb(b)`, and the threshold
     /// `nb(b)` of step 10.
     fn raw_threshold(&self, energy: &[f64], unpredictability: &[f64], block: &mut BlockThreshold) {
-        let ecb = self.energy(energy, block);
+        self.partition_energy(energy, block);
         // Step 5: the weighted unpredictability of each partition.
         let mut c = [0.0; MAX_PARTITIONS];
         for (b, p) in self.partitions.iter().enumerate() {
@@ -240,7 +263,8 @@ impl Tables {
             }
         }
         // Step 6: spread, and normalized.
-        let ct = self.spread(&c);
+        let [ecb, ct] = self.spread([&block.e, &c]);
+        self.normalize(&ecb, block);
         for b in 0..self.partitions.len() {
             // Spec gap: without energy `cb(b) = ct(b) / ecb(b)` is
             // undefined; its threshold is 0 whatever the tonality, and the
