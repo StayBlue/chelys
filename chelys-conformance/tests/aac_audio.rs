@@ -1253,3 +1253,42 @@ fn temporal_noise_shaping_holds_back_the_noise_before_attacks() {
         }
     }
 }
+
+/// A click right after a louder one, its onset at a frame's first sample,
+/// is coded with short windows as the first is, at 44.1 kHz and 48 kbit/s
+/// and at 96 kHz and 32 kbit/s, and both come back in place, the second
+/// kept as well as the first: the perceptual entropy of the second's short
+/// block rises far above the block before it, though not above the first
+/// click's. At 96 kHz and 32 kbit/s, which code few bands, each comes back
+/// at about 0.6 of its level.
+#[test]
+fn a_click_after_a_louder_one_is_coded_with_short_windows() {
+    for (sample_rate, bits_per_second) in [(44_100, 48_000), (96_000, 32_000)] {
+        let context = format!("{sample_rate} Hz, {bits_per_second} bit/s");
+        let clicks = [(2304, 0.85), (3072, 0.3)];
+        let mut input = vec![0.0; 8192];
+        for &(onset, level) in &clicks {
+            input[onset] = level;
+        }
+        let encoded = encode(sample_rate, &[input], bits_per_second);
+        let sequences = window_sequences(&encoded.stream, sample_rate);
+        assert!(transitions_are_meaningful(&sequences), "{context}");
+        let output = decode(&encoded, 1, &context);
+        let kept = clicks.map(|(onset, level)| {
+            assert!(
+                short_at(&sequences, 0, onset),
+                "{context}, onset {onset}: {sequences:?}"
+            );
+            let near = &output[onset + DELAY - 64..onset + DELAY + 64];
+            let peak = (0..near.len())
+                .max_by(|&a, &b| near[a].abs().total_cmp(&near[b].abs()))
+                .expect("samples");
+            assert_eq!(peak, 64, "{context}, onset {onset}");
+            f64::from(output[onset + DELAY]) / level
+        });
+        assert!(
+            kept[0] > 0.5 && (kept[1] - kept[0]).abs() < 0.1,
+            "{context}: {kept:?} of each click's level"
+        );
+    }
+}

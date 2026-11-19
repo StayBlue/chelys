@@ -14,16 +14,17 @@ use crate::window::{Grouping, SHORT_WINDOWS, WindowSequence, WindowShape};
 
 /// `switch_pe`: a frame has an attack, and is coded with short blocks, when
 /// the perceptual entropy of one of its short blocks rises by more than
-/// this above the most of the eight short blocks before it (step 13, as
-/// departed from below).
+/// this above the most of the eight short blocks before it, or by more
+/// than [`SWITCH_PE_STEP`] above the one before it (step 13, as departed
+/// from below).
 ///
 /// Spec gap: step 13 calls `switch_pe` "a implementation dependend
 /// constant", which it compares with the perceptual entropy of the long
 /// block. This deliberately departs from that comparison, and compares it
 /// with the largest rise of the entropy of the short blocks (step 12), each
 /// above the most of the eight before it, those of the frame before among
-/// them (see [`Analysis::entropy_rise`]); step 15's entropy is left as
-/// printed.
+/// them (see [`Analysis::entropy_rise`]), and above the one before it (see
+/// [`Analysis::entropy_step`]); step 15's entropy is left as printed.
 ///
 /// The entropy is taken as printed (see [`Model::analyze`]), and its
 /// partitions below their thresholds in quiet subtract from it, by an
@@ -90,6 +91,32 @@ use crate::window::{Grouping, SHORT_WINDOWS, WindowSequence, WindowShape};
 /// the frames of the pop music are short, 8.1 to 24.6% at 8 kHz and 2.1 to
 /// 24.5% at 16 kHz.
 ///
+/// The most of the eight blocks before alone misses an attack soon after a
+/// louder one, which still holds that most: a click of 0.3 at a frame's
+/// first sample, 768 samples after one of 0.85, rose 700 above the block
+/// before it at 44.1 kHz but 78 below the first, and was coded with long
+/// windows, decoding at 0.132 at 48 kbit/s, and at 96 kHz and 32 kbit/s
+/// not at all (the conformance test
+/// `a_click_after_a_louder_one_is_coded_with_short_windows`). So a rise
+/// above the block before by more than 200, the criterion that the most of
+/// the eight replaced, is an attack too, which the steady tones and the
+/// sweep, at 119 and 161, stay below. Of pairs of bursts of noise that die
+/// away in 5 ms over a quiet tone, the second 256 to 1024 samples after the
+/// first and 0.3 to 1 times as loud, the most of the eight alone caught 7
+/// of 18 second bursts at 8 kHz, 15 of 33 at 16 kHz, 34 of 70 at 44.1 kHz
+/// and 58 of 118 at 96 kHz; with the rise above the block before, 16, 25,
+/// 35 and 58; that rise alone, above 200, 16, 25, 34 and 56. The frames of
+/// the pop music it adds are a few in ten thousand.
+///
+/// Noise under an envelope that falls to silence and rises 3 times a
+/// second, which neither criterion that the most of the eight replaced
+/// coded short, is coded short in most frames at 8 kHz, as its rise from
+/// silence spans a frame of 128 ms. In the stereo pair of such noise at 16
+/// and 32 kbit/s, the noise where the envelope is below a quarter is 4.7
+/// and 4.8 dB less so coded, as the long windows spread the noise of the
+/// loud parts into the quiet ones, and over all 0.7 dB less and 0.1 dB
+/// more.
+///
 /// Graded with PEAQ, the 8 tracks gave means of -3.543, -1.002 and -0.237
 /// at 64, 128 and 192 kbit/s, against -3.584, -1.087 and -0.283 with the
 /// rise from the one block before above 200; 3 tracks of rock music and
@@ -104,13 +131,18 @@ use crate::window::{Grouping, SHORT_WINDOWS, WindowSequence, WindowShape};
 /// where they count treble lost.
 const SWITCH_PE: f64 = 100.0;
 
+/// A frame has an attack too when the perceptual entropy of one of its
+/// short blocks rises by more than this above the one before it, though
+/// not above the most of the eight before (see [`SWITCH_PE`]).
+const SWITCH_PE_STEP: f64 = 200.0;
+
 /// Two short windows of a frame share a group while the energy of each,
 /// in its short FFT, is within this factor of every other's in the group.
 const GROUPING_RATIO: f64 = 10.0;
 
 /// Whether the frame analyzed as `analysis` has an attack (step 13).
 pub fn attack(analysis: &Analysis) -> bool {
-    analysis.entropy_rise > SWITCH_PE
+    analysis.entropy_rise > SWITCH_PE || analysis.entropy_step > SWITCH_PE_STEP
 }
 
 /// The model of one channel, with its output delayed by a frame, so that a

@@ -169,6 +169,8 @@ impl MidSideModel {
         // whose attacks are found in its channels.
         mid.entropy_rise = 0.0;
         side.entropy_rise = 0.0;
+        mid.entropy_step = 0.0;
+        side.entropy_step = 0.0;
     }
 }
 

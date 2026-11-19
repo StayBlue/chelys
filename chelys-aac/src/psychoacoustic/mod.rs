@@ -510,6 +510,10 @@ pub struct Analysis {
     /// reach back into the frame before, by which [`switching`] finds an
     /// attack.
     pub entropy_rise: f64,
+    /// The largest rise of the perceptual entropy of one of the frame's
+    /// eight short blocks above the one before it, by which [`switching`]
+    /// finds an attack too.
+    pub entropy_step: f64,
     sampling_frequency: SamplingFrequency,
 }
 
@@ -522,6 +526,7 @@ impl Analysis {
                 Threshold::new(GroupBands::short(sampling_frequency, 1))
             }),
             entropy_rise: 0.0,
+            entropy_step: 0.0,
             sampling_frequency,
         }
     }
@@ -808,15 +813,20 @@ impl Model {
                 threshold,
             );
         }
-        // Each short block rises from the most of the eight before it, the
-        // first of the stream from itself.
+        // Each short block rises from the most of the eight before it and
+        // from the one before it, the first of the stream from itself.
         let mut recent =
             (self.last_short_entropies).unwrap_or([out.short[0].perceptual_entropy; SHORT_WINDOWS]);
+        let mut last = recent[SHORT_WINDOWS - 1];
         out.entropy_rise = f64::NEG_INFINITY;
+        out.entropy_step = f64::NEG_INFINITY;
         for (w, threshold) in out.short.iter().enumerate() {
+            let pe = threshold.perceptual_entropy;
             let most = recent.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-            out.entropy_rise = out.entropy_rise.max(threshold.perceptual_entropy - most);
-            recent[w] = threshold.perceptual_entropy;
+            out.entropy_rise = out.entropy_rise.max(pe - most);
+            out.entropy_step = out.entropy_step.max(pe - last);
+            recent[w] = pe;
+            last = pe;
         }
         self.last_short_entropies = Some(recent);
         let long = &self.long_block;
