@@ -106,7 +106,7 @@ pub struct Block {
 /// half of full scale, the second frame's second stream starts after 43
 /// bits of the element, and its `crc_check` is D458, where feeding all 149
 /// bits of the second stream within the 192 again would give FC83. No
-/// decoder settles it, as ffmpeg does not check the CRC (see
+/// decoder settles it, as neither ffmpeg nor FAAD2 checks the CRC (see
 /// [`adts::crc_check`](crate::adts::crc_check)); the test of this reading
 /// is `a_second_stream_from_before_bit_64_is_protected_again_for_128_bits`.
 ///
