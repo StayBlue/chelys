@@ -6,6 +6,8 @@
 
 use std::f64::consts::TAU;
 
+use chelys::aac::internals::raw_data_block::decoder::{adts_frame, raw_data_block};
+use chelys::aac::internals::sampling_frequency::SamplingFrequency;
 use chelys::aac::{Config, DELAY, Encoder, Rate};
 use chelys_conformance::ffmpeg::{self, StreamInfo};
 
@@ -212,7 +214,9 @@ fn ffmpeg_names_the_channels_of_its_layouts() {
 
 /// Noise with clicks, a different one in each channel, in 5.1 and 7.1 at
 /// the lowest and highest bitrates of 8, 48 and 96 kHz, with the CRC and
-/// without, decodes without complaint, every frame whole.
+/// without, decodes without complaint, every frame whole, and no element
+/// longer than its share of the decoder's input buffer, 6144 bits a
+/// channel with its `id_syn_ele` (clause 8.2.3.1).
 #[test]
 fn ffmpeg_decodes_5_1_and_7_1_at_the_ends_of_their_range() {
     use chelys::aac::ConfigError;
@@ -250,6 +254,18 @@ fn ffmpeg_decodes_5_1_and_7_1_at_the_ends_of_their_range() {
                     let mut stream = Vec::new();
                     encoder.encode_interleaved(&pcm, &mut stream);
                     let finished = encoder.finish(&mut stream);
+                    let fs = SamplingFrequency::from_hz(sample_rate).unwrap();
+                    let mut rest = stream.as_slice();
+                    while !rest.is_empty() {
+                        let frame = adts_frame(rest);
+                        rest = &rest[frame.aac_frame_length..];
+                        for element in raw_data_block(frame.raw_data_block, fs).elements {
+                            let bits = 3 + element.bits.len();
+                            let channels = element.element.channels.len();
+                            let lfe = element.id_syn_ele == 3;
+                            assert!(lfe || bits <= 6144 * channels, "{context}: {bits}");
+                        }
+                    }
                     let decoded = ffmpeg::decode_aac(&stream);
                     assert_eq!(decoded.diagnostics, "", "{context}");
                     assert_eq!(

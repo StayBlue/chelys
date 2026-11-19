@@ -16,7 +16,7 @@ use super::config::Framing;
 use super::raw_data_block;
 use super::raw_data_block::data_stream::{self, DataStreamQueue};
 use super::raw_data_block::element::CodedElement;
-use super::reservoir::BitReservoir;
+use super::reservoir::{self, BitReservoir};
 use super::sampling_frequency::SamplingFrequency;
 use super::stereo::intensity;
 use super::stereo::middle_side::MsMask;
@@ -459,6 +459,10 @@ impl StreamEncoder {
 
     /// Quantizes the frame's elements, prepared, in `available_bits`.
     ///
+    /// No element is given more than its share of the decoder's input
+    /// buffer (see [`reservoir::element_max_bits`]); what it cannot take
+    /// goes to those quantized after it.
+    ///
     /// Spec gap: Annex C does not say how the bits of a frame are shared
     /// between its elements, any more than between its channels (see
     /// [`ElementEncoder::quantize`]). Each element is given the fewest bits
@@ -503,6 +507,8 @@ impl StreamEncoder {
                     .unwrap_or(0);
                 element.least_bits() + share as u32
             };
+            let budget =
+                reservoir::element_max_bits(element.kind()).map_or(budget, |max| budget.min(max));
             let element = self.elements[e].quantize(budget);
             remaining = remaining.saturating_sub(element.bits());
             coded[e] = Some(element);
@@ -1070,6 +1076,78 @@ mod tests {
             });
             assert_eq!(lfe_frames, 9, "{channel_configuration:?}");
             assert!(short && shaped, "{channel_configuration:?}");
+        }
+    }
+
+    /// No element is longer than its share of the decoder's input buffer,
+    /// 6144 bits a channel with its `id_syn_ele`, however many bits the
+    /// frame has and however few of its elements ask for them: noise in
+    /// one element of 5.1 and 7.1 beside silence, up to the highest
+    /// bitrate.
+    #[test]
+    fn no_element_outgrows_its_buffer() {
+        use crate::raw_data_block::decoder::raw_data_block;
+
+        for (fs, channel_configuration, loud, bits_per_second) in [
+            (
+                SamplingFrequency::Hz48000,
+                ChannelConfiguration::FiveOne,
+                0,
+                320_000,
+            ),
+            (
+                SamplingFrequency::Hz48000,
+                ChannelConfiguration::FiveOne,
+                1,
+                640_000,
+            ),
+            (
+                SamplingFrequency::Hz96000,
+                ChannelConfiguration::SevenOne,
+                1,
+                0,
+            ),
+        ] {
+            let mut config = StreamConfig {
+                sampling_frequency: fs,
+                channel_configuration,
+                bits_per_second,
+                framing: Framing::Raw,
+                flags: Flags::default(),
+                crc_protected: false,
+            };
+            if bits_per_second == 0 {
+                config.bits_per_second = config.max_bits_per_second();
+            }
+            // Loud noise in the channels of element `loud`, silence in the
+            // rest.
+            let noise = noise(12 * FRAME_SAMPLES, 21)
+                .iter()
+                .map(|x| 3.0 * x)
+                .collect::<Vec<_>>();
+            let silence = vec![0.0; noise.len()];
+            let mut channels = Vec::new();
+            for (e, kind) in channel_configuration.elements().iter().enumerate() {
+                let samples = if e == loud { &noise } else { &silence };
+                channels.extend(std::iter::repeat_n(samples.as_slice(), kind.channels()));
+            }
+            let mut longest = 0;
+            StreamEncoder::new(config).encode(&channels, &mut |frame: &[u8]| {
+                for element in raw_data_block(frame, fs).elements {
+                    let channels = element.element.channels.len();
+                    let bits = 3 + element.bits.len();
+                    if element.id_syn_ele != 3 {
+                        assert!(bits <= 6144 * channels, "{channel_configuration:?}: {bits}");
+                    }
+                    longest = longest.max(bits);
+                }
+            });
+            // The loud element takes all its buffer allows.
+            let kind = channel_configuration.elements()[loud];
+            assert!(
+                longest > 6144 * kind.channels() - 100,
+                "{channel_configuration:?}: {longest}"
+            );
         }
     }
 

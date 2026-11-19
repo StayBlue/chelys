@@ -5,13 +5,38 @@
 //! far each frame may fall short of the mean length, or run past it, and
 //! the state ADTS reports as `adts_buffer_fullness`.
 
-use super::channel_configuration::ChannelConfiguration;
+use super::channel_configuration::{ChannelConfiguration, ElementKind};
 use super::sampling_frequency::SamplingFrequency;
 use super::stream::FRAME_SAMPLES;
 
 /// The bits of the decoder's input buffer per channel of the NCC (clause
 /// 8.2.3.1).
 const BUFFER_BITS_PER_CHANNEL: u64 = 6144;
+
+/// The most bits an element of `kind` may take in a frame, after its
+/// `id_syn_ele`: those of its own share of the decoder's input buffer,
+/// 6144 for a single channel and 12288 for a pair, less the 3 of its
+/// `id_syn_ele`; `None` for a low frequency enhancement channel, whose bits
+/// come from the whole buffer's.
+///
+/// Spec reading: clause 8.2.3.1 limits "the individual buffer sizes" of
+/// the elements as well as the whole buffer's, "permitting the decoder to
+/// break a multichannel bitstream into separate mono and stereo bitstreams
+/// which are decoded by separate mono and stereo decoders"; "All bits for
+/// LFE's ... must be supplied from the total buffer requirements". It does
+/// not say at what rate such a decoder's buffer fills, so the limit is
+/// taken frame by frame: an element is never longer than its buffer. Nor
+/// does it say whether the element's `id_syn_ele`, which a decoder that
+/// breaks the stream apart reads to do so, is counted: it is, which is the
+/// stricter reading. With one element, the frame, its header among its
+/// bits, is no longer than the whole buffer, so that the limit holds of
+/// itself.
+pub fn element_max_bits(kind: ElementKind) -> Option<u32> {
+    match kind {
+        ElementKind::Lfe => None,
+        kind => Some(BUFFER_BITS_PER_CHANNEL as u32 * kind.channels() as u32 - 3),
+    }
+}
 
 /// The state of the bit reservoir, kept exactly: in bits times the
 /// sampling frequency, as the mean length of a frame is a fraction of a
