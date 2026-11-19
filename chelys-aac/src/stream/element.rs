@@ -427,7 +427,16 @@ impl ElementEncoder {
     /// the right channel's attack into the left channel's intensity signal
     /// and the left's into the right. Coded so, a one-sample impulse in one
     /// channel of a pair at 64 kHz and 96 kbit/s decoded at about half its
-    /// level.
+    /// level. Music does not settle it either way: graded with PEAQ
+    /// (GstPEAQ 0.6.1, black box) at 48 and 64 kbit/s, short windows coded
+    /// in intensity stereo too gave means of -3.653 and -3.537 on 8 tracks
+    /// of pop music at 44.1 kHz in stereo, against -3.657 and -3.543, and
+    /// -3.589 and -3.561 on 3 tracks of rock music and their 3 windows of 3
+    /// s with the most frames coded short, against -3.591 and -3.563. In
+    /// the short windows of the 3 rock tracks at 64 kbit/s, the difference
+    /// of the channels' levels above 6 kHz, in blocks of 128 samples, was
+    /// 0.72, 1.14 and 1.93 dB off on average, weighed by their energy,
+    /// against 0.92, 1.41 and 1.87 dB.
     fn intensity_from(&self) -> Option<usize> {
         let windows = self.prepared[0].windows;
         let long = windows.sequence.transform() == Transform::Long;
