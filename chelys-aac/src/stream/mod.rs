@@ -315,6 +315,14 @@ impl StreamEncoder {
         self
     }
 
+    /// The encoder, but with spectrum clipping on or off, for comparing
+    /// the two in tests.
+    #[cfg(any(test, feature = "unstable"))]
+    pub fn spectrum_clipping(mut self, on: bool) -> Self {
+        self.element.spectrum_clipping(on);
+        self
+    }
+
     /// Whether the next frame's bits, those the reservoir makes available
     /// to it when it asks for none beyond the mean, pay for the shortest
     /// frame of eight short windows in every channel with `data_bits` of
@@ -579,6 +587,42 @@ mod tests {
                 shaped += element.channels.iter().filter(|c| c.tns.is_some()).count();
             });
             assert_eq!(shaped > 0, tns, "{shaped}");
+        }
+    }
+
+    #[test]
+    fn spectrum_clipping_is_off_unless_asked_for() {
+        use crate::noiseless::decoder::{BitReader, element};
+        let config = config(Framing::Raw, 128_000);
+        // Noise falling by 6 dB an octave, whose highest lines quantize to
+        // few above 1.
+        let (mut state, mut y) = (1u64, 0.0);
+        let input: Vec<f64> = (0..24 * FRAME_SAMPLES)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1);
+                y = 0.98 * y + ((state >> 11) as f64 / (1u64 << 53) as f64 - 0.5);
+                0.2 * y
+            })
+            .collect();
+        let right: Vec<f64> = input.iter().map(|x| -0.7 * x).collect();
+        for on in [None, Some(false), Some(true)] {
+            let mut encoder = StreamEncoder::new(config);
+            if let Some(on) = on {
+                encoder = encoder.spectrum_clipping(on);
+            }
+            let mut pulses = 0;
+            encoder.encode(&[&input, &right], &mut |frame: &[u8]| {
+                let mut r = BitReader::new(frame);
+                let element = element(&mut r, SamplingFrequency::Hz44100);
+                pulses += element
+                    .channels
+                    .iter()
+                    .filter(|c| c.pulses.is_some())
+                    .count();
+            });
+            assert_eq!(pulses > 0, on == Some(true), "{on:?}: {pulses}");
         }
     }
 

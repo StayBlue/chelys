@@ -16,9 +16,11 @@
 //! the bits of each coding without writing it, for the rate control loops
 //! to count many.
 //!
-//! Spectrum clipping (clause C.8.2), the pulse escape that Annex C says
-//! "may be applied", is not.
+//! Spectrum clipping (clause C.8.2), which Annex C says "may be applied"
+//! to a long window's lines first, sends some of them as pulses where that
+//! takes fewer bits.
 
+pub mod clipping;
 pub mod codebooks;
 pub mod pulses;
 pub mod scalefactors;

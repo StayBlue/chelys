@@ -7,7 +7,6 @@
 
 use chelys_core::bitstream::BitWriter;
 
-#[cfg(test)]
 use crate::scalefactor_bands::{GroupBands, Transform};
 
 /// The most pulses `pulse_data()` sends: `number_pulse` + 1, of 2 bits
@@ -15,11 +14,9 @@ use crate::scalefactor_bands::{GroupBands, Transform};
 pub const MAX_PULSES: usize = 4;
 
 /// The largest `pulse_offset`, of 5 bits (Table 21).
-#[cfg(test)]
 pub const MAX_OFFSET: usize = (1 << 5) - 1;
 
 /// The largest `pulse_amp`, of 4 bits (Table 21).
-#[cfg(test)]
 pub const MAX_AMP: u32 = (1 << 4) - 1;
 
 /// The bits of `pulse_data()` besides its pulses: `number_pulse` and
@@ -67,7 +64,6 @@ impl Pulses {
     /// Spec reading: a `pulse_offset` of 0 after the first would restore
     /// the line before it again. Each line is taken to be restored once,
     /// so that each pulse lies above the one before.
-    #[cfg(test)]
     pub fn new(bands: GroupBands, pulses: &[(usize, u32)]) -> Option<Self> {
         if bands.transform() != Transform::Long || !(1..=MAX_PULSES).contains(&pulses.len()) {
             return None;
@@ -156,7 +152,6 @@ impl Pulses {
     ///
     /// If a pulse's line would not keep its sign, and so be restored: a
     /// caller's error.
-    #[cfg(test)]
     pub fn clip(&self, lines: &mut [i32]) {
         for (line, amp) in self.iter() {
             let q = lines[line];

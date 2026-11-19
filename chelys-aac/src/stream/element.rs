@@ -146,6 +146,9 @@ pub struct ElementEncoder {
     /// Whether the channels' lines are shaped by temporal noise shaping,
     /// and the memory it works in.
     tns: bool,
+    /// Whether the loops clip the lines of long windows where that saves
+    /// bits (see [`ChannelCoding::spectrum_clipping`]).
+    spectrum_clipping: bool,
     shaping: Shaping,
     /// How the second channel of the last pair that shared its window was
     /// given its bits, for tests.
@@ -198,6 +201,7 @@ impl ElementEncoder {
             intensity_border,
             intensity: Intensity::NONE,
             tns: true,
+            spectrum_clipping: loops::SPECTRUM_CLIPPING,
             shaping: Shaping::default(),
             #[cfg(test)]
             second_channel: std::cell::Cell::new(None),
@@ -213,6 +217,13 @@ impl ElementEncoder {
     #[cfg(any(test, feature = "unstable"))]
     pub fn without_tns(&mut self) {
         self.tns = false;
+    }
+
+    /// The element, but with spectrum clipping on or off, for comparing the
+    /// two in tests.
+    #[cfg(any(test, feature = "unstable"))]
+    pub fn spectrum_clipping(&mut self, on: bool) {
+        self.spectrum_clipping = on;
     }
 
     /// Appends the next samples of each channel.
@@ -951,6 +962,10 @@ impl ElementEncoder {
         if prepared.silent {
             CodedChannel::without_lines(prepared.windows, self.sampling_frequency, prepared.tns)
         } else {
+            let coding = ChannelCoding {
+                spectrum_clipping: self.spectrum_clipping,
+                ..coding
+            };
             loops::quantize_channel(
                 &prepared.spectrum,
                 &prepared.weights,
@@ -1064,7 +1079,18 @@ mod tests {
         intensity_border: Option<f64>,
         block_switching: bool,
     ) -> Vec<(Element, Vec<Vec<f64>>)> {
-        let mut encoder = ElementEncoder::new(fs, input.len(), intensity_border);
+        let encoder = ElementEncoder::new(fs, input.len(), intensity_border);
+        round_trip_encoder(encoder, input, bits, block_switching)
+    }
+
+    /// [`round_trip_switching`] with `encoder`.
+    fn round_trip_encoder(
+        mut encoder: ElementEncoder,
+        input: &[Vec<f64>],
+        bits: u32,
+        block_switching: bool,
+    ) -> Vec<(Element, Vec<Vec<f64>>)> {
+        let fs = encoder.sampling_frequency;
         let channels: Vec<&[f64]> = input.iter().map(Vec::as_slice).collect();
         encoder.push(&channels);
         encoder.prime();
@@ -1187,6 +1213,37 @@ mod tests {
                 assert_eq!(left.info.max_sfb, right.info.max_sfb);
             }
         }
+    }
+
+    /// Single channels and pairs with spectrum clipping fit their bits, in
+    /// long windows and short, and send pulses in long windows only.
+    #[test]
+    fn clipped_channels_fit_their_bits() {
+        let fs = SamplingFrequency::Hz44100;
+        let len = 12 * FRAME_SAMPLES;
+        // Noise, and clicks for short windows.
+        let clicks = |seed| -> Vec<f64> {
+            (noise(len, seed).iter().enumerate())
+                .map(|(i, x)| 0.2 * x + if i % 3000 == 1500 { 0.5 } else { 0.0 })
+                .collect()
+        };
+        let pair = [clicks(5), clicks(6)];
+        let (mut pulses, mut short) = (0, 0);
+        for (input, bits) in [(&pair[..1], 500), (&pair[..1], 1500), (&pair[..], 3000)] {
+            let mut encoder = ElementEncoder::new(fs, input.len(), None);
+            encoder.spectrum_clipping(true);
+            // round_trip_encoder checks the bits and decodes each frame.
+            for (element, _) in round_trip_encoder(encoder, input, bits, true) {
+                for ics in &element.channels {
+                    if ics.info.window_sequence == 2 {
+                        short += 1;
+                        assert_eq!(ics.pulses, None);
+                    }
+                    pulses += usize::from(ics.pulses.is_some());
+                }
+            }
+        }
+        assert!(pulses > 0 && short > 0, "{pulses} pulses, {short} short");
     }
 
     /// A pair coded in intensity stereo above 6 kHz decodes with each band

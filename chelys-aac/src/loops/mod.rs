@@ -40,6 +40,23 @@ use crate::window::Windows;
 /// 6 dB at 64 kbit/s.
 pub const XMIN_OFFSET_DB: f64 = 3.0;
 
+/// Whether the loops clip the lines of long windows where that saves bits,
+/// unless asked otherwise (see [`ChannelCoding::spectrum_clipping`]):
+/// Annex C says it "may be applied" (clause C.8.2), and it is not, as it
+/// saves almost nothing and costs time.
+///
+/// On 8 tracks of pop music and 3 of rock at 44.1 kHz in stereo, it
+/// clipped 1.8%, 3.0% and 3.3% of the long windows of each channel at 64,
+/// 128 and 192 kbit/s, each saving 4 to 5 bits: 0.04, 0.12 and 0.16 bits
+/// for each long window, of some 750 to 2200. Graded with PEAQ (GstPEAQ
+/// 0.6.1, black box), the means of the pop tracks were -3.593, -1.183 and
+/// -0.310 with it, and -3.593, -1.184 and -0.310 without; of the rock
+/// tracks and their 3 windows of 3 s with the most frames coded short,
+/// -3.584, -0.842 and -0.160, and -3.584, -0.843 and -0.160. It made the
+/// encoder 47% slower, as each count of the inner loop chooses sections
+/// for each clipping too.
+pub const SPECTRUM_CLIPPING: bool = false;
+
 /// Raises each allowed distortion `xmin` by [`XMIN_OFFSET_DB`], as the
 /// loops take it.
 pub fn raise_xmin(xmin: &mut [[f64; MAX_BANDS]]) {
@@ -75,6 +92,9 @@ pub struct ChannelCoding<'a> {
     pub intensity: Option<&'a Intensity>,
     /// The filters that shaped the channel's lines, which it sends.
     pub tns: &'a Tns,
+    /// Whether the lines of a long window are clipped where that saves
+    /// bits (see [`clipping`](crate::noiseless::clipping)).
+    pub spectrum_clipping: bool,
 }
 
 impl<'a> ChannelCoding<'a> {
@@ -96,6 +116,7 @@ impl<'a> ChannelCoding<'a> {
             element_bits: [0; MAX_BANDS + 1],
             intensity: None,
             tns,
+            spectrum_clipping: SPECTRUM_CLIPPING,
         }
     }
 

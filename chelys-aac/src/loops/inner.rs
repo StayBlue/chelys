@@ -8,12 +8,13 @@
 use std::ops::Range;
 
 use crate::channel::{self, CodedChannel, CodedGroup, FRAME_LINES};
+use crate::noiseless::clipping::{self, Clipping};
 use crate::noiseless::codebooks::MAX_MAGNITUDE;
 use crate::noiseless::pulses::Pulses;
 use crate::noiseless::scalefactors;
 use crate::noiseless::sections::{self, IntensityBands, Sections};
 use crate::noiseless::spectrum;
-use crate::scalefactor_bands::{GroupBands, MAX_BANDS};
+use crate::scalefactor_bands::{GroupBands, MAX_BANDS, Transform};
 
 use super::ChannelCoding;
 
@@ -275,9 +276,13 @@ pub struct Counting<'a> {
     /// Each group's lines counted at the step counted last, kept to reuse
     /// their memory.
     counted: Vec<sections::Counted>,
+    /// The clippings of a long window's lines counted last (see
+    /// [`clipping::clippings`]), kept to reuse their memory.
+    clippings: Vec<Clipping>,
     /// The sections chosen for each group at the step counted last, if
-    /// it fits.
+    /// it fits, and the pulses chosen with them.
     sections: Vec<Sections>,
+    pulses: Pulses,
     /// The `sf_decoder` of each group's bands below `max_sfb` at the step
     /// counted last, if it fits.
     sf_decoder: Vec<Vec<u8>>,
@@ -299,7 +304,9 @@ impl<'a> Counting<'a> {
             scalefactors: vec![[0; MAX_BANDS]; groups],
             x_quant: [0; FRAME_LINES],
             counted: Vec::with_capacity(groups),
+            clippings: Vec::new(),
             sections: Vec::with_capacity(groups),
+            pulses: Pulses::NONE,
             sf_decoder: vec![Vec::with_capacity(MAX_BANDS); groups],
             fitted_at: None,
             fitted_scalefactors: vec![[0; MAX_BANDS]; groups],
@@ -339,6 +346,15 @@ impl<'a> Counting<'a> {
     /// band of zeros before it repeats it (see
     /// [`scalefactors`](crate::noiseless::scalefactors)). The bits counted
     /// are those the channel is written in.
+    ///
+    /// Where the coding asks for it, the lines of a long window are clipped
+    /// where that saves bits (see [`clipping`], which clips no short
+    /// windows): "the noiseless coding is done inside the quantizer inner
+    /// loop", and spectrum clipping is its first step (clause C.8.1), so
+    /// each count clips the lines it quantized, and the loops count the
+    /// bits of the coding as clipped.
+    /// The distortion of the outer loop (clause C.7.4.3) is that of the
+    /// quantized lines, which clipping leaves to the decoder to restore.
     pub fn count_at(&mut self, common_gain: u8, band_limit: usize) -> bool {
         self.fitted_at = None;
         let fits = self.count(common_gain, band_limit);
@@ -391,6 +407,9 @@ impl<'a> Counting<'a> {
             channel::bits(windows, common_window, &Pulses::NONE, tns, 0) + element_bits;
         self.sections.clear();
         self.counted.clear();
+        self.pulses = Pulses::NONE;
+        // Only long windows are clipped (see clipping's spec reading).
+        let clip = self.coding.spectrum_clipping && windows.sequence.transform() == Transform::Long;
         for (g, (start, bands)) in self.groups().enumerate() {
             let lines = &self.x_quant[start..start + bands.lines()];
             let intensity = intensity.map_or(IntensityBands::NONE, |i| i.bands[g]);
@@ -398,13 +417,27 @@ impl<'a> Counting<'a> {
             else {
                 return false;
             };
-            least_bits += group.least_bits();
+            let mut least = group.least_bits();
+            if clip {
+                clipping::clippings(lines, bands, &group, &mut self.clippings);
+                least = (self.clippings.iter())
+                    .map(Clipping::least_bits)
+                    .fold(least, u32::min);
+            }
+            least_bits += least;
             if least_bits > available_bits {
                 return false;
             }
             self.counted.push(group);
         }
-        (self.sections).extend(self.counted.drain(..).map(sections::Counted::choose));
+        if clip {
+            let counted = self.counted.pop().expect("a long window");
+            let (pulses, sections) = clipping::choose(counted, &mut self.clippings);
+            self.pulses = pulses;
+            self.sections.push(sections);
+        } else {
+            (self.sections).extend(self.counted.drain(..).map(sections::Counted::choose));
+        }
         for g in 0..self.sf_decoder.len() {
             let mut sf_decoder = std::mem::take(&mut self.sf_decoder[g]);
             sf_decoder.clear();
@@ -429,7 +462,7 @@ impl<'a> Counting<'a> {
         channel::bits(
             windows,
             common_window,
-            &Pulses::NONE,
+            &self.pulses,
             tns,
             noiseless + scalefactor_bits,
         ) + element_bits
@@ -471,6 +504,8 @@ impl<'a> Counting<'a> {
             assert!(self.count_at(common_gain, band_limit), "a coding that fits");
         }
         let global_gain = self.global_gain(common_gain);
+        let mut lines = self.x_quant;
+        self.pulses.clip(&mut lines);
         let groups = (self.sections.into_iter())
             .zip(self.sf_decoder)
             .enumerate()
@@ -487,8 +522,8 @@ impl<'a> Counting<'a> {
             self.coding.sampling_frequency,
             global_gain,
             *self.coding.tns,
-            Pulses::NONE,
-            self.x_quant,
+            self.pulses,
+            lines,
             groups,
         )
         .expect("the scalefactors were counted")
@@ -795,5 +830,92 @@ mod tests {
         let channel = counting.into_channel(140, MAX_BANDS);
         let (group, _) = channel.groups().next().unwrap();
         assert_eq!(group.scalefactors[2..5], [140, 138, 140]);
+    }
+
+    /// Lines that quantize to ones and zeros in their upper half but for a
+    /// few: those spectrum clipping saves bits on.
+    fn sparse_peaks() -> [f64; FRAME_LINES] {
+        spectrum(|i| {
+            let sign = if i % 3 == 0 { -1.0 } else { 1.0 };
+            let x = match i {
+                _ if i < 400 => 300.0 / (1.0 + i as f64 / 20.0),
+                601 | 620 | 633 => 2000.0,
+                _ if i % 4 == 0 => 0.0,
+                _ => 60.0,
+            };
+            sign * x
+        })
+    }
+
+    /// A channel of `lines` counted at `gain` with clipping `on` or off.
+    fn counted_at(
+        lines: &[f64; FRAME_LINES],
+        windows: Windows,
+        on: bool,
+        gain: u8,
+    ) -> Option<CodedChannel> {
+        let fs = SamplingFrequency::Hz44100;
+        let coding = ChannelCoding {
+            spectrum_clipping: on,
+            ..ChannelCoding::single(windows, fs, 1 << 20)
+        };
+        let mut counting = Counting::new(Lines::new(lines), coding);
+        counting
+            .count_at(gain, MAX_BANDS)
+            .then(|| counting.into_channel(gain, MAX_BANDS))
+    }
+
+    /// Clipping codes the same quantized lines in fewer bits, counted as
+    /// written, with the lines of its pulses sent as magnitudes of 1.
+    #[test]
+    fn clipping_codes_the_same_lines_in_fewer_bits() {
+        let lines = sparse_peaks();
+        let plain = counted_at(&lines, Windows::LONG_SINE, false, 124).unwrap();
+        let clipped = counted_at(&lines, Windows::LONG_SINE, true, 124).unwrap();
+        assert!(!plain.pulses().is_present());
+        assert!(clipped.pulses().is_present());
+        assert_eq!(clipped.quantized_lines(), *plain.lines());
+        for (line, _) in clipped.pulses().iter() {
+            assert_eq!(clipped.lines()[line].abs(), 1);
+            assert!(plain.lines()[line].abs() > 1);
+        }
+        assert!(clipped.bits(false) < plain.bits(false));
+        let mut w = chelys_core::bitstream::BitWriter::new();
+        crate::raw_data_block::ics::write_individual_channel_stream(&clipped, false, &mut w);
+        assert_eq!(w.bit_len() as u32, clipped.bits(false));
+    }
+
+    /// The loops fit the bits available with clipping as without, at a
+    /// step no coarser, and never clip short windows.
+    #[test]
+    fn clipping_fits_the_bits_available() {
+        use crate::window::{Grouping, WindowSequence, WindowShape};
+        let fs = SamplingFrequency::Hz44100;
+        let lines = sparse_peaks();
+        let mut pulses = 0;
+        for available in [300, 600, 900, 1500] {
+            let coded = |on: bool| {
+                let coding = ChannelCoding {
+                    spectrum_clipping: on,
+                    ..ChannelCoding::single(Windows::LONG_SINE, fs, available)
+                };
+                let mut counting = Counting::new(Lines::new(&lines), coding);
+                let (gain, band_limit) = first_inner_loop(&mut counting);
+                counting.into_channel(gain, band_limit)
+            };
+            let (plain, clipped) = (coded(false), coded(true));
+            assert!(clipped.bits(false) <= available, "{available}");
+            assert!(clipped.global_gain() <= plain.global_gain(), "{available}");
+            pulses += usize::from(clipped.pulses().is_present());
+        }
+        assert!(pulses > 0);
+        let short = Windows {
+            sequence: WindowSequence::EightShort {
+                grouping: Grouping::from_starts([true; 8]),
+            },
+            shape: WindowShape::Sine,
+        };
+        let channel = counted_at(&lines, short, true, 124).unwrap();
+        assert!(!channel.pulses().is_present());
     }
 }

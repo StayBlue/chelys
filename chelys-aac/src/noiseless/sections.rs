@@ -178,6 +178,7 @@ impl Sections {
         let mut counted = Counted {
             bands,
             max_sfb,
+            top,
             bits_below: [[0; 12]; MAX_BANDS + 1],
             zero_bands_below: [0; MAX_BANDS + 1],
             classes,
@@ -315,6 +316,19 @@ impl Sections {
         self.spectral_bits
     }
 
+    /// The bits that the choice of sections changes: those of
+    /// `section_data()` and `spectral_data()`, and the scalefactors that
+    /// the bands of zeros in sections with a spectrum codebook send (see
+    /// [`Counted::choose`]).
+    pub fn coding_bits(&self) -> u32 {
+        let repeated = (self.bands_with_scalefactors())
+            .filter(|&sfb| self.is_zero_band(sfb))
+            .count() as u32;
+        self.section_data_bits()
+            + self.spectral_data_bits()
+            + repeated * scalefactors::REPEATED_BITS
+    }
+
     /// Writes the group's part of `section_data()` (Table 17): for each
     /// section its `sect_cb`, then its length in bands as `sect_len_incr`
     /// fields, each `sect_esc_val` but the last, which is less.
@@ -395,6 +409,9 @@ pub fn max_sfb(lines: &[i32], bands: GroupBands) -> usize {
 pub struct Counted {
     bands: GroupBands,
     max_sfb: usize,
+    /// The highest class of a band, the highest whose codebooks are
+    /// counted.
+    top: usize,
     /// `bits_below[b][cb]`: the bits of bands `0..b` in codebook `cb`, or
     /// [`UNCODABLE`] where it is not counted.
     bits_below: [[u32; 12]; MAX_BANDS + 1],
@@ -413,6 +430,42 @@ impl Counted {
     /// where it is already too many, they need not be chosen.
     pub fn least_bits(&self) -> u32 {
         self.least_bits
+    }
+
+    /// Counts band `sfb` again for its lines `lines`, which hold the same
+    /// lines of zero as those counted, and no larger magnitudes: those of
+    /// a long window that [spectrum clipping](super::clipping) clips. The
+    /// band is counted in the codebooks up to those of the highest class of
+    /// the lines counted before, as any section that merges it can take.
+    ///
+    /// # Panics
+    ///
+    /// If the band is not one counted, or its lines are not as many as it
+    /// holds, or have other zeros or larger magnitudes than those counted:
+    /// a caller's error.
+    pub fn recount_band(&mut self, sfb: usize, lines: &[i32]) {
+        assert!(sfb < self.max_sfb, "band {sfb} is not counted");
+        assert_eq!(lines.len(), self.bands.band(sfb).len(), "the band's lines");
+        let largest = lines.iter().map(|line| line.unsigned_abs()).max();
+        let class = class(largest.expect("a band holds lines")).expect("a codable line");
+        assert!(
+            (class == 0) == (self.classes[sfb] == 0) && class <= self.classes[sfb],
+            "lines of the band's zeros and magnitudes"
+        );
+        if class == 0 {
+            return;
+        }
+        let new = spectrum::bits_by_codebook(lines, class, self.top);
+        let old: [u32; 12] =
+            std::array::from_fn(|cb| self.bits_below[sfb + 1][cb] - self.bits_below[sfb][cb]);
+        for below in &mut self.bits_below[sfb + 1..=self.max_sfb] {
+            for (bits, (new, old)) in below.iter_mut().zip(new.iter().zip(&old)) {
+                *bits = *bits - old + new;
+            }
+        }
+        let least = |bits: &[u32; 12]| *bits.iter().min().expect("a codebook");
+        self.least_bits = self.least_bits - least(&old) + least(&new);
+        self.classes[sfb] = class;
     }
 
     /// Divides the bands into sections and chooses their codebooks, by the
