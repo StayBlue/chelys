@@ -549,13 +549,16 @@ impl Counted {
         }
         let mut section_count = max_sfb;
         loop {
-            let mut best: Option<(usize, u32)> = None;
-            for (i, &saved) in saved[..section_count.saturating_sub(1)].iter().enumerate() {
-                if saved > best.map_or(0, |(_, most)| most) {
-                    best = Some((i, saved));
-                }
+            // The first merge of those that save the most, if any saves.
+            let pairs = &saved[..section_count.saturating_sub(1)];
+            let most = pairs.iter().copied().max().unwrap_or(0);
+            if most == 0 {
+                break;
             }
-            let Some((i, _)) = best else { break };
+            let i = pairs
+                .iter()
+                .position(|&saved| saved == most)
+                .expect("the most");
             sections[i] = merged[i];
             sections.copy_within(i + 2..section_count, i + 1);
             merged.copy_within(i + 1..section_count - 1, i);
