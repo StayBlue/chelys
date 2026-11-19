@@ -15,10 +15,11 @@ use super::{ID_DSE, Protected};
 /// The `element_instance_tag` of every `data_stream_element()`.
 ///
 /// Spec gap: the standard leaves the tag of a data stream to the encoder,
-/// asking only that the elements of one stream share it (clause 8.2.2,
+/// asking only that the elements of one stream share it (clause 8.2.4,
 /// "All data_stream_element()'s have the same element_instance_tag if they
-/// are part of the same data stream"). The encoder sends one stream, which
-/// is given the first tag.
+/// are part of the same data stream", and clause 8.2.1.1), and exempting
+/// data stream elements from the tags' being unique in a block (clause
+/// 8.2.2). The encoder sends one stream, which is given the first tag.
 pub const ELEMENT_INSTANCE_TAG: u32 = 0;
 
 /// The most `data_stream_byte`s one element holds: a `count` of 255 and an
@@ -50,6 +51,11 @@ pub fn bits(bytes: usize) -> u32 {
 /// with its `id_syn_ele`, in the bits [`bits`] counts; and gives the bits
 /// of each that an `adts_error_check()` protects: "All information in any
 /// ... data_stream_element()" (clause 8.1.3.2.1), its `id_syn_ele` aside.
+///
+/// Spec reading: the clause's "The id_syn_ele bits shall be excluded from
+/// CRC protection" follows its sentences on the channel elements, but is
+/// not limited to them: a data stream element's `id_syn_ele` is excluded
+/// too, and its other bits are protected, from `element_instance_tag` on.
 ///
 /// The bytes are not aligned: `data_byte_align_flag` is 0, which leaves
 /// out the `byte_alignment()` that would cost up to 7 bits an element.

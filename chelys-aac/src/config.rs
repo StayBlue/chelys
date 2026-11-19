@@ -91,8 +91,8 @@ impl Config {
     }
 
     /// Sets each ADTS header's `private_bit`, which ISO/IEC 11172-3 defines
-    /// as a "bit for private use" (clause 8.1.3.2.2 refers to it). ADTS
-    /// only.
+    /// as a "Bit for private use", which "will not be used in the future by
+    /// ISO/IEC" (clause 8.1.3.2.2 refers to it). ADTS only.
     pub fn private_bit(mut self, on: bool) -> Self {
         self.flags.private_bit = on;
         self

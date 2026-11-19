@@ -78,6 +78,12 @@ pub struct Block {
 /// first 128 of its second `individual_channel_stream()`, each padded with
 /// zeros where the element or the stream is shorter.
 ///
+/// Spec reading: the 192 bits are counted from the element's first bit
+/// after its `id_syn_ele`, `element_instance_tag`, where its syntax starts
+/// (Tables 13 and 14), rather than from the `id_syn_ele`, whose bits would
+/// then be left out of them: the clause's example counts the bits "of
+/// CPE", and "the 190th bit of CPE" leaves 3 bits of 192 after it.
+///
 /// Spec reading: the clause lists the bits protected "in order of their
 /// appearance", and a pair's second stream, whose first 128 bits are
 /// protected apart from the element's first 192, appears within them or
@@ -126,8 +132,12 @@ pub fn min_len(element: &CodedElement, data_bytes: usize) -> usize {
 
 /// A `raw_data_block()` of `element` and data stream elements of `data`,
 /// padded with fill elements to `len` bytes, or to [`min_len`] if that is
-/// longer. Fill elements are not protected (clause 8.1.3.2.1), nor is
-/// `ID_END`, nor the bits that align.
+/// longer.
+///
+/// Spec reading: clause 8.1.3.2.1 lists the bits that `adts_error_check()`
+/// protects, and the list is taken as whole: the fill elements, which it
+/// does not name, are not protected, nor is `ID_END`, nor the bits that
+/// align the block.
 ///
 /// # Panics
 ///

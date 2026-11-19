@@ -39,8 +39,8 @@ const LOW_COMPLEXITY: u32 = 1;
 /// both references.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Flags {
-    /// `private_bit`: as ISO/IEC 11172-3 defines it, a "bit for private
-    /// use", which the standard does not use.
+    /// `private_bit`: as ISO/IEC 11172-3 defines it, a "Bit for private
+    /// use", which "will not be used in the future by ISO/IEC".
     pub private_bit: bool,
     pub original_copy: bool,
     pub home: bool,
