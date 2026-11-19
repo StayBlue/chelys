@@ -14,8 +14,7 @@ usage: chelys aac --sample-rate HZ --channels N [--bitrate KBPS]
                   < input.f32 > output.aac
 
 Reads interleaved 32-bit little-endian float PCM from stdin and writes MPEG-2
-AAC in the Low Complexity profile (AAC-LC) to stdout, each frame in ADTS
-(experimental: the encoder is still being built).
+AAC in the Low Complexity profile (AAC-LC) to stdout, each frame in ADTS.
 
   --sample-rate HZ   96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050,
                      16000, 12000, 11025 or 8000

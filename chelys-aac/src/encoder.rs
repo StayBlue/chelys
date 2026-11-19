@@ -29,9 +29,7 @@ fn assert_finite<S: Sample>(samples: &[S]) {
 }
 
 /// Encodes PCM as MPEG-2 AAC in the Low Complexity profile (ISO/IEC
-/// 13818-7), as it arrives.
-///
-/// The encoder is being built: for what it codes so far, see the [crate
+/// 13818-7), as it arrives. For what it codes, see the [crate
 /// documentation](crate).
 ///
 /// Output lags input: a frame is coded once its samples, and any the

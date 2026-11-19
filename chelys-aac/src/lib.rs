@@ -8,14 +8,38 @@
 //! Clause and table references refer to ISO/IEC 13818-7:2006, or, where
 //! they name it, to ISO/IEC 14496-3:2019.
 //!
-//! The encoder is being built: for now it switches to eight short windows
-//! where the psychoacoustic model of Annex C finds an attack, shapes the
-//! quantization noise within each window in time with temporal noise
-//! shaping, codes a pair's channels as middle and side or in intensity
-//! stereo where Annex C finds it pays, and fits each channel's lines to
-//! its share of the frame's bits with the iteration loops of Annex C, which
-//! shape the quantization noise of each scalefactor band to what the model
-//! allows.
+//! The encoder takes PCM at the twelve sampling frequencies from 8 to
+//! 96 kHz, and codes:
+//!
+//! - each frame's channels in a long window, or in eight short windows
+//!   where the psychoacoustic model of Annex C finds an attack, with start
+//!   and stop windows between them: the Kaiser-Bessel derived window shape
+//!   for long and stop windows, and the sine window for start and short
+//!   ones; consecutive short windows of like energy grouped, to share their
+//!   scalefactors;
+//! - the quantization noise of each scalefactor band shaped to what the
+//!   model allows, and each channel's lines fitted to its share of the
+//!   frame's bits, by the iteration loops of Annex C;
+//! - the quantization noise within each window shaped in time with
+//!   temporal noise shaping (clause 14), from the analysis of Annex C;
+//! - a channel pair's bands as middle and side (M/S stereo), or in
+//!   intensity stereo, where Annex C finds it pays;
+//! - the channel configurations 1 to 7 (Table 42): mono, stereo, 3, 4 and
+//!   5 channels, and 5.1 and 7.1, whose low frequency enhancement channel
+//!   is coded in its lowest lines;
+//! - a constant rate, with the bit reservoir (clause 8.2.3.2) lending
+//!   frames bits and keeping those they leave, and fill where it is full;
+//! - each frame in ADTS, with an optional CRC and the header's
+//!   `private_bit`, `original_copy` and `home` as asked, or as its
+//!   `raw_data_block()` alone, for a container that carries the
+//!   `AudioSpecificConfig()` of ISO/IEC 14496-3 that describes the stream;
+//! - bytes of data beside the audio, in data stream elements (clause 8.6).
+//!
+//! Spectrum clipping (clause C.8.2), which sends part of up to four lines
+//! of a long window as pulse data, is implemented but not applied: Annex
+//! C says it "may be applied", and on music it saved about a tenth of a
+//! bit for each long window, changed grades of PEAQ by 0.001 at most, and
+//! made the encoder 47% slower.
 //!
 //! ```
 //! use chelys_aac::{Config, Encoder, Rate};

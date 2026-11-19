@@ -22,7 +22,7 @@ usage: chelys CODEC [OPTIONS] < input.f32 > output
 Reads interleaved 32-bit little-endian float PCM from stdin and writes it
 to stdout, encoded with CODEC:
 
-  aac   MPEG-2 AAC in the Low Complexity profile, in ADTS (experimental)
+  aac   MPEG-2 AAC in the Low Complexity profile, in ADTS
   mp3   MPEG-1 Layer III, MPEG-2 Layer III at its lower sampling
         frequencies, and MPEG-2.5
 
