@@ -322,7 +322,7 @@ impl Sections {
 }
 
 /// `max_sfb` for a window group whose bands' lines have the largest
-/// magnitudes `largest` (as for [`Counted::count_with_largest`]): the bands
+/// magnitudes `largest` (as for [`Counted::count_with`]): the bands
 /// up to the highest with a line that is not zero, so that no section has
 /// to code the bands of zeros above it. Over the groups of an
 /// EIGHT_SHORT_SEQUENCE, `max_sfb` is the largest of theirs.
@@ -423,14 +423,27 @@ impl Counted {
                 .max()
                 .unwrap_or(0);
         }
-        self.count_with_largest(lines, bands, max_sfb, intensity, &largest, u32::MAX)
+        let band_bits =
+            |_, class, top, lines: &[i32]| spectrum::bits_by_codebook(lines, class, top);
+        self.count_with(
+            lines,
+            bands,
+            max_sfb,
+            intensity,
+            &largest,
+            u32::MAX,
+            band_bits,
+        )
     }
 
     /// [`count`](Self::count), given the largest magnitude of each band's
-    /// lines in `largest`, but giving `false` too once the
-    /// [`least_bits`](Self::least_bits) of the bands counted exceed
-    /// `budget`, without counting the rest.
-    pub fn count_with_largest(
+    /// lines in `largest`, and each band's bits in each codebook, and the
+    /// least of them, by `band_bits(sfb, class, top, lines)`, as
+    /// `spectrum::bits_by_codebook` gives them; but giving `false` too
+    /// once the [`least_bits`](Self::least_bits) of the bands counted
+    /// exceed `budget`, without counting the rest.
+    #[allow(clippy::too_many_arguments)]
+    pub fn count_with(
         &mut self,
         lines: &[i32],
         bands: GroupBands,
@@ -438,6 +451,7 @@ impl Counted {
         intensity: IntensityBands,
         largest: &[u32],
         budget: u32,
+        mut band_bits: impl FnMut(usize, usize, usize, &[i32]) -> ([u32; 12], u32),
     ) -> bool {
         assert_eq!(lines.len(), bands.lines(), "a group's lines fill its bands");
         assert!(
@@ -487,7 +501,7 @@ impl Counted {
             let class = self.classes[sfb];
             let lines = &lines[bands.offset(sfb)..bands.offset(sfb + 1)];
             let bits = if class < CLASSES.len() {
-                let (bits, least) = spectrum::bits_by_codebook(lines, class, self.top);
+                let (bits, least) = band_bits(sfb, class, self.top, lines);
                 self.least_bits += least;
                 if self.least_bits > budget {
                     return false;

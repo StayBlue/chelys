@@ -16,7 +16,7 @@ use super::codebooks::{
 /// A count of bits that stands for a codebook not counted for some lines:
 /// more than any coding of a window's lines takes, and small enough that
 /// the counts of all its bands add up without overflow.
-pub(super) const UNCODABLE: u32 = 1 << 24;
+pub(crate) const UNCODABLE: u32 = 1 << 24;
 
 /// The bits of `lines` in each codebook of [`CLASSES`] `class..=top`, by
 /// codebook number, as [`write`] writes them, and [`UNCODABLE`] for the
@@ -27,7 +27,7 @@ pub(super) const UNCODABLE: u32 = 1 << 24;
 /// The two codebooks of a class share their codeword indexes, and are
 /// counted together (see `paired_bits`), and the classes of quadruples, and
 /// those of pairs, each in one pass over the lines.
-pub(super) fn bits_by_codebook(lines: &[i32], class: usize, top: usize) -> ([u32; 12], u32) {
+pub(crate) fn bits_by_codebook(lines: &[i32], class: usize, top: usize) -> ([u32; 12], u32) {
     // Each class's bits, those of a class of two codebooks paired.
     let mut counted = [0; CLASSES.len()];
     if class == 0 {

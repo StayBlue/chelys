@@ -294,6 +294,30 @@ impl Default for BandScratch {
     }
 }
 
+/// The `quantized_at` of a band of a [`Counting`]'s lines that were set to
+/// zero.
+const UNQUANTIZED: u16 = u16::MAX;
+
+/// A band's bits in each codebook and the least of them (see
+/// [`spectrum::bits_by_codebook`]), and the `sf_decoder` its lines were
+/// quantized with and the group's top class it was counted with.
+#[derive(Clone, Copy)]
+struct BandCount {
+    quantized_at: u16,
+    top: usize,
+    bits: [u32; 12],
+    least: u32,
+}
+
+impl BandCount {
+    const NONE: Self = Self {
+        quantized_at: UNQUANTIZED,
+        top: 0,
+        bits: [0; 12],
+        least: 0,
+    };
+}
+
 /// The coding of a channel's lines that the loops last counted, with the
 /// scalefactors of the outer loop that it was counted with.
 pub struct Counting<'a> {
@@ -307,6 +331,13 @@ pub struct Counting<'a> {
     /// magnitude of each group's bands.
     x_quant: [i32; FRAME_LINES],
     largest: Vec<[u32; MAX_BANDS]>,
+    /// The `sf_decoder` that each group's bands of `x_quant` were quantized
+    /// with, or [`UNQUANTIZED`] where they were set to zero: a band of the
+    /// same `sf_decoder` is not quantized again.
+    quantized_at: Vec<[u16; MAX_BANDS]>,
+    /// The bits each group's bands were last counted in, kept for a band
+    /// counted again with the same lines and top class.
+    band_counts: Vec<[BandCount; MAX_BANDS]>,
     /// Each group's lines counted at the step counted last, which each
     /// count counts into.
     counted: Vec<Counted>,
@@ -338,6 +369,8 @@ impl<'a> Counting<'a> {
             scalefactors: vec![[0; MAX_BANDS]; groups],
             x_quant: [0; FRAME_LINES],
             largest: vec![[0; MAX_BANDS]; groups],
+            quantized_at: vec![[UNQUANTIZED; MAX_BANDS]; groups],
+            band_counts: vec![[BandCount::NONE; MAX_BANDS]; groups],
             counted: (coding.windows.groups(coding.sampling_frequency))
                 .map(Counted::new)
                 .collect(),
@@ -410,13 +443,18 @@ impl<'a> Counting<'a> {
                 let Some(sf_decoder) = self.sf_decoder(common_gain, g, sb) else {
                     return false;
                 };
+                if self.quantized_at[g][sb] == u16::from(sf_decoder) {
+                    continue;
+                }
                 let band = bands.band(sb);
                 let range = start + band.start..start + band.end;
                 self.largest[g][sb] =
                     (self.lines).quantize(sf_decoder, range.clone(), &mut self.x_quant[range]);
+                self.quantized_at[g][sb] = u16::from(sf_decoder);
             }
             self.x_quant[start + bands.offset(sent)..start + bands.lines()].fill(0);
             self.largest[g][sent..].fill(0);
+            self.quantized_at[g][sent..].fill(UNQUANTIZED);
         }
         let ChannelCoding {
             windows,
@@ -457,8 +495,23 @@ impl<'a> Counting<'a> {
             } else {
                 available_bits.saturating_sub(least_bits)
             };
-            let largest = &self.largest[g];
-            if !group.count_with_largest(lines, bands, max_sfb, intensity, largest, budget) {
+            let (largest, quantized_at) = (&self.largest[g], &self.quantized_at[g]);
+            let counts = &mut self.band_counts[g];
+            let band_bits = |sfb: usize, class: usize, top: usize, lines: &[i32]| {
+                let at = quantized_at[sfb];
+                let count = &mut counts[sfb];
+                if at == UNQUANTIZED || (count.quantized_at, count.top) != (at, top) {
+                    let (bits, least) = spectrum::bits_by_codebook(lines, class, top);
+                    *count = BandCount {
+                        quantized_at: at,
+                        top,
+                        bits,
+                        least,
+                    };
+                }
+                (count.bits, count.least)
+            };
+            if !group.count_with(lines, bands, max_sfb, intensity, largest, budget, band_bits) {
                 return false;
             }
             let mut least = group.least_bits();
