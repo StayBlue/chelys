@@ -107,6 +107,7 @@ pub fn write<O: FrameSink + ?Sized>(
             let header = adts::Header {
                 sampling_frequency: config.sampling_frequency,
                 channel_configuration: config.channel_configuration,
+                flags: config.flags,
             };
             let mut w = BitWriter::new();
             header.write(&mut w, frame_len, reservoir.adts_buffer_fullness());

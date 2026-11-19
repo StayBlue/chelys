@@ -8,7 +8,7 @@ mod element;
 mod frame;
 
 use super::DELAY;
-use super::adts::HEADER_LEN;
+use super::adts::{Flags, HEADER_LEN};
 use super::audio_specific_config::audio_specific_config;
 use super::channel::CodedChannel;
 use super::channel_configuration::ChannelConfiguration;
@@ -58,6 +58,8 @@ pub struct StreamConfig {
     pub channel_configuration: ChannelConfiguration,
     pub bits_per_second: u32,
     pub framing: Framing,
+    /// The flags of each ADTS header; raw frames have none.
+    pub flags: Flags,
 }
 
 impl StreamConfig {
@@ -355,6 +357,7 @@ mod tests {
             channel_configuration: ChannelConfiguration::Stereo,
             bits_per_second,
             framing,
+            flags: Flags::default(),
         }
     }
 
@@ -410,6 +413,7 @@ mod tests {
                         channel_configuration,
                         bits_per_second: 0,
                         framing,
+                        flags: Flags::default(),
                     };
                     let (min, max) = (config.min_bits_per_second(), config.max_bits_per_second());
                     for bits_per_second in [min - 1, min, max, max + 1] {
@@ -510,6 +514,7 @@ mod tests {
             channel_configuration: ChannelConfiguration::Mono,
             bits_per_second: 0,
             framing: Framing::Adts,
+            flags: Flags::default(),
         };
         let min = config.min_bits_per_second();
         let mut input = vec![0.0; 12 * FRAME_SAMPLES];
@@ -541,6 +546,7 @@ mod tests {
             channel_configuration: ChannelConfiguration::Mono,
             bits_per_second: 8_000,
             framing: Framing::Adts,
+            flags: Flags::default(),
         };
         // Silence, which takes the shortest frames and fills the
         // reservoir, then white noise, whose perceptual entropy asks for

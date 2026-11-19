@@ -7,6 +7,7 @@
 
 use std::fmt;
 
+use super::adts::Flags;
 use super::channel_configuration::ChannelConfiguration;
 use super::sampling_frequency::SamplingFrequency;
 use super::stream::StreamConfig;
@@ -51,6 +52,7 @@ pub struct Config {
     channels: usize,
     rate: Rate,
     framing: Framing,
+    flags: Flags,
 }
 
 impl Config {
@@ -64,12 +66,43 @@ impl Config {
             channels,
             rate,
             framing: Framing::default(),
+            flags: Flags::default(),
         }
     }
 
     /// How each frame is given: in ADTS, the default, or raw.
     pub fn framing(mut self, framing: Framing) -> Self {
         self.framing = framing;
+        self
+    }
+
+    /// Sets each ADTS header's `private_bit`, which ISO/IEC 11172-3 defines
+    /// as a "bit for private use" (clause 8.1.3.2.2 refers to it). ADTS
+    /// only.
+    pub fn private_bit(mut self, on: bool) -> Self {
+        self.flags.private_bit = on;
+        self
+    }
+
+    /// Sets each ADTS header's `original_copy`. ADTS only.
+    ///
+    /// The standard defines it by reference to ISO/IEC 11172-3's
+    /// `copyright`, which is set where the stream is copyright protected,
+    /// though its name is that of 11172-3's `original/copy` (clauses
+    /// 8.1.3.2.2 and 8.1.2.2.2): the bit is set as asked, and what it
+    /// marks is left to the reader.
+    pub fn original_copy(mut self, on: bool) -> Self {
+        self.flags.original_copy = on;
+        self
+    }
+
+    /// Sets each ADTS header's `home`. ADTS only.
+    ///
+    /// The standard defines it by reference to ISO/IEC 11172-3's
+    /// `original/copy`, which is set where the stream is an original rather
+    /// than a copy (clauses 8.1.3.2.2 and 8.1.2.2.2).
+    pub fn home(mut self, on: bool) -> Self {
+        self.flags.home = on;
         self
     }
 
@@ -94,12 +127,16 @@ impl Config {
                 channels: self.channels,
             },
         )?;
+        if self.framing == Framing::Raw && self.flags != Flags::default() {
+            return Err(ConfigError::AdtsOnly);
+        }
         let Rate::Constant { bits_per_second } = self.rate;
         let config = StreamConfig {
             sampling_frequency,
             channel_configuration,
             bits_per_second,
             framing: self.framing,
+            flags: self.flags,
         };
         if !config.is_valid() {
             return Err(ConfigError::UnsupportedBitrate {
@@ -129,6 +166,9 @@ pub enum ConfigError {
         min: u32,
         max: u32,
     },
+    /// A header flag was set in [`Framing::Raw`], whose frames have no
+    /// header to carry it.
+    AdtsOnly,
 }
 
 impl fmt::Display for ConfigError {
@@ -148,8 +188,58 @@ impl fmt::Display for ConfigError {
                 f,
                 "unsupported bitrate: {bits_per_second} bit/s, not {min} to {max} bit/s"
             ),
+            Self::AdtsOnly => write!(f, "raw frames have no ADTS header to carry its flags"),
         }
     }
 }
 
 impl std::error::Error for ConfigError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Encoder;
+
+    fn config(framing: Framing) -> Config {
+        Config::new(
+            48_000,
+            2,
+            Rate::Constant {
+                bits_per_second: 96_000,
+            },
+        )
+        .framing(framing)
+    }
+
+    #[test]
+    fn every_adts_header_carries_the_flags() {
+        let config = config(Framing::Adts)
+            .private_bit(true)
+            .original_copy(false)
+            .home(true);
+        let mut encoder = Encoder::new(config).unwrap();
+        let mut frames = Vec::new();
+        let mut out = |frame: &[u8]| frames.push(frame.to_vec());
+        encoder.encode_interleaved(&[0.0f32; 2 * 4096], &mut out);
+        encoder.finish(&mut out);
+        assert_eq!(frames.len(), 5);
+        for frame in frames {
+            // private_bit is bit 22, original_copy 26 and home 27.
+            assert_eq!(frame[2] & 0b10, 0b10);
+            assert_eq!((frame[3] >> 4) & 0b11, 0b01);
+        }
+    }
+
+    #[test]
+    fn raw_frames_have_no_header_for_the_flags() {
+        assert_eq!(config(Framing::Raw).check(), Ok(()));
+        assert_eq!(config(Framing::Raw).home(false).check(), Ok(()));
+        for config in [
+            config(Framing::Raw).private_bit(true),
+            config(Framing::Raw).original_copy(true),
+            config(Framing::Raw).home(true),
+        ] {
+            assert_eq!(config.check(), Err(ConfigError::AdtsOnly));
+        }
+    }
+}

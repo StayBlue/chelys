@@ -20,11 +20,32 @@ pub const MAX_FRAME_LEN: usize = (1 << 13) - 1;
 /// `profile` (Table 31).
 const LOW_COMPLEXITY: u32 = 1;
 
+/// The bits of the header that describe the stream and leave its decoding
+/// alone, each set as the user asks.
+///
+/// Spec reading: clause 8.1.3.2.2 defines `original_copy` and `home` by
+/// those of ADIF (clause 8.1.2.2.2), which refer `original_copy` to the
+/// definition of ISO/IEC 11172-3's `copyright` ("'1' means copyright
+/// protected") and `home` to that of its `original/copy` ("'0' if the
+/// bitstream is a copy, '1' if it is an original"), against what the name
+/// `original_copy` says. Neither meaning is chosen here: each bit is named
+/// for its field and set as asked, and [`Config`](crate::Config) gives
+/// both references.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Flags {
+    /// `private_bit`: as ISO/IEC 11172-3 defines it, a "bit for private
+    /// use", which the standard does not use.
+    pub private_bit: bool,
+    pub original_copy: bool,
+    pub home: bool,
+}
+
 /// What every header of a stream holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Header {
     pub sampling_frequency: SamplingFrequency,
     pub channel_configuration: ChannelConfiguration,
+    pub flags: Flags,
 }
 
 impl Header {
@@ -40,9 +61,7 @@ impl Header {
             "an ADTS frame of {frame_len} bytes"
         );
         debug_assert!(buffer_fullness < 0x7FF, "buffer fullness {buffer_fullness}");
-        // The private bit, original_copy and home, and the copyright
-        // identification, are the user's to set; none are offered, and
-        // they are 0.
+        // The copyright identification is not offered (see below).
         // adts_fixed_header()
         w.write(0xFFF, 12); // syncword
         w.write(1, 1); // ID: "set to '1'" (clause 8.1.3.2.2)
@@ -50,12 +69,18 @@ impl Header {
         w.write(1, 1); // protection_absent
         w.write(LOW_COMPLEXITY, 2); // profile
         w.write(self.sampling_frequency.index(), 4); // sampling_frequency_index
-        w.write(0, 1); // private_bit
+        w.write_bool(self.flags.private_bit);
         w.write(self.channel_configuration.value(), 3); // channel_configuration
-        w.write(0, 1); // original_copy
-        w.write(0, 1); // home
+        w.write_bool(self.flags.original_copy);
+        w.write_bool(self.flags.home);
         // adts_variable_header()
-        w.write(0, 1); // copyright_identification_bit
+        // copyright_identification_bit: one bit a frame of a 72-bit field,
+        // an identifier that a registration authority gives and a number
+        // that identifies the material (clause 8.1.3.2.2). It is not
+        // offered, and is 0: the clause does not say in which frame the
+        // field starts or whether it repeats, and refers to ISO/IEC
+        // 13818-3, subclause 2.5.2.13, for it.
+        w.write(0, 1);
         // copyright_identification_start: "If no copyright identification
         // is transmitted, this bit should be kept '0'."
         w.write(0, 1);
@@ -76,6 +101,7 @@ mod tests {
         let header = Header {
             sampling_frequency: SamplingFrequency::Hz44100,
             channel_configuration: ChannelConfiguration::Stereo,
+            flags: Flags::default(),
         };
         let mut w = BitWriter::new();
         header.write(&mut w, 0x1ABC, 0x123);
@@ -103,5 +129,49 @@ mod tests {
             binary_digits(&w.into_bytes()),
             [fixed.concat(), variable.concat()].concat()
         );
+    }
+
+    #[test]
+    fn each_flag_sets_its_bit() {
+        let set = |flags| {
+            let header = Header {
+                sampling_frequency: SamplingFrequency::Hz8000,
+                channel_configuration: ChannelConfiguration::Mono,
+                flags,
+            };
+            let mut w = BitWriter::new();
+            header.write(&mut w, HEADER_LEN, 0);
+            binary_digits(&w.into_bytes())
+        };
+        let none = set(Flags::default());
+        // private_bit, channel_configuration 1, original_copy, home.
+        assert_eq!(&none[22..28], "000100");
+        let flips = |flags| {
+            let bits = set(flags);
+            (0..bits.len())
+                .filter(|&i| bits.as_bytes()[i] != none.as_bytes()[i])
+                .collect::<Vec<_>>()
+        };
+        let private_bit = Flags {
+            private_bit: true,
+            ..Flags::default()
+        };
+        let original_copy = Flags {
+            original_copy: true,
+            ..Flags::default()
+        };
+        let home = Flags {
+            home: true,
+            ..Flags::default()
+        };
+        assert_eq!(flips(private_bit), [22]);
+        assert_eq!(flips(original_copy), [26]);
+        assert_eq!(flips(home), [27]);
+        let all = Flags {
+            private_bit: true,
+            original_copy: true,
+            home: true,
+        };
+        assert_eq!(flips(all), [22, 26, 27]);
     }
 }
