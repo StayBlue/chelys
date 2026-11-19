@@ -8,6 +8,7 @@
 //! ffmpeg -i song.flac -f f32le -ar 44100 -ac 2 - | chelys mp3 --sample-rate 44100 --channels 2 > song.mp3
 //! ```
 
+mod aac;
 mod mp3;
 mod output;
 mod pcm;
@@ -21,6 +22,7 @@ usage: chelys CODEC [OPTIONS] < input.f32 > output
 Reads interleaved 32-bit little-endian float PCM from stdin and writes it
 to stdout, encoded with CODEC:
 
+  aac   MPEG-2 AAC in the Low Complexity profile, in ADTS (experimental)
   mp3   MPEG-1 Layer III, MPEG-2 Layer III at its lower sampling
         frequencies, and MPEG-2.5
 
@@ -37,6 +39,7 @@ fn value<T: FromStr>(args: &mut impl Iterator<Item = String>, name: &str) -> Res
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
+        Some("aac") => run(aac::USAGE, aac::parse(args), |o| aac::encode(&o)),
         Some("mp3") => run(mp3::USAGE, mp3::parse(args), |o| mp3::encode(&o)),
         Some("-h" | "--help") => {
             println!("{USAGE}");
