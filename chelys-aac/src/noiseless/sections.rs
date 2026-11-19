@@ -693,13 +693,22 @@ impl Counted {
             return candidate(codebook, header);
         }
         // The codebooks of a class differ only in their spectral bits.
-        let books = CLASSES[class];
-        let shared = header + self.repeated_bits(start, end, books[0]);
-        let (codebook, bits) = (books.iter())
-            .map(|&codebook| (codebook, shared + self.spectral_bits(start, end, codebook)))
-            .min_by_key(|&(_, bits)| bits)
-            .expect("a class has a codebook");
-        candidate(codebook, bits)
+        let shared = header + self.repeated_bits(start, end, CLASSES[class][0]);
+        match *CLASSES[class] {
+            [a] => candidate(a, shared + self.spectral_bits(start, end, a)),
+            [a, b] => {
+                let (a_bits, b_bits) = (
+                    self.spectral_bits(start, end, a),
+                    self.spectral_bits(start, end, b),
+                );
+                if b_bits < a_bits {
+                    candidate(b, shared + b_bits)
+                } else {
+                    candidate(a, shared + a_bits)
+                }
+            }
+            _ => unreachable!("a class of one codebook or two"),
+        }
     }
 
     /// Sections `a` and `b`, neighbours, merged into one. Bands in
