@@ -332,10 +332,14 @@ impl Tables {
             let limited = block.nb[b].min(nb_last[b] * rpelev);
             nb_last[b] = block.nb[b];
             nb[b] = self.quiet[b].max(limited);
-            // Step 12.
+            // Step 12. A partition of one line weighs nothing (see
+            // `Model::analyze`), and the logarithm is not taken: the
+            // product would be 0, which leaves the sum as it is.
             let p = &self.partitions[b];
-            let weight = f64::from(p.w_high - p.w_low);
-            perceptual_entropy -= weight * (nb[b] / (block.e[b] + 1.0)).log10();
+            if p.w_high > p.w_low {
+                let weight = f64::from(p.w_high - p.w_low);
+                perceptual_entropy -= weight * (nb[b] / (block.e[b] + 1.0)).log10();
+            }
         }
 
         // Step 14.
