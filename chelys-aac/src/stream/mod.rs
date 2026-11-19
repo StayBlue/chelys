@@ -843,28 +843,47 @@ mod tests {
     }
 
     #[test]
-    fn the_bits_frames_leave_come_back_below_a_full_reservoir() {
+    fn the_bits_frames_leave_come_back_to_their_audio() {
+        use crate::raw_data_block::decoder::{adts_frame, raw_data_block};
+
         let config = config(Framing::Adts, 128_000);
         let reservoir = config.reservoir().unwrap();
-        // White noise, which takes all the bits it is given, but for what
-        // the loops leave of them.
-        let (left, right) = (noise(301 * FRAME_SAMPLES, 5), noise(301 * FRAME_SAMPLES, 6));
+        // Noise falling with frequency, whose perceptual entropy asks for no
+        // bits beyond the mean, and which takes all it is given, but for
+        // what the loops leave.
+        let red = |seed| {
+            let mut y = 0.0;
+            (noise(301 * FRAME_SAMPLES, seed).into_iter())
+                .map(|x| {
+                    y = 0.99 * y + 0.1 * x;
+                    y
+                })
+                .collect::<Vec<f64>>()
+        };
+        let (left, right) = (red(5), red(6));
         let mut encoder = StreamEncoder::new(config);
-        let mut fullness = Vec::new();
-        encoder.encode(&[&left, &right], &mut |frame: &[u8]| {
-            fullness.push((u32::from(frame[5] & 0b1_1111) << 6) | u32::from(frame[6] >> 2));
-        });
-        assert_eq!(fullness.len(), 300);
-        // adts_buffer_fullness of a full reservoir, and of one a mean frame
-        // below it.
-        let mean = 128_000 * FRAME_SAMPLES as u64 / 44_100;
-        let full = reservoir.max_bits() / 2 / 32;
-        let kept = (reservoir.max_bits() - mean) / 2 / 32;
-        let most = u64::from(*fullness[200..].iter().max().unwrap());
-        assert!(
-            (kept - 2..=kept + 2).contains(&most),
-            "{most} against {kept} and {full}"
-        );
+        let mut stream = Vec::new();
+        encoder.encode(&[&left, &right], &mut stream);
+        let (mut frame_bits, mut element_bits, mut fullness) = (0, 0, Vec::new());
+        let mut rest = stream.as_slice();
+        for k in 0..300 {
+            let frame = adts_frame(rest);
+            rest = &rest[frame.aac_frame_length..];
+            if k >= 100 {
+                let block = raw_data_block(frame.raw_data_block, config.sampling_frequency);
+                frame_bits += 8 * frame.aac_frame_length;
+                element_bits += block.elements[0].bits.len();
+                fullness.push(frame.adts_buffer_fullness);
+            }
+        }
+        // The audio takes all but the header, the element's id_syn_ele and
+        // ID_END, 62 of the 2972 bits of a mean frame, and a few the loops
+        // leave; filled out to the mean, it took 92.2%.
+        let share = element_bits as f64 / frame_bits as f64;
+        assert!(share > 0.975, "{share}");
+        // The reservoir is never full, which would have frames filled out.
+        let full = (reservoir.max_bits() / 2 / 32) as u32;
+        assert!(fullness.iter().all(|&f| f + 8 < full), "{fullness:?}");
     }
 
     /// A mono stream at 44.1 kHz and 48 kbit/s, with the CRC and 124 bytes
