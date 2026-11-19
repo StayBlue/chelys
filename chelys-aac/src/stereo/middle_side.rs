@@ -59,8 +59,9 @@ pub fn matrix(
 /// as its codebook gives it (clause 12.2.3).
 ///
 /// Spec reading: with `ms_mask_present` 2, `invert_intensity` is +1 for
-/// every band (clause 12.2.3), so that a frame whose other bands are all
-/// coded as middle and side could send 2 and no flags. Where a frame has
+/// every band (clause 12.2.3), and the bands in intensity stereo are not
+/// decoded as middle and side (clause 12.1.3), so that a frame whose other
+/// bands are all coded as middle and side could send 2 and no flags. Where a frame has
 /// bands in intensity stereo, it sends 1 and their flags of 0 instead,
 /// which no reading of `ms_used` can take as inverting them. Settled by
 /// decoding with ffmpeg (black box): sent with `ms_mask_present` 2, the

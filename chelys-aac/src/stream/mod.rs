@@ -44,7 +44,11 @@ pub const FRAME_SAMPLES: usize = 1024;
 /// 64 kbit/s from 9 and 12 kHz, -3.657 and -3.591, and -3.673 and -3.591.
 /// The limit lies between 64 and 96 kbit/s, 0.73 and 1.09 bits a sample;
 /// it is set per sample, untested at other sampling frequencies, so as to
-/// hold where a band's lines are as few for its bits.
+/// hold where a band's lines are as few for its bits. Below about 16 kHz
+/// sampling, the border of 6 kHz leaves few bands above it or none, so the
+/// limit matters little there. At 88.2 and 96 kHz, where a frame's bits
+/// are spread over a band twice as wide, the limit is generous, and
+/// untested.
 pub const INTENSITY_BITS_PER_SAMPLE: f64 = 0.75;
 
 /// What the stream is: what its headers say, its rate and its framing.
