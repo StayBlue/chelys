@@ -201,3 +201,21 @@ next to ffmpeg's.
 *User, 2026-11-19, when ffmpeg contradicted clause 12.2.3 on intensity bands
 under `ms_mask_present` 2 and was found not to check the ADTS CRC: the wording
 was proposed by the agent and approved by the user.*
+
+## FFmpeg's AAC encoder as a benchmark
+
+FFmpeg's native AAC encoder (`-c:a aac`) may be run as a black box to
+benchmark the quality of chelys's AAC output. It is run at its default
+settings, apart from the bitrate. Only the PEAQ grades and measures of its
+decoded output are used. They are taken from the same input, at the same
+bitrate and sampling frequency, and through the same decoding and grading as
+chelys's output. No other measurement is taken of its decoded output, and no
+signal derived from that output is given to PEAQ. Its bitstreams are not
+inspected beyond decoding them, and its choices are not copied: its grades
+show how far chelys's tuning has to go, not how to get there. Its source code
+stays under "Clean room", as the AAC entry says. Record the FFmpeg version the
+benchmark was run with in the `chelys-conformance` crate's documentation,
+next to the decoders'.
+
+*User, 2026-11-19, when asked whether chelys's AAC encoder is competitive with
+FFmpeg's: the wording was proposed by the agent and approved by the user.*
