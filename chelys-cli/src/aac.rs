@@ -19,16 +19,28 @@ AAC in the Low Complexity profile (AAC-LC) to stdout, each frame in ADTS
 
   --sample-rate HZ   96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050,
                      16000, 12000, 11025 or 8000
-  --channels N       1 or 2
+  --channels N       1, 2, 3, 4, 5, 6 (5.1) or 8 (7.1), interleaved in the
+                     order the stream sends them:
+                       1  center
+                       2  left, right
+                       3  center, left, right
+                       4  center, left, right, rear surround
+                       5  center, left, right, left surround, right surround
+                       6  as 5, then LFE
+                       8  center, left center, right center, left, right,
+                          left surround, right surround, LFE
+                     of which the LFE is coded in its lowest 12 of 1024
+                     lines, up to 281 Hz at 48 kHz
   --bitrate KBPS     the stream's constant bitrate, ADTS headers and any CRC
                      included: a whole number within the range of the
-                     sample rate and channels, at 48 kHz 5 to 287 in mono
-                     and 5 to 575 in stereo, at 44.1 kHz 4 to 264 and 5 to
-                     528, from 1 to 47 and 1 to 95 at 8 kHz to 9 to 575 and
-                     10 to 1151 at 96 kHz; with --crc, the lowest is up to
-                     2 higher, at 96 kHz 10 and 12 (default 128, or the
-                     highest the sample rate and channels allow where that
-                     is lower)
+                     sample rate and channels, at 48 kHz 5 to 287 in mono,
+                     5 to 575 in stereo, 10 to 1439 in 5.1 and 12 to 2015
+                     in 7.1, at 44.1 kHz 4 to 264, 5 to 528, 9 to 1322 and
+                     11 to 1851; the lowest from 1 in mono at 8 kHz to 24
+                     in 7.1 at 96 kHz, and the highest 6144 bits a frame
+                     for each channel but the LFE; with --crc, the lowest
+                     is up to 2 higher (default 128, or the highest the
+                     sample rate and channels allow where that is lower)
   --crc              protect each frame's header and the start of its audio
                      with a CRC-16 check word, 16 bits a frame (default:
                      off)
@@ -96,7 +108,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> 
     }
     let sample_rate = sample_rate.ok_or("--sample-rate is required")?;
     let channels = match channels.ok_or("--channels is required")? {
-        n @ (1 | 2) => n as usize,
+        n @ (1..=6 | 8) => n as usize,
         n => return Err(format!("unsupported channel count: {n}")),
     };
     let kbps = bitrate.unwrap_or_else(|| default_kbps(sample_rate, channels, crc));
@@ -130,10 +142,12 @@ fn default_kbps(sample_rate: u32, channels: usize, crc: bool) -> u32 {
 fn describe(error: ConfigError, options: &Options) -> String {
     match error {
         ConfigError::UnsupportedBitrate { min, max, .. } => {
-            let channels = if options.channels == 1 {
-                "mono"
-            } else {
-                "stereo"
+            let channels = match options.channels {
+                1 => "mono".to_owned(),
+                2 => "stereo".to_owned(),
+                6 => "5.1".to_owned(),
+                8 => "7.1".to_owned(),
+                n => format!("{n} channels"),
             };
             format!(
                 "unsupported bitrate at {} Hz in {channels}: {}; it takes {} to {}",
@@ -221,7 +235,16 @@ mod tests {
                 kbps,
             ])
         };
-        assert_eq!(args("44100", "3", "128"), "unsupported channel count: 3");
+        assert_eq!(args("44100", "7", "128"), "unsupported channel count: 7");
+        assert_eq!(args("44100", "9", "128"), "unsupported channel count: 9");
+        assert_eq!(
+            args("48000", "6", "9"),
+            "unsupported bitrate at 48000 Hz in 5.1: 9; it takes 10 to 1439"
+        );
+        assert_eq!(
+            args("48000", "3", "900"),
+            "unsupported bitrate at 48000 Hz in 3 channels: 900; it takes 7 to 863"
+        );
         assert_eq!(args("44000", "2", "128"), "unsupported sample rate: 44000");
         assert_eq!(
             args("44100", "2", "4"),
@@ -301,12 +324,17 @@ mod tests {
             ("96000", "1", "9 to 575", "10 to 575"),
             ("96000", "2", "10 to 1151", "12 to 1151"),
             ("88200", "2", "9 to 1057", "11 to 1057"),
+            ("48000", "6", "10 to 1439", "11 to 1439"),
+            ("48000", "8", "12 to 2015", "13 to 2015"),
+            ("44100", "6", "9 to 1322", "10 to 1322"),
+            ("44100", "8", "11 to 1851", "12 to 1851"),
+            ("96000", "8", "24 to 4031", "25 to 4031"),
         ] {
             assert_eq!(range(rate, channels, &[]), without, "{rate} {channels}");
             assert_eq!(range(rate, channels, &["--crc"]), with, "{rate} {channels}");
         }
         for rate in SAMPLE_RATES {
-            for channels in ["1", "2"] {
+            for channels in ["1", "2", "3", "4", "5", "6", "8"] {
                 let lowest = |crc| range(&rate.to_string(), channels, crc);
                 let low = |range: String| range.split(' ').next().unwrap().parse::<u32>().unwrap();
                 let rise = low(lowest(&["--crc"])) - low(lowest(&[]));
@@ -317,7 +345,13 @@ mod tests {
 
     #[test]
     fn takes_the_ends_of_the_range() {
-        for (rate, channels, kbps) in [("44100", "2", "5"), ("44100", "2", "528")] {
+        for (rate, channels, kbps) in [
+            ("44100", "2", "5"),
+            ("44100", "2", "528"),
+            ("48000", "6", "10"),
+            ("48000", "6", "1439"),
+            ("48000", "8", "2015"),
+        ] {
             let args = [
                 "--sample-rate",
                 rate,
@@ -343,5 +377,7 @@ mod tests {
         assert_eq!(kbps("8000", "1"), 47);
         assert_eq!(kbps("8000", "2"), 95);
         assert_eq!(kbps("16000", "1"), 95);
+        assert_eq!(kbps("48000", "6"), 128);
+        assert_eq!(kbps("8000", "8"), 128);
     }
 }

@@ -202,6 +202,42 @@ fn encodes_mono_at_the_default_bitrate() {
     assert_eq!(header.channel_configuration, 1);
 }
 
+/// Interleaved input of 6 and 8 channels gives the stream the library
+/// writes of it, in channel configurations 6 and 7.
+#[test]
+fn encodes_5_1_and_7_1_as_the_library_does() {
+    for (channels, channel_configuration) in [(6, 6), (8, 7)] {
+        let pcm: Vec<f32> = (stereo_tone(48_000, 0.2).chunks(2))
+            .flat_map(|pair| (0..channels).map(move |c| pair[c % 2] / (1 + c) as f32))
+            .collect();
+        let args = [
+            "--sample-rate",
+            "48000",
+            "--channels",
+            &channels.to_string(),
+        ];
+        let output = chelys(
+            &[&["aac"][..], &args, &["--bitrate", "320"]].concat(),
+            &le_bytes(&pcm),
+        );
+        assert!(output.status.success(), "{}", text(&output.stderr));
+        let config = Config::new(
+            48_000,
+            channels,
+            Rate::Constant {
+                bits_per_second: 320_000,
+            },
+        );
+        let mut expected = Vec::new();
+        let mut encoder = Encoder::new(config).unwrap();
+        encoder.encode_interleaved(&pcm, &mut expected);
+        encoder.finish(&mut expected);
+        assert!(output.stdout == expected, "{channels} channels");
+        let header = adts_header(&output.stdout);
+        assert_eq!(header.channel_configuration, channel_configuration);
+    }
+}
+
 #[test]
 fn encodes_empty_input_to_a_frame_of_silence() {
     let output = chelys(&["aac", "--sample-rate", "48000", "--channels", "2"], &[]);
