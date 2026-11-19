@@ -881,9 +881,67 @@ mod tests {
         // leave; filled out to the mean, it took 92.2%.
         let share = element_bits as f64 / frame_bits as f64;
         assert!(share > 0.975, "{share}");
-        // The reservoir is never full, which would have frames filled out.
+        // The reservoir is never full, which would have frames filled out,
+        // and keeps what lies within half a mean frame of its maximum, for
+        // frames that ask for more.
+        let mean = 128_000 * FRAME_SAMPLES as u64 / 44_100;
         let full = (reservoir.max_bits() / 2 / 32) as u32;
-        assert!(fullness.iter().all(|&f| f + 8 < full), "{fullness:?}");
+        let kept = ((reservoir.max_bits() - mean / 2) / 2 / 32) as u32;
+        assert!(
+            fullness.iter().all(|&f| (kept..full).contains(&f)),
+            "{fullness:?}"
+        );
+    }
+
+    /// A mono stream at 44.1 kHz whose reservoir is as large as a mean
+    /// frame, 3072 bits, with the CRC and data streams that leave its audio
+    /// a few bits a frame: 38 blocks of silence fill the reservoir, then
+    /// white noise sets in, with a second attack after a gap in block 44.
+    /// Neither the first attack nor the frames after it take all that the
+    /// reservoir holds, which leaves the second bits to borrow: every frame
+    /// codes lines, the second attack's in eight short windows, in more
+    /// than the 436 bits it took before frames were offered any.
+    #[test]
+    fn an_attack_finds_bits_in_the_reservoir_after_another() {
+        use crate::raw_data_block::decoder::{adts_frame, raw_data_block};
+
+        let fs = SamplingFrequency::Hz44100;
+        let config = StreamConfig {
+            sampling_frequency: fs,
+            channel_configuration: ChannelConfiguration::Mono,
+            bits_per_second: 132_300,
+            framing: Framing::Adts,
+            flags: Flags::default(),
+            crc_protected: true,
+        };
+        let mut input = vec![0.0; 38 * FRAME_SAMPLES];
+        let gap = 6 * FRAME_SAMPLES..6 * FRAME_SAMPLES + 600;
+        let noise = noise(12 * FRAME_SAMPLES, 3);
+        input.extend(
+            (noise.iter().enumerate()).map(|(t, &x)| if gap.contains(&t) { 0.0 } else { x }),
+        );
+        let mut encoder = StreamEncoder::new(config).with_data_stream(368);
+        let mut stream = Vec::new();
+        encoder.encode(&[&input[..38 * FRAME_SAMPLES]], &mut stream);
+        encoder.push_data_stream(&[0x33; 368 * 60]);
+        encoder.encode(&[&input[38 * FRAME_SAMPLES..]], &mut stream);
+        let mut rest = stream.as_slice();
+        // The frames from the first attack's on.
+        let frames: Vec<_> = (0..49)
+            .map(|_| {
+                let frame = adts_frame(rest);
+                rest = &rest[frame.aac_frame_length..];
+                raw_data_block(frame.raw_data_block, fs).elements[0].clone()
+            })
+            .skip(38)
+            .collect();
+        for (k, element) in frames.iter().enumerate() {
+            let lines = &element.element.channels[0].lines;
+            assert!(lines.iter().flatten().any(|&q| q != 0), "frame {}", 38 + k);
+        }
+        let second = &frames[45 - 38];
+        assert_eq!(second.element.channels[0].info.window_sequence, 2);
+        assert!(second.bits.len() > 436, "{}", second.bits.len());
     }
 
     /// A mono stream at 44.1 kHz and 48 kbit/s, with the CRC and 124 bytes

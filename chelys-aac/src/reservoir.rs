@@ -158,14 +158,16 @@ impl BitReservoir {
     }
 
     /// The bits the next frame is offered whatever it asks for: the mean,
-    /// and what the reservoir holds beyond `max_bit_reservoir -
-    /// mean_framelength`, in whole bits, and no more than the longest frame
-    /// that [`Self::frame_len_range`] allows, in its whole bytes. A frame
-    /// that takes them all leaves the reservoir a mean frame below its
-    /// maximum, or as it was where it held less.
+    /// and a quarter of what the reservoir holds beyond `max_bit_reservoir`
+    /// less half of `mean_framelength`, or beyond half of
+    /// `max_bit_reservoir` where that is more, in whole bits, and no more
+    /// than the longest frame that [`Self::frame_len_range`] allows, in its
+    /// whole bytes. Frames that take them leave the reservoir within half a
+    /// mean frame of its maximum, and at least half full.
     pub fn offered_bits(&self) -> u32 {
-        let keep = self.max.saturating_sub(self.mean);
-        let bits = (self.mean + self.state.saturating_sub(keep)) / self.sample_rate;
+        let keep = (self.max / 2).max(self.max.saturating_sub(self.mean / 2));
+        let beyond = self.state.saturating_sub(keep);
+        let bits = (self.mean + beyond / 4) / self.sample_rate;
         let (_, longest) = self.frame_len_range();
         bits.min(8 * longest as u64) as u32
     }
@@ -275,30 +277,52 @@ mod tests {
     }
 
     #[test]
-    fn the_bits_offered_are_those_beyond_a_mean_frame_below_the_maximum() {
-        // mean_framelength 2229.1156... bits, max_bit_reservoir 10058.
+    fn the_bits_offered_are_a_quarter_of_those_beyond_what_is_kept() {
+        // mean_framelength 2229.1156... bits, max_bit_reservoir 10058: what
+        // lies beyond 8943.44... bits.
         let mut reservoir = BitReservoir::new(Hz44100, Stereo, 96_000).unwrap();
         // Empty, the frame is offered the most it may take: 278 bytes.
         assert_eq!(reservoir.offered_bits(), 2224);
-        for _ in 0..5 {
+        for _ in 0..6 {
             reservoir.spend(100);
         }
-        // 7145.57... bits, below 10058 - 2229.11...: the mean.
+        // 8574.69... bits: the mean.
         assert_eq!(reservoir.offered_bits(), 2229);
+        // Full, the mean and a quarter of what lies beyond; frames that take
+        // them, in whole bytes, bring the reservoir down to what is kept,
+        // and no further.
         while reservoir.max_bits() - reservoir.state_bits() > 8 {
             let (shortest, _) = reservoir.frame_len_range();
             reservoir.spend(shortest.max(10));
         }
-        // The mean and what the reservoir holds beyond 7828.88... bits.
-        let beyond = reservoir.state_bits() as f64 - (10_058.0 - 2229.1156);
+        let beyond = reservoir.state_bits() as f64 - 8943.44;
         let offered = f64::from(reservoir.offered_bits());
-        assert!((offered - (2229.1156 + beyond)).abs() <= 1.0, "{offered}");
-        // A frame that takes them, in whole bytes, leaves the reservoir a
-        // mean frame below its maximum, within a byte.
-        reservoir.spend(reservoir.offered_bits() as usize / 8);
-        let below = reservoir.max_bits() - reservoir.state_bits();
-        assert!((2229 - 9..=2229).contains(&below), "{below}");
-        assert!((2229..=2229 + 9).contains(&reservoir.offered_bits()));
+        assert!(
+            (offered - (2229.1156 + beyond / 4.0)).abs() <= 1.0,
+            "{offered}"
+        );
+        for _ in 0..100 {
+            reservoir.spend(reservoir.offered_bits() as usize / 8);
+            assert!(reservoir.state_bits() >= 8943, "{}", reservoir.state_bits());
+        }
+        assert!(
+            reservoir.state_bits() <= 8943 + 40,
+            "{}",
+            reservoir.state_bits()
+        );
+        // Where the maximum less half a mean frame is less than half of
+        // the maximum, half of it is kept: in mono at 192 kbit/s, whose
+        // maximum of 1685 bits is less than half a mean frame, 842.
+        let mut reservoir = BitReservoir::new(Hz44100, Mono, 192_000).unwrap();
+        assert_eq!(reservoir.max_bits(), 1685);
+        while reservoir.max_bits() - reservoir.state_bits() > 8 {
+            let (shortest, _) = reservoir.frame_len_range();
+            reservoir.spend(shortest);
+        }
+        for _ in 0..100 {
+            reservoir.spend(reservoir.offered_bits() as usize / 8);
+            assert!(reservoir.state_bits() >= 842, "{}", reservoir.state_bits());
+        }
     }
 
     #[test]

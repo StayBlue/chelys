@@ -103,25 +103,49 @@ pub fn more_bits(config: &StreamConfig, demand: &Demand, data_bits: u32) -> i64 
 /// loops left (clause 8.8.2.2), which codes nothing. On 8 tracks of pop
 /// music and 3 of rock at 44.1 kHz in stereo, those fill bits took 2.4%,
 /// 2.9% and 3.0% of the stream at 64, 128 and 192 kbit/s. A frame is
-/// therefore also offered what the reservoir holds beyond
-/// `max_bit_reservoir - mean_framelength`: the bits a frame leaves come
-/// back to the frames after it, and the reservoir stays about a mean frame
-/// below its maximum, for frames that ask for more. The fill bits fell to
-/// 0.5%, 0.4% and 0.4%. Graded with PEAQ (GstPEAQ 0.6.1, black box), the
-/// means of the pop tracks were -3.583, -1.087 and -0.282 at 64, 128 and
-/// 192 kbit/s, and of the rock tracks and their 3 windows of 3 s with the
-/// most frames coded short -3.579, -0.803 and -0.142, against -3.593,
-/// -1.184 and -0.310, and -3.584, -0.843 and -0.160, before. Keeping the
-/// reservoir within a quarter of a frame of its maximum graded alike,
-/// -1.088 and -0.803 at 128 kbit/s. Spending what the loops leave within
-/// the frame instead was tried too, at 128 kbit/s: trying two finer steps
-/// after the inner loop, where the bits do not fall as the step grows (see
+/// therefore also offered a quarter of what the reservoir holds beyond what
+/// it keeps, `max_bit_reservoir` less half of `mean_framelength`, or half
+/// of `max_bit_reservoir` where that is more: the bits a frame leaves come
+/// back to the frames after it, a little at a time, and the reservoir keeps
+/// most of its bits, at least half, for frames that ask for more. The fill
+/// bits fell to 0.5%, 0.4% and 0.4%. Graded with PEAQ (GstPEAQ 0.6.1, black
+/// box), the means of the pop tracks were -3.584, -1.087 and -0.283 at 64,
+/// 128 and 192 kbit/s, and of the rock tracks and their 3 windows of 3 s
+/// with the most frames coded short -3.578, -0.801 and -0.134, against
+/// -3.593, -1.184 and -0.310, and -3.584, -0.843 and -0.160, before.
+///
+/// Offering all that the reservoir holds beyond `max_bit_reservoir -
+/// mean_framelength`, beyond `max_bit_reservoir` less half of
+/// `mean_framelength`, or beyond half of `max_bit_reservoir`, or a quarter
+/// of what lies beyond half of it, graded alike, within 0.008. But where
+/// the maximum is a mean frame or less, as in mono at 44.1 kHz from 132.3
+/// kbit/s, the first leaves the reservoir nothing for an attack after
+/// another: with the CRC and data streams that leave the audio a few bits a
+/// frame, the frames after the first attack took all it held and coded no
+/// lines (the test `an_attack_finds_bits_in_the_reservoir_after_another`).
+/// Offering all at once also made the bits frames take jump further from
+/// one frame to the next: at 192 kbit/s, by 432 bits or more in one frame
+/// of twenty, against 256 before frames were offered any, and 290 offering
+/// a quarter. And of the conformance tests that compare encodes with and
+/// without temporal noise shaping, whose margins the bits passed between
+/// frames move, the first took struck bars before their attacks to 1.1 dB
+/// more error with it
+/// (`temporal_noise_shaping_holds_back_the_noise_before_attacks`), and a
+/// quarter beyond half of the maximum gave a sweep at 256 kbit/s 1.3 dB
+/// more SNR without it than with it
+/// (`temporal_noise_shaping_costs_a_sweep_little`); as chosen, both keep
+/// within their thresholds.
+///
+/// Spending what the loops leave within the frame instead was tried too, at
+/// 128 kbit/s, offering what lies beyond `max_bit_reservoir -
+/// mean_framelength` before: trying two finer steps after the inner loop,
+/// where the bits do not fall as the step grows (see
 /// [`inner_loop`](crate::loops::inner::inner_loop)), found one that fits
-/// for about 18% of the channels and graded -1.172 and -0.864; amplifying,
-/// one at a time, the bands whose distortion lies nearest their allowance,
-/// or furthest over it, until four in a row do not fit, used the bits as
-/// well as the reservoir does but graded -1.234 and -0.948, and took more
-/// than twice as long to encode.
+/// for about 18% of the channels and graded -1.172 and -0.864, against
+/// -1.087 and -0.803 so offered; amplifying, one at a time, the bands whose
+/// distortion lies nearest their allowance, or furthest over it, until four
+/// in a row do not fit, used the bits as well as the reservoir does but
+/// graded -1.234 and -0.948, and took more than twice as long to encode.
 pub fn elements_bits(
     config: &StreamConfig,
     reservoir: &BitReservoir,
