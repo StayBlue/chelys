@@ -136,7 +136,15 @@ impl WindowFilters {
 /// How far the decoder's filters raise the quantization noise of the
 /// lines of each window that they span: the mean power gain of each
 /// window's filter (see [`analysis::Shaping::shape`]), 1 where it has none.
-
+///
+/// The gain counts the noise each line's error adds to the lines above it
+/// within the filter's span as raising that line's own: it misses that the
+/// error of a band's lines reaches the bands above, which the loops measure
+/// apart. Through a filter of order 1 whose coefficient is sent as -8, an
+/// error of 1 in a band's last line adds errors of 14.9 in power to the 16
+/// lines above it, which no band's distortion counts. Measured without the
+/// weights, or with the allowance of the shaped lines' own energy, sweeps
+/// decoded worse (see `ElementEncoder`'s thresholds).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct NoiseGains {
     /// Each window's gain, and the bands its filter spans.
