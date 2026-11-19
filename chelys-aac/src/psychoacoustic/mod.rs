@@ -276,13 +276,22 @@ impl Tables {
 
     /// Steps 7 to 10 for one block whose `en(b)` and `cb(b)` `block` holds:
     /// its power ratio `bc(b)` and threshold `nb(b)`.
+    ///
+    /// Most partitions' tonality is limited to 0 or 1, whose power ratios
+    /// are taken once (see [`NOISELIKE_CB`] and [`TONAL_CB`]); the tonality
+    /// of the others is computed.
     fn threshold_from_tonality(&self, block: &mut BlockThreshold) {
+        let (noise, tone) =
+            *NOISE_AND_TONE_RATIOS.get_or_init(|| (power_ratio(0.0), power_ratio(1.0)));
         for b in 0..self.partitions.len() {
-            // Step 7: the tonality, within 0 and 1.
-            let tb = (-0.299 - 0.43 * block.cb[b].ln()).clamp(0.0, 1.0);
-            // Steps 8 to 10.
-            let snr = tb * TMN + (1.0 - tb) * NMT;
-            block.bc[b] = 10f64.powf(-snr / 10.0);
+            let cb = block.cb[b];
+            block.bc[b] = if cb >= NOISELIKE_CB {
+                noise
+            } else if cb <= TONAL_CB {
+                tone
+            } else {
+                power_ratio(tonality(cb))
+            };
             block.nb[b] = block.en[b] * block.bc[b];
         }
     }
@@ -660,6 +669,32 @@ impl Analysis {
     }
 }
 
+/// Step 7: the tonality `tb(b)` of a partition of normalized
+/// unpredictability `cb(b)`, within 0 and 1.
+fn tonality(cb: f64) -> f64 {
+    (-0.299 - 0.43 * cb.ln()).clamp(0.0, 1.0)
+}
+
+/// Steps 8 and 9: the power ratio `bc(b)` of a partition of tonality
+/// `tb(b)`.
+fn power_ratio(tb: f64) -> f64 {
+    let snr = tb * TMN + (1.0 - tb) * NMT;
+    10f64.powf(-snr / 10.0)
+}
+
+/// A `cb(b)` from which on the [`tonality`] is 0: `-0.299 - 0.43 ln(cb(b))`
+/// is 0 at `cb(b) = e^(-0.299 / 0.43) = 0.49890`, and at 0.499 it is
+/// already -0.00009, far beyond any rounding.
+const NOISELIKE_CB: f64 = 0.499;
+
+/// A `cb(b)` up to which the [`tonality`] is 1: `-0.299 - 0.43 ln(cb(b))`
+/// is 1 at `cb(b) = e^(-1.299 / 0.43) = 0.048756`, and at 0.0487 it is
+/// already 1.0005, far beyond any rounding.
+const TONAL_CB: f64 = 0.0487;
+
+/// The [`power_ratio`] of tonality 0 and of tonality 1.
+static NOISE_AND_TONE_RATIOS: OnceLock<(f64, f64)> = OnceLock::new();
+
 /// The model of one channel, with what it keeps from one frame to the
 /// next.
 #[derive(Debug)]
@@ -881,6 +916,19 @@ mod tests {
             })
             .max();
         assert_eq!(most, Some(MAX_PARTITIONS));
+    }
+
+    #[test]
+    fn partitions_beyond_the_limits_of_tonality_are_found_without_it() {
+        let grid = (0..=1_000_000).map(|i| f64::from(i) / 1_000_000.0);
+        for cb in grid.chain([NOISELIKE_CB, TONAL_CB, 1.5, 1e9]) {
+            if cb >= NOISELIKE_CB {
+                assert_eq!(tonality(cb), 0.0, "{cb}");
+            }
+            if cb <= TONAL_CB {
+                assert_eq!(tonality(cb), 1.0, "{cb}");
+            }
+        }
     }
 
     #[test]
