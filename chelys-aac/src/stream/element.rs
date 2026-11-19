@@ -695,16 +695,8 @@ impl ElementEncoder {
         match order[..] {
             [only] => {
                 let prepared = &self.prepared[only];
-                let coding = ChannelCoding {
-                    windows: prepared.windows,
-                    sampling_frequency: fs,
-                    available_bits: budget(prepared),
-                    common_window: false,
-                    least_max_sfb: 0,
-                    element_bits: [0; MAX_BANDS + 1],
-                    intensity: None,
-                    tns: &prepared.tns,
-                };
+                let coding =
+                    ChannelCoding::new(prepared.windows, fs, budget(prepared), &prepared.tns);
                 CodedElement::single(self.code(prepared, coding))
             }
             [first, second] if self.common_window => {
@@ -714,14 +706,8 @@ impl ElementEncoder {
                 let num_swb = windows.groups(fs).next().expect("a group").num_swb();
                 let ms = self.ms;
                 let mut coding = ChannelCoding {
-                    windows,
-                    sampling_frequency: fs,
-                    available_bits: budget(a),
                     common_window: true,
-                    least_max_sfb: 0,
-                    element_bits: [0; MAX_BANDS + 1],
-                    intensity: None,
-                    tns: &a.tns,
+                    ..ChannelCoding::new(windows, fs, budget(a), &a.tns)
                 };
                 let (mut a_channel, intensity, b_coding) = loop {
                     let a_channel = self.code(a, coding);
@@ -730,14 +716,9 @@ impl ElementEncoder {
                     let left = budget(a) - a_channel.bits(true);
                     let least_max_sfb = a_channel.max_sfb();
                     let mut b_coding = ChannelCoding {
-                        windows,
-                        sampling_frequency: fs,
-                        available_bits: budget(b) + left,
                         common_window: true,
                         least_max_sfb,
-                        element_bits: [0; MAX_BANDS + 1],
-                        intensity: None,
-                        tns: &b.tns,
+                        ..ChannelCoding::new(windows, fs, budget(b) + left, &b.tns)
                     };
                     for m in least_max_sfb..=num_swb {
                         b_coding.element_bits[m] =
@@ -784,16 +765,7 @@ impl ElementEncoder {
                 for c in [first, second] {
                     let prepared = &self.prepared[c];
                     let available = budget(prepared) + left;
-                    let coding = ChannelCoding {
-                        windows: prepared.windows,
-                        sampling_frequency: fs,
-                        available_bits: available,
-                        common_window: false,
-                        least_max_sfb: 0,
-                        element_bits: [0; MAX_BANDS + 1],
-                        intensity: None,
-                        tns: &prepared.tns,
-                    };
+                    let coding = ChannelCoding::new(prepared.windows, fs, available, &prepared.tns);
                     let channel = self.code(prepared, coding);
                     left = available - channel.bits(false);
                     channels[c] = Some(channel);

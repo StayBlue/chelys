@@ -77,15 +77,15 @@ pub struct ChannelCoding<'a> {
     pub tns: &'a Tns,
 }
 
-impl ChannelCoding<'_> {
-    /// The coding of a channel of a `single_channel_element()`, or of a
-    /// pair that does not share its window, in `available_bits`, without
-    /// temporal noise shaping.
-    #[cfg(test)]
-    pub fn single(
+impl<'a> ChannelCoding<'a> {
+    /// The coding of a channel of `windows` shaped by `tns`, of a
+    /// `single_channel_element()` or of a pair that does not share its
+    /// window, in `available_bits`.
+    pub fn new(
         windows: Windows,
         sampling_frequency: SamplingFrequency,
         available_bits: u32,
+        tns: &'a Tns,
     ) -> Self {
         Self {
             windows,
@@ -95,8 +95,18 @@ impl ChannelCoding<'_> {
             least_max_sfb: 0,
             element_bits: [0; MAX_BANDS + 1],
             intensity: None,
-            tns: &Tns::NONE,
+            tns,
         }
+    }
+
+    /// [`new`](Self::new) without temporal noise shaping.
+    #[cfg(test)]
+    pub fn single(
+        windows: Windows,
+        sampling_frequency: SamplingFrequency,
+        available_bits: u32,
+    ) -> Self {
+        Self::new(windows, sampling_frequency, available_bits, &Tns::NONE)
     }
 }
 
