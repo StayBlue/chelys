@@ -30,10 +30,6 @@ const MAGIC_NUMBER: f64 = 0.4054;
 /// encoded in the bitstream, defined as 8191".
 const MAX_QUANT: f64 = MAX_MAGNITUDE as f64;
 
-/// `quantizer_change` of the first run of the inner loop (clause
-/// C.7.4.5).
-const FIRST_CHANGE: i32 = 32;
-
 /// A magnitude that no codebook codes, at which the quantizer stops.
 const BEYOND_MAGNITUDE: f64 = 2.0 * MAX_QUANT;
 
@@ -640,9 +636,10 @@ impl<'a> Counting<'a> {
 /// in the channel's available bits, of which `counting` keeps the coding.
 /// Gives the step, or `None` if none fits up to the largest.
 ///
-/// The first run of the inner loop starts at `start_common_scalefac`
-/// (clause C.7.2.1) with a change of 32, the later runs of the outer loop
-/// at the step before with a change of 1 (clause C.7.4.5).
+/// The later runs of the outer loop start at the step before with a change
+/// of 1 (clause C.7.4.5). The first run starts at `start_common_scalefac`
+/// (clause C.7.2.1) with a change of 32, which [`first_inner_loop`] ends
+/// where this loop would without counting every step it tries.
 ///
 /// Spec reading: the pseudo code of clause C.7.4.5 changes
 /// `common_scalefac` after each count, also after the last, which fits,
@@ -675,11 +672,26 @@ impl<'a> Counting<'a> {
 /// scalefactor (clause 11.3.2), takes it there instead.
 pub fn inner_loop(counting: &mut Counting, start: u8, change: i32) -> Option<u8> {
     let floor = counting.lines.start_gain().min(start);
+    successive_approximation(start, floor, change, |gain| {
+        counting.count_at(gain, MAX_BANDS)
+    })
+}
+
+/// The search of [`inner_loop`] from `start`, no finer than `floor`, with a
+/// first change of `change`, where `fits` counts whether a step fits: the
+/// step it ends on, the one counted last, or `None` if none fits up to the
+/// largest.
+fn successive_approximation(
+    start: u8,
+    floor: u8,
+    change: i32,
+    mut fits: impl FnMut(u8) -> bool,
+) -> Option<u8> {
     let mut gain = i32::from(start);
     let mut change = change;
     loop {
         let counted = gain as u8;
-        let fits = counting.count_at(counted, MAX_BANDS);
+        let fits = fits(counted);
         if fits && counted == floor {
             return Some(counted);
         }
@@ -698,9 +710,34 @@ pub fn inner_loop(counting: &mut Counting, start: u8, change: i32) -> Option<u8>
     }
 }
 
-/// The step of the first run of the inner loop, from
-/// `start_common_scalefac` (clause C.7.2.1), at which `counting` keeps its
-/// coding, and the bands it sends, all of them unless none fits.
+/// The step of the first run of the inner loop, at which `counting` keeps
+/// its coding, and the bands it sends, all of them unless none fits.
+///
+/// Spec reading: clause C.7.4.5 starts the first run at
+/// `start_common_scalefac` (clause C.7.2.1) with a `quantizer_change` of
+/// 32, a successive approximation over most of the range of
+/// `common_scalefac`, which takes some seven counts of the lines' bits.
+/// For speed, the search here starts instead from the step at which their
+/// bits are estimated to fit (see `estimated_gain`), never below
+/// `start_common_scalefac`, as the clause requires. From there it goes to
+/// finer steps where that step fits, and to coarser ones where it does
+/// not, doubling the distance and then bisecting, to a step that fits
+/// whose next finer step does not, or `start_common_scalefac`. From it,
+/// the step coded is the one the successive approximation would end on if
+/// the steps that fit were those from it up, worked out without counting:
+/// it or the one above it, which is counted, and where that does not fit,
+/// those above it in turn, as the clause's loop does.
+///
+/// Spec reading: where the bits fall as the step grows, that is the step
+/// the successive approximation ends on, and the coding is the same; where
+/// they do not, it can stop at another. On 8 tracks of pop music and 3 of
+/// rock, with their 3 windows of 3 s with the most frames coded short, at
+/// 44.1 kHz in stereo at 64, 128 and 192 kbit/s, it stopped at another in
+/// one channel of one frame: near silence at the end of a rock track at
+/// 192 kbit/s, where the steps 69 and 71 and above fit and 70 does not,
+/// coded at 71 rather than 69. Graded with PEAQ (GstPEAQ 0.6.1, black
+/// box), every track's grade was the same as the successive
+/// approximation's.
 ///
 /// Spec gap: Annex C does not say what to do with lines whose coding does
 /// not fit even at the largest step that `global_gain` allows, as from
@@ -715,8 +752,26 @@ pub fn inner_loop(counting: &mut Counting, start: u8, change: i32) -> Option<u8>
 /// If not even a channel without lines fits in the available bits: a
 /// caller's error.
 pub fn first_inner_loop(counting: &mut Counting) -> (u8, usize) {
-    let start = counting.lines.start_gain();
-    if let Some(gain) = inner_loop(counting, start, FIRST_CHANGE) {
+    let floor = counting.lines.start_gain();
+    let start = estimated_gain(counting).max(floor);
+    if let Some(smallest) = search_from(counting, floor, start) {
+        // The step the successive approximation of clause C.7.4.5 ends on
+        // where the bits fall as the step grows: the smallest that fits or
+        // the one above it.
+        let mut gain =
+            successive_approximation(floor, floor, FIRST_CHANGE, |gain| gain >= smallest)
+                .expect("the largest step fits");
+        while gain != smallest && !counting.count_at(gain, MAX_BANDS) {
+            if gain == u8::MAX {
+                gain = smallest;
+                break;
+            }
+            gain += 1;
+        }
+        // The coding kept is that of the step counted last.
+        if counting.fitted_at != Some((gain, MAX_BANDS)) {
+            assert!(counting.count_at(gain, MAX_BANDS), "a step that fitted");
+        }
         return (gain, MAX_BANDS);
     }
     for band_limit in (0..MAX_BANDS).rev() {
@@ -728,6 +783,135 @@ pub fn first_inner_loop(counting: &mut Counting) -> (u8, usize) {
         "not even a channel without lines fits in {} bits",
         counting.coding.available_bits
     );
+}
+
+/// `quantizer_change` of the first run of the inner loop (clause
+/// C.7.4.5).
+const FIRST_CHANGE: i32 = 32;
+
+/// The search of [`first_inner_loop`] from the step `start`, no finer than
+/// `floor`: the step it ends on, which fitted though another may have been
+/// counted after it, or `None` if not even the largest fits.
+fn search_from(counting: &mut Counting, floor: u8, start: u8) -> Option<u8> {
+    let mut fits = |gain: u8| counting.count_at(gain, MAX_BANDS);
+    // Steps from `start`, doubling the distance, until one does not fit,
+    // then bisecting between it and the last that fits.
+    let (mut fitting, mut over, mut distance) = (start, start, 1u8);
+    if fits(start) {
+        // Finer steps.
+        loop {
+            if fitting == floor {
+                return Some(floor);
+            }
+            let next = fitting.saturating_sub(distance).max(floor);
+            if !fits(next) {
+                over = next;
+                break;
+            }
+            fitting = next;
+            distance = distance.saturating_mul(2);
+        }
+    } else {
+        // Coarser steps.
+        loop {
+            let next = over.saturating_add(distance);
+            if fits(next) {
+                fitting = next;
+                break;
+            }
+            if next == u8::MAX {
+                return None;
+            }
+            over = next;
+            distance = distance.saturating_mul(2);
+        }
+    }
+    while fitting - over > 1 {
+        let middle = over + (fitting - over) / 2;
+        if fits(middle) {
+            fitting = middle;
+        } else {
+            over = middle;
+        }
+    }
+    Some(fitting)
+}
+
+/// The bits that the noiseless coding of a channel's lines is estimated to
+/// take for each line that is not zero, by [`estimated_gain`]. This and
+/// [`ESTIMATED_BITS_PER_MAGNITUDE_BIT`] were fitted to the steps that the
+/// first run of the inner loop ends on, for the channels of 60 s of pop
+/// music at 44.1 kHz in stereo at 128 kbit/s.
+const ESTIMATED_BITS_PER_VALUE: f64 = 2.9;
+/// The bits estimated for each bit of the magnitude of a line above that
+/// of 1, by [`estimated_gain`].
+const ESTIMATED_BITS_PER_MAGNITUDE_BIT: f64 = 1.2;
+
+/// The step from which [`first_inner_loop`] searches: the finest, as a
+/// `global_gain`, at which the lines of `counting`, with every
+/// scalefactor 0, are estimated to fit in the channel's available bits.
+///
+/// The bits of the channel's fields are counted as they are sent without
+/// lines, and those of its lines estimated as
+/// [`ESTIMATED_BITS_PER_VALUE`] for each line that is not zero and
+/// [`ESTIMATED_BITS_PER_MAGNITUDE_BIT`] for each bit of its magnitude.
+/// A line is quantized to zero only from a step on, and each step finer
+/// adds 3/16 of a bit to the magnitude of every line that is not; so the
+/// estimate takes only the step at which each line stops being zero, from
+/// the logarithm of `mdct_scaled`.
+///
+/// On the channels the constants were fitted to, the estimate is within a
+/// step of the smallest step that fits for 97% of them; at 64 and 192
+/// kbit/s and in 5.1 at 384 kbit/s, for 70%, 88% and 97%.
+fn estimated_gain(counting: &Counting) -> u8 {
+    let ChannelCoding {
+        windows,
+        common_window,
+        tns,
+        element_bits,
+        available_bits,
+        ..
+    } = counting.coding;
+    let fields = channel::bits(windows, common_window, &Pulses::NONE, tns, 0) + element_bits[0];
+    let available = f64::from(available_bits.saturating_sub(fields));
+    // A line is not zero up to the step `z` at which `mdct_scaled *
+    // 2^(-3/16 * (z - SF_OFFSET)) + MAGIC_NUMBER >= 1`. Lines that are zero
+    // at every step are left out, and those that are zero at none are
+    // counted as if they were from the step after the coarsest.
+    let mut steps = [0u16; 257];
+    let lowest = (1.0 - MAGIC_NUMBER).log2();
+    let lines = &counting.lines;
+    for &scaled in &lines.scaled[..lines.end] {
+        if scaled == 0.0 {
+            continue;
+        }
+        let z = f64::from(SF_OFFSET) + (approximate_log2(scaled) - lowest) * 16.0 / 3.0;
+        if z >= 0.0 {
+            steps[z.min(256.0) as i32 as usize] += 1;
+        }
+    }
+    // From the coarsest step down: the lines not zero, and the bits of
+    // their magnitudes in steps of 3/16 of a bit.
+    let (mut values, mut magnitude_steps) = (u32::from(steps[256]), 0u32);
+    for gain in (0..=u8::MAX).rev() {
+        magnitude_steps += values;
+        values += u32::from(steps[usize::from(gain)]);
+        let bits = ESTIMATED_BITS_PER_VALUE * f64::from(values)
+            + ESTIMATED_BITS_PER_MAGNITUDE_BIT * 3.0 / 16.0 * f64::from(magnitude_steps);
+        if bits > available {
+            return gain.saturating_add(1);
+        }
+    }
+    0
+}
+
+/// `log2(x)` for positive normal `x`, within 0.09: the bits of `x` taken as
+/// a fixed-point number, where the exponent gives the integer part and the
+/// mantissa `m` the fraction, approximating `log2(1 + m)` with `m`.
+fn approximate_log2(x: f64) -> f64 {
+    const MANTISSA_BITS: u32 = 52;
+    const EXPONENT_BIAS: f64 = 1023.0;
+    x.to_bits() as f64 / (1u64 << MANTISSA_BITS) as f64 - EXPONENT_BIAS
 }
 
 #[cfg(test)]
@@ -868,6 +1052,44 @@ mod tests {
                 "{available}: {gain}, {smallest}"
             );
             assert!(gain > start + 1, "{available}: the loop ran");
+        }
+    }
+
+    /// Where the steps that fit are those from one up, the successive
+    /// approximation of the first run ends at it or the one above it, from
+    /// every start at or below it.
+    #[test]
+    fn the_first_approximation_ends_at_the_smallest_step_that_fits_or_the_next() {
+        for floor in 0..=u8::MAX {
+            for smallest in floor..=u8::MAX {
+                let gain =
+                    successive_approximation(floor, floor, FIRST_CHANGE, |gain| gain >= smallest)
+                        .unwrap();
+                assert!(
+                    gain == smallest || u16::from(gain) == u16::from(smallest) + 1,
+                    "{floor} {smallest}: {gain}"
+                );
+            }
+        }
+    }
+
+    /// The first run ends where the successive approximation from the start
+    /// step does.
+    #[test]
+    fn the_first_run_ends_where_the_successive_approximation_does() {
+        let fs = SamplingFrequency::Hz44100;
+        for (seed, available) in [(1, 100), (2, 400), (3, 1500), (4, 4000), (5, 12_000)] {
+            let lines = noise(seed);
+            let counting = || {
+                Counting::new(
+                    Lines::new(&lines),
+                    ChannelCoding::single(Windows::LONG_SINE, fs, available),
+                )
+            };
+            let mut approximated = counting();
+            let start = approximated.lines.start_gain();
+            let expected = inner_loop(&mut approximated, start, FIRST_CHANGE).unwrap();
+            assert_eq!(first_inner_loop(&mut counting()), (expected, MAX_BANDS));
         }
     }
 
