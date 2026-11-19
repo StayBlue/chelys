@@ -476,6 +476,18 @@ impl StreamEncoder {
     /// and leaves most of its share, then the others in order of their
     /// perceptual entropy (see [`ElementEncoder::perceptual_entropy`]), the
     /// least first, as the channels of an element are.
+    ///
+    /// Carried forward alone, the bits an element leaves can come too late:
+    /// an element quantized early in a share too small for any line is
+    /// coded without lines, while one after it codes its own in the bits
+    /// the first left, and the frame ends with bits unspent. In 4 channels
+    /// at 48 kHz and 11 kbit/s with the CRC, the center channel carrying
+    /// the same tone of 79 Hz as the rear surround so decoded to silence
+    /// throughout, the rear surround at its level. An element with lines
+    /// to code that its share left without any is therefore quantized
+    /// again, once, after all the others, in its bits and those the frame
+    /// has left, within its share of the buffer. With one element, the
+    /// frame's bits are its share, and the element is not quantized again.
     fn quantize(&mut self, available_bits: u32) -> Vec<CodedElement> {
         let mut order: Vec<usize> = (0..self.elements.len()).collect();
         order.sort_by(|&a, &b| {
@@ -490,6 +502,7 @@ impl StreamEncoder {
             a.0.cmp(&b.0).then(a.1.total_cmp(&b.1))
         });
         let mut coded: Vec<Option<CodedElement>> = vec![None; self.elements.len()];
+        let mut budgets = vec![0; self.elements.len()];
         let mut remaining = available_bits;
         for (k, &e) in order.iter().enumerate() {
             let rest = &order[k..];
@@ -511,7 +524,24 @@ impl StreamEncoder {
                 reservoir::element_max_bits(element.kind()).map_or(budget, |max| budget.min(max));
             let element = self.elements[e].quantize(budget);
             remaining = remaining.saturating_sub(element.bits());
+            budgets[e] = budget;
             coded[e] = Some(element);
+        }
+        // An element with lines to code that its share left without any is
+        // quantized again, once, with the bits the frame has left.
+        for &e in &order {
+            let element = coded[e].as_ref().expect("quantized");
+            let silenced = self.elements[e].coded_channels() > 0
+                && (element.channels().iter()).all(|c| c.lines().iter().all(|&q| q == 0));
+            let budget = element.bits() + remaining;
+            let budget =
+                reservoir::element_max_bits(element.kind()).map_or(budget, |max| budget.min(max));
+            if silenced && budget > budgets[e] {
+                remaining += element.bits();
+                let element = self.elements[e].quantize(budget);
+                remaining = remaining.saturating_sub(element.bits());
+                coded[e] = Some(element);
+            }
         }
         coded.into_iter().map(|e| e.expect("quantized")).collect()
     }
@@ -1149,6 +1179,55 @@ mod tests {
                 "{channel_configuration:?}: {longest}"
             );
         }
+    }
+
+    /// An element that its share leaves without lines is quantized again
+    /// with the bits the frame has left: in 4 channels at 48 kHz and 11
+    /// kbit/s with the CRC, the center and rear surround carrying the same
+    /// tone of 79 Hz, and the front pair one of 1.3 kHz, the center sends
+    /// lines in every frame of the tone as the rear surround does, where
+    /// it once sent none.
+    #[test]
+    fn an_element_left_without_lines_takes_the_bits_left() {
+        use crate::raw_data_block::decoder::{adts_frame, raw_data_block};
+
+        let fs = SamplingFrequency::Hz48000;
+        let config = StreamConfig {
+            sampling_frequency: fs,
+            channel_configuration: ChannelConfiguration::Four,
+            bits_per_second: 11_000,
+            framing: Framing::Adts,
+            flags: Flags::default(),
+            crc_protected: true,
+        };
+        let tone = |frequency: f64, amplitude: f64| -> Vec<f64> {
+            (0..3 * 48_000)
+                .map(|t| {
+                    amplitude * (std::f64::consts::TAU * frequency * t as f64 / 48_000.0).sin()
+                })
+                .collect()
+        };
+        let (low, mid) = (tone(79.0, 0.8), tone(1300.0, 0.5));
+        let mut stream = Vec::new();
+        StreamEncoder::new(config).encode(&[&low, &mid, &mid, &low], &mut stream);
+        let mut sending = Vec::new();
+        let mut rest = stream.as_slice();
+        while !rest.is_empty() {
+            let frame = adts_frame(rest);
+            rest = &rest[frame.aac_frame_length..];
+            let block = raw_data_block(frame.raw_data_block, fs);
+            let sends = |e: usize| {
+                let lines = &block.elements[e].element.channels[0].lines;
+                lines.iter().flatten().any(|&q| q != 0)
+            };
+            sending.push((sends(0), sends(2)));
+        }
+        assert!(sending.len() > 100);
+        // From the third frame, the first of the tone throughout.
+        assert!(
+            sending[2..].iter().all(|&s| s == (true, true)),
+            "{sending:?}"
+        );
     }
 
     /// The bitrate of a configuration ranges from that of its shortest
