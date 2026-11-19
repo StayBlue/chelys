@@ -23,38 +23,68 @@ pub(super) const UNCODABLE: u32 = 1 << 24;
 /// others, and the least of them. `class` is that of the lines' largest
 /// magnitude, the first whose codebooks code them, and the lines divide
 /// into quadruples.
+///
+/// The two codebooks of a class share their codeword indexes, and are
+/// counted together (see `paired_bits`), and the classes of quadruples, and
+/// those of pairs, each in one pass over the lines.
 pub(super) fn bits_by_codebook(lines: &[i32], class: usize, top: usize) -> ([u32; 12], u32) {
+    // Each class's bits, those of a class of two codebooks paired.
+    let mut counted = [0; CLASSES.len()];
+    if class == 0 {
+        // Lines of zeros, all one tuple.
+        let quadruples = (lines.len() / 4) as u32;
+        let pairs = (lines.len() / 2) as u32;
+        let book = Codebook::ESC.spectrum().expect("a spectrum codebook");
+        let zeros = [
+            0,
+            quadruples * PAIRED_BITS_1[index::<4, true, 1>(&[0; 4])],
+            quadruples * PAIRED_BITS_2[0],
+            pairs * PAIRED_BITS_3[index::<2, true, 4>(&[0; 2])],
+            pairs * PAIRED_BITS_4[0],
+            pairs * PAIRED_BITS_5[0],
+            pairs * book.tuple_bits(0),
+        ];
+        counted[..=top].copy_from_slice(&zeros[..=top]);
+    } else {
+        let quadruples = match (class, top) {
+            (1, 1) => quadruples::<1, 1>(lines),
+            (1, _) => quadruples::<1, 2>(lines),
+            (2, _) => quadruples::<2, 2>(lines),
+            _ => [0; 2],
+        };
+        let pairs = match (class.max(3), top) {
+            (_, ..=2) => [0; 4],
+            (3, 3) => pairs::<3, 3>(lines),
+            (3, 4) => pairs::<3, 4>(lines),
+            (3, 5) => pairs::<3, 5>(lines),
+            (3, _) => pairs::<3, 6>(lines),
+            (4, 4) => pairs::<4, 4>(lines),
+            (4, 5) => pairs::<4, 5>(lines),
+            (4, _) => pairs::<4, 6>(lines),
+            (5, 5) => pairs::<5, 5>(lines),
+            (5, _) => pairs::<5, 6>(lines),
+            _ => pairs::<6, 6>(lines),
+        };
+        counted[1..3].copy_from_slice(&quadruples);
+        counted[3..].copy_from_slice(&pairs);
+    }
     let mut bits = [UNCODABLE; 12];
     // The least of those counted, as the others are UNCODABLE.
     let mut least = UNCODABLE;
-    if class == 0 {
-        (bits[0], least) = (0, 0);
-    }
-    let zeros = class == 0;
-    let classes = CLASSES.iter().enumerate().take(top + 1);
-    for (class, books) in classes.skip(class.max(1)) {
-        // The two codebooks of a class share their codeword indexes, and
-        // are counted together (see `paired_bits`).
-        let paired = match class {
-            1 => paired::<4, true, 1>(lines, &PAIRED_BITS_1, zeros),
-            2 => paired::<4, false, 2>(lines, &PAIRED_BITS_2, zeros),
-            3 => paired::<2, true, 4>(lines, &PAIRED_BITS_3, zeros),
-            4 => paired::<2, false, 7>(lines, &PAIRED_BITS_4, zeros),
-            5 => paired::<2, false, 12>(lines, &PAIRED_BITS_5, zeros),
-            _ => {
-                let escaped = escaped(lines, zeros);
-                bits[usize::from(Codebook::ESC.number())] = escaped;
-                least = least.min(escaped);
-                continue;
+    for (books, &counted) in CLASSES.iter().zip(&counted).take(top + 1).skip(class) {
+        match books {
+            [book] => {
+                bits[usize::from(book.number())] = counted;
+                least = least.min(counted);
             }
-        };
-        let [a, b] = books else {
-            unreachable!("a class of two codebooks")
-        };
-        let (a_bits, b_bits) = (paired & 0xffff, paired >> 16);
-        bits[usize::from(a.number())] = a_bits;
-        bits[usize::from(b.number())] = b_bits;
-        least = least.min(a_bits).min(b_bits);
+            [a, b] => {
+                let (a_bits, b_bits) = (counted & 0xffff, counted >> 16);
+                bits[usize::from(a.number())] = a_bits;
+                bits[usize::from(b.number())] = b_bits;
+                least = least.min(a_bits).min(b_bits);
+            }
+            _ => unreachable!("a class of one codebook or two"),
+        }
     }
     (bits, least)
 }
@@ -73,39 +103,52 @@ fn index<const DIMENSION: usize, const SIGNED: bool, const LAV: u32>(tuple: &[i3
     })
 }
 
-/// The bits of `lines` in the two codebooks of a class, by `bits` (see
-/// `paired_bits`), the first's in the low 16 bits and the second's in the
-/// high 16; all tuples of zeros if `zeros`.
-fn paired<const DIMENSION: usize, const SIGNED: bool, const LAV: u32>(
-    lines: &[i32],
-    bits: &[u32],
-    zeros: bool,
-) -> u32 {
-    if zeros {
-        let tuples = (lines.len() / DIMENSION) as u32;
-        return tuples * bits[index::<DIMENSION, SIGNED, LAV>(&[0; DIMENSION])];
+/// The bits of `lines`, which the classes `FROM..=TO` of quadruples, 1 and
+/// 2, code, in each of those classes' two codebooks, paired (see
+/// `paired_bits`), by class.
+fn quadruples<const FROM: usize, const TO: usize>(lines: &[i32]) -> [u32; 2] {
+    let counts = |class: usize| FROM <= class && class <= TO;
+    let mut bits = [0; 2];
+    for tuple in lines.chunks_exact(4) {
+        if counts(1) {
+            bits[0] += PAIRED_BITS_1[index::<4, true, 1>(tuple)];
+        }
+        if counts(2) {
+            bits[1] += PAIRED_BITS_2[index::<4, false, 2>(tuple)];
+        }
     }
-    (lines.chunks_exact(DIMENSION))
-        .map(|tuple| bits[index::<DIMENSION, SIGNED, LAV>(tuple)])
-        .sum()
+    bits
 }
 
-/// The bits of `lines` in `ESC_HCB`, with their escape sequences; all
-/// pairs of zeros if `zeros`.
-fn escaped(lines: &[i32], zeros: bool) -> u32 {
+/// The bits of `lines`, which the classes `FROM..=TO` of pairs, 3 to 6,
+/// code, in each of those classes' codebooks, by class: those of two
+/// codebooks paired (see `paired_bits`), and in `ESC_HCB` with the escape
+/// sequences, which only lines of class 6 have.
+fn pairs<const FROM: usize, const TO: usize>(lines: &[i32]) -> [u32; 4] {
+    let counts = |class: usize| FROM <= class && class <= TO;
     let book = Codebook::ESC.spectrum().expect("a spectrum codebook");
-    if zeros {
-        return (lines.len() / 2) as u32 * book.tuple_bits(0);
-    }
-    let mut bits = 0;
+    let lav = ESC_FLAG as usize;
+    let mut bits = [0; 4];
     for pair in lines.chunks_exact(2) {
-        let (a, b) = (pair[0].unsigned_abs(), pair[1].unsigned_abs());
-        let lav = ESC_FLAG as usize;
-        let index = (lav + 1) * (a as usize).min(lav) + (b as usize).min(lav);
-        bits += book.tuple_bits(index);
-        for magnitude in [a, b] {
-            if magnitude >= ESC_FLAG {
-                bits += escape_bits(magnitude);
+        if counts(3) {
+            bits[0] += PAIRED_BITS_3[index::<2, true, 4>(pair)];
+        }
+        if counts(4) {
+            bits[1] += PAIRED_BITS_4[index::<2, false, 7>(pair)];
+        }
+        if counts(5) {
+            bits[2] += PAIRED_BITS_5[index::<2, false, 12>(pair)];
+        }
+        if counts(6) {
+            let (a, b) = (pair[0].unsigned_abs(), pair[1].unsigned_abs());
+            let index = (lav + 1) * (a as usize).min(lav) + (b as usize).min(lav);
+            bits[3] += book.tuple_bits(index);
+            if FROM == 6 {
+                for magnitude in [a, b] {
+                    if magnitude >= ESC_FLAG {
+                        bits[3] += escape_bits(magnitude);
+                    }
+                }
             }
         }
     }
