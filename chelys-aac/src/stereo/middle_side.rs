@@ -85,11 +85,17 @@ pub fn matrix(
 /// bands are all coded as middle and side could send 2 and no flags. Where a frame has
 /// bands in intensity stereo, it sends 1 and their flags of 0 instead,
 /// which no reading of `ms_used` can take as inverting them. Settled by
-/// decoding with ffmpeg (black box): sent with `ms_mask_present` 2, the
-/// right channel's tones in intensity stereo decoded with their phase
-/// inverted, against clause 12.2.3; sent with 1 and flags of 0, in the
-/// phase their codebooks give, at every sampling frequency. The
-/// conformance test is `intensity_stereo_keeps_each_tones_panning`.
+/// decoding with ffmpeg and FAAD2 (black box), which disagree on 2: sent
+/// with `ms_mask_present` 2, ffmpeg decoded the right channel's tones in
+/// intensity stereo with their phase inverted, against clause 12.2.3, and
+/// FAAD2 decoded them as the clause says, to the very samples of the same
+/// frames sent with 1 and flags of 0. Sent with 1 and flags of 0, both
+/// decode them in the phase their codebooks give, at every sampling
+/// frequency from 22.05 kHz (FAAD2's phase checked above 24 kHz, below
+/// which it gives samples at twice the sampling frequency). So 1 is sent,
+/// for ffmpeg.
+/// The conformance tests are `intensity_stereo_keeps_each_tones_panning`
+/// and `intensity_bands_under_ms_mask_present_2_keep_their_phase_in_faad_only`.
 pub fn choose(
     windows: Windows,
     sampling_frequency: SamplingFrequency,
