@@ -38,15 +38,29 @@ pub struct MidSideModel {
     /// middle and of the side channel, before pre-echo control (step 11).
     long_nb_last: [Vec<f64>; 2],
     short_nb_last: [Vec<f64>; 2],
-    /// The middle and side channels' long block and short blocks of the
-    /// frame being analyzed, kept for their memory.
+    /// The middle and side channels of the frame whose windows are chosen
+    /// next, and of the frame analyzed last.
+    current: Box<Frame>,
+    ahead: Box<Frame>,
+    primed: bool,
+}
+
+/// The middle and side channels of a frame, through step 10, with the
+/// thresholds of the blocks before its own, and their analyses as far as
+/// they are finished: only the threshold of the frame's transform is used,
+/// that of its long block or of its short ones, and only that is finished
+/// from step 11 (see [`MidSideModel::current`]).
+#[derive(Debug)]
+struct Frame {
     long_blocks: [Block; 2],
     short_blocks: [Box<[Block; SHORT_WINDOWS]>; 2],
-    /// The analysis of the middle and side channels of the frame whose
-    /// windows are chosen next, and of the frame analyzed last.
-    current: [Box<Analysis>; 2],
-    ahead: [Box<Analysis>; 2],
-    primed: bool,
+    /// `nb(b)` of the long block and of the short block before the frame's,
+    /// before pre-echo control.
+    long_nb_before: [Vec<f64>; 2],
+    short_nb_before: [Vec<f64>; 2],
+    analyses: [Box<Analysis>; 2],
+    /// The transform whose thresholds the analyses hold, if either's.
+    finished: Option<Transform>,
 }
 
 impl MidSideModel {
@@ -54,7 +68,19 @@ impl MidSideModel {
         let long = Tables::get(sampling_frequency, Transform::Long);
         let short = Tables::get(sampling_frequency, Transform::Short);
         let bmaxes = |tables: &Tables| tables.partitions.iter().map(|p| bmax(p.bval)).collect();
-        let analysis = || Box::new(Analysis::new(sampling_frequency));
+        let frame = || {
+            let analysis = || Box::new(Analysis::new(sampling_frequency));
+            Box::new(Frame {
+                long_blocks: std::array::from_fn(|_| Block::new(super::LONG_IBLEN)),
+                short_blocks: std::array::from_fn(|_| {
+                    Box::new(std::array::from_fn(|_| Block::new(super::SHORT_IBLEN)))
+                }),
+                long_nb_before: std::array::from_fn(|_| vec![0.0; long.partitions.len()]),
+                short_nb_before: std::array::from_fn(|_| vec![0.0; short.partitions.len()]),
+                analyses: [analysis(), analysis()],
+                finished: None,
+            })
+        };
         Self {
             long,
             short,
@@ -62,28 +88,64 @@ impl MidSideModel {
             short_bmax: bmaxes(short),
             long_nb_last: std::array::from_fn(|_| vec![0.0; long.partitions.len()]),
             short_nb_last: std::array::from_fn(|_| vec![0.0; short.partitions.len()]),
-            long_blocks: std::array::from_fn(|_| Block::new(super::LONG_IBLEN)),
-            short_blocks: std::array::from_fn(|_| {
-                Box::new(std::array::from_fn(|_| Block::new(super::SHORT_IBLEN)))
-            }),
-            current: [analysis(), analysis()],
-            ahead: [analysis(), analysis()],
+            current: frame(),
+            ahead: frame(),
             primed: false,
         }
     }
 
     /// The analyses of the middle and of the side channel of the frame
-    /// whose windows are chosen next.
-    pub fn current(&self) -> [&Analysis; 2] {
-        [&self.current[0], &self.current[1]]
+    /// whose windows are chosen next, for a frame coded with `transform`:
+    /// their thresholds of its long block or of its short blocks, finished
+    /// from step 11 as [`look_ahead`](Self::look_ahead) would have, and
+    /// only those. The others are not to be used.
+    pub fn current(&mut self, transform: Transform) -> [&Analysis; 2] {
+        let frame = &mut *self.current;
+        if frame.finished != Some(transform) {
+            frame.finished = Some(transform);
+            for m in 0..2 {
+                let analysis = &mut frame.analyses[m];
+                let mut nb_last = [0.0; MAX_PARTITIONS];
+                match transform {
+                    Transform::Long => {
+                        let nb_last = &mut nb_last[..self.long.partitions.len()];
+                        nb_last.copy_from_slice(&frame.long_nb_before[m]);
+                        let block = &frame.long_blocks[m];
+                        (self.long).finish(
+                            &block.energy,
+                            &block.threshold,
+                            nb_last,
+                            RPELEV_LONG,
+                            &mut analysis.long,
+                        );
+                    }
+                    Transform::Short => {
+                        let nb_last = &mut nb_last[..self.short.partitions.len()];
+                        nb_last.copy_from_slice(&frame.short_nb_before[m]);
+                        for (block, out) in frame.short_blocks[m].iter().zip(&mut analysis.short) {
+                            (self.short).finish(
+                                &block.energy,
+                                &block.threshold,
+                                nb_last,
+                                RPELEV_SHORT,
+                                out,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        let [mid, side] = &frame.analyses;
+        [mid, side]
     }
 
     /// Analyzes the next frame of the pair whose channels' models `left`
     /// and `right` have taken it through steps 1 to 10 (see
     /// `Model::blocks`), before they finish it: computes the thresholds of
-    /// its middle and side channels (step 1), adjusts all four by the
-    /// imaging control (step 2), and finishes the middle and side channels'
-    /// analyses with them from step 11.
+    /// its middle and side channels (step 1) and adjusts all four by the
+    /// imaging control (step 2); the middle and side channels' analyses are
+    /// finished with them from step 11 when asked for (see
+    /// [`current`](Self::current)).
     ///
     /// Spec reading: step 1 computes the "raw thresholds" of the middle and
     /// side channels "rather than using the tonality for the M or S
@@ -118,31 +180,24 @@ impl MidSideModel {
             std::mem::swap(&mut self.current, &mut self.ahead);
         }
         self.primed = true;
-        let [mid, side] = &mut self.ahead;
-        let [mid_long, side_long] = &mut self.long_blocks;
+        let frame = &mut *self.ahead;
+        frame.finished = None;
+        let [mid_long, side_long] = &mut frame.long_blocks;
         pair_block(
             self.long,
             &self.long_bmax,
             [&mut left.long_block, &mut right.long_block],
             [mid_long, side_long],
         );
-        let [mid_nb_last, side_nb_last] = &mut self.long_nb_last;
-        (self.long).finish(
-            &mid_long.energy,
-            &mid_long.threshold,
-            mid_nb_last,
-            RPELEV_LONG,
-            &mut mid.long,
-        );
-        (self.long).finish(
-            &side_long.energy,
-            &side_long.threshold,
-            side_nb_last,
-            RPELEV_LONG,
-            &mut side.long,
-        );
-        let [mid_short, side_short] = &mut self.short_blocks;
-        let [mid_nb_last, side_nb_last] = &mut self.short_nb_last;
+        // Each block's nb(b) is the next block's nb_l(b) of step 11 (see
+        // `Tables::finish`), whatever is finished of either.
+        for (m, block) in frame.long_blocks.iter().enumerate() {
+            let nb_last = &mut self.long_nb_last[m];
+            frame.long_nb_before[m].copy_from_slice(nb_last);
+            let n = nb_last.len();
+            nb_last.copy_from_slice(&block.threshold.nb[..n]);
+        }
+        let [mid_short, side_short] = &mut frame.short_blocks;
         for k in 0..SHORT_WINDOWS {
             pair_block(
                 self.short,
@@ -150,27 +205,20 @@ impl MidSideModel {
                 [&mut left.short_blocks[k], &mut right.short_blocks[k]],
                 [&mut mid_short[k], &mut side_short[k]],
             );
-            (self.short).finish(
-                &mid_short[k].energy,
-                &mid_short[k].threshold,
-                mid_nb_last,
-                RPELEV_SHORT,
-                &mut mid.short[k],
-            );
-            (self.short).finish(
-                &side_short[k].energy,
-                &side_short[k].threshold,
-                side_nb_last,
-                RPELEV_SHORT,
-                &mut side.short[k],
-            );
+        }
+        for (m, blocks) in frame.short_blocks.iter().enumerate() {
+            let nb_last = &mut self.short_nb_last[m];
+            frame.short_nb_before[m].copy_from_slice(nb_last);
+            let last = &blocks[SHORT_WINDOWS - 1].threshold.nb;
+            let n = nb_last.len();
+            nb_last.copy_from_slice(&last[..n]);
         }
         // The middle and side channels' windows are those of the pair,
         // whose attacks are found in its channels.
-        mid.entropy_rise = 0.0;
-        side.entropy_rise = 0.0;
-        mid.entropy_step = 0.0;
-        side.entropy_step = 0.0;
+        for analysis in &mut frame.analyses {
+            analysis.entropy_rise = 0.0;
+            analysis.entropy_step = 0.0;
+        }
     }
 }
 

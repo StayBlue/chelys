@@ -623,7 +623,7 @@ impl ElementEncoder {
         for (i, (&l, &r)) in left.weights.iter().zip(&*right.weights).enumerate() {
             (mid.weights[i], side.weights[i]) = (l.max(r), l.max(r));
         }
-        let analyses = mid_side.model.current();
+        let analyses = mid_side.model.current(windows.sequence.transform());
         for (channel, analysis) in [&mut *mid, &mut *side].into_iter().zip(analyses) {
             channel.windows = windows;
             channel.thresholds(analysis);
