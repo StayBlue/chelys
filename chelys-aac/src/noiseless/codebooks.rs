@@ -67,6 +67,7 @@ impl Codebook {
 
     /// The largest magnitude of a line the codebook codes: zero for
     /// `ZERO_HCB`.
+    #[cfg(any(test, feature = "unstable"))]
     pub fn largest_magnitude(self) -> u32 {
         self.spectrum()
             .map_or(0, SpectrumCodebook::largest_magnitude)
@@ -97,9 +98,16 @@ pub(super) const CLASSES: [&[Codebook]; 7] = [
 /// The first of [`CLASSES`] whose codebooks code lines of up to `largest`,
 /// or `None` above [`MAX_MAGNITUDE`].
 pub(super) fn class(largest: u32) -> Option<usize> {
-    CLASSES
-        .iter()
-        .position(|books| books[0].largest_magnitude() >= largest)
+    match largest {
+        0 => Some(0),
+        1 => Some(1),
+        2 => Some(2),
+        3..=4 => Some(3),
+        5..=7 => Some(4),
+        8..=12 => Some(5),
+        13..=MAX_MAGNITUDE => Some(6),
+        _ => None,
+    }
 }
 
 /// A spectrum Huffman codebook (Table 59 and Tables A.2 to A.12), which
@@ -294,7 +302,10 @@ macro_rules! spectrum_codebook {
 
 /// Table 59: codebook number, `unsigned_cb`, dimension and LAV, with the
 /// codebook's table.
-static SPECTRUM_CODEBOOKS: [SpectrumCodebook; 11] = [
+static SPECTRUM_CODEBOOKS: [SpectrumCodebook; 11] = CODEBOOKS;
+
+/// [`SPECTRUM_CODEBOOKS`], as a constant for the tables built from it.
+const CODEBOOKS: [SpectrumCodebook; 11] = [
     spectrum_codebook!(1, false, 4, 1, SPECTRUM_1),
     spectrum_codebook!(2, false, 4, 1, SPECTRUM_2),
     spectrum_codebook!(3, true, 4, 2, SPECTRUM_3),
@@ -307,6 +318,32 @@ static SPECTRUM_CODEBOOKS: [SpectrumCodebook; 11] = [
     spectrum_codebook!(10, true, 2, 12, SPECTRUM_10),
     spectrum_codebook!(11, true, 2, 16, SPECTRUM_11),
 ];
+
+/// The bits of each codeword index of the two codebooks of a class of
+/// [`CLASSES`] that has two, `first` and the one after it, with their sign
+/// bits (see [`SpectrumCodebook::tuple_bits`]): the first's in the low 16
+/// bits and the second's in the high 16, so that one sum over a band's
+/// tuples counts both. No band's sum reaches 2^16: a band has at most 1024
+/// lines, and a codeword of at most 16 bits (Table 20) with its sign bits
+/// takes at most 9 bits a line.
+const fn paired_bits<const N: usize>(first: usize) -> [u32; N] {
+    let (a, b) = (CODEBOOKS[first].tuple_bits, CODEBOOKS[first + 1].tuple_bits);
+    assert!(a.len() == N && b.len() == N, "two codebooks of N codewords");
+    let mut bits = [0; N];
+    let mut index = 0;
+    while index < N {
+        bits[index] = a[index] as u32 | ((b[index] as u32) << 16);
+        index += 1;
+    }
+    bits
+}
+
+/// [`paired_bits`] of the classes 1 to 5 of [`CLASSES`].
+pub(super) static PAIRED_BITS_1: [u32; 81] = paired_bits(0);
+pub(super) static PAIRED_BITS_2: [u32; 81] = paired_bits(2);
+pub(super) static PAIRED_BITS_3: [u32; 81] = paired_bits(4);
+pub(super) static PAIRED_BITS_4: [u32; 64] = paired_bits(6);
+pub(super) static PAIRED_BITS_5: [u32; 169] = paired_bits(8);
 
 #[cfg(test)]
 mod tests {

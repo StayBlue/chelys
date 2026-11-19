@@ -9,7 +9,8 @@
 use chelys_core::bitstream::BitWriter;
 
 use super::codebooks::{
-    CLASSES, Codebook, ESC_FLAG, SpectrumCodebook, escape_bits, escape_sequence,
+    CLASSES, Codebook, ESC_FLAG, PAIRED_BITS_1, PAIRED_BITS_2, PAIRED_BITS_3, PAIRED_BITS_4,
+    PAIRED_BITS_5, SpectrumCodebook, escape_bits, escape_sequence,
 };
 
 /// A count of bits that stands for a codebook not counted for some lines:
@@ -26,38 +27,79 @@ pub(super) fn bits_by_codebook(lines: &[i32], class: usize, top: usize) -> [u32;
     if class == 0 {
         bits[0] = 0;
     }
-    for books in &CLASSES[class.max(1)..=top] {
-        let a = spectrum_codebook(books, 0);
-        let b = (books.len() > 1).then(|| spectrum_codebook(books, 1));
-        let dimension = a.dimension();
-        let (mut bits_a, mut bits_b) = (0, 0);
-        if class == 0 {
-            // Lines of zeros, all one tuple.
-            let index = a.index(&[0; 4][..dimension]);
-            let tuples = (lines.len() / dimension) as u32;
-            bits_a = tuples * a.tuple_bits(index);
-            bits_b = b.map_or(0, |b| tuples * b.tuple_bits(index));
-        } else if let Some(b) = b {
-            // The two codebooks of a class share their codeword indexes.
-            for tuple in lines.chunks_exact(dimension) {
-                let index = a.index(tuple);
-                bits_a += a.tuple_bits(index);
-                bits_b += b.tuple_bits(index);
+    let zeros = class == 0;
+    let classes = CLASSES.iter().enumerate().take(top + 1);
+    for (class, books) in classes.skip(class.max(1)) {
+        // The two codebooks of a class share their codeword indexes, and
+        // are counted together (see `paired_bits`).
+        let paired = match class {
+            1 => paired::<4, true, 1>(lines, &PAIRED_BITS_1, zeros),
+            2 => paired::<4, false, 2>(lines, &PAIRED_BITS_2, zeros),
+            3 => paired::<2, true, 4>(lines, &PAIRED_BITS_3, zeros),
+            4 => paired::<2, false, 7>(lines, &PAIRED_BITS_4, zeros),
+            5 => paired::<2, false, 12>(lines, &PAIRED_BITS_5, zeros),
+            _ => {
+                bits[usize::from(Codebook::ESC.number())] = escaped(lines, zeros);
+                continue;
             }
+        };
+        let [a, b] = books else {
+            unreachable!("a class of two codebooks")
+        };
+        bits[usize::from(a.number())] = paired & 0xffff;
+        bits[usize::from(b.number())] = paired >> 16;
+    }
+    bits
+}
+
+/// The codeword index of `tuple` in a codebook of `DIMENSION`, signed or
+/// not, and `LAV` (see [`SpectrumCodebook::index`]), for lines it codes.
+fn index<const DIMENSION: usize, const SIGNED: bool, const LAV: u32>(tuple: &[i32]) -> usize {
+    let modulus = if SIGNED { 2 * LAV + 1 } else { LAV + 1 };
+    tuple.iter().fold(0, |index, &line| {
+        let digit = if SIGNED {
+            line.wrapping_add_unsigned(LAV) as u32
         } else {
-            debug_assert!(a.has_escapes());
-            for tuple in lines.chunks_exact(dimension) {
-                bits_a += a.tuple_bits(a.index(tuple));
-                for magnitude in tuple.iter().map(|line| line.unsigned_abs()) {
-                    if magnitude >= ESC_FLAG {
-                        bits_a += escape_bits(magnitude);
-                    }
-                }
+            line.unsigned_abs()
+        };
+        index * modulus as usize + digit as usize
+    })
+}
+
+/// The bits of `lines` in the two codebooks of a class, by `bits` (see
+/// `paired_bits`), the first's in the low 16 bits and the second's in the
+/// high 16; all tuples of zeros if `zeros`.
+fn paired<const DIMENSION: usize, const SIGNED: bool, const LAV: u32>(
+    lines: &[i32],
+    bits: &[u32],
+    zeros: bool,
+) -> u32 {
+    if zeros {
+        let tuples = (lines.len() / DIMENSION) as u32;
+        return tuples * bits[index::<DIMENSION, SIGNED, LAV>(&[0; DIMENSION])];
+    }
+    (lines.chunks_exact(DIMENSION))
+        .map(|tuple| bits[index::<DIMENSION, SIGNED, LAV>(tuple)])
+        .sum()
+}
+
+/// The bits of `lines` in `ESC_HCB`, with their escape sequences; all
+/// pairs of zeros if `zeros`.
+fn escaped(lines: &[i32], zeros: bool) -> u32 {
+    let book = Codebook::ESC.spectrum().expect("a spectrum codebook");
+    if zeros {
+        return (lines.len() / 2) as u32 * book.tuple_bits(0);
+    }
+    let mut bits = 0;
+    for pair in lines.chunks_exact(2) {
+        let (a, b) = (pair[0].unsigned_abs(), pair[1].unsigned_abs());
+        let lav = ESC_FLAG as usize;
+        let index = (lav + 1) * (a as usize).min(lav) + (b as usize).min(lav);
+        bits += book.tuple_bits(index);
+        for magnitude in [a, b] {
+            if magnitude >= ESC_FLAG {
+                bits += escape_bits(magnitude);
             }
-        }
-        bits[usize::from(a.number())] = bits_a;
-        if let Some(b) = b {
-            bits[usize::from(b.number())] = bits_b;
         }
     }
     bits
@@ -74,10 +116,6 @@ pub fn least_bits(lines: &[i32]) -> Option<u32> {
         .unwrap_or(0);
     let class = super::codebooks::class(largest)?;
     bits_by_codebook(lines, class, class).into_iter().min()
-}
-
-fn spectrum_codebook(books: &[Codebook], i: usize) -> &'static SpectrumCodebook {
-    books[i].spectrum().expect("a spectrum codebook")
 }
 
 /// Writes `lines` in `codebook`: for each n-tuple its codeword, then, in an
