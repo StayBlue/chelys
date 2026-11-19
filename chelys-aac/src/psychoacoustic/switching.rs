@@ -490,9 +490,10 @@ mod tests {
 
     /// Neither a loud steady tone of 80 Hz, whose phase moves through each
     /// short block, nor a sweep from 20 Hz to 20 kHz in 3 s, which moves
-    /// through the partitions, has an attack after its onset: the rise of
-    /// their short blocks' entropy from the block before reaches 119 and
-    /// 161.
+    /// through the partitions, has an attack after its onset: their short
+    /// blocks' entropy rises by at most 50 above the most of the eight
+    /// before, half of `SWITCH_PE`, though by up to 119 and 161 above the
+    /// block before, which `SWITCH_PE_STEP` is set above.
     #[test]
     fn steady_tones_and_sweeps_have_no_attack() {
         use std::f64::consts::TAU;
@@ -512,10 +513,38 @@ mod tests {
                     signal(name, (block * FRAME_SAMPLES + t) as f64 / rate)
                 });
                 if let Some(attacks) = switching.look_ahead(&samples) {
-                    assert!(block < 2 || !attacks.this, "{name}, frame {}", block - 1);
+                    let analysis = switching.current();
+                    assert!(
+                        block < 2 || (analysis.entropy_rise < SWITCH_PE / 2.0 && !attacks.this),
+                        "{name}, frame {}: {}",
+                        block - 1,
+                        analysis.entropy_rise
+                    );
                 }
             }
         }
+    }
+
+    /// A one-sample impulse of 0.0003 in silence at 8 kHz is an attack:
+    /// its short block's entropy rises by about 174, above `SWITCH_PE` but
+    /// not `SWITCH_PE_STEP`.
+    #[test]
+    fn a_faint_impulse_in_silence_is_an_attack() {
+        let fs = SamplingFrequency::Hz8000;
+        let mut switching = BlockSwitching::new(fs);
+        let mut found = Vec::new();
+        for block in 0..8 {
+            let samples: [f64; FRAME_SAMPLES] =
+                std::array::from_fn(|t| if block == 4 && t == 500 { 0.0003 } else { 0.0 });
+            if let Some(attacks) = switching.look_ahead(&samples) {
+                let analysis = switching.current();
+                assert!(analysis.entropy_step < SWITCH_PE_STEP);
+                found.push(attacks.this);
+            }
+        }
+        // Frame 4, whose short windows span samples -576 to 575 of its
+        // block.
+        assert_eq!(found, [false, false, false, false, true, false, false]);
     }
 
     /// A burst of noise in a quiet tone is coded with short windows in the
