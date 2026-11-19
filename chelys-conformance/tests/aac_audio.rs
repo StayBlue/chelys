@@ -801,7 +801,8 @@ fn tone_amplitude(samples: &[f64], sample_rate: u32, frequency: f64, start: usiz
 /// right and one to both in opposite phase, decode from a pair coded in
 /// intensity stereo panned within 1 dB of the input, each channel within 3
 /// dB of its level, and in the right channel in phase or opposite as it
-/// was, at every sampling frequency whose band reaches past 9 kHz, where
+/// was, and a tone below them alike in both channels within 0.5 dB of its
+/// level in each, at every sampling frequency whose band reaches past 9 kHz, where
 /// the tones lie in bands apart, at 0.7 bit a sample. The right channel
 /// sends bands of both intensity codebooks.
 ///
@@ -809,8 +810,8 @@ fn tone_amplitude(samples: &[f64], sample_rate: u32, frequency: f64, start: usiz
 /// `stereo::middle_side::choose` marks as settled by decoding with ffmpeg:
 /// frames with bands in intensity stereo are sent with `ms_mask_present` 1
 /// and their flags 0, which ffmpeg decodes in phase. Sent with
-/// `ms_mask_present` 2, as clause 12.2.3 allows, the right channel's tones
-/// came back inverted.
+/// `ms_mask_present` 2, as clauses 12.1.3 and 12.2.3 allow, the right
+/// channel's tones came back inverted.
 #[test]
 fn intensity_stereo_keeps_each_tones_panning() {
     for sample_rate in SAMPLE_RATES.into_iter().filter(|&fs| fs >= 22_050) {
@@ -887,6 +888,13 @@ fn intensity_stereo_keeps_each_tones_panning() {
                 (l * r).signum(),
                 "{context}, {frequency:.0} Hz"
             );
+        }
+        // The low tone, alike in both channels, which the pair codes below
+        // the border as middle and side.
+        for (c, decoded) in decoded.iter().enumerate() {
+            let (re, im) = tone_amplitude(decoded, sample_rate, 440.0, 2048);
+            let db = 20.0 * ((re * re + im * im).sqrt() / 0.2).log10();
+            assert!(db.abs() < 0.5, "{context}, 440 Hz, channel {c}: {db:.2} dB");
         }
     }
 }
