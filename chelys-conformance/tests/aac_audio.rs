@@ -1042,6 +1042,12 @@ fn shaped_share(elements: &[Element]) -> (f64, f64) {
 /// stereo, whose filters end below its first band in intensity stereo with
 /// a filter of order 0 above; ffmpeg decodes the filters' `tns_data()`
 /// without complaint.
+///
+/// This is the evidence for the reading of the standard that the encoder's
+/// filters of temporal noise shaping mark as settled by decoding with
+/// ffmpeg: that the first filter's `length` counts its bands down from
+/// `num_swb`, and that a filter of order 0 spans its bands and filters
+/// none of them.
 #[test]
 fn temporal_noise_shaping_decodes_in_place() {
     let (mut long_shaped, mut short_shaped, mut cut_short) = (false, false, false);
