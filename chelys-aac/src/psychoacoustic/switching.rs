@@ -13,15 +13,17 @@ use crate::stream::FRAME_SAMPLES;
 use crate::window::{Grouping, SHORT_WINDOWS, WindowSequence, WindowShape};
 
 /// `switch_pe`: a frame has an attack, and is coded with short blocks, when
-/// the perceptual entropy rises by more than this from one of its short
-/// blocks to the next (step 13, as departed from below).
+/// the perceptual entropy of one of its short blocks rises by more than
+/// this above the most of the eight short blocks before it (step 13, as
+/// departed from below).
 ///
 /// Spec gap: step 13 calls `switch_pe` "a implementation dependend
 /// constant", which it compares with the perceptual entropy of the long
 /// block. This deliberately departs from that comparison, and compares it
 /// with the largest rise of the entropy of the short blocks (step 12), each
-/// from the one before it, the first from the last of the frame before
-/// (see [`Analysis::entropy_rise`]); step 15's entropy is left as printed.
+/// above the most of the eight before it, those of the frame before among
+/// them (see [`Analysis::entropy_rise`]); step 15's entropy is left as
+/// printed.
 ///
 /// The entropy is taken as printed (see [`Model::analyze`]), and its
 /// partitions below their thresholds in quiet subtract from it, by an
@@ -46,13 +48,61 @@ use crate::window::{Grouping, SHORT_WINDOWS, WindowSequence, WindowShape};
 ///   96 kHz, but with 17 to 21% of the frames of rock music short.
 /// - The long block's entropy over its partitions below 20 kHz alone, so
 ///   set: 51 to 151, no impulse of 0.3 at any sampling frequency.
-/// - The rise of the short blocks' entropy, above 200 at every sampling
-///   frequency: every onset over a quiet tone caught, at every place and
-///   sampling frequency, and 0 to 16 of the 32 bursts over the louder
-///   background; 0 to 3.2% of the frames of pop music short, and 0 to 1.5%
-///   of rock. Above 150, 16 to 24 of those bursts are caught, but up to
-///   11% of the frames of pop music at 8 to 16 kHz are short.
-const SWITCH_PE: f64 = 200.0;
+/// - The rise of each short block's entropy from the one before it, above
+///   200 at every sampling frequency: every onset over a quiet tone
+///   caught, at every place and sampling frequency, and 0 to 16 of the 32
+///   bursts over the louder background; 0 to 3.2% of the frames of pop
+///   music short, and 0 to 1.5% of rock. Above 150, 16 to 24 of those
+///   bursts are caught, but up to 11% of the frames of pop music at 8 to
+///   16 kHz are short.
+///
+/// The rise from the one block before missed attacks over a loud
+/// background, which temporal noise shaping then shaped in long windows:
+/// with it off in long windows, 8 tracks of pop music at 44.1 kHz in
+/// stereo at 128 kbit/s graded -1.367 with PEAQ (GstPEAQ 0.6.1, black
+/// box), against -1.087, the noise in the 1024 samples before the onsets
+/// of the frames whose filters' prediction gain exceeded 3 being 1.4 dB
+/// louder. Nor could it be lowered: the entropy of the short blocks of a
+/// steady tone of 80 Hz at half of full scale rises by up to 119 from one
+/// block to the next, as the tone's phase moves through the block, and
+/// that of a sweep from 20 Hz to 20 kHz in 3 s by up to 161, though
+/// neither has an attack. Above the most of the eight blocks before,
+/// which span a period of either, the entropy of tones of 20 Hz to 16 kHz
+/// rises by at most 6, and the sweep's by 47. With bursts of noise that
+/// die away in 5 ms over a tone of 0.1 and noise, at 31 to 37 places, at
+/// about 6, 11 and 16 dB above its level, a rise above 200 caught 0, 0 and
+/// 0 to 14 of the bursts at 8, 16, 44.1 and 48 kHz, above 100 2 to 26, 18
+/// to 34 and 24 to 37, and above 70 19 to 35, 25 to 37 and 28 to 37; none
+/// of the three switched a frame of steady noise, or of a tone in noise.
+///
+/// The constant is set from the noise of the frames that each value codes
+/// short and the next value up does not, in the 8 tracks of pop music: it
+/// is to fall more in the 384 samples before their short windows than it
+/// rises within them, at every bitrate. Above 100, 3.2% of the frames are
+/// coded short that the rise from the one block before, above 200, coded
+/// long, and their noise, at 64, 128 and 192 kbit/s, is 2.3, 3.4 and 3.7
+/// dB less before their short windows, and 0.6 less, 0.9 more and 0.8
+/// less within them. Above 70, another 2.8% are,
+/// whose noise is 1.1, 1.5 and 1.7 dB less before, and 0.1 less, 1.8 more
+/// and alike within, as of a gradual rise of the signal rather than an
+/// attack. Above 100, the noise in the 1024 samples before the onsets of
+/// the frames shaped as above is 0.9, 0.6 and 1.1 dB less; 0.5 to 6.7% of
+/// the frames of the pop music are short, 8.1 to 24.6% at 8 kHz and 2.1 to
+/// 24.5% at 16 kHz.
+///
+/// Graded with PEAQ, the 8 tracks gave means of -3.543, -1.002 and -0.237
+/// at 64, 128 and 192 kbit/s, against -3.584, -1.087 and -0.283 with the
+/// rise from the one block before above 200; 3 tracks of rock music and
+/// their 3 windows of 3 s with the most frames coded short, -3.563, -0.770
+/// and -0.110, against -3.578, -0.801 and -0.134; and 30 s of each pop
+/// track, resampled and graded against the excerpt resampled alike, -3.795
+/// against -3.826 at 8 kHz and 16 kbit/s, -2.552 against -2.644 at 16 kHz
+/// and 32 kbit/s, and -1.019 against -1.063 at 48 kHz and 128 kbit/s. Of
+/// the rise of the pop music's grades, the measures of noise give all at
+/// 192 kbit/s, four fifths at 128 kbit/s, where the bandwidth measures
+/// count the treble kept above 16 kHz, and more than all at 64 kbit/s,
+/// where they count treble lost.
+const SWITCH_PE: f64 = 100.0;
 
 /// Two short windows of a frame share a group while the energy of each,
 /// in its short FFT, is within this factor of every other's in the group.
@@ -404,6 +454,36 @@ mod tests {
         }
         let grouping = grouping(&[&analysis]);
         assert_eq!(grouping.lengths().collect::<Vec<_>>(), [6, 2]);
+    }
+
+    /// Neither a loud steady tone of 80 Hz, whose phase moves through each
+    /// short block, nor a sweep from 20 Hz to 20 kHz in 3 s, which moves
+    /// through the partitions, has an attack after its onset: the rise of
+    /// their short blocks' entropy from the block before reaches 119 and
+    /// 161.
+    #[test]
+    fn steady_tones_and_sweeps_have_no_attack() {
+        use std::f64::consts::TAU;
+        let fs = SamplingFrequency::Hz44100;
+        let rate = f64::from(fs.hz());
+        let frames = 3 * fs.hz() as usize / FRAME_SAMPLES;
+        let k = (20_000.0f64 / 20.0).ln();
+        let duration = (frames * FRAME_SAMPLES) as f64 / rate;
+        let signal = |name: &str, t: f64| match name {
+            "tone" => 0.5 * (TAU * 80.0 * t).sin(),
+            _ => 0.5 * (TAU * 20.0 * duration / k * ((k * t / duration).exp() - 1.0)).sin(),
+        };
+        for name in ["tone", "sweep"] {
+            let mut switching = BlockSwitching::new(fs);
+            for block in 0..frames {
+                let samples: [f64; FRAME_SAMPLES] = std::array::from_fn(|t| {
+                    signal(name, (block * FRAME_SAMPLES + t) as f64 / rate)
+                });
+                if let Some(attacks) = switching.look_ahead(&samples) {
+                    assert!(block < 2 || !attacks.this, "{name}, frame {}", block - 1);
+                }
+            }
+        }
     }
 
     /// A burst of noise in a quiet tone is coded with short windows in the

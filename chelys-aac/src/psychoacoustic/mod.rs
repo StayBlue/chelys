@@ -505,9 +505,10 @@ impl Threshold {
 pub struct Analysis {
     pub long: Threshold,
     pub short: [Threshold; SHORT_WINDOWS],
-    /// The largest rise of the perceptual entropy from one short block to
-    /// the next over the frame's eight, from the last of the frame before,
-    /// by which [`switching`] finds an attack.
+    /// The largest rise of the perceptual entropy of one of the frame's
+    /// eight short blocks above the most of the eight before it, which
+    /// reach back into the frame before, by which [`switching`] finds an
+    /// attack.
     pub entropy_rise: f64,
     sampling_frequency: SamplingFrequency,
 }
@@ -658,9 +659,9 @@ pub struct Model {
     c: Vec<f64>,
     short_c: Vec<f64>,
     short_c_min: Vec<f64>,
-    /// The perceptual entropy of the last short block, `None` before the
-    /// first.
-    last_short_entropy: Option<f64>,
+    /// The perceptual entropy of the last eight short blocks, each in the
+    /// place of its window in the frame, `None` before the first frame.
+    last_short_entropies: Option<[f64; SHORT_WINDOWS]>,
 }
 
 impl Model {
@@ -689,7 +690,7 @@ impl Model {
             c: vec![0.0; LONG_IBLEN + 1],
             short_c: vec![0.0; SHORT_IBLEN + 1],
             short_c_min: vec![0.0; SHORT_IBLEN + 1],
-            last_short_entropy: None,
+            last_short_entropies: None,
         }
     }
 
@@ -807,14 +808,17 @@ impl Model {
                 threshold,
             );
         }
-        // The first short block of the stream rises from itself.
-        let mut last = (self.last_short_entropy).unwrap_or(out.short[0].perceptual_entropy);
+        // Each short block rises from the most of the eight before it, the
+        // first of the stream from itself.
+        let mut recent =
+            (self.last_short_entropies).unwrap_or([out.short[0].perceptual_entropy; SHORT_WINDOWS]);
         out.entropy_rise = f64::NEG_INFINITY;
-        for threshold in &out.short {
-            out.entropy_rise = out.entropy_rise.max(threshold.perceptual_entropy - last);
-            last = threshold.perceptual_entropy;
+        for (w, threshold) in out.short.iter().enumerate() {
+            let most = recent.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            out.entropy_rise = out.entropy_rise.max(threshold.perceptual_entropy - most);
+            recent[w] = threshold.perceptual_entropy;
         }
-        self.last_short_entropy = Some(last);
+        self.last_short_entropies = Some(recent);
         let long = &self.long_block;
         (self.long).finish(
             &long.energy,

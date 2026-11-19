@@ -1503,7 +1503,7 @@ mod tests {
     /// for the second to pay for its bands, the second is given every bit
     /// of the two channels' shares that the first leaves, the bits taken
     /// from the first among them: at 64 kHz and 23 kbit/s, with noise in
-    /// each channel in turn.
+    /// each channel in turn, coded with short windows.
     #[test]
     fn a_retry_gives_the_second_channel_what_the_first_leaves() {
         let fs = SamplingFrequency::Hz64000;
@@ -1526,6 +1526,14 @@ mod tests {
         let mut start = 0;
         while encoder.buffered() - start >= 2 * FRAME_SAMPLES {
             encoder.look_ahead(start + FRAME_SAMPLES, true);
+            // Short windows in every frame, whose side information leaves
+            // the channels the fewest bits for their lines.
+            for channel in &mut encoder.channels {
+                channel.attacks = Attacks {
+                    this: true,
+                    next: true,
+                };
+            }
             encoder.prepare(start, true);
             encoder.second_channel.set(None);
             let coded = encoder.quantize(bits);
