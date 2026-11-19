@@ -102,7 +102,8 @@ impl ChannelCoding<'_> {
 
 /// The iteration loop of one channel (figure C.6): quantizes the lines
 /// `spectrum` by the outer loop to fit as `coding` asks, with the noise of
-/// each scalefactor band of each window group shaped to its allowed
+/// each scalefactor band of each window group, each line's error weighed
+/// by `weights` (see [`Lines::weighted`]), shaped to its allowed
 /// distortion `xmin`, raised by [`XMIN_OFFSET_DB`] (see [`raise_xmin`] and
 /// [`outer::outer_loop`]). Gives the channel and how far its noise exceeds
 /// that allowance (see [`outer::excess`]).
@@ -116,10 +117,11 @@ impl ChannelCoding<'_> {
 /// caller's error.
 pub fn quantize(
     spectrum: &[f64; FRAME_LINES],
+    weights: &[f64; FRAME_LINES],
     xmin: &[[f64; MAX_BANDS]],
     coding: ChannelCoding<'_>,
 ) -> (CodedChannel, f64) {
-    let counting = Counting::new(Lines::new(spectrum), coding);
+    let counting = Counting::new(Lines::weighted(spectrum, weights), coding);
     outer::outer_loop(counting, xmin)
 }
 
@@ -127,8 +129,9 @@ pub fn quantize(
 /// excess.
 pub fn quantize_channel(
     spectrum: &[f64; FRAME_LINES],
+    weights: &[f64; FRAME_LINES],
     xmin: &[[f64; MAX_BANDS]],
     coding: ChannelCoding<'_>,
 ) -> CodedChannel {
-    quantize(spectrum, xmin, coding).0
+    quantize(spectrum, weights, xmin, coding).0
 }

@@ -590,6 +590,38 @@ impl Analysis {
             first += bands.windows();
         }
     }
+
+    /// Whether each window of a frame coded with `windows`, whose lines in
+    /// the order they are sent are `spectrum`, has a band among `bands`
+    /// whose energy exceeds its allowed distortion `xmin(n)` (step 14): a
+    /// band whose quantization noise the loops are to shape.
+    pub fn audible(
+        &self,
+        windows: Windows,
+        spectrum: &[f64; FRAME_LINES],
+        bands: Range<usize>,
+    ) -> [bool; SHORT_WINDOWS] {
+        let energy = |lines: &[f64]| -> f64 { lines.iter().map(|x| x * x).sum() };
+        let thresholds = match windows.sequence.transform() {
+            Transform::Long => std::slice::from_ref(&self.long),
+            Transform::Short => &self.short[..],
+        };
+        let mut audible = [false; SHORT_WINDOWS];
+        let mut first = 0;
+        for (start, group) in windows.groups_with_start(self.sampling_frequency) {
+            let lines = &spectrum[start..start + group.lines()];
+            for w in 0..group.windows() {
+                let threshold = &thresholds[first + w];
+                let bands = bands.start..bands.end.min(group.num_swb());
+                audible[first + w] = bands.into_iter().any(|n| {
+                    let energy = energy(&lines[group.window_band(w, n)]);
+                    energy > threshold.xmin(n, energy)
+                });
+            }
+            first += group.windows();
+        }
+        audible
+    }
 }
 
 /// The model of one channel, with what it keeps from one frame to the

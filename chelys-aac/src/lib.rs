@@ -8,12 +8,14 @@
 //! Clause and table references refer to ISO/IEC 13818-7:2006, or, where
 //! they name it, to ISO/IEC 14496-3:2019.
 //!
-//! The encoder is being built: for now it codes each channel apart,
-//! switching to eight short windows where the psychoacoustic model of
-//! Annex C finds an attack, and fits each channel's lines to its share of
-//! the frame's bits with the iteration loops of Annex C, which shape the
-//! quantization noise of each scalefactor band to what the model allows.
-//! Stereo coding is to come.
+//! The encoder is being built: for now it switches to eight short windows
+//! where the psychoacoustic model of Annex C finds an attack, shapes the
+//! quantization noise within each window in time with temporal noise
+//! shaping, codes a pair's channels as middle and side or in intensity
+//! stereo where Annex C finds it pays, and fits each channel's lines to
+//! its share of the frame's bits with the iteration loops of Annex C, which
+//! shape the quantization noise of each scalefactor band to what the model
+//! allows.
 //!
 //! ```
 //! use chelys_aac::{Config, Encoder, Rate};

@@ -118,11 +118,15 @@ pub fn outer_loop(mut counting: Counting, xmin: &[[f64; MAX_BANDS]]) -> (CodedCh
     // Whether each band's energy exceeds its xmin: those the loop is to
     // amplify, if it can.
     let mut audible = vec![[false; MAX_BANDS]; groups.len()];
-    let spectrum = counting.lines().spectrum();
+    let (spectrum, weights) = (counting.lines().spectrum(), counting.lines().weights());
     for (g, &(start, bands)) in groups.iter().enumerate() {
+        let group = start..start + bands.lines();
+        let (spectrum, weights) = (&spectrum[group.clone()], &weights[group]);
         for (sb, audible) in audible[g][..bands.num_swb()].iter_mut().enumerate() {
-            let lines = &spectrum[start..start + bands.lines()][bands.band(sb)];
-            let energy: f64 = lines.iter().map(|x| x * x).sum();
+            let lines = spectrum[bands.band(sb)]
+                .iter()
+                .zip(&weights[bands.band(sb)]);
+            let energy: f64 = lines.map(|(x, w)| x * x * w).sum();
             *audible = energy > xmin[g][sb];
         }
     }
@@ -186,28 +190,33 @@ pub fn excess(
 /// The distortion `error_energy(sb)` of each band of each window group
 /// of the quantization `counting` counted last, at the step `common_gain`
 /// (clause C.7.4.3; see [`outer_loop`] for its sign): the energy of the
-/// difference between the lines and the lines the decoder reconstructs.
+/// difference between the lines and the lines the decoder reconstructs,
+/// each line's weighed as [`Lines::weighted`](super::inner::Lines::weighted)
+/// says.
 fn quantization_distortion(
     counting: &Counting,
     common_gain: u8,
     distortion: &mut [[f64; MAX_BANDS]],
 ) {
-    let spectrum = counting.lines().spectrum();
+    let (spectrum, weights) = (counting.lines().spectrum(), counting.lines().weights());
     for (g, ((start, bands), (_, quantized))) in
         counting.groups().zip(counting.group_lines()).enumerate()
     {
-        let spectrum = &spectrum[start..start + bands.lines()];
+        let group = start..start + bands.lines();
+        let (spectrum, weights) = (&spectrum[group.clone()], &weights[group]);
         for sb in 0..bands.num_swb() {
             let range = bands.band(sb);
-            let lines = &spectrum[range.clone()];
+            let lines = (spectrum[range.clone()].iter())
+                .zip(&quantized[range.clone()])
+                .zip(&weights[range]);
             let sf_decoder = counting
                 .sf_decoder(common_gain, g, sb)
                 .expect("the scalefactors quantized with are in range");
             let gain = decoder_gain(sf_decoder);
-            distortion[g][sb] = (lines.iter().zip(&quantized[range]))
-                .map(|(&x, &q)| {
+            distortion[g][sb] = lines
+                .map(|((&x, &q), &weight)| {
                     let error = x.abs() - power_four_thirds(q.unsigned_abs()) * gain;
-                    error * error
+                    error * error * weight
                 })
                 .sum();
         }

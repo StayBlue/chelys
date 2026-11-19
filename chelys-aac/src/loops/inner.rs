@@ -13,6 +13,7 @@ use crate::noiseless::scalefactors;
 use crate::noiseless::sections::{self, IntensityBands, Sections};
 use crate::noiseless::spectrum;
 use crate::scalefactor_bands::{GroupBands, MAX_BANDS};
+use crate::tns::Tns;
 
 use super::ChannelCoding;
 
@@ -78,10 +79,16 @@ pub(super) fn decoder_gain(sf_decoder: u8) -> f64 {
     table[usize::from(sf_decoder)]
 }
 
+/// The weights of lines that no filter of temporal noise shaping spans.
+#[cfg(test)]
+static UNWEIGHTED: [f64; FRAME_LINES] = [1.0; FRAME_LINES];
+
 /// A channel's lines with the powers the quantizer takes of them, taken
-/// once for every step tried.
+/// once for every step tried, and the weight of each line's quantization
+/// error in its band's distortion.
 pub struct Lines<'a> {
     spectrum: &'a [f64; FRAME_LINES],
+    weights: &'a [f64; FRAME_LINES],
     /// `abs(mdct_line)^(3/4)`: `mdct_scaled` of clause C.7.4.1 with every
     /// scalefactor 0.
     scaled: [f64; FRAME_LINES],
@@ -93,12 +100,22 @@ pub struct Lines<'a> {
 }
 
 impl<'a> Lines<'a> {
+    /// Lines that no filter shaped, whose errors are weighed alike.
+    #[cfg(test)]
     pub fn new(spectrum: &'a [f64; FRAME_LINES]) -> Self {
+        Self::weighted(spectrum, &UNWEIGHTED)
+    }
+
+    /// Lines whose quantization errors count in their bands' distortion
+    /// by `weights`: each by how far the decoder's filters of temporal
+    /// noise shaping raise it (see [`NoiseGains`](crate::tns::NoiseGains)).
+    pub fn weighted(spectrum: &'a [f64; FRAME_LINES], weights: &'a [f64; FRAME_LINES]) -> Self {
         let scaled = spectrum.map(power_three_quarters);
         let largest = scaled.iter().fold(0.0f64, |a, &x| a.max(x));
         let start = (16.0 / 3.0 * (largest / MAX_QUANT).log2()).ceil();
         Self {
             spectrum,
+            weights,
             scaled,
             end: spectrum
                 .iter()
@@ -110,6 +127,10 @@ impl<'a> Lines<'a> {
 
     pub fn spectrum(&self) -> &'a [f64; FRAME_LINES] {
         self.spectrum
+    }
+
+    pub fn weights(&self) -> &'a [f64; FRAME_LINES] {
+        self.weights
     }
 
     /// `start_common_scalefac = ceiling(16/3 * log2(max_mdct_line^(3/4) /
@@ -177,8 +198,8 @@ impl<'a> Lines<'a> {
 /// [`Lines::start_gain`]) to the largest `global_gain`, taking the
 /// distortion to grow with the step; where even the smallest exceeds
 /// `allowed`, it is taken.
-pub fn band_bits(lines: &[f64], allowed: f64, scratch: &mut BandScratch) -> u32 {
-    let energy: f64 = lines.iter().map(|x| x * x).sum();
+pub fn band_bits(lines: &[f64], weights: &[f64], allowed: f64, scratch: &mut BandScratch) -> u32 {
+    let energy: f64 = lines.iter().zip(weights).map(|(x, w)| x * x * w).sum();
     if energy <= allowed {
         return 0;
     }
@@ -198,10 +219,10 @@ pub fn band_bits(lines: &[f64], allowed: f64, scratch: &mut BandScratch) -> u32 
     let distortion = |sf_decoder: u8, x_quant: &mut [i32]| {
         quantize(sf_decoder, x_quant);
         let gain = decoder_gain(sf_decoder);
-        (lines.iter().zip(&*x_quant))
-            .map(|(&x, &q)| {
+        (lines.iter().zip(&*x_quant).zip(weights))
+            .map(|((&x, &q), &weight)| {
                 let error = x.abs() - power_four_thirds(q.unsigned_abs().min(MAX_MAGNITUDE)) * gain;
-                error * error
+                error * error * weight
             })
             .sum::<f64>()
     };
@@ -544,6 +565,17 @@ pub fn inner_loop(counting: &mut Counting, start: u8, change: i32) -> Option<u8>
 /// of frames of channels without lines (see
 /// [`StreamConfig::min_bits_per_second`](crate::stream::StreamConfig::min_bits_per_second)).
 ///
+/// Spec gap: nor does it say what to do where the bits of the channel's
+/// temporal noise shaping leave no room even for the channel without
+/// lines. The element shapes no channel where its channels without lines
+/// would not fit in the fewest bits the frame is given (see
+/// `ElementEncoder::prepare`),
+/// but a pair's channels share its bits unevenly. Where it happens, the
+/// channel is coded without lines and without filters, which decodes alike
+/// where its lines decode to zero: a single channel, or a pair's bands
+/// coded as left and right; in a pair's bands coded as middle and side,
+/// the channel takes the other's lines unshaped.
+///
 /// # Panics
 ///
 /// If not even a channel without lines fits in the available bits: a
@@ -557,6 +589,10 @@ pub fn first_inner_loop(counting: &mut Counting) -> (u8, usize) {
         if counting.count_at(u8::MAX, band_limit) {
             return (u8::MAX, band_limit);
         }
+    }
+    counting.coding.tns = &Tns::NONE;
+    if counting.count_at(u8::MAX, 0) {
+        return (u8::MAX, 0);
     }
     panic!(
         "not even a channel without lines fits in {} bits",

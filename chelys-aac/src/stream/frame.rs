@@ -77,6 +77,14 @@ pub fn element_bits(config: &StreamConfig, reservoir: &BitReservoir, demand: &De
     available.saturating_sub(overhead_bits(config))
 }
 
+/// The fewest bits that the frame's element may take in the next frame:
+/// those the reservoir makes available to a frame that asks for none
+/// beyond the mean, which it gives every frame at least.
+pub fn least_element_bits(config: &StreamConfig, reservoir: &BitReservoir) -> u32 {
+    let available = reservoir.available_bits(0);
+    available.saturating_sub(overhead_bits(config))
+}
+
 /// Writes the frame of `element`, spends its bits from `reservoir`, and
 /// gives it to `out`: as long as the element takes, or longer, with fill
 /// elements, where the reservoir would otherwise overflow (clause

@@ -73,6 +73,7 @@ pub fn choose(
     windows: Windows,
     sampling_frequency: SamplingFrequency,
     lines: [&[f64; FRAME_LINES]; 4],
+    weights: [&[f64; FRAME_LINES]; 4],
     allowed: [&[[f64; MAX_BANDS]]; 4],
     intensity: &Intensity,
 ) -> MsMask {
@@ -86,8 +87,10 @@ pub fn choose(
                 continue;
             }
             let [l, r, m, s] = std::array::from_fn(|c| {
-                let lines = &lines[c][start..start + bands.lines()];
-                inner::band_bits(&lines[bands.band(sfb)], allowed[c][g][sfb], &mut scratch)
+                let group = start..start + bands.lines();
+                let lines = &lines[c][group.clone()][bands.band(sfb)];
+                let weights = &weights[c][group][bands.band(sfb)];
+                inner::band_bits(lines, weights, allowed[c][g][sfb], &mut scratch)
             });
             let (left_right, mid_side) = (l + r, m + s);
             match mid_side.cmp(&left_right) {

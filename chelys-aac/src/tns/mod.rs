@@ -4,9 +4,9 @@
 //! Temporal noise shaping (clause 14): filters across the spectral lines
 //! of each window of a channel that shape its quantization noise in time.
 //! The encoder filters the lines with the prediction error filter of their
-//! linear prediction over frequency (clause C.5), and sends the filters as
-//! the channel's `tns_data()` (Table 19), with which the decoder applies
-//! their inverse.
+//! linear prediction over frequency (clause C.5, see [`analysis`]), and
+//! sends the filters as the channel's `tns_data()` (Table 19), with which
+//! the decoder applies their inverse.
 //!
 //! The decoder applies the filters after M/S stereo and intensity stereo,
 //! before the filterbank (clause 4, figure 2): to each channel's spectrum
@@ -14,10 +14,14 @@
 //! they are coded jointly, as figure 1 has it, and a pair's middle and side
 //! channels, and its intensity signal, are made of the filtered lines.
 
+pub mod analysis;
+
 use chelys_core::bitstream::BitWriter;
 
+use crate::channel::FRAME_LINES;
+use crate::sampling_frequency::SamplingFrequency;
 use crate::scalefactor_bands::Transform;
-use crate::window::SHORT_WINDOWS;
+use crate::window::{SHORT_WINDOWS, Windows};
 
 /// `TNS_MAX_ORDER` of the Low Complexity profile for long windows, the
 /// highest of any window (clause 7.1.6): the most coefficients a filter
@@ -27,6 +31,36 @@ pub const MAX_ORDER: usize = 12;
 /// The most filters of one window: those that `n_filt` of a long window, 2
 /// bits, counts (Table 19).
 pub const MAX_FILTERS: usize = 3;
+
+/// `TNS_MAX_ORDER` of the Low Complexity profile (clause 7.1.6): the
+/// highest order of a filter, 12 for long windows and 7 for short ones.
+pub fn max_order(transform: Transform) -> usize {
+    match transform {
+        Transform::Long => MAX_ORDER,
+        Transform::Short => 7,
+    }
+}
+
+/// `TNS_MAX_BANDS` of the Low Complexity profile at `sampling_frequency`
+/// (Table 33, as printed): the scalefactor bands of a window below which
+/// the filters apply.
+pub fn max_bands(sampling_frequency: SamplingFrequency, transform: Transform) -> usize {
+    use SamplingFrequency::*;
+    let (long, short) = match sampling_frequency {
+        Hz96000 | Hz88200 => (31, 9),
+        Hz64000 => (34, 10),
+        Hz48000 => (40, 14),
+        Hz44100 => (42, 14),
+        Hz32000 => (51, 14),
+        Hz24000 | Hz22050 => (46, 14),
+        Hz16000 | Hz12000 | Hz11025 => (42, 14),
+        Hz8000 => (39, 14),
+    };
+    match transform {
+        Transform::Long => long,
+        Transform::Short => short,
+    }
+}
 
 /// The sizes of the fields of `tns_data()` that depend on the window
 /// (clause 14.2.1): those of `n_filt`, `length` and `order`.
@@ -99,6 +133,49 @@ impl WindowFilters {
     }
 }
 
+/// How far the decoder's filters raise the quantization noise of the
+/// lines of each window that they span: the mean power gain of each
+/// window's filter (see [`analysis::Shaping::shape`]), 1 where it has none.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NoiseGains {
+    /// Each window's gain, and the bands its filter spans.
+    windows: [(f64, u8, u8); SHORT_WINDOWS],
+}
+
+impl NoiseGains {
+    /// No window filtered.
+    pub const NONE: Self = Self {
+        windows: [(1.0, 0, 0); SHORT_WINDOWS],
+    };
+
+    /// Window `w`'s filter raises the noise of `bands` by `gain`.
+    pub fn set(&mut self, w: usize, gain: f64, bands: std::ops::Range<usize>) {
+        self.windows[w] = (gain, bands.start as u8, bands.end as u8);
+    }
+
+    /// The gain of each line of a frame of `windows`, in the order they are
+    /// sent, into `weights`.
+    pub fn weights(
+        &self,
+        windows: Windows,
+        sampling_frequency: SamplingFrequency,
+        weights: &mut [f64; FRAME_LINES],
+    ) {
+        weights.fill(1.0);
+        let mut first = 0;
+        for (start, bands) in windows.groups_with_start(sampling_frequency) {
+            let group = &mut weights[start..start + bands.lines()];
+            for w in 0..bands.windows() {
+                let (gain, from, to) = self.windows[first + w];
+                for sfb in usize::from(from)..usize::from(to).min(bands.num_swb()) {
+                    group[bands.window_band(w, sfb)].fill(gain);
+                }
+            }
+            first += bands.windows();
+        }
+    }
+}
+
 /// A channel's temporal noise shaping in a frame: the filters of each of
 /// its windows, which its `tns_data_present` and `tns_data()` send.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -116,7 +193,6 @@ impl Tns {
 
     /// The windows of `transform`, `num_windows` of them, without filters
     /// as yet.
-    #[cfg(test)]
     pub fn new(transform: Transform) -> Self {
         Self {
             transform,
@@ -138,7 +214,6 @@ impl Tns {
     }
 
     /// The filters of window `w`.
-    #[cfg(test)]
     pub fn window_mut(&mut self, w: usize) -> &mut WindowFilters {
         let windows = self.num_windows();
         &mut self.windows[..windows][w]
@@ -230,6 +305,7 @@ mod tests {
     use chelys_core::bitstream::binary_digits;
 
     use super::*;
+    use crate::scalefactor_bands::{num_swb, swb_offsets};
 
     fn written(tns: &Tns) -> String {
         let mut w = BitWriter::new();
@@ -305,5 +381,43 @@ mod tests {
         tns.window_mut(0).n_filt = 1;
         tns.window_mut(0).filters[0] = filter;
         written(&tns);
+    }
+
+    #[test]
+    fn the_limits_are_those_of_the_low_complexity_profile() {
+        use SamplingFrequency::*;
+        // Table 33, Low Complexity columns.
+        let printed = [
+            (Hz96000, 31, 9),
+            (Hz88200, 31, 9),
+            (Hz64000, 34, 10),
+            (Hz48000, 40, 14),
+            (Hz44100, 42, 14),
+            (Hz32000, 51, 14),
+            (Hz24000, 46, 14),
+            (Hz22050, 46, 14),
+            (Hz16000, 42, 14),
+            (Hz12000, 42, 14),
+            (Hz11025, 42, 14),
+            (Hz8000, 39, 14),
+        ];
+        for (fs, long, short) in printed {
+            assert_eq!(max_bands(fs, Transform::Long), long, "{fs:?}");
+            assert_eq!(max_bands(fs, Transform::Short), short, "{fs:?}");
+            // Within the bands of each window, and the fields that count
+            // them.
+            for transform in [Transform::Long, Transform::Short] {
+                let bands = max_bands(fs, transform);
+                assert!(bands <= num_swb(fs, transform), "{fs:?} {transform:?}");
+                let (_, length, _) = field_bits(transform);
+                assert!(num_swb(fs, transform) < 1 << length);
+                assert!(swb_offsets(fs, transform)[bands] > 0);
+            }
+        }
+        // Clause 7.1.6.
+        assert_eq!(max_order(Transform::Long), 12);
+        assert_eq!(max_order(Transform::Short), 7);
+        let (_, _, order) = field_bits(Transform::Short);
+        assert!(max_order(Transform::Short) < 1 << order);
     }
 }

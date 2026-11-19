@@ -195,7 +195,9 @@ fn align(input: &[f64], output: &[f32], channels: usize, channel: usize) -> (usi
 /// before the input, and each frame after it to the block before its own,
 /// at the level the encoder takes its input at. The psychoacoustic model
 /// shapes the noise to what it finds masked rather than to the least, so
-/// at 8 kHz, where a bit a sample is fewest, the SNR is about 11 dB.
+/// at 8 kHz, where a bit a sample is fewest, the SNR is about 11 dB; in
+/// mono, where temporal noise shaping shapes the sweep's noise in most
+/// frames, about 8 dB (15 dB unshaped).
 ///
 /// This is the evidence for the gap in the standard that [`DELAY`] marks
 /// as settled by decoding with ffmpeg: where the input lands in the
@@ -220,7 +222,7 @@ fn ffmpeg_decodes_the_input_a_frame_late_at_every_sample_rate() {
                 if false {
                     assert_eq!(lag, DELAY);
                 }
-                assert!(snr > 9.0, "{context}, channel {c}: {snr:.1} dB");
+                assert!(snr > 7.0, "{context}, channel {c}: {snr:.1} dB");
             }
         }
     }
@@ -231,7 +233,9 @@ fn ffmpeg_decodes_the_input_a_frame_late_at_every_sample_rate() {
 /// quantizer codes well at these rates. The psychoacoustic model shapes
 /// the noise to what it finds masked rather than to the least, so that at
 /// 128 kbit/s the tones' SNR is about 44 dB and the first sweep's, which
-/// rises to 20 kHz, where the thresholds in quiet are high, about 59 dB.
+/// rises to 20 kHz, where the thresholds in quiet are high, about 53 dB.
+/// Temporal noise shaping shapes the sweeps' noise in many frames, and
+/// lowers their SNR by 5 to 7 dB (from about 59 dB at 128 kbit/s).
 /// The rates start above those at which a pair is coded in intensity
 /// stereo, which gives up each channel's waveform in the bands it codes.
 #[test]
@@ -240,7 +244,7 @@ fn snr_rises_with_the_bitrate() {
     let len = 3 * sample_rate as usize;
     let signals = [
         ("tones", [(96_000, 36.0), (128_000, 41.0), (256_000, 56.0)]),
-        ("sweep", [(96_000, 48.0), (128_000, 56.0), (256_000, 70.0)]),
+        ("sweep", [(96_000, 45.0), (128_000, 52.0), (256_000, 65.0)]),
         ("noise", [(96_000, 2.0), (128_000, 3.5), (256_000, 12.0)]),
     ];
     for (name, thresholds) in signals {
@@ -578,7 +582,10 @@ fn attacks_are_coded_with_short_windows_at_every_sample_rate() {
 
 /// One-sample impulses over a quiet tone, at many places in a frame, are
 /// coded with short windows in each channel, at sampling frequencies of
-/// every short band table, and come back at about their level.
+/// every short band table, and come back at about their level. In pairs at
+/// 64 and 96 kHz, at three quarters of a bit a sample, those shaped by
+/// temporal noise shaping come back at 0.18 to 0.3 of their 0.3 (0.23 to
+/// 0.3 unshaped).
 #[test]
 fn impulses_over_a_quiet_tone_are_coded_with_short_windows() {
     for sample_rate in [8_000, 22_050, 44_100, 48_000, 64_000, 96_000] {
@@ -616,7 +623,7 @@ fn impulses_over_a_quiet_tone_are_coded_with_short_windows() {
                     );
                     let y = f64::from(output[(onset + DELAY) * channels + c]);
                     assert!(
-                        (y - 0.3).abs() < 0.1,
+                        (y - 0.3).abs() < 0.125,
                         "{context}, channel {c}, onset {onset}: {y}"
                     );
                 }
@@ -698,8 +705,10 @@ fn middle_side_share(elements: &[Element]) -> f64 {
 /// panned to one side, a signal and its negation, independent noise, and
 /// a signal beside silence. Each channel lines up with its own input
 /// [`DELAY`] samples late, at its level, not its pair's nor negated; the
-/// output after the input ends is no louder than the coding noise of its
-/// last frame; and a silent channel stays all but silent. The pair shares
+/// output after the input ends is not much louder than the coding noise of
+/// its last frame (temporal noise shaping of the frame in which the input
+/// ends raises it, to about 8 times at 48 kHz, where it was about twice);
+/// and a silent channel stays all but silent. The pair shares
 /// its window in every frame, and codes all but a few bands as middle and
 /// side where its channels are alike or opposite. Independent noise, which
 /// costs about as many bits either way, has about half its bands so coded.
@@ -748,7 +757,14 @@ fn stereo_pairs_decode_each_channel_in_place() {
                 }
                 let (lag, snr) = align(input, &output, 2, c);
                 assert_eq!(lag, DELAY, "{context}, channel {c}: {snr:.1} dB");
-                let least_snr = if noisy { 1.5 } else { 12.0 };
+                // Temporal noise shaping shapes the sweep's noise at 8 kHz
+                // in most frames, which lowers the panned pair's SNR there to
+                // about 9 dB.
+                let least_snr = match (noisy, sample_rate) {
+                    (true, _) => 1.5,
+                    (false, 8_000) => 8.0,
+                    (false, _) => 12.0,
+                };
                 assert!(snr > least_snr, "{context}, channel {c}: {snr:.1} dB");
                 // The input's level in the output: their correlation over
                 // the input's energy, which noise coded at a bit a sample
@@ -774,7 +790,7 @@ fn stereo_pairs_decode_each_channel_in_place() {
                     energy(tail) / tail.len().max(1) as f64,
                 );
                 assert!(
-                    tail_power < 4.0 * noise_power,
+                    tail_power < 10.0 * noise_power,
                     "{context}, channel {c}: tail {tail_power} against {noise_power}"
                 );
             }

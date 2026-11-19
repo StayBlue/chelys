@@ -9,7 +9,7 @@ use crate::channel::FRAME_LINES;
 use crate::noiseless::codebooks::Codebook;
 use crate::noiseless::sections::IntensityBands;
 use crate::sampling_frequency::SamplingFrequency;
-use crate::scalefactor_bands::{MAX_BANDS, Transform, swb_offsets};
+use crate::scalefactor_bands::MAX_BANDS;
 use crate::window::{SHORT_WINDOWS, Windows};
 
 /// The bands of a pair's window groups coded in intensity stereo, each
@@ -47,22 +47,6 @@ pub const MAX_POSITION: i8 = 30;
 /// intensity stereo: "An average value of f0 = 6 kHz is appropriate for
 /// most types of signals" (clause C.6.2).
 pub const BORDER_HZ: f64 = 6000.0;
-
-/// The first scalefactor band of a window of `transform` at
-/// `sampling_frequency` that lies above `border` Hz: the first whose lowest
-/// line's frequency is `border` or more.
-pub fn first_band_above(
-    sampling_frequency: SamplingFrequency,
-    transform: Transform,
-    border: f64,
-) -> usize {
-    let offsets = swb_offsets(sampling_frequency, transform);
-    let line_hz = f64::from(sampling_frequency.hz()) / (2 * transform.lines()) as f64;
-    (offsets.iter())
-        .position(|&offset| f64::from(offset) * line_hz >= border)
-        .unwrap_or(offsets.len())
-        .min(offsets.len() - 1)
-}
 
 /// Codes the bands of each window group of `windows` from `first` up in
 /// intensity stereo as clause C.6.2 describes, in the pair's lines `left`

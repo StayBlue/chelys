@@ -71,6 +71,22 @@ pub fn num_swb(sampling_frequency: SamplingFrequency, transform: Transform) -> u
     swb_offsets(sampling_frequency, transform).len() - 1
 }
 
+/// The first scalefactor band of a window of `transform` at
+/// `sampling_frequency` that lies above `border` Hz: the first whose lowest
+/// line's frequency is `border` or more.
+pub fn first_band_above(
+    sampling_frequency: SamplingFrequency,
+    transform: Transform,
+    border: f64,
+) -> usize {
+    let offsets = swb_offsets(sampling_frequency, transform);
+    let line_hz = f64::from(sampling_frequency.hz()) / (2 * transform.lines()) as f64;
+    (offsets.iter())
+        .position(|&offset| f64::from(offset) * line_hz >= border)
+        .unwrap_or(offsets.len())
+        .min(offsets.len() - 1)
+}
+
 /// The scalefactor bands of a window group (clause 8.3.4): of a long
 /// window, or of a group of 1 to 8 short windows of an
 /// EIGHT_SHORT_SEQUENCE, each of whose bands holds that band of every
@@ -211,7 +227,6 @@ pub fn interleave<T: Copy>(
 /// # Panics
 ///
 /// As [`interleave`].
-#[cfg(test)]
 pub fn deinterleave<T: Copy>(
     groups: impl IntoIterator<Item = GroupBands>,
     sent: &[T],

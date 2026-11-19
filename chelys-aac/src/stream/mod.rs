@@ -227,6 +227,14 @@ impl StreamEncoder {
         self
     }
 
+    /// The encoder, but without temporal noise shaping, for comparing with
+    /// it in tests.
+    #[cfg(any(test, feature = "unstable"))]
+    pub fn without_tns(mut self) -> Self {
+        self.element.without_tns();
+        self
+    }
+
     /// Whether the next frame's bits, those the reservoir makes available
     /// to it when it asks for none beyond the mean, pay for the shortest
     /// frame of eight short windows in every channel, and so for any
@@ -314,7 +322,8 @@ impl StreamEncoder {
         self.element
             .look_ahead(start + FRAME_SAMPLES, self.block_switching);
         let afford_short = self.affords_short();
-        self.element.prepare(start, afford_short);
+        let least_bits = frame::least_element_bits(&self.config, &self.reservoir);
+        self.element.prepare(start, afford_short, least_bits);
         let demand = self.element.demand();
         let available_bits = frame::element_bits(&self.config, &self.reservoir, &demand);
         let element = self.element.quantize(available_bits);
@@ -445,6 +454,30 @@ mod tests {
     /// frame cannot afford the side information of eight short windows,
     /// and an attack is coded with long ones; a little above it, it is
     /// coded short.
+    #[test]
+    fn tns_can_be_turned_off() {
+        use crate::noiseless::decoder::{BitReader, element};
+        let config = config(Framing::Raw, 64_000);
+        // A click in each of the frames, coded with long windows.
+        let mut input = vec![0.0; 8 * FRAME_SAMPLES];
+        for frame in 0..8 {
+            input[frame * FRAME_SAMPLES + 300] = 0.9;
+        }
+        for tns in [true, false] {
+            let mut encoder = StreamEncoder::new(config).without_block_switching();
+            if !tns {
+                encoder = encoder.without_tns();
+            }
+            let mut shaped = 0;
+            encoder.encode(&[&input, &input], &mut |frame: &[u8]| {
+                let mut r = BitReader::new(frame);
+                let element = element(&mut r, SamplingFrequency::Hz44100);
+                shaped += element.channels.iter().filter(|c| c.tns.is_some()).count();
+            });
+            assert_eq!(shaped > 0, tns, "{shaped}");
+        }
+    }
+
     #[test]
     fn a_frame_without_bits_for_short_windows_stays_long() {
         let mut config = StreamConfig {

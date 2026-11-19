@@ -15,10 +15,11 @@ use crate::psychoacoustic::middle_side::MidSideModel;
 use crate::psychoacoustic::switching::{self, Attacks, BlockSwitching};
 use crate::raw_data_block::element::CodedElement;
 use crate::sampling_frequency::SamplingFrequency;
-use crate::scalefactor_bands::{MAX_BANDS, Transform};
+use crate::scalefactor_bands::{MAX_BANDS, Transform, first_band_above};
 use crate::stereo::intensity::{self, Intensity};
 use crate::stereo::middle_side::{self, MsMask};
-use crate::tns::Tns;
+use crate::tns::analysis::{Shaping, target_bands};
+use crate::tns::{NoiseGains, Tns};
 use crate::window::{SHORT_WINDOWS, WindowSequence, Windows};
 
 /// One channel of the element: its samples not yet coded, and what codes
@@ -66,6 +67,12 @@ pub struct PreparedChannel {
     pub spectrum: Box<[f64; FRAME_LINES]>,
     /// The filters of the channel's temporal noise shaping.
     pub tns: Tns,
+    /// The lines of the frame's transform before temporal noise shaping.
+    pub unshaped: Box<[f64; FRAME_LINES]>,
+    /// The weight of each line's quantization error in its band's
+    /// distortion (see
+    /// [`Lines::weighted`](crate::loops::inner::Lines::weighted)).
+    pub weights: Box<[f64; FRAME_LINES]>,
     /// The allowed distortion `xmin` of each band of each window group,
     /// raised by [`XMIN_OFFSET_DB`](loops::XMIN_OFFSET_DB) as the loops take
     /// it.
@@ -85,6 +92,8 @@ impl PreparedChannel {
             windows: Windows::LONG_SINE,
             spectrum: Box::new([0.0; FRAME_LINES]),
             tns: Tns::NONE,
+            unshaped: Box::new([0.0; FRAME_LINES]),
+            weights: Box::new([1.0; FRAME_LINES]),
             xmin: Vec::with_capacity(SHORT_WINDOWS),
             bit_allocation: 0.0,
             perceptual_entropy: 0.0,
@@ -93,10 +102,10 @@ impl PreparedChannel {
     }
 
     /// The channel's allowed distortions, perceptual entropy and
-    /// `bit_allocation`, from its lines and `analysis`, its model's
-    /// thresholds.
+    /// `bit_allocation`, from its lines before temporal noise shaping and
+    /// `analysis`, its model's thresholds.
     fn thresholds(&mut self, analysis: &Analysis) {
-        analysis.xmin(self.windows, &self.spectrum, &mut self.xmin);
+        analysis.xmin(self.windows, &self.unshaped, &mut self.xmin);
         loops::raise_xmin(&mut self.xmin);
         self.bit_allocation = analysis.bit_allocation(self.windows.sequence);
         self.perceptual_entropy = analysis.perceptual_entropy(self.windows.sequence);
@@ -126,6 +135,10 @@ pub struct ElementEncoder {
     /// The bands of the frame being coded that a pair that shares its
     /// window codes in intensity stereo.
     intensity: Intensity,
+    /// Whether the channels' lines are shaped by temporal noise shaping,
+    /// and the memory it works in.
+    tns: bool,
+    shaping: Shaping,
     /// How the second channel of the last pair that shared its window was
     /// given its bits, for tests.
     #[cfg(test)]
@@ -175,6 +188,8 @@ impl ElementEncoder {
             ms: MsMask::NONE,
             intensity_border,
             intensity: Intensity::NONE,
+            tns: true,
+            shaping: Shaping::default(),
             #[cfg(test)]
             second_channel: std::cell::Cell::new(None),
         }
@@ -182,6 +197,13 @@ impl ElementEncoder {
 
     pub fn channels(&self) -> usize {
         self.channels.len()
+    }
+
+    /// The element, but without temporal noise shaping, for comparing with
+    /// it in tests.
+    #[cfg(any(test, feature = "unstable"))]
+    pub fn without_tns(&mut self) {
+        self.tns = false;
     }
 
     /// Appends the next samples of each channel.
@@ -267,9 +289,15 @@ impl ElementEncoder {
     /// Prepares the frame whose block is at `start` in stages: its
     /// [spectra](Self::spectra), each channel's windows chosen, short ones
     /// only if the frame can `afford_short` them, and its block transformed
-    /// with them; their [thresholds](Self::thresholds), what each
-    /// scalefactor band may take as noise; a pair's [joint](Self::joint)
-    /// coding; and which channels are [silent](Self::find_silence).
+    /// with them; their [temporal noise
+    /// shaping](Self::temporal_noise_shaping); their
+    /// [thresholds](Self::thresholds), what each scalefactor band may take
+    /// as noise; a pair's [joint](Self::joint) coding; and which channels
+    /// are [silent](Self::find_silence). The stages follow the decoder's
+    /// tools in reverse (clause 4, figure 2), as the encoder of figure 1
+    /// orders them: the decoder restores the temporal noise shaping of each
+    /// channel after it decodes the pair's joint coding, so the encoder
+    /// shapes each channel's lines before it codes them jointly.
     ///
     /// A pair shares its `ics_info()`, `common_window` 1, where "each
     /// individual channel in the pair window switch together" (clause
@@ -280,8 +308,9 @@ impl ElementEncoder {
     /// (see [`SHARED_ATTACKS`]), so that their window sequences, chosen
     /// alike from the same state, are the same, and where they are short,
     /// their grouping is chosen from both (see [`switching::grouping`]).
-    pub fn prepare(&mut self, start: usize, afford_short: bool) {
+    pub fn prepare(&mut self, start: usize, afford_short: bool, least_bits: u32) {
         self.spectra(start, afford_short);
+        self.temporal_noise_shaping(least_bits);
         self.thresholds();
         self.joint();
         self.find_silence();
@@ -331,9 +360,111 @@ impl ElementEncoder {
         };
     }
 
+    /// The first band of the frame's pair coded in intensity stereo, where
+    /// it is: where the pair shares a window of long blocks and its stream
+    /// codes it so, the first above the border frequency (see
+    /// [`intensity_bands`](Self::intensity_bands)).
+    ///
+    /// Spec reading: this deliberately departs from clause C.6.2, which
+    /// codes every window group in intensity stereo, for frames of eight
+    /// short windows, which are not: they are chosen for attacks, whose
+    /// timing intensity stereo would give up in the right channel, moving
+    /// the right channel's attack into the left channel's intensity signal
+    /// and the left's into the right. Coded so, a one-sample impulse in one
+    /// channel of a pair at 64 kHz and 96 kbit/s decoded at about half its
+    /// level.
+    fn intensity_from(&self) -> Option<usize> {
+        let windows = self.prepared[0].windows;
+        let long = windows.sequence.transform() == Transform::Long;
+        let border = self
+            .intensity_border
+            .filter(|_| self.common_window && long)?;
+        Some(first_band_above(
+            self.sampling_frequency,
+            Transform::Long,
+            border,
+        ))
+    }
+
+    /// Each channel's lines shaped in time by the filters of temporal noise
+    /// shaping (see [`Shaping::shape`]), and the filters that shaped them,
+    /// where the element's channels without lines, with their filters,
+    /// fit in `least_bits`, the fewest the frame is given.
+    ///
+    /// Spec reading: this deliberately departs from clause C.5, which
+    /// shapes every window whose prediction gain exceeds the threshold,
+    /// for windows none of whose bands in the target range exceeds its
+    /// allowed distortion (see [`Analysis::audible`]): their lines quantize
+    /// to zero within their allowance, which leaves no noise to shape, and
+    /// their filters would take bits for nothing. The lines above 1.5 kHz
+    /// of a steady tone below it, the leakage of its window, are well
+    /// predicted and inaudible: a tone of 1 kHz beside silence, at 6.5
+    /// kbit/s in stereo, so shaped in most frames, decoded at an SNR of 0
+    /// dB, against more than 10 dB unshaped (the conformance test
+    /// `a_tone_beside_silence_decodes_alike_in_either_channel`).
+    ///
+    /// Spec gap: Annex C does not count the bits of `tns_data()` against
+    /// the frame's, which near the lowest bitrates, set by frames of
+    /// channels without lines or filters, may not pay for them. Where the
+    /// element's channels could not be coded even without lines, their
+    /// lines are not shaped.
+    ///
+    /// Spec gap: the decoder applies the right channel's filters to its
+    /// bands in intensity stereo, after it has taken them from the left
+    /// channel's lines as they were sent (clause 4, figure 2), which the
+    /// left channel's filters have shaped; Annex C does not say how
+    /// temporal noise shaping and intensity stereo combine. Where the pair
+    /// is coded in intensity stereo, the filters of both channels end below
+    /// its first band in intensity stereo: the left channel sends the
+    /// bands above unfiltered, and the right channel takes them so.
+    fn temporal_noise_shaping(&mut self, least_bits: u32) {
+        let fs = self.sampling_frequency;
+        let top = self.intensity_from();
+        for (channel, prepared) in self.channels.iter().zip(&mut self.prepared) {
+            prepared.unshaped.copy_from_slice(&*prepared.spectrum);
+            prepared.tns = Tns::NONE;
+            let mut gains = NoiseGains::NONE;
+            if self.tns {
+                let windows = prepared.windows;
+                let bands = target_bands(fs, windows.sequence.transform(), top);
+                let analysis = channel.switching.current();
+                let active = analysis.audible(windows, &prepared.spectrum, bands);
+                let spectrum = &mut prepared.spectrum;
+                prepared.tns = (self.shaping).shape(windows, fs, top, spectrum, active, &mut gains);
+            }
+            gains.weights(prepared.windows, fs, &mut prepared.weights);
+        }
+        let fields = CodedElement::fields_bits(self.channels(), self.common_windows());
+        let channels: u32 = self.prepared.iter().map(|c| self.silent_bits(c)).sum();
+        if fields + channels > least_bits {
+            for prepared in &mut self.prepared {
+                prepared.spectrum.copy_from_slice(&*prepared.unshaped);
+                prepared.tns = Tns::NONE;
+                prepared.weights.fill(1.0);
+            }
+        }
+    }
+
     /// From each channel's lines and its model's thresholds, what each of
     /// its scalefactor bands may take as noise, and its perceptual entropy
     /// and `bit_allocation`.
+    ///
+    /// Spec gap: Annex C computes `xmin(n)` from the energy of each band's
+    /// MDCT lines (clause C.1.4, step 14), and measures the distortion of
+    /// the lines it quantizes (clause C.7.4.3), without saying how either
+    /// combines with temporal noise shaping, which comes between the
+    /// filterbank and the quantization (clause 4, figure 1). The allowance
+    /// is that of the lines as the filterbank gave them, which the decoder
+    /// restores; the loops measure the distortion of the lines as shaped,
+    /// each line's error weighed by how far the decoder's filter raises it
+    /// (see [`NoiseGains`]). With the allowance of the shaped lines' own
+    /// energy and their errors unweighed, a sweep from 100 Hz to 6 kHz at
+    /// 12 kHz in mono at 12 kbit/s decoded at an SNR of 3.3 dB, against
+    /// 13.0 dB so weighed and 18.3 dB unshaped; graded with PEAQ (GstPEAQ
+    /// 0.6.1, black box), 8 tracks of pop music at 128 kbit/s gave means of
+    /// -1.197 and -1.181. Measuring the distortion of the lines as the
+    /// decoder restores them, through its filters, rather than weighing
+    /// them, graded -1.200 and took half as long again to encode.
     fn thresholds(&mut self) {
         for (channel, prepared) in self.channels.iter().zip(&mut self.prepared) {
             prepared.thresholds(channel.switching.current());
@@ -346,9 +477,8 @@ impl ElementEncoder {
         self.ms = MsMask::NONE;
         self.intensity = Intensity::NONE;
         if self.common_window {
-            let short = self.prepared[0].windows.sequence.transform() == Transform::Short;
-            if let (Some(border), false) = (self.intensity_border, short) {
-                self.intensity_bands(border);
+            if let Some(first) = self.intensity_from() {
+                self.intensity_bands(first);
             }
             self.middle_side_bands();
         }
@@ -371,23 +501,13 @@ impl ElementEncoder {
     }
 
     /// Codes the frame's pair, which shares its window, in intensity stereo
-    /// from the first band above `border` Hz up (see [`intensity::code`]).
-    ///
-    /// Spec reading: this deliberately departs from clause C.6.2, which
-    /// codes every window group in intensity stereo, for frames of eight
-    /// short windows, which are not: they are chosen for attacks, whose
-    /// timing intensity stereo would give up in the right channel, moving
-    /// the right channel's attack into the left channel's intensity signal
-    /// and the left's into the right. Coded so, a one-sample impulse in one
-    /// channel of a pair at 64 kHz and 96 kbit/s decoded at about half its
-    /// level.
-    fn intensity_bands(&mut self, border: f64) {
+    /// from the band `first` up (see [`intensity::code`]).
+    fn intensity_bands(&mut self, first: usize) {
         let fs = self.sampling_frequency;
         let [left, right] = &mut self.prepared[..] else {
             unreachable!("a pair")
         };
         let windows = left.windows;
-        let first = intensity::first_band_above(fs, windows.sequence.transform(), border);
         self.intensity = intensity::code(
             windows,
             fs,
@@ -430,6 +550,17 @@ impl ElementEncoder {
             &mut mid.spectrum,
             &mut side.spectrum,
         );
+        middle_side::matrix(
+            &left.unshaped,
+            &right.unshaped,
+            &mut mid.unshaped,
+            &mut side.unshaped,
+        );
+        // The noise of the middle and side channels reaches both channels,
+        // and is raised by the filters of both.
+        for (i, (&l, &r)) in left.weights.iter().zip(&*right.weights).enumerate() {
+            (mid.weights[i], side.weights[i]) = (l.max(r), l.max(r));
+        }
         let analyses = mid_side.model.current();
         for (channel, analysis) in [&mut *mid, &mut *side].into_iter().zip(analyses) {
             channel.windows = windows;
@@ -440,6 +571,7 @@ impl ElementEncoder {
             windows,
             fs,
             channels.map(|c| &*c.spectrum),
+            channels.map(|c| &*c.weights),
             channels.map(|c| &c.xmin[..]),
             &self.intensity,
         );
@@ -452,7 +584,9 @@ impl ElementEncoder {
                     let range = start + band.start..start + band.end;
                     lines_mid_side += range.len();
                     left.spectrum[range.clone()].copy_from_slice(&mid.spectrum[range.clone()]);
-                    right.spectrum[range.clone()].copy_from_slice(&side.spectrum[range]);
+                    right.spectrum[range.clone()].copy_from_slice(&side.spectrum[range.clone()]);
+                    left.weights[range.clone()].copy_from_slice(&mid.weights[range.clone()]);
+                    right.weights[range.clone()].copy_from_slice(&side.weights[range]);
                     left.xmin[g][sfb] = mid.xmin[g][sfb];
                     right.xmin[g][sfb] = side.xmin[g][sfb];
                 }
@@ -677,7 +811,12 @@ impl ElementEncoder {
         if prepared.silent {
             CodedChannel::without_lines(prepared.windows, self.sampling_frequency, prepared.tns)
         } else {
-            loops::quantize_channel(&prepared.spectrum, &prepared.xmin, coding)
+            loops::quantize_channel(
+                &prepared.spectrum,
+                &prepared.weights,
+                &prepared.xmin,
+                coding,
+            )
         }
     }
 }
@@ -758,12 +897,24 @@ mod tests {
 
     /// [`round_trip`], coding a pair in intensity stereo above
     /// `intensity_border` Hz, if given; the spectra are given as the
-    /// filterbanks gave them, before the pair was coded jointly.
+    /// filterbanks gave them, before temporal noise shaping and before the
+    /// pair was coded jointly.
     fn round_trip_with(
         fs: SamplingFrequency,
         input: &[Vec<f64>],
         bits: u32,
         intensity_border: Option<f64>,
+    ) -> Vec<(Element, Vec<Vec<f64>>)> {
+        round_trip_switching(fs, input, bits, intensity_border, true)
+    }
+
+    /// [`round_trip_with`], with `block_switching` or every frame long.
+    fn round_trip_switching(
+        fs: SamplingFrequency,
+        input: &[Vec<f64>],
+        bits: u32,
+        intensity_border: Option<f64>,
+        block_switching: bool,
     ) -> Vec<(Element, Vec<Vec<f64>>)> {
         let mut encoder = ElementEncoder::new(fs, input.len(), intensity_border);
         let channels: Vec<&[f64]> = input.iter().map(Vec::as_slice).collect();
@@ -772,11 +923,12 @@ mod tests {
         let mut frames = Vec::new();
         let mut start = 0;
         while encoder.buffered() - start >= 2 * FRAME_SAMPLES {
-            encoder.look_ahead(start + FRAME_SAMPLES, true);
+            encoder.look_ahead(start + FRAME_SAMPLES, block_switching);
             encoder.spectra(start, true);
             let original: Vec<Vec<f64>> = (encoder.prepared.iter())
                 .map(|prepared| prepared.spectrum.to_vec())
                 .collect();
+            encoder.temporal_noise_shaping(u32::MAX);
             encoder.thresholds();
             encoder.joint();
             encoder.find_silence();
@@ -924,7 +1076,7 @@ mod tests {
                 if info.window_sequence == 2 {
                     continue;
                 }
-                let first = intensity::first_band_above(fs, Transform::Long, 6000.0);
+                let first = crate::scalefactor_bands::first_band_above(fs, Transform::Long, 6000.0);
                 let bands = GroupBands::long(fs);
                 let out = decoded.spectra(fs);
                 // The lines of the bands below the border.
@@ -962,6 +1114,79 @@ mod tests {
 
     /// Bands of a pair's short windows trimmed to the left channel's
     /// `max_sfb` keep positions that the scalefactor codebook can send.
+    /// Clicks over quiet noise are shaped in time in their frames, long and
+    /// short, in one channel and in a pair, and the decoder's filters
+    /// restore their lines; in a pair coded in intensity stereo, the
+    /// filters stop below its first band in intensity stereo, and the
+    /// right channel's bands there keep their level.
+    #[test]
+    fn clicks_are_shaped_in_time_and_restored() {
+        let fs = SamplingFrequency::Hz44100;
+        let len = 16 * FRAME_SAMPLES;
+        let clicks = |seed: u64, every: usize| -> Vec<f64> {
+            let mut input: Vec<f64> = noise(len, seed).iter().map(|x| 0.01 * x).collect();
+            for at in (700..len).step_by(every) {
+                input[at] += 0.7;
+            }
+            input
+        };
+        let first = first_band_above(fs, Transform::Long, intensity::BORDER_HZ);
+        let cases = [
+            (vec![clicks(1, 1301)], 6000, None),
+            (vec![clicks(2, 1301), clicks(3, 1777)], 12000, None),
+            (
+                vec![clicks(4, 1301), clicks(4, 1301)],
+                12000,
+                Some(intensity::BORDER_HZ),
+            ),
+        ];
+        for (i, (input, bits, border)) in cases.iter().enumerate() {
+            let mut frames = round_trip_with(fs, input, *bits, *border);
+            frames.extend(round_trip_switching(fs, input, *bits, *border, false));
+            let (mut long, mut short) = (0, 0);
+            for (f, (decoded, spectra)) in frames.iter().enumerate() {
+                for (c, (ics, decoded)) in
+                    decoded.channels.iter().zip(decoded.spectra(fs)).enumerate()
+                {
+                    let Some(tns) = &ics.tns else { continue };
+                    let context = format!("case {i}, frame {f}, channel {c}");
+                    if ics.info.window_sequence == 2 {
+                        short += tns.iter().filter(|w| !w.filters.is_empty()).count();
+                    } else {
+                        long += 1;
+                        let filters = &tns[0].filters;
+                        if border.is_some() {
+                            // A filter of order 0 from the first band in
+                            // intensity stereo up, then the filter.
+                            assert_eq!(filters.len(), 2, "{context}");
+                            assert_eq!(filters[0].length, 49 - first, "{context}");
+                            assert_eq!(filters[0].order, 0, "{context}");
+                        } else {
+                            assert_eq!(filters.len(), 1, "{context}");
+                        }
+                    }
+                    // Below the border, where the pair is coded in
+                    // intensity stereo, as the right channel's bands above
+                    // it are not its own.
+                    let lines = match (border, ics.info.window_sequence) {
+                        (Some(_), 0 | 1 | 3) => GroupBands::long(fs).offset(first),
+                        _ => FRAME_LINES,
+                    };
+                    if spectra[c][..lines].iter().all(|&x| x == 0.0) {
+                        continue;
+                    }
+                    let snr = snr(&spectra[c][..lines], &decoded[..lines]);
+                    assert!(snr > 10.0, "{context}: {snr:.1} dB");
+                }
+            }
+            assert!(long > 3, "case {i}: {long} long windows shaped");
+            assert!(
+                border.is_some() || short > 3,
+                "case {i}: {short} short windows shaped"
+            );
+        }
+    }
+
     #[test]
     fn trimmed_positions_stay_within_reach_of_each_other() {
         use crate::noiseless::codebooks::Codebook;
@@ -1018,7 +1243,7 @@ mod tests {
         let mut start = 0;
         while encoder.buffered() - start >= 2 * FRAME_SAMPLES {
             encoder.look_ahead(start + FRAME_SAMPLES, true);
-            encoder.prepare(start, true);
+            encoder.prepare(start, true, u32::MAX);
             encoder.second_channel.set(None);
             let coded = encoder.quantize(bits);
             assert!(coded.bits() <= bits);
