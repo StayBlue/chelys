@@ -890,6 +890,42 @@ fn tone_amplitude(samples: &[f64], sample_rate: u32, frequency: f64, start: usiz
     })
 }
 
+/// A bitrate at `sample_rate`, of 0.7 bit a sample, at which a pair of
+/// [`panned_tones`] is coded in intensity stereo.
+fn intensity_bitrate(sample_rate: u32) -> u32 {
+    14 * sample_rate / 10
+}
+
+/// A tone's frequency and its gains in the left and right channels.
+type PannedTone = (f64, f64, f64);
+
+/// A second of a pair at `sample_rate`: three tones above 6 kHz, one to
+/// the left, one to the right and one to both in opposite phase, and a
+/// tone of 440 Hz alike in both channels; with the high tones.
+fn panned_tones(sample_rate: u32) -> ([Vec<f64>; 2], [PannedTone; 3]) {
+    let len = sample_rate as usize;
+    let nyquist = f64::from(sample_rate) / 2.0;
+    let top = (0.9 * nyquist).min(14_000.0);
+    let tones = [
+        (6_600.0 + 0.1 * (top - 6_600.0), 0.3, 0.15),
+        (6_600.0 + 0.5 * (top - 6_600.0), 0.1, 0.3),
+        (top, 0.2, -0.2),
+    ];
+    let channel = |c: usize| -> Vec<f64> {
+        (0..len)
+            .map(|t| {
+                let t = t as f64 / f64::from(sample_rate);
+                let low = 0.2 * (TAU * 440.0 * t).sin();
+                let high: f64 = (tones.iter())
+                    .map(|&(f, l, r)| [l, r][c] * (TAU * f * t).sin())
+                    .sum();
+                low + high
+            })
+            .collect()
+    };
+    ([channel(0), channel(1)], tones)
+}
+
 /// Tones above 6 kHz, each panned its own way, one to the left, one to the
 /// right and one to both in opposite phase, decode from a pair coded in
 /// intensity stereo panned within 1 dB of the input, each channel within 3
@@ -899,41 +935,20 @@ fn tone_amplitude(samples: &[f64], sample_rate: u32, frequency: f64, start: usiz
 /// the tones lie in bands apart, at 0.7 bit a sample. The right channel
 /// sends bands of both intensity codebooks.
 ///
-/// This is the evidence for the reading of the standard that
-/// `stereo::middle_side::choose` marks as settled by decoding with ffmpeg:
-/// frames with bands in intensity stereo are sent with `ms_mask_present` 1
-/// and their flags 0, which ffmpeg decodes in phase. Sent with
-/// `ms_mask_present` 2, as clauses 12.1.3 and 12.2.3 allow, the right
-/// channel's tones came back inverted.
+/// This is evidence for the reading of the standard that
+/// `stereo::middle_side::choose` marks as settled by decoding with ffmpeg
+/// and FAAD2: frames with bands in intensity stereo are sent with
+/// `ms_mask_present` 1 and their flags 0, which ffmpeg decodes in phase.
+/// Sent with `ms_mask_present` 2, as clauses 12.1.3 and 12.2.3 allow, they
+/// decode differently in ffmpeg and FAAD2
+/// (`intensity_bands_under_ms_mask_present_2_keep_their_phase_in_faad_only`).
 #[test]
 fn intensity_stereo_keeps_each_tones_panning() {
     for sample_rate in SAMPLE_RATES.into_iter().filter(|&fs| fs >= 22_050) {
         let len = sample_rate as usize;
-        let nyquist = f64::from(sample_rate) / 2.0;
-        let top = (0.9 * nyquist).min(14_000.0);
-        // Gains of each tone in the left and right channels.
-        let tones = [
-            (6_600.0 + 0.1 * (top - 6_600.0), 0.3, 0.15),
-            (6_600.0 + 0.5 * (top - 6_600.0), 0.1, 0.3),
-            (top, 0.2, -0.2),
-        ];
-        let channel = |c: usize| -> Vec<f64> {
-            (0..len)
-                .map(|t| {
-                    let t = t as f64 / f64::from(sample_rate);
-                    // A low tone beside them, alike in both channels.
-                    let low = 0.2 * (TAU * 440.0 * t).sin();
-                    let high: f64 = (tones.iter())
-                        .map(|&(f, l, r)| [l, r][c] * (TAU * f * t).sin())
-                        .sum();
-                    low + high
-                })
-                .collect()
-        };
-        let input = [channel(0), channel(1)];
+        let (input, tones) = panned_tones(sample_rate);
         let context = format!("{sample_rate} Hz");
-        let bits_per_second = 14 * sample_rate / 10;
-        let encoded = encode(sample_rate, &input, bits_per_second);
+        let encoded = encode(sample_rate, &input, intensity_bitrate(sample_rate));
         let output = decode(&encoded, 2, &context);
         let elements = elements(&encoded.stream, sample_rate);
         let codebooks: Vec<u8> = (elements.iter())
@@ -989,6 +1004,162 @@ fn intensity_stereo_keeps_each_tones_panning() {
             let db = 20.0 * ((re * re + im * im).sqrt() / 0.2).log10();
             assert!(db.abs() < 0.5, "{context}, 440 Hz, channel {c}: {db:.2} dB");
         }
+    }
+}
+
+/// `stream`, an unprotected pair in ADTS at `sample_rate`, with each frame
+/// that has bands in intensity stereo and sends `ms_mask_present` 1, with
+/// a flag of 0 for each of them and of 1 for each other band but those
+/// that both channels code with `ZERO_HCB`, sent instead with
+/// `ms_mask_present` 2 and no flags; with the frames so rewritten, and
+/// those with bands in intensity stereo.
+fn with_ms_mask_present_2(stream: &[u8], sample_rate: u32) -> (Vec<u8>, usize, usize) {
+    use chelys::aac::internals::noiseless::decoder::ics_info;
+    use chelys::aac::internals::raw_data_block::decoder::{adts_frame, raw_data_block};
+
+    let fs = SamplingFrequency::from_hz(sample_rate).unwrap();
+    let (mut rewritten, mut rewritten_frames, mut intensity_frames) = (Vec::new(), 0, 0);
+    let mut rest = stream;
+    while !rest.is_empty() {
+        let frame = adts_frame(rest);
+        assert!(frame.protection_absent);
+        let (whole, block) = (&rest[..frame.aac_frame_length], frame.raw_data_block);
+        rest = &rest[frame.aac_frame_length..];
+        let element = &raw_data_block(block, fs).elements[0].element;
+        let [left, right] = [0, 1].map(|c| &element.channels[c]);
+        let max_sfb = left.info.max_sfb;
+        let groups = left.info.group_lengths.len();
+        let bands = || (0..groups).flat_map(|g| (0..max_sfb).map(move |sfb| (g, sfb)));
+        let intensity = |g, sfb| matches!(right.codebook(g, sfb), 14 | 15);
+        let both_zero = |g, sfb| left.codebook(g, sfb) == 0 && right.codebook(g, sfb) == 0;
+        if !bands().any(|(g, sfb)| intensity(g, sfb)) {
+            rewritten.extend_from_slice(whole);
+            continue;
+        }
+        intensity_frames += 1;
+        let mask_2_alike = element.ms_mask_present == 1
+            && bands().all(|(g, sfb)| {
+                if intensity(g, sfb) {
+                    !element.ms_used[g][sfb]
+                } else {
+                    element.ms_used[g][sfb] || both_zero(g, sfb)
+                }
+            });
+        if !mask_2_alike {
+            rewritten.extend_from_slice(whole);
+            continue;
+        }
+        rewritten_frames += 1;
+        // ms_mask_present follows id_syn_ele, element_instance_tag,
+        // common_window and ics_info(); the flags follow it, and the
+        // block's last 1 ends ID_END.
+        let mut r = BitReader::new(block);
+        r.read(3 + 4 + 1);
+        ics_info(&mut r);
+        let at = r.position();
+        let bits: Vec<bool> = (0..8 * block.len())
+            .map(|i| (block[i / 8] >> (7 - i % 8)) & 1 == 1)
+            .collect();
+        let end = bits.iter().rposition(|&bit| bit).unwrap() + 1;
+        let flags_end = at + 2 + groups * max_sfb;
+        let mut bits = [&bits[..at], &[true, false], &bits[flags_end..end]].concat();
+        bits.resize(bits.len().next_multiple_of(8), false);
+        let len = 7 + bits.len() / 8;
+        let mut header = frame.header.to_vec();
+        header[3] = (header[3] & !0b11) | (len >> 11) as u8;
+        header[4] = (len >> 3) as u8;
+        header[5] = (header[5] & 0b1_1111) | ((len & 0b111) << 5) as u8;
+        rewritten.extend_from_slice(&header);
+        rewritten.extend(
+            (bits.chunks(8)).map(|byte| byte.iter().fold(0, |b, &bit| (b << 1) | u8::from(bit))),
+        );
+    }
+    (rewritten, rewritten_frames, intensity_frames)
+}
+
+/// The decoders disagree on bands in intensity stereo sent with
+/// `ms_mask_present` 2. Sent so, a frame of [`panned_tones`] whose other
+/// bands are all coded as middle and side, or with `ZERO_HCB` in both
+/// channels, decodes as it does sent with 1 and flags of 0 for those bands
+/// and 1 for the others, by clauses 12.1.3 and 12.2.3: 2 codes every band
+/// as middle and side but those in intensity stereo, which are not, and
+/// gives each band `invert_intensity` +1 where flags of 0 give it +1 too.
+/// [`with_ms_mask_present_2`] rewrites such frames, all those with bands
+/// in intensity stereo or all but one, at every sampling frequency from
+/// 22.05 kHz.
+///
+/// FAAD2 decodes the rewritten stream to the very samples of the stream
+/// as sent, as the clauses say; and above 24 kHz, where it gives samples at
+/// the stream's sampling frequency, with the right channel's tones in the
+/// phase of the input against the left's. ffmpeg decodes the left channel
+/// to the same samples, but every tone of the right channel in intensity
+/// stereo with its phase inverted against the left's: as though it read
+/// `ms_mask_present` 2 as flags of 1 in those bands too, and inverted them
+/// by `invert_intensity`, which clause 12.2.3 takes from the flags only
+/// where `ms_mask_present` is 1.
+///
+/// This is the evidence for the reading of the standard that
+/// `stereo::middle_side::choose` marks as settled by decoding with ffmpeg
+/// and FAAD2: frames with bands in intensity stereo are sent with
+/// `ms_mask_present` 1 and their flags 0, which both decode in phase.
+#[test]
+fn intensity_bands_under_ms_mask_present_2_keep_their_phase_in_faad_only() {
+    for sample_rate in SAMPLE_RATES.into_iter().filter(|&fs| fs >= 22_050) {
+        let len = sample_rate as usize;
+        let (input, tones) = panned_tones(sample_rate);
+        let context = format!("{sample_rate} Hz");
+        let encoded = encode(sample_rate, &input, intensity_bitrate(sample_rate));
+        let (rewritten, frames, intensity_frames) =
+            with_ms_mask_present_2(&encoded.stream, sample_rate);
+        assert!(
+            frames >= 20 && frames + 1 >= intensity_frames,
+            "{context}: {frames} of {intensity_frames} frames"
+        );
+        // Each high tone's sign in the right channel against the left's, a
+        // frame late.
+        let signs = |output: &[f32]| -> Vec<f64> {
+            let decoded: Vec<Vec<f64>> = (0..2)
+                .map(|c| {
+                    (output.iter().skip(c).step_by(2))
+                        .skip(DELAY)
+                        .take(len)
+                        .map(|&y| f64::from(y))
+                        .collect()
+                })
+                .collect();
+            (tones.iter())
+                .map(|&(frequency, ..)| {
+                    let [left, right] =
+                        [0, 1].map(|c| tone_amplitude(&decoded[c], sample_rate, frequency, 2048));
+                    (left.0 * right.0 + left.1 * right.1).signum()
+                })
+                .collect()
+        };
+        let in_phase: Vec<f64> = tones.iter().map(|&(_, l, r)| (l * r).signum()).collect();
+        let inverted: Vec<f64> = in_phase.iter().map(|&sign| -sign).collect();
+
+        let [sent, mask_2] = [&encoded.stream, &rewritten].map(|s| faad::decode_aac(s));
+        for decoded in [&sent, &mask_2] {
+            assert_eq!(decoded.diagnostics, "", "{context}");
+        }
+        assert!(sent.samples == mask_2.samples, "{context}: FAAD2");
+        if sample_rate > 24_000 {
+            assert_eq!(signs(&mask_2.samples), in_phase, "{context}: FAAD2");
+        }
+
+        let [sent, mask_2] = [&encoded.stream, &rewritten].map(|s| ffmpeg::decode_aac(s));
+        for decoded in [&sent, &mask_2] {
+            assert_eq!(decoded.diagnostics, "", "{context}");
+        }
+        let channel = |samples: &[f32], c: usize| -> Vec<f32> {
+            samples.iter().skip(c).step_by(2).copied().collect()
+        };
+        assert!(
+            channel(&sent.samples, 0) == channel(&mask_2.samples, 0),
+            "{context}: ffmpeg's left channel"
+        );
+        assert_eq!(signs(&sent.samples), in_phase, "{context}: ffmpeg");
+        assert_eq!(signs(&mask_2.samples), inverted, "{context}: ffmpeg");
     }
 }
 
