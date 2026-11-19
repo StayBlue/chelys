@@ -145,6 +145,36 @@ pub fn probe_aac(stream: &[u8]) -> (StreamInfo, String) {
     (info, field("profile").to_owned())
 }
 
+/// The channel layout that ffprobe reports for the first audio stream of
+/// an AAC stream in ADTS, as ffmpeg names it, such as "5.1", and the
+/// channels of ffmpeg's decoded output in their order, such as
+/// "FL+FR+FC+LFE+BL+BR".
+pub fn channel_layout_aac(stream: &[u8]) -> (String, String) {
+    let file = TempFile::new("aac", stream);
+    let output = run(Command::new("ffprobe")
+        .args(["-v", "error", "-f", "aac", "-select_streams", "a:0"])
+        .args(["-show_entries", "stream=channel_layout"])
+        .args(["-of", "default=noprint_wrappers=1:nokey=1"])
+        .arg(file.path()));
+    let layout = String::from_utf8(output.stdout).unwrap().trim().to_owned();
+    let channels = channels_of_layout(&layout);
+    (layout, channels)
+}
+
+/// The channels of a channel layout that ffmpeg names, in order, as
+/// `ffmpeg -layouts` lists them.
+fn channels_of_layout(layout: &str) -> String {
+    let output = run(Command::new("ffmpeg").args(["-hide_banner", "-layouts"]));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    stdout
+        .lines()
+        .skip_while(|line| !line.starts_with("Standard channel layouts"))
+        .filter_map(|line| line.split_once(char::is_whitespace))
+        .find(|(name, _)| *name == layout)
+        .map(|(_, channels)| channels.trim().to_owned())
+        .unwrap_or_else(|| panic!("ffmpeg lists no layout {layout}"))
+}
+
 /// The `AudioSpecificConfig()` that ffmpeg gives an AAC stream in ADTS
 /// when it copies the stream into an MPEG-4 file, as ffprobe reports it
 /// there.
