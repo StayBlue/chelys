@@ -97,11 +97,13 @@ pub fn decode_mp3_seeking(stream: &[u8], from: f64, seconds: f64) -> Decoded {
     }
 }
 
-/// Decodes an AAC stream in ADTS.
+/// Decodes an AAC stream in ADTS, with CRC checking enabled, as MP3 is
+/// decoded; though ffmpeg n9.0.2 does not check the `crc_check` of ADTS
+/// (see `ffmpeg_skips_the_crc_unchecked` in the `aac_adts` test).
 pub fn decode_aac(stream: &[u8]) -> Decoded {
     let file = TempFile::new("aac", stream);
     let output = run(Command::new("ffmpeg")
-        .args(["-nostdin", "-v", "error"])
+        .args(["-nostdin", "-v", "error", "-err_detect", "crccheck"])
         .args(["-f", "aac", "-i"])
         .arg(file.path())
         .args(["-f", "f32le", "-acodec", "pcm_f32le", "-"]));
