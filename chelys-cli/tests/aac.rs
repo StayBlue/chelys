@@ -147,6 +147,48 @@ fn encodes_raw_pcm_to_the_adts_stream_the_library_writes() {
     assert_eq!(count, frames);
 }
 
+/// Each option of the header gives the stream the library writes with it,
+/// and every option together their stream.
+#[test]
+fn the_header_options_are_the_library_s() {
+    let pcm: Vec<f32> = stereo_tone(48_000, 0.3).into_iter().step_by(2).collect();
+    let base = ["aac", "--sample-rate", "48000", "--channels", "1"];
+    type Set = fn(Config) -> Config;
+    let options: [(&str, Set); 4] = [
+        ("--crc", |config| config.crc(true)),
+        ("--private-bit", |config| config.private_bit(true)),
+        ("--original-copy", |config| config.original_copy(true)),
+        ("--home", |config| config.home(true)),
+    ];
+    let encode = |config: Config| {
+        let mut expected = Vec::new();
+        let mut encoder = Encoder::new(config).unwrap();
+        encoder.encode_interleaved(&pcm, &mut expected);
+        encoder.finish(&mut expected);
+        expected
+    };
+    let plain = Config::new(
+        48_000,
+        1,
+        Rate::Constant {
+            bits_per_second: 128_000,
+        },
+    );
+    let mut all_args = base.to_vec();
+    let mut all = plain;
+    for (flag, set) in options {
+        let output = chelys(&[&base[..], &[flag]].concat(), &le_bytes(&pcm));
+        assert_eq!(text(&output.stderr), "", "{flag}");
+        assert!(output.stdout == encode(set(plain)), "{flag}");
+        assert!(output.stdout != encode(plain), "{flag}");
+        all_args.push(flag);
+        all = set(all);
+    }
+    let output = chelys(&all_args, &le_bytes(&pcm));
+    assert!(output.stdout == encode(all));
+    assert_eq!(adts_header(&output.stdout).protection_absent, 0);
+}
+
 #[test]
 fn encodes_mono_at_the_default_bitrate() {
     let pcm: Vec<f32> = stereo_tone(8_000, 0.5).into_iter().step_by(2).collect();

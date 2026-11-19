@@ -10,6 +10,7 @@ use crate::{pcm, value};
 
 pub const USAGE: &str = "\
 usage: chelys aac --sample-rate HZ --channels N [--bitrate KBPS]
+                  [--crc] [--private-bit] [--original-copy] [--home]
                   < input.f32 > output.aac
 
 Reads interleaved 32-bit little-endian float PCM from stdin and writes MPEG-2
@@ -19,13 +20,24 @@ AAC in the Low Complexity profile (AAC-LC) to stdout, each frame in ADTS
   --sample-rate HZ   96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050,
                      16000, 12000, 11025 or 8000
   --channels N       1 or 2
-  --bitrate KBPS     the stream's constant bitrate, ADTS headers included:
-                     a whole number within the range of the sample rate and
-                     channels, at 48 kHz 5 to 287 in mono and 6 to 575 in
-                     stereo, at 44.1 kHz 4 to 264 and 5 to 528, and lower
-                     with the sample rate, to 1 to 47 and 1 to 95 at 8 kHz
+  --bitrate KBPS     the stream's constant bitrate, ADTS headers and any CRC
+                     included: a whole number within the range of the
+                     sample rate and channels, at 48 kHz 5 to 287 in mono
+                     and 6 to 575 in stereo, at 44.1 kHz 4 to 264 and 5 to
+                     528, and lower with the sample rate, to 1 to 47 and 1
+                     to 95 at 8 kHz; with --crc, the lowest may be 1 higher
                      (default 128, or the highest the sample rate and
                      channels allow where that is lower)
+  --crc              protect each frame's header and the start of its audio
+                     with a CRC-16 check word, 16 bits a frame (default:
+                     off)
+  --private-bit      set each frame's bit for private use (default: off)
+  --original-copy    set each header's original_copy bit, which the
+                     standard defines as MPEG-1 Audio's copyright bit, set
+                     where the stream is copyright protected (default: off)
+  --home             set each header's home bit, which the standard defines
+                     as MPEG-1 Audio's original/copy bit, set where the
+                     stream is an original (default: off)
 
 The decoded output starts with 1024 samples before the input and ends with
 fewer than 1024 after it, near silence to be discarded: ADTS has no field
@@ -39,11 +51,19 @@ pub struct Options {
     sample_rate: u32,
     channels: usize,
     kbps: u32,
+    crc: bool,
+    private_bit: bool,
+    original_copy: bool,
+    home: bool,
 }
 
 impl Options {
     fn config(&self) -> Config {
         config(self.sample_rate, self.channels, self.kbps)
+            .crc(self.crc)
+            .private_bit(self.private_bit)
+            .original_copy(self.original_copy)
+            .home(self.home)
     }
 }
 
@@ -56,6 +76,7 @@ fn config(sample_rate: u32, channels: usize, kbps: u32) -> Config {
 
 pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
     let (mut sample_rate, mut channels, mut bitrate) = (None, None, None);
+    let (mut crc, mut private_bit, mut original_copy, mut home) = (false, false, false, false);
     let mut args = args.into_iter();
     while let Some(flag) = args.next() {
         let args = &mut args;
@@ -63,6 +84,10 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> 
             "--sample-rate" => sample_rate = Some(value::<u32>(args, &flag)?),
             "--channels" => channels = Some(value::<u32>(args, &flag)?),
             "--bitrate" => bitrate = Some(value::<u32>(args, &flag)?),
+            "--crc" => crc = true,
+            "--private-bit" => private_bit = true,
+            "--original-copy" => original_copy = true,
+            "--home" => home = true,
             // An empty message asks for the usage text alone.
             "-h" | "--help" => return Err(String::new()),
             other => return Err(format!("unknown argument: {other}")),
@@ -73,11 +98,15 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> 
         n @ (1 | 2) => n as usize,
         n => return Err(format!("unsupported channel count: {n}")),
     };
-    let kbps = bitrate.unwrap_or_else(|| default_kbps(sample_rate, channels));
+    let kbps = bitrate.unwrap_or_else(|| default_kbps(sample_rate, channels, crc));
     let options = Options {
         sample_rate,
         channels,
         kbps,
+        crc,
+        private_bit,
+        original_copy,
+        home,
     };
     options
         .config()
@@ -87,9 +116,9 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> 
 }
 
 /// [`DEFAULT_KBPS`], or the highest whole bitrate the sample rate and
-/// channels allow where that is lower.
-fn default_kbps(sample_rate: u32, channels: usize) -> u32 {
-    match config(sample_rate, channels, DEFAULT_KBPS).check() {
+/// channels allow where that is lower, with the CRC if `crc`.
+fn default_kbps(sample_rate: u32, channels: usize, crc: bool) -> u32 {
+    match config(sample_rate, channels, DEFAULT_KBPS).crc(crc).check() {
         Err(ConfigError::UnsupportedBitrate { max, .. }) if max < DEFAULT_KBPS * 1000 => max / 1000,
         _ => DEFAULT_KBPS,
     }
@@ -206,6 +235,30 @@ mod tests {
             args("44100", "1", "4294968"),
             "unsupported bitrate at 44100 Hz in mono: 4294968; it takes 4 to 264"
         );
+    }
+
+    #[test]
+    fn the_crc_raises_the_lowest_bitrate_at_44100_hz() {
+        let lowest = |crc: &[&str]| {
+            let args = [
+                &[
+                    "--sample-rate",
+                    "44100",
+                    "--channels",
+                    "1",
+                    "--bitrate",
+                    "1",
+                ],
+                crc,
+            ];
+            error(&args.concat())
+        };
+        assert!(
+            lowest(&[]).ends_with("it takes 4 to 264"),
+            "{}",
+            lowest(&[])
+        );
+        assert!(lowest(&["--crc"]).ends_with("it takes 5 to 264"));
     }
 
     #[test]
