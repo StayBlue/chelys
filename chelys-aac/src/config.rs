@@ -60,8 +60,9 @@ pub struct Config {
 impl Config {
     /// A configuration of `channels` channels, in ADTS: 1 (mono), 2
     /// (stereo), 3, 4, 5, 6 (5.1) or 8 (7.1), each coded as the
-    /// `channel_configuration` of as many speakers (Table 42). 7 channels
-    /// have none, and are refused. [`Encoder::new`] checks it.
+    /// `channel_configuration` of as many speakers (Table 42), and 8 as
+    /// configuration 7, which ISO/IEC 14496-3 names "7.1 Front". 7
+    /// channels have none, and are refused. [`Encoder::new`] checks it.
     ///
     /// The input gives the channels in the order the stream sends them:
     /// that of the configuration's elements, and in a channel pair, left
@@ -80,9 +81,14 @@ impl Config {
     /// | 6 | center, left, right, left surround, right surround, LFE |
     /// | 8 | center, left center, right center, left, right, left surround, right surround, LFE |
     ///
-    /// In 7.1, the left and right center front speakers lie between the
-    /// center and the left and right outside front speakers, which Table 1.23
-    /// of ISO/IEC 14496-3 names the "left, right front speakers".
+    /// In 7.1, Table 42 names the first pair the "left, right center front
+    /// speakers" and the second the "left, right outside front speakers";
+    /// Table 1.23 of ISO/IEC 14496-3 names them the "left, right front
+    /// center speakers" and the "left, right front speakers". In 4
+    /// channels, Table 42 names the pair the "left, right center front
+    /// speakers" and the last channel the "rear surround"; Table 1.23 names
+    /// them the "left, right front speakers" and the "rear center
+    /// speakers".
     ///
     /// Spec reading: Table 42 lists each configuration's elements "in order
     /// received", and the speakers each maps to, those of a

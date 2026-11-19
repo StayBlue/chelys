@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: MIT
 
 //! The channel configurations coded, with the elements that carry their
-//! channels (Table 42; Table 1.23 of ISO/IEC 14496-3 gives the same for
-//! these).
+//! channels (Table 42). Table 1.23 of ISO/IEC 14496-3 lists the same
+//! elements for these values, naming some of their speakers otherwise.
 
 /// An audio channel element, as a channel configuration lists it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -13,7 +13,8 @@ pub enum ElementKind {
     /// A `channel_pair_element()`.
     Pair,
     /// An `lfe_channel_element()`, the low frequency enhancement channel
-    /// (clause 8.4).
+    /// (clause 8.4), which a decoder of the Low Complexity profile of 5 or 7
+    /// main channels decodes (Table 32).
     Lfe,
 }
 
@@ -46,8 +47,10 @@ pub enum ChannelConfiguration {
     /// 3: the center front speaker, then the left and right front
     /// speakers.
     Three,
-    /// 4: the center front speaker, the left and right front speakers, and
-    /// the rear surround speaker.
+    /// 4: the center front speaker, the left and right center front
+    /// speakers, and the rear surround speaker. Table 1.23 of ISO/IEC
+    /// 14496-3 names the pair the "left, right front speakers", and the
+    /// last the "rear center speakers".
     Four,
     /// 5: the center front speaker, the left and right front speakers, and
     /// the left and right surround rear speakers.
@@ -58,14 +61,18 @@ pub enum ChannelConfiguration {
     /// 7, 7+1: the center front speaker, the left and right center front
     /// speakers, the left and right outside front speakers, the left and
     /// right surround rear speakers, and the front low frequency effects
-    /// speaker.
+    /// speaker. Table 1.23 of ISO/IEC 14496-3 names it "7.1 Front", and
+    /// its pairs the "left, right front center speakers" and the "left,
+    /// right front speakers".
     SevenOne,
 }
 
 impl ChannelConfiguration {
-    /// The configuration of `channels` channels, if one has as many: each
-    /// count from 1 to 6 has one, and 8 has 7+1. 7 has none, as Table 42
-    /// lists no configuration of 7 channels.
+    /// The configuration of `channels` channels, if Table 42 has one of as
+    /// many: each count from 1 to 6 has one, and 8 has 7+1. 7 has none.
+    /// (ISO/IEC 14496-3 adds configurations of 7 and 8 channels from 11
+    /// up, which the 3 bits of ADTS's `channel_configuration` cannot
+    /// carry.)
     pub fn from_channels(channels: usize) -> Option<Self> {
         match channels {
             1 => Some(Self::Mono),

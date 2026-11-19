@@ -217,13 +217,13 @@ mod tests {
         assert_eq!(crc_check(&header, &block), crc_of(&protected));
     }
 
-    /// In frames of noise and silence, in one channel and two, the
-    /// `crc_check` of each frame is that of the bits the test decoder finds
-    /// in it: the headers, the first 192 bits of the element after its
-    /// `id_syn_ele`, zero padded, and of a pair the first 128 of its second
-    /// stream, zero padded, then each data stream element after its
-    /// `id_syn_ele`; elements long and short among them, and frames with
-    /// data streams and without.
+    /// In frames of noise and silence, in one channel, two, 5.1 and 7.1,
+    /// the `crc_check` of each frame is that of the bits the test decoder
+    /// finds in it: the headers, then of each element in turn the first 192
+    /// bits after its `id_syn_ele`, zero padded, and of a pair the first 128
+    /// of its second stream, zero padded, then each data stream element
+    /// after its `id_syn_ele`; elements long and short among them, and
+    /// frames with data streams and without.
     #[test]
     fn each_frame_protects_the_bits_its_elements_start_with() {
         use crate::config::Framing;
@@ -244,6 +244,8 @@ mod tests {
             (ChannelConfiguration::Mono, 64_000),
             (ChannelConfiguration::Stereo, 128_000),
             (ChannelConfiguration::Stereo, 32_000),
+            (ChannelConfiguration::FiveOne, 320_000),
+            (ChannelConfiguration::SevenOne, 96_000),
         ] {
             let config = StreamConfig {
                 sampling_frequency: fs,

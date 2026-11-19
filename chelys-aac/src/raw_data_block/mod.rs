@@ -141,7 +141,18 @@ fn write_element(
 /// its element_instance_tag, each CPE associated with the front channel
 /// pair must have the same value ..., and each CPE associated with the back
 /// channel pair must have the same value". The first of each kind is given
-/// tag 0, the next 1, and so on. Settled by decoding with ffmpeg (black
+/// tag 0, the next 1, and so on.
+///
+/// Spec reading: clause 8.2.2 says that elements with tags "must have a
+/// unique element_instance_tag in each raw_data_block()", which could be
+/// read across kinds, so that an SCE and a CPE could not both have tag 0.
+/// It is read within each kind, as clause 8.2.1.1 puts it: "several
+/// instances of the same syntactic element may occur, but must have a
+/// different 4 bit element_instance_tag. Therefore, in one
+/// raw_data_block(), there can be from 0 to at most 16 instances of any
+/// syntactic element", which tags unique across kinds would not allow; and
+/// a `program_config_element()` tells an SCE from a CPE of the same tag by
+/// its `is_cpe` flags (clause 8.5.2). Settled by decoding with ffmpeg (black
 /// box): it decodes mono and stereo streams so tagged, at every sampling
 /// frequency, without complaint; the conformance test is
 /// `ffmpeg_decodes_silence_at_every_sample_rate`.
@@ -174,6 +185,13 @@ pub fn min_len(
 /// protects, and the list is taken as whole: the fill elements, which it
 /// does not name, are not protected, nor is `ID_END`, nor the bits that
 /// align the block.
+///
+/// Spec reading: with several elements, the bits that
+/// `adts_error_check()` protects are fed "in order of their appearance"
+/// (clause 8.1.3.2.1): element by element, each element's 192 bits and a
+/// pair's 128 together, as `write_element` gives them, rather than the
+/// 192 bits of every element before the 128 of any pair, an order of the
+/// clause's list rather than of the bits' appearance.
 ///
 /// # Panics
 ///
