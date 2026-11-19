@@ -9,6 +9,7 @@ use super::frame::Demand;
 use crate::channel::{self, CodedChannel, CodedGroup, FRAME_LINES};
 use crate::filterbank::Filterbank;
 use crate::loops::{self, ChannelCoding};
+use crate::noiseless::pulses::Pulses;
 use crate::noiseless::sections::Sections;
 use crate::psychoacoustic::Analysis;
 use crate::psychoacoustic::middle_side::MidSideModel;
@@ -619,7 +620,13 @@ impl ElementEncoder {
     /// The bits of a channel of the frame without lines, as its element
     /// sends it, with its temporal noise shaping.
     fn silent_bits(&self, channel: &PreparedChannel) -> u32 {
-        channel::bits(channel.windows, self.common_window, &channel.tns, 0)
+        channel::bits(
+            channel.windows,
+            self.common_window,
+            &Pulses::NONE,
+            &channel.tns,
+            0,
+        )
     }
 
     /// What the frame prepared asks of the frame.
@@ -983,8 +990,16 @@ fn least_channel(
             }
         })
         .collect();
-    CodedChannel::new(windows, sampling_frequency, 0, *tns, lines, groups)
-        .expect("positions within the codebook's reach")
+    CodedChannel::new(
+        windows,
+        sampling_frequency,
+        0,
+        *tns,
+        Pulses::NONE,
+        lines,
+        groups,
+    )
+    .expect("positions within the codebook's reach")
 }
 
 /// Whether the channels of a pair share their attacks, so that a frame

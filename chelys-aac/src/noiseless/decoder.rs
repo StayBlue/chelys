@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 //! A decoder of the audio channel elements, written from the syntax of
-//! Tables 13 to 20 and from clauses 7.1.6, 8.3.5, 9.3, 10.3, 11.3, 12.1.3,
+//! Tables 13 to 21 and from clauses 7.1.6, 8.3.5, 9.3, 10.3, 11.3, 12.1.3,
 //! 12.2.3 and 14.3 apart from the encoder, for tests to decode what it
 //! writes: the fields of a `single_channel_element()` or
 //! `channel_pair_element()`, and the spectra they reconstruct. It shares
@@ -477,18 +477,78 @@ fn quant_to_spec(
     }
 }
 
+/// A `pulse_data()` (Table 21) as read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PulseData {
+    pub number_pulse: usize,
+    pub pulse_start_sfb: usize,
+    pub pulse_offset: Vec<usize>,
+    pub pulse_amp: Vec<i32>,
+}
+
+/// Reads a `pulse_data()` (Table 21).
+pub fn pulse_data(r: &mut BitReader) -> PulseData {
+    let number_pulse = r.read(2) as usize;
+    let pulse_start_sfb = r.read(6) as usize;
+    let (mut pulse_offset, mut pulse_amp) = (Vec::new(), Vec::new());
+    for _ in 0..number_pulse + 1 {
+        pulse_offset.push(r.read(5) as usize);
+        pulse_amp.push(r.read(4) as i32);
+    }
+    PulseData {
+        number_pulse,
+        pulse_start_sfb,
+        pulse_offset,
+        pulse_amp,
+    }
+}
+
+/// The decoding of `pulse_data()` of clause 9.3, transcribed: adds each
+/// `pulse_amp` to the line it gives of `x_quant`, the lines of the first
+/// window of the first group, where that line is above 0, or subtracts it
+/// otherwise. The pulse escape "is illegal for a block whose
+/// window_sequence is EIGHT_SHORT_SEQUENCE".
+fn restore_pulses(pulses: &PulseData, info: &IcsInfo, fs: SamplingFrequency, x_quant: &mut [i32]) {
+    assert_ne!(info.window_sequence, 2, "pulse data in short windows");
+    let swb_offset = swb_offsets(fs, info.transform());
+    let num_swb = swb_offset.len() - 1;
+    let mut k = usize::from(swb_offset[pulses.pulse_start_sfb]);
+    for j in 0..pulses.number_pulse + 1 {
+        k += pulses.pulse_offset[j];
+        // translate_pulse_parameters()
+        let mut found = None;
+        for sfb in pulses.pulse_start_sfb..num_swb {
+            if k < usize::from(swb_offset[sfb + 1]) {
+                found = Some((sfb, k - usize::from(swb_offset[sfb])));
+                break;
+            }
+        }
+        let (sfb, bin) = found.expect("a pulse within the window's bands");
+        // restore coefficients: x_quant[g][win][sfb][bin], of a long window.
+        let line = &mut x_quant[usize::from(swb_offset[sfb]) + bin];
+        if *line > 0 {
+            *line += pulses.pulse_amp[j];
+        } else {
+            *line -= pulses.pulse_amp[j];
+        }
+    }
+}
+
 /// An `individual_channel_stream()` (Table 16) as read.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Ics {
     pub global_gain: i32,
     pub info: IcsInfo,
+    /// The `pulse_data()` where `pulse_data_present` is 1.
+    pub pulses: Option<PulseData>,
     /// Each window's `tns_data()` where `tns_data_present` is 1.
     pub tns: Option<Vec<TnsWindow>>,
     /// Each group's sections, as [`section_data`] gives them.
     pub sections: Vec<Vec<(u8, usize, usize)>>,
     /// Each group's scalefactors, as [`scale_factor_data`] gives them.
     pub scalefactors: Vec<Vec<i32>>,
-    /// Each group's quantized lines, in the order they are sent.
+    /// Each group's quantized lines, in the order they are sent, with the
+    /// pulses of its `pulse_data()` restored.
     pub lines: Vec<Vec<i32>>,
 }
 
@@ -526,19 +586,23 @@ pub fn individual_channel_stream(
             scale_factor_data(r, sections, &mut last_sf, &mut last_is, intensity)
         })
         .collect();
-    assert_eq!(r.read(1), 0, "pulse_data_present");
+    let pulses = (r.read(1) == 1).then(|| pulse_data(r));
     let tns = (r.read(1) == 1).then(|| tns_data(r, &info));
     assert_eq!(r.read(1), 0, "gain_control_data_present");
-    let lines = (sections.iter().zip(&info.group_lengths))
+    let mut lines: Vec<_> = (sections.iter().zip(&info.group_lengths))
         .map(|(sections, &len)| {
             let offsets = info.offsets(fs, len);
             let lines = usize::from(*offsets.last().expect("bands"));
             spectral_data(r, sections, &offsets, lines)
         })
         .collect();
+    if let Some(pulses) = &pulses {
+        restore_pulses(pulses, &info, fs, &mut lines[0]);
+    }
     Ics {
         global_gain,
         info,
+        pulses,
         tns,
         sections,
         scalefactors,

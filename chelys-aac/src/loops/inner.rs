@@ -9,6 +9,7 @@ use std::ops::Range;
 
 use crate::channel::{self, CodedChannel, CodedGroup, FRAME_LINES};
 use crate::noiseless::codebooks::MAX_MAGNITUDE;
+use crate::noiseless::pulses::Pulses;
 use crate::noiseless::scalefactors;
 use crate::noiseless::sections::{self, IntensityBands, Sections};
 use crate::noiseless::spectrum;
@@ -386,7 +387,8 @@ impl<'a> Counting<'a> {
             .max(intensity_end);
         let element_bits = self.coding.element_bits[max_sfb];
         let tns = self.coding.tns;
-        let mut least_bits = channel::bits(windows, common_window, tns, 0) + element_bits;
+        let mut least_bits =
+            channel::bits(windows, common_window, &Pulses::NONE, tns, 0) + element_bits;
         self.sections.clear();
         self.counted.clear();
         for (g, (start, bands)) in self.groups().enumerate() {
@@ -424,7 +426,13 @@ impl<'a> Counting<'a> {
         let noiseless: u32 = (self.sections.iter())
             .map(|s| s.section_data_bits() + s.spectral_data_bits())
             .sum();
-        channel::bits(windows, common_window, tns, noiseless + scalefactor_bits) + element_bits
+        channel::bits(
+            windows,
+            common_window,
+            &Pulses::NONE,
+            tns,
+            noiseless + scalefactor_bits,
+        ) + element_bits
             <= available_bits
     }
 
@@ -479,6 +487,7 @@ impl<'a> Counting<'a> {
             self.coding.sampling_frequency,
             global_gain,
             *self.coding.tns,
+            Pulses::NONE,
             self.x_quant,
             groups,
         )

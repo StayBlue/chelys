@@ -2,13 +2,15 @@
 // SPDX-License-Identifier: MIT
 
 //! One channel of one frame as its `individual_channel_stream()` (Table
-//! 16) codes it: its windows, `global_gain`, its temporal noise shaping,
-//! and for each window group its sections, scalefactors and quantized
-//! lines.
+//! 16) codes it: its windows, `global_gain`, its pulses and temporal noise
+//! shaping, and for each window group its sections, scalefactors and
+//! quantized lines.
 
+use crate::noiseless::pulses::Pulses;
 use crate::noiseless::scalefactors;
 use crate::noiseless::sections::Sections;
 use crate::sampling_frequency::SamplingFrequency;
+use crate::scalefactor_bands::Transform;
 use crate::stream::FRAME_SAMPLES;
 use crate::tns::Tns;
 use crate::window::Windows;
@@ -18,10 +20,9 @@ use crate::window::Windows;
 pub const FRAME_LINES: usize = FRAME_SAMPLES;
 
 /// The bits of an `individual_channel_stream()` (Table 16) besides its
-/// `ics_info()`, temporal noise shaping and noiseless coding:
-/// `global_gain`, and the `pulse_data_present` and
-/// `gain_control_data_present` flags, which are 0.
-const FIXED_BITS: u32 = 8 + 2;
+/// `ics_info()`, pulses, temporal noise shaping and noiseless coding:
+/// `global_gain`, and the `gain_control_data_present` flag, which is 0.
+const FIXED_BITS: u32 = 8 + 1;
 
 /// The `global_gain` of a channel without spectrum.
 ///
@@ -63,7 +64,12 @@ pub struct CodedChannel {
     /// The filters that shaped its lines, with which the decoder restores
     /// them.
     tns: Tns,
-    /// The quantized lines in the order they are sent (clause 8.3.5).
+    /// The lines of its long window that `lines` hold clipped, which the
+    /// decoder restores.
+    pulses: Pulses,
+    /// The lines in the order they are sent (clause 8.3.5), as
+    /// `spectral_data()` sends them: the quantized lines, those of the
+    /// pulses clipped.
     lines: [i32; FRAME_LINES],
     groups: Vec<CodedGroup>,
     /// The bits of the scalefactors of all groups.
@@ -71,22 +77,24 @@ pub struct CodedChannel {
 }
 
 impl CodedChannel {
-    /// A channel whose lines are `lines`, in the window groups of
-    /// `windows`, shaped by the filters of `tns`, each group with its
-    /// sections chosen for its lines and its scalefactors; or `None` if a
-    /// difference of scalefactors has no codeword (see
-    /// [`scalefactors::bits`]).
+    /// A channel that sends the lines `lines`, in the window groups of
+    /// `windows`, shaped by the filters of `tns`, with the lines of
+    /// `pulses` clipped, each group with its sections chosen for its lines
+    /// and its scalefactors; or `None` if a difference of scalefactors has
+    /// no codeword (see [`scalefactors::bits`]).
     ///
     /// # Panics
     ///
     /// If the groups are not those of `windows` at the sections' sampling
-    /// frequency, or do not share one `max_sfb`: a caller's error. Lines
-    /// other than those the sections were chosen for panic when written.
+    /// frequency, or do not share one `max_sfb`, or there are pulses in
+    /// short windows: a caller's error. Lines other than those the sections
+    /// were chosen for panic when written.
     pub fn new(
         windows: Windows,
         sampling_frequency: SamplingFrequency,
         global_gain: u8,
         tns: Tns,
+        pulses: Pulses,
         lines: [i32; FRAME_LINES],
         groups: Vec<CodedGroup>,
     ) -> Option<Self> {
@@ -104,12 +112,17 @@ impl CodedChannel {
                 .all(|group| group.sections.max_sfb() == max_sfb),
             "one max_sfb for every group"
         );
+        assert!(
+            !pulses.is_present() || windows.sequence.transform() == Transform::Long,
+            "pulses in short windows"
+        );
         let scalefactor_bits =
             scalefactors::bits(global_gain, groups.iter().map(CodedGroup::scalefactor_data))?;
         Some(Self {
             windows,
             global_gain,
             tns,
+            pulses,
             lines,
             groups,
             scalefactor_bits,
@@ -148,6 +161,7 @@ impl CodedChannel {
             sampling_frequency,
             SILENT_GLOBAL_GAIN,
             tns,
+            Pulses::NONE,
             lines,
             groups,
         )
@@ -166,9 +180,28 @@ impl CodedChannel {
         &self.tns
     }
 
-    /// The quantized lines in the order they are sent.
+    pub fn pulses(&self) -> &Pulses {
+        &self.pulses
+    }
+
+    /// The lines in the order they are sent, as `spectral_data()` sends
+    /// them, with the lines of the [`pulses`](Self::pulses) clipped. Only
+    /// their magnitudes differ from the quantized lines: none is zero
+    /// that is not.
     pub fn lines(&self) -> &[i32; FRAME_LINES] {
         &self.lines
+    }
+
+    /// The quantized lines in the order they are sent, those of the pulses
+    /// restored, as the decoder restores them (clause 9.3).
+    #[cfg(test)]
+    pub fn quantized_lines(&self) -> [i32; FRAME_LINES] {
+        let mut lines = self.lines;
+        for (line, amp) in self.pulses.iter() {
+            let q = &mut lines[line];
+            *q += q.signum() * amp as i32;
+        }
+        lines
     }
 
     /// `max_sfb`: the scalefactor bands each group sends.
@@ -205,8 +238,8 @@ impl CodedChannel {
         }
     }
 
-    /// Each window group with its quantized lines, in the order they are
-    /// sent.
+    /// Each window group with its lines, in the order and as they are sent
+    /// (see [`lines`](Self::lines)).
     pub fn groups(&self) -> impl Iterator<Item = (&CodedGroup, &[i32])> + Clone + '_ {
         let mut start = 0;
         self.groups.iter().map(move |group| {
@@ -226,6 +259,7 @@ impl CodedChannel {
         bits(
             self.windows,
             common_window,
+            &self.pulses,
             &self.tns,
             sections + self.scalefactor_bits,
         )
@@ -233,16 +267,22 @@ impl CodedChannel {
 }
 
 /// The bits of an `individual_channel_stream()` of `windows` with
-/// `common_window`, the temporal noise shaping `tns` and the given
-/// noiseless coding, as [`CodedChannel::bits`] counts them, for counting a
-/// coding without making a channel of it.
-pub fn bits(windows: Windows, common_window: bool, tns: &Tns, noiseless_bits: u32) -> u32 {
+/// `common_window`, the pulses `pulses`, the temporal noise shaping `tns`
+/// and the given noiseless coding, as [`CodedChannel::bits`] counts them,
+/// for counting a coding without making a channel of it.
+pub fn bits(
+    windows: Windows,
+    common_window: bool,
+    pulses: &Pulses,
+    tns: &Tns,
+    noiseless_bits: u32,
+) -> u32 {
     let ics_info = if common_window {
         0
     } else {
         windows.ics_info_bits()
     };
-    FIXED_BITS + ics_info + tns.bits() + noiseless_bits
+    FIXED_BITS + ics_info + pulses.bits() + tns.bits() + noiseless_bits
 }
 
 #[cfg(test)]
@@ -301,6 +341,7 @@ mod tests {
             fs,
             120,
             Tns::NONE,
+            Pulses::NONE,
             lines,
             vec![group.clone()],
         )
@@ -308,7 +349,13 @@ mod tests {
         assert_eq!(channel.max_sfb(), 3);
         assert_eq!(
             channel.bits(false),
-            bits(Windows::LONG_SINE, false, &Tns::NONE, noiseless + sf_bits)
+            bits(
+                Windows::LONG_SINE,
+                false,
+                &Pulses::NONE,
+                &Tns::NONE,
+                noiseless + sf_bits
+            )
         );
         assert_eq!(channel.bits(false), 8 + 11 + 3 + noiseless + sf_bits);
         // A filter adds its tns_data(): n_filt, coef_res, length, order,
@@ -318,7 +365,15 @@ mod tests {
         window.n_filt = 1;
         window.filters[0].length = 30;
         window.filters[0].order = 2;
-        let channel = CodedChannel::new(Windows::LONG_SINE, fs, 120, tns, lines, vec![group]);
+        let channel = CodedChannel::new(
+            Windows::LONG_SINE,
+            fs,
+            120,
+            tns,
+            Pulses::NONE,
+            lines,
+            vec![group],
+        );
         let channel = channel.unwrap();
         let tns_data = 2 + 1 + 6 + 5 + 1 + 1 + 2 * 4;
         assert_eq!(
@@ -339,7 +394,15 @@ mod tests {
             positions: Vec::new(),
         };
         assert_eq!(
-            CodedChannel::new(Windows::LONG_SINE, fs, 100, Tns::NONE, lines, vec![group]),
+            CodedChannel::new(
+                Windows::LONG_SINE,
+                fs,
+                100,
+                Tns::NONE,
+                Pulses::NONE,
+                lines,
+                vec![group]
+            ),
             None
         );
     }
