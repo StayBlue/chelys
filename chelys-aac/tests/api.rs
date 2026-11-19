@@ -9,7 +9,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use chelys_aac::{Config, ConfigError, DELAY, Encoder, Framing, Rate, SAMPLE_RATES};
 
 /// The channel counts the encoder takes.
-const CHANNELS: [usize; 5] = [1, 2, 3, 4, 5];
+const CHANNELS: [usize; 7] = [1, 2, 3, 4, 5, 6, 8];
 
 fn constant(bits_per_second: u32) -> Rate {
     Rate::Constant { bits_per_second }
@@ -55,7 +55,7 @@ fn errors_name_what_was_refused() {
             Some(ConfigError::UnsupportedSampleRate { sample_rate })
         );
     }
-    for channels in [0, 6, 7, usize::MAX] {
+    for channels in [0, 7, 9, usize::MAX] {
         assert_eq!(
             Encoder::new(Config::new(44_100, channels, constant(64_000))).err(),
             Some(ConfigError::UnsupportedChannels { channels })
@@ -251,14 +251,15 @@ fn every_sample_type_is_taken() {
 #[test]
 fn the_audio_specific_config_names_the_stream() {
     for (index, sample_rate) in SAMPLE_RATES.into_iter().enumerate() {
-        for channels in CHANNELS {
+        // 8 channels are channelConfiguration 7.
+        for (channels, value) in CHANNELS.into_iter().zip([1, 2, 3, 4, 5, 6, 7]) {
             let config = Config::new(sample_rate, channels, constant(16_000 * channels as u32));
             let asc = Encoder::new(config).unwrap().audio_specific_config();
             let bits = u16::from_be_bytes([asc[0], asc[1]]);
             assert_eq!(asc.len(), 2);
             assert_eq!(bits >> 11, 2, "audioObjectType");
             assert_eq!(usize::from((bits >> 7) & 0xF), index);
-            assert_eq!(usize::from((bits >> 3) & 0xF), channels);
+            assert_eq!((bits >> 3) & 0xF, value);
             assert_eq!(bits & 0b111, 0);
         }
     }

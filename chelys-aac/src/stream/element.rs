@@ -15,7 +15,7 @@ use crate::noiseless::sections::Sections;
 use crate::psychoacoustic::Analysis;
 use crate::psychoacoustic::middle_side::MidSideModel;
 use crate::psychoacoustic::switching::{self, Attacks, BlockSwitching};
-use crate::raw_data_block::element::CodedElement;
+use crate::raw_data_block::element::{CodedElement, LFE_LINES};
 use crate::sampling_frequency::SamplingFrequency;
 use crate::scalefactor_bands::{MAX_BANDS, Transform, first_band_above};
 use crate::stereo::intensity::{self, Intensity};
@@ -118,11 +118,25 @@ impl PreparedChannel {
     }
 }
 
-/// An element of a stream: a `single_channel_element()` of one channel, or
-/// a `channel_pair_element()` of two.
+/// An element of a stream: a `single_channel_element()` or
+/// `lfe_channel_element()` of one channel, or a `channel_pair_element()` of
+/// two.
+///
+/// Spec gap: Annex C does not mention the low frequency enhancement
+/// channel. It is coded as a single channel within the restrictions of
+/// clause 8.4.1 (see [`CodedElement::lfe`]): its model analyzes the
+/// channel's samples as they are given, as those of a channel that holds
+/// low frequencies only, for the thresholds of its bands; it finds no
+/// attacks, so that the channel is coded with long windows, of the sine
+/// shape; it is not shaped by temporal noise shaping; and its lines from
+/// [`LFE_LINES`] up are set to zero before it is quantized, so that they
+/// cost no bits and the loops measure no distortion there. Its
+/// `bit_allocation` is not counted in the frame's demand (see
+/// [`demand`](Self::demand)).
 #[derive(Debug)]
 pub struct ElementEncoder {
     sampling_frequency: SamplingFrequency,
+    kind: ElementKind,
     channels: Vec<ChannelEncoder>,
     /// Where the input ends among the samples buffered, once the stream is
     /// padded past it.
@@ -187,6 +201,7 @@ impl ElementEncoder {
         let channels = kind.channels();
         Self {
             sampling_frequency,
+            kind,
             input_end: None,
             channels: (0..channels)
                 .map(|_| ChannelEncoder::new(sampling_frequency))
@@ -212,6 +227,10 @@ impl ElementEncoder {
 
     pub fn channels(&self) -> usize {
         self.channels.len()
+    }
+
+    pub fn kind(&self) -> ElementKind {
+        self.kind
     }
 
     /// The element, but without temporal noise shaping, for comparing with
@@ -269,13 +288,13 @@ impl ElementEncoder {
 
     /// Has the models analyze the block at `next`, after that of the frame
     /// coded next, and keeps what they find of the attacks of the frame,
-    /// none if `block_switching` is off. The channels of a pair share
-    /// their attacks, so that they can share their windows (see
-    /// [`prepare`](Self::prepare)).
+    /// none if `block_switching` is off or the element is a low frequency
+    /// enhancement channel. The channels of a pair share their attacks, so
+    /// that they can share their windows (see [`prepare`](Self::prepare)).
     pub fn look_ahead(&mut self, next: usize, block_switching: bool) {
         let mut attacks = self.analyze(next).expect("primed");
         let attacks = &mut attacks[..self.channels.len()];
-        if !block_switching {
+        if !block_switching || self.kind == ElementKind::Lfe {
             attacks.fill(Attacks {
                 this: false,
                 next: false,
@@ -371,15 +390,24 @@ impl ElementEncoder {
                 },
                 sequence => sequence,
             };
-            let windows = Windows {
-                sequence,
-                shape: switching::shape(sequence),
+            let windows = match self.kind {
+                ElementKind::Lfe => {
+                    debug_assert_eq!(sequence, WindowSequence::OnlyLong);
+                    Windows::LONG_SINE
+                }
+                _ => Windows {
+                    sequence,
+                    shape: switching::shape(sequence),
+                },
             };
             let block = channel.pcm[start..start + FRAME_SAMPLES]
                 .try_into()
                 .expect("a block of samples");
             prepared.windows = windows;
             (channel.filterbank).spectrum(block, windows, &mut prepared.spectrum);
+            if self.kind == ElementKind::Lfe {
+                prepared.spectrum[LFE_LINES..].fill(0.0);
+            }
         }
         self.common_window = match &self.prepared[..] {
             [left, right] => left.windows == right.windows,
@@ -457,7 +485,7 @@ impl ElementEncoder {
             prepared.unshaped.copy_from_slice(&*prepared.spectrum);
             prepared.tns = Tns::NONE;
             let mut gains = NoiseGains::NONE;
-            if self.tns && shape {
+            if self.tns && shape && self.kind != ElementKind::Lfe {
                 let windows = prepared.windows;
                 let bands = target_bands(fs, windows.sequence.transform(), top);
                 let analysis = channel.switching.current();
@@ -671,11 +699,19 @@ impl ElementEncoder {
     }
 
     /// What the frame prepared asks of the frame.
+    ///
+    /// A low frequency enhancement channel asks for no `bit_allocation`:
+    /// its model's perceptual entropy is that of all its lines, of which it
+    /// sends [`LFE_LINES`] at most.
     pub fn demand(&self) -> Demand {
         let channels: u32 = self.prepared.iter().map(|c| self.silent_bits(c)).sum();
         let fields = CodedElement::fields_bits(self.channels(), self.common_windows());
+        let bit_allocation = match self.kind {
+            ElementKind::Lfe => 0.0,
+            _ => self.prepared.iter().map(|c| c.bit_allocation).sum(),
+        };
         Demand {
-            bit_allocation: self.prepared.iter().map(|c| c.bit_allocation).sum(),
+            bit_allocation,
             side_info_bits: fields + channels,
         }
     }
@@ -906,7 +942,11 @@ impl ElementEncoder {
                 let prepared = &self.prepared[only];
                 let coding =
                     ChannelCoding::new(prepared.windows, fs, budget(prepared), &prepared.tns);
-                CodedElement::single(self.code(prepared, coding))
+                let channel = self.code(prepared, coding);
+                match self.kind {
+                    ElementKind::Lfe => CodedElement::lfe(channel),
+                    _ => CodedElement::single(channel),
+                }
             }
             [first, second] if self.common_window => {
                 let (a, b) = (&self.prepared[first], &self.prepared[second]);

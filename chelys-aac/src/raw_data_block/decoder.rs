@@ -110,7 +110,8 @@ pub struct Block {
 }
 
 /// Reads a `raw_data_block()` at `fs` that holds
-/// `single_channel_element()`s and `channel_pair_element()`s, one at least,
+/// `single_channel_element()`s, `channel_pair_element()`s and
+/// `lfe_channel_element()`s, one at least,
 /// any `data_stream_element()`s and `fill_element()`s, and `ID_END`, then
 /// aligns to its byte (Table 12), which must be its last.
 pub fn raw_data_block(block: &[u8], fs: SamplingFrequency) -> Block {
@@ -123,7 +124,7 @@ pub fn raw_data_block(block: &[u8], fs: SamplingFrequency) -> Block {
         ids.push(id);
         let start = r.position();
         match id {
-            0 | 1 => {
+            0 | 1 | 3 => {
                 let (element, second_channel_start) = element_after_id(&mut r, fs, id);
                 elements.push(BlockElement {
                     id_syn_ele: id,

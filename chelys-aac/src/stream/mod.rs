@@ -88,9 +88,12 @@ impl StreamConfig {
     /// `data_bytes` of data streams, as the encoder writes it: its channels
     /// silent, without fill, a pair sharing its `ics_info()` where its
     /// channels share their attacks, and so their windows, in every frame
-    /// (see [`element::SHARED_ATTACKS`]), and each with its own otherwise.
+    /// (see [`element::SHARED_ATTACKS`]), and each with its own otherwise,
+    /// and a low frequency enhancement channel with long windows, its only
+    /// ones (see [`CodedElement::lfe`]).
     fn shortest_frame_len(&self, windows: Windows, data_bytes: usize) -> usize {
-        let channel = CodedChannel::silent(windows, self.sampling_frequency);
+        let fs = self.sampling_frequency;
+        let channel = CodedChannel::silent(windows, fs);
         let configuration = self.channel_configuration;
         let elements: Vec<CodedElement> = (configuration.elements().iter())
             .map(|kind| match kind {
@@ -99,6 +102,7 @@ impl StreamConfig {
                     CodedElement::common_pair(channel.clone(), channel.clone(), MsMask::NONE)
                 }
                 ElementKind::Pair => CodedElement::pair(channel.clone(), channel.clone()),
+                ElementKind::Lfe => CodedElement::lfe(CodedChannel::silent(Windows::LONG_SINE, fs)),
             })
             .collect();
         self.header_len() + raw_data_block::min_len(configuration, &elements, data_bytes)
@@ -139,9 +143,10 @@ impl StreamConfig {
         fitting
     }
 
-    /// The bits of the shortest frame of eight short windows, without data
-    /// streams, which a frame must be able to take with its data streams to
-    /// be coded with them (see [`StreamEncoder::affords_short`]).
+    /// The bits of the shortest frame of eight short windows, those of a
+    /// low frequency enhancement channel long, without data streams, which
+    /// a frame must be able to take with its data streams to be coded with
+    /// them (see [`StreamEncoder::affords_short`]).
     fn shortest_short_frame_bits(&self) -> u32 {
         let windows = Windows {
             sequence: WindowSequence::EIGHT_SHORT,
@@ -332,8 +337,8 @@ impl StreamEncoder {
 
     /// Whether the next frame's bits, those the reservoir makes available
     /// to it when it asks for none beyond the mean, pay for the shortest
-    /// frame of eight short windows in every channel with `data_bits` of
-    /// data stream elements, and so for any windows: a frame is given no
+    /// frame of eight short windows in every channel but a low frequency
+    /// enhancement channel, with `data_bits` of data stream elements, and so for any windows: a frame is given no
     /// fewer when it asks for more. Near the lowest bitrate they may not,
     /// as it is set by the frames of long windows (see
     /// [`StreamConfig::min_bits_per_second`]).
@@ -462,15 +467,23 @@ impl StreamEncoder {
     /// channels each codes with lines, so that each channel has about an
     /// equal share, as within an element. The elements are quantized one
     /// after another, each in its share of the bits the elements before it
-    /// left, so that what one leaves goes to those quantized after it, in
-    /// order of their perceptual entropy (see
-    /// [`ElementEncoder::perceptual_entropy`]), the least first, as the
-    /// channels of an element are.
+    /// left, so that what one leaves goes to those quantized after it: a
+    /// low frequency enhancement channel first, which sends a few lines
+    /// and leaves most of its share, then the others in order of their
+    /// perceptual entropy (see [`ElementEncoder::perceptual_entropy`]), the
+    /// least first, as the channels of an element are.
     fn quantize(&mut self, available_bits: u32) -> Vec<CodedElement> {
         let mut order: Vec<usize> = (0..self.elements.len()).collect();
         order.sort_by(|&a, &b| {
-            let key = |e: usize| self.elements[e].perceptual_entropy();
-            key(a).total_cmp(&key(b))
+            let key = |e: usize| {
+                let element = &self.elements[e];
+                (
+                    element.kind() != ElementKind::Lfe,
+                    element.perceptual_entropy(),
+                )
+            };
+            let (a, b) = (key(a), key(b));
+            a.0.cmp(&b.0).then(a.1.total_cmp(&b.1))
         });
         let mut coded: Vec<Option<CodedElement>> = vec![None; self.elements.len()];
         let mut remaining = available_bits;
@@ -926,10 +939,12 @@ mod tests {
     }
 
     /// The channel configurations of more than two channels.
-    const MULTICHANNEL: [ChannelConfiguration; 3] = [
+    const MULTICHANNEL: [ChannelConfiguration; 5] = [
         ChannelConfiguration::Three,
         ChannelConfiguration::Four,
         ChannelConfiguration::Five,
+        ChannelConfiguration::FiveOne,
+        ChannelConfiguration::SevenOne,
     ];
 
     /// Each frame of a configuration holds its elements in order, each kind
@@ -951,8 +966,14 @@ mod tests {
                 flags: Flags::default(),
                 crc_protected: false,
             };
-            // Channel c a steady tone at the centre of line 40 + 37c.
-            let line = |c: usize| 40 + 37 * c;
+            // Channel c a steady tone at the centre of line 40 + 37c, and a
+            // low frequency enhancement channel, last, at line 5, among the
+            // 12 it sends.
+            let lfe = channel_configuration.elements().last() == Some(&ElementKind::Lfe);
+            let line = |c: usize| match c {
+                c if lfe && c == channels - 1 => 5,
+                c => 40 + 37 * c,
+            };
             let input: Vec<Vec<f64>> = (0..channels)
                 .map(|c| {
                     let k = line(c) as f64 + 0.5;
@@ -983,13 +1004,72 @@ mod tests {
                     .flat_map(|e| e.element.spectra(fs))
                     .collect();
                 assert_eq!(spectra.len(), channels);
+                // A tone at the centre of a line spreads to the lines beside
+                // it with its phase.
                 for (c, spectrum) in spectra.iter().enumerate() {
-                    let peak = (0..spectrum.len())
-                        .max_by(|&a, &b| spectrum[a].abs().total_cmp(&spectrum[b].abs()))
-                        .unwrap();
-                    assert_eq!(peak, line(c), "{channel_configuration:?}, channel {c}");
+                    let energy = |lines: &[f64]| lines.iter().map(|x| x * x).sum::<f64>();
+                    let near = energy(&spectrum[line(c) - 2..=line(c) + 2]);
+                    assert!(
+                        near > 0.99 * energy(spectrum),
+                        "{channel_configuration:?}, channel {c}"
+                    );
                 }
             }
+        }
+    }
+
+    /// A low frequency enhancement channel keeps to its restrictions
+    /// (clause 8.4.1) whatever it is given: clicks over loud noise, which
+    /// the other channels code with short windows and temporal noise
+    /// shaping, it codes with long windows of the sine shape, unshaped, in
+    /// its 12 lowest lines, which carry its tone.
+    #[test]
+    fn a_low_frequency_enhancement_channel_keeps_to_its_restrictions() {
+        use crate::raw_data_block::decoder::raw_data_block;
+        use crate::raw_data_block::element::LFE_LINES;
+
+        let fs = SamplingFrequency::Hz48000;
+        for (channel_configuration, clipping) in [
+            (ChannelConfiguration::FiveOne, false),
+            (ChannelConfiguration::SevenOne, true),
+        ] {
+            let channels = channel_configuration.channels();
+            let config = StreamConfig {
+                sampling_frequency: fs,
+                channel_configuration,
+                bits_per_second: 64_000 * channel_configuration.ncc() as u32,
+                framing: Framing::Raw,
+                flags: Flags::default(),
+                crc_protected: false,
+            };
+            let mut input = noise(10 * FRAME_SAMPLES, 13);
+            for (t, x) in input.iter_mut().enumerate() {
+                *x += 0.5 * (std::f64::consts::PI * 5.5 * t as f64 / 1024.0).sin();
+                if t % 1500 == 700 {
+                    *x += 0.9;
+                }
+            }
+            let mut encoder = StreamEncoder::new(config).spectrum_clipping(clipping);
+            let (mut short, mut shaped, mut lfe_frames) = (false, false, 0);
+            encoder.encode(&vec![input.as_slice(); channels], &mut |frame: &[u8]| {
+                let block = raw_data_block(frame, fs);
+                for element in &block.elements {
+                    for ics in &element.element.channels {
+                        if element.id_syn_ele != 3 {
+                            short |= ics.info.window_sequence == 2;
+                            shaped |= ics.tns.is_some();
+                            continue;
+                        }
+                        lfe_frames += 1;
+                        assert_eq!((ics.info.window_sequence, ics.info.window_shape), (0, 0));
+                        assert!(ics.tns.is_none());
+                        assert!(ics.lines[0][LFE_LINES..].iter().all(|&q| q == 0));
+                        assert!(ics.lines[0][4..8].iter().any(|&q| q != 0));
+                    }
+                }
+            });
+            assert_eq!(lfe_frames, 9, "{channel_configuration:?}");
+            assert!(short && shaped, "{channel_configuration:?}");
         }
     }
 

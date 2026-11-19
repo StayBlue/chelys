@@ -59,12 +59,16 @@ pub struct Config {
 
 impl Config {
     /// A configuration of `channels` channels, in ADTS: 1 (mono), 2
-    /// (stereo), 3, 4 or 5, each coded as the `channel_configuration` of
-    /// as many speakers (Table 42). [`Encoder::new`] checks it.
+    /// (stereo), 3, 4, 5, 6 (5.1) or 8 (7.1), each coded as the
+    /// `channel_configuration` of as many speakers (Table 42). 7 channels
+    /// have none, and are refused. [`Encoder::new`] checks it.
     ///
     /// The input gives the channels in the order the stream sends them:
     /// that of the configuration's elements, and in a channel pair, left
-    /// before right.
+    /// before right. The low frequency enhancement channel (LFE) comes
+    /// last, and only its lowest frequencies are coded: the 12 lowest of
+    /// the 1024 lines of its spectrum, up to 281 Hz at 48 kHz (clause
+    /// 8.4.1).
     ///
     /// | `channels` | Order |
     /// |---|---|
@@ -73,6 +77,12 @@ impl Config {
     /// | 3 | center, left, right |
     /// | 4 | center, left, right, rear surround |
     /// | 5 | center, left, right, left surround, right surround |
+    /// | 6 | center, left, right, left surround, right surround, LFE |
+    /// | 8 | center, left center, right center, left, right, left surround, right surround, LFE |
+    ///
+    /// In 7.1, the left and right center front speakers lie between the
+    /// center and the left and right outside front speakers, which Table 1.23
+    /// of ISO/IEC 14496-3 names the "left, right front speakers".
     ///
     /// Spec reading: Table 42 lists each configuration's elements "in order
     /// received", and the speakers each maps to, those of a
@@ -226,7 +236,8 @@ pub enum ConfigError {
     UnsupportedChannels { channels: usize },
     /// The bitrate is outside the range, from `min` to `max`, of the sample
     /// rate, channels and framing: below the bits of the shortest frame, or
-    /// above those of the decoder's input buffer, 6144 a channel (clause
+    /// above those of the decoder's input buffer, 6144 a channel, the
+    /// low frequency enhancement channel not counted (clauses 8.2.3.1 and
     /// 8.2.3.3), less a byte for the bit reservoir.
     UnsupportedBitrate {
         bits_per_second: u32,

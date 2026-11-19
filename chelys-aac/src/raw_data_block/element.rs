@@ -1,8 +1,9 @@
 // Copyright (c) 2026 StayBlue
 // SPDX-License-Identifier: MIT
 
-//! The audio channel elements: the `single_channel_element()` (Table 13)
-//! and the `channel_pair_element()` (Table 14).
+//! The audio channel elements: the `single_channel_element()` (Table 13),
+//! the `channel_pair_element()` (Table 14) and the `lfe_channel_element()`
+//! (Table 23).
 
 use chelys_core::bitstream::BitWriter;
 
@@ -12,8 +13,14 @@ use crate::channel_configuration::ElementKind;
 use crate::stereo::middle_side::MsMask;
 use crate::window::Windows;
 
-/// The bits of a `single_channel_element()` besides its channel's
-/// `individual_channel_stream()`: `element_instance_tag`.
+/// The lines of a low frequency enhancement channel that may be other than
+/// zero: "Only the lowest 12 spectral coefficients of any LFE may be
+/// non-zero" (clause 8.4.1).
+pub const LFE_LINES: usize = 12;
+
+/// The bits of a `single_channel_element()` or `lfe_channel_element()`
+/// besides its channel's `individual_channel_stream()`:
+/// `element_instance_tag`.
 const SINGLE_CHANNEL_ELEMENT_BITS: u32 = 4;
 
 /// The bits of a `channel_pair_element()` besides its channels'
@@ -22,7 +29,8 @@ const SINGLE_CHANNEL_ELEMENT_BITS: u32 = 4;
 const CHANNEL_PAIR_ELEMENT_BITS: u32 = 4 + 1;
 
 /// One element of a frame as it is written: a `single_channel_element()`
-/// of one channel, or a `channel_pair_element()` of two.
+/// or `lfe_channel_element()` of one channel, or a
+/// `channel_pair_element()` of two.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CodedElement {
     kind: ElementKind,
@@ -36,6 +44,30 @@ impl CodedElement {
     pub fn single(channel: CodedChannel) -> Self {
         Self {
             kind: ElementKind::Single,
+            channels: vec![channel],
+            common: None,
+        }
+    }
+
+    /// The low frequency enhancement channel, "a standard
+    /// individual_channel_stream(0) element, i.e. equal to a
+    /// single_channel_element()" (clause 8.4.1), with its restrictions:
+    /// long windows of the sine shape, no temporal noise shaping, and lines
+    /// that are zero from [`LFE_LINES`] up. (Prediction, which it may not
+    /// use either, is not a tool of the Low Complexity profile.)
+    ///
+    /// # Panics
+    ///
+    /// If the channel does not keep to them: a caller's error.
+    pub fn lfe(channel: CodedChannel) -> Self {
+        assert!(
+            channel.windows() == Windows::LONG_SINE
+                && !channel.tns().is_present()
+                && channel.lines()[LFE_LINES..].iter().all(|&q| q == 0),
+            "a low frequency enhancement channel beyond its restrictions"
+        );
+        Self {
+            kind: ElementKind::Lfe,
             channels: vec![channel],
             common: None,
         }
@@ -124,7 +156,7 @@ impl CodedElement {
         }
     }
 
-    /// Writes the element (Table 13 or 14), after its `id_syn_ele`, with
+    /// Writes the element (Table 13, 14 or 23), after its `id_syn_ele`, with
     /// `element_instance_tag`.
     pub fn write(&self, w: &mut BitWriter, element_instance_tag: u32) {
         let start = w.bit_len();

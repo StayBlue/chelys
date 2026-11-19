@@ -231,6 +231,7 @@ mod tests {
             .map(|kind| match kind {
                 ElementKind::Single => CodedElement::single(channel.clone()),
                 ElementKind::Pair => CodedElement::pair(channel.clone(), channel.clone()),
+                ElementKind::Lfe => CodedElement::lfe(channel.clone()),
             })
             .collect()
     }

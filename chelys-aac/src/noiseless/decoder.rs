@@ -610,8 +610,8 @@ pub fn individual_channel_stream(
     }
 }
 
-/// A `single_channel_element()` or `channel_pair_element()` (Tables 13 and
-/// 14) as read.
+/// A `single_channel_element()`, `channel_pair_element()` or
+/// `lfe_channel_element()` (Tables 13, 14 and 23) as read.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Element {
     pub element_instance_tag: u32,
@@ -622,8 +622,9 @@ pub struct Element {
     pub ms_used: Vec<Vec<bool>>,
 }
 
-/// Reads an element, from its `id_syn_ele`: a `single_channel_element()`
-/// or a `channel_pair_element()` of the Low Complexity profile at `fs`.
+/// Reads an element, from its `id_syn_ele`: a `single_channel_element()`,
+/// a `channel_pair_element()` or an `lfe_channel_element()` of the Low
+/// Complexity profile at `fs`.
 pub fn element(r: &mut BitReader, fs: SamplingFrequency) -> Element {
     let id_syn_ele = r.read(3);
     element_after_id(r, fs, id_syn_ele).0
@@ -639,7 +640,9 @@ pub fn element_after_id(
 ) -> (Element, Option<usize>) {
     let element_instance_tag = r.read(4);
     match id_syn_ele {
-        0 => (
+        // An lfe_channel_element() is "equal to a single_channel_element()"
+        // (clause 8.4.1).
+        0 | 3 => (
             Element {
                 element_instance_tag,
                 channels: vec![individual_channel_stream(r, fs, None, false)],
