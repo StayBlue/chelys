@@ -362,12 +362,27 @@ impl TargetRange {
 }
 
 /// Adds to `r` the autocorrelation of `lines` at each lag from 0 to
-/// `r.len() - 1`.
+/// `r.len() - 1`, of 1 to [`MAX_ORDER`] + 1 lags: for each lag, the products of the
+/// lines that lag apart, summed in the order of the lines, from -0.0, as a
+/// sum of floats starts. The lags are summed together, each line's
+/// products at all of them at once.
 fn autocorrelation(lines: &[f64], r: &mut [f64]) {
-    for (lag, r) in r.iter_mut().enumerate() {
-        *r += (lines.iter().zip(lines.get(lag..).unwrap_or_default()))
-            .map(|(x, y)| x * y)
-            .sum::<f64>();
+    let lags = r.len();
+    let mut sums = [-0.0; MAX_ORDER + 1];
+    let sums = &mut sums[..lags];
+    let whole = lines.len().saturating_sub(lags - 1);
+    for (i, &x) in lines[..whole].iter().enumerate() {
+        for (sum, &y) in sums.iter_mut().zip(&lines[i..i + lags]) {
+            *sum += x * y;
+        }
+    }
+    for (i, &x) in lines.iter().enumerate().skip(whole) {
+        for (sum, &y) in sums.iter_mut().zip(&lines[i..]) {
+            *sum += x * y;
+        }
+    }
+    for (r, sum) in r.iter_mut().zip(sums) {
+        *r += *sum;
     }
 }
 
