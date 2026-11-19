@@ -153,7 +153,7 @@ pub fn clippings(
 /// `section_data()` and `spectral_data()`, the scalefactors they send for
 /// bands of zeros (see [`Sections::coding_bits`]), and `pulse_data()`.
 /// Of codings of as many bits, the one of fewer pulses is taken.
-pub fn choose(counted: Counted, clippings: &mut Vec<Clipping>) -> (Pulses, Sections) {
+pub fn choose(counted: &Counted, clippings: &mut Vec<Clipping>) -> (Pulses, Sections) {
     let mut sections = counted.choose();
     let mut pulses = Pulses::NONE;
     let mut bits = sections.coding_bits();
@@ -235,7 +235,7 @@ mod tests {
         }
         // One pulse saves its band of ones the escape codebook, which
         // costs more than the pulse.
-        let (pulses, sections) = choose(counted.clone(), &mut found);
+        let (pulses, sections) = choose(&counted, &mut found);
         assert!(pulses.is_present());
         assert!(found.is_empty());
         let unclipped = counted.choose();
@@ -252,7 +252,7 @@ mod tests {
         let mut found = Vec::new();
         clippings(&lines, bands, &counted, &mut found);
         assert_eq!(found.len(), 4);
-        let (pulses, sections) = choose(counted.clone(), &mut found);
+        let (pulses, sections) = choose(&counted, &mut found);
         assert_eq!(pulses, Pulses::NONE);
         assert_eq!(sections, counted.choose());
     }

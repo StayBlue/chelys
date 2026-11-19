@@ -20,12 +20,15 @@ pub(super) const UNCODABLE: u32 = 1 << 24;
 
 /// The bits of `lines` in each codebook of [`CLASSES`] `class..=top`, by
 /// codebook number, as [`write`] writes them, and [`UNCODABLE`] for the
-/// others. `class` is that of the lines' largest magnitude, the first whose
-/// codebooks code them, and the lines divide into quadruples.
-pub(super) fn bits_by_codebook(lines: &[i32], class: usize, top: usize) -> [u32; 12] {
+/// others, and the least of them. `class` is that of the lines' largest
+/// magnitude, the first whose codebooks code them, and the lines divide
+/// into quadruples.
+pub(super) fn bits_by_codebook(lines: &[i32], class: usize, top: usize) -> ([u32; 12], u32) {
     let mut bits = [UNCODABLE; 12];
+    // The least of those counted, as the others are UNCODABLE.
+    let mut least = UNCODABLE;
     if class == 0 {
-        bits[0] = 0;
+        (bits[0], least) = (0, 0);
     }
     let zeros = class == 0;
     let classes = CLASSES.iter().enumerate().take(top + 1);
@@ -39,17 +42,21 @@ pub(super) fn bits_by_codebook(lines: &[i32], class: usize, top: usize) -> [u32;
             4 => paired::<2, false, 7>(lines, &PAIRED_BITS_4, zeros),
             5 => paired::<2, false, 12>(lines, &PAIRED_BITS_5, zeros),
             _ => {
-                bits[usize::from(Codebook::ESC.number())] = escaped(lines, zeros);
+                let escaped = escaped(lines, zeros);
+                bits[usize::from(Codebook::ESC.number())] = escaped;
+                least = least.min(escaped);
                 continue;
             }
         };
         let [a, b] = books else {
             unreachable!("a class of two codebooks")
         };
-        bits[usize::from(a.number())] = paired & 0xffff;
-        bits[usize::from(b.number())] = paired >> 16;
+        let (a_bits, b_bits) = (paired & 0xffff, paired >> 16);
+        bits[usize::from(a.number())] = a_bits;
+        bits[usize::from(b.number())] = b_bits;
+        least = least.min(a_bits).min(b_bits);
     }
-    bits
+    (bits, least)
 }
 
 /// The codeword index of `tuple` in a codebook of `DIMENSION`, signed or
@@ -115,7 +122,7 @@ pub fn least_bits(lines: &[i32]) -> Option<u32> {
         .max()
         .unwrap_or(0);
     let class = super::codebooks::class(largest)?;
-    bits_by_codebook(lines, class, class).into_iter().min()
+    Some(bits_by_codebook(lines, class, class).1)
 }
 
 /// Writes `lines` in `codebook`: for each n-tuple its codeword, then, in an
@@ -219,7 +226,7 @@ mod tests {
                 let largest = lines.iter().map(|line| line.unsigned_abs()).max().unwrap();
                 let class = class(largest).unwrap();
                 for top in class..CLASSES.len() {
-                    let counted = bits_by_codebook(&lines, class, top);
+                    let (counted, _) = bits_by_codebook(&lines, class, top);
                     for (other, &counted) in (0..).zip(&counted) {
                         let codebook = Codebook::new(other).unwrap();
                         let in_range = (class..=top).any(|c| CLASSES[c].contains(&codebook));
@@ -246,7 +253,7 @@ mod tests {
             .sum();
         let bits = codewords + 7 + 21 + 21 + 5 + 5 + 7 + 19;
         assert_eq!(written_bits(11, &lines), bits);
-        assert_eq!(bits_by_codebook(&lines, 6, 6)[11], bits);
+        assert_eq!(bits_by_codebook(&lines, 6, 6).0[11], bits);
     }
 
     #[test]

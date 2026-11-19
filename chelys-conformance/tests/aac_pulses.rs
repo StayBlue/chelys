@@ -158,7 +158,7 @@ fn ffmpeg_restores_clipped_lines_as_sent_unclipped() {
                 let counted = Sections::count(&lines, bands, max_sfb).unwrap();
                 let mut found = Vec::new();
                 clipping::clippings(&lines, bands, &counted, &mut found);
-                let (pulses, _) = clipping::choose(counted, &mut found);
+                let (pulses, _) = clipping::choose(&counted, &mut found);
                 (pulses, lines)
             } else {
                 // Four pulses at the limits of their fields: the first up

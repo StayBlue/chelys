@@ -12,7 +12,7 @@ use crate::noiseless::clipping::{self, Clipping};
 use crate::noiseless::codebooks::MAX_MAGNITUDE;
 use crate::noiseless::pulses::Pulses;
 use crate::noiseless::scalefactors;
-use crate::noiseless::sections::{self, IntensityBands, Sections};
+use crate::noiseless::sections::{self, Counted, IntensityBands, Sections};
 use crate::noiseless::spectrum;
 use crate::scalefactor_bands::{GroupBands, MAX_BANDS, Transform};
 
@@ -290,9 +290,9 @@ pub struct Counting<'a> {
     pub scalefactors: Vec<[u8; MAX_BANDS]>,
     /// The lines quantized at the step counted last.
     x_quant: [i32; FRAME_LINES],
-    /// Each group's lines counted at the step counted last, kept to reuse
-    /// their memory.
-    counted: Vec<sections::Counted>,
+    /// Each group's lines counted at the step counted last, which each
+    /// count counts into.
+    counted: Vec<Counted>,
     /// The clippings of a long window's lines counted last (see
     /// [`clipping::clippings`]), kept to reuse their memory.
     clippings: Vec<Clipping>,
@@ -320,7 +320,9 @@ impl<'a> Counting<'a> {
             coding,
             scalefactors: vec![[0; MAX_BANDS]; groups],
             x_quant: [0; FRAME_LINES],
-            counted: Vec::with_capacity(groups),
+            counted: (coding.windows.groups(coding.sampling_frequency))
+                .map(Counted::new)
+                .collect(),
             clippings: Vec::new(),
             sections: Vec::with_capacity(groups),
             pulses: Pulses::NONE,
@@ -423,20 +425,19 @@ impl<'a> Counting<'a> {
         let mut least_bits =
             channel::bits(windows, common_window, &Pulses::NONE, tns, 0) + element_bits;
         self.sections.clear();
-        self.counted.clear();
         self.pulses = Pulses::NONE;
         // Only long windows are clipped (see clipping's spec reading).
         let clip = self.coding.spectrum_clipping && windows.sequence.transform() == Transform::Long;
         for (g, (start, bands)) in self.groups().enumerate() {
             let lines = &self.x_quant[start..start + bands.lines()];
             let intensity = intensity.map_or(IntensityBands::NONE, |i| i.bands[g]);
-            let Some(group) = Sections::count_with_intensity(lines, bands, max_sfb, intensity)
-            else {
+            let group = &mut self.counted[g];
+            if !group.count(lines, bands, max_sfb, intensity) {
                 return false;
-            };
+            }
             let mut least = group.least_bits();
             if clip {
-                clipping::clippings(lines, bands, &group, &mut self.clippings);
+                clipping::clippings(lines, bands, group, &mut self.clippings);
                 least = (self.clippings.iter())
                     .map(Clipping::least_bits)
                     .fold(least, u32::min);
@@ -445,15 +446,14 @@ impl<'a> Counting<'a> {
             if least_bits > available_bits {
                 return false;
             }
-            self.counted.push(group);
         }
         if clip {
-            let counted = self.counted.pop().expect("a long window");
+            let counted = self.counted.last().expect("a long window");
             let (pulses, sections) = clipping::choose(counted, &mut self.clippings);
             self.pulses = pulses;
             self.sections.push(sections);
         } else {
-            (self.sections).extend(self.counted.drain(..).map(|counted| counted.choose()));
+            (self.sections).extend(self.counted.iter().map(Counted::choose));
         }
         for g in 0..self.sf_decoder.len() {
             let mut sf_decoder = std::mem::take(&mut self.sf_decoder[g]);

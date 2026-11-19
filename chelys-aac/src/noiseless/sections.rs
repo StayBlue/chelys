@@ -146,65 +146,10 @@ impl Sections {
         max_sfb: usize,
         intensity: IntensityBands,
     ) -> Option<Counted> {
-        assert_eq!(lines.len(), bands.lines(), "a group's lines fill its bands");
-        assert!(
-            max_sfb <= bands.num_swb(),
-            "max_sfb {max_sfb} exceeds num_swb {}",
-            bands.num_swb()
-        );
-        debug_assert!(
-            lines[bands.offset(max_sfb)..].iter().all(|&line| line == 0),
-            "lines above max_sfb are not sent"
-        );
-        assert!(intensity.end() <= max_sfb, "intensity bands above max_sfb");
-        let mut classes = [0; MAX_BANDS];
-        for (sfb, class) in classes[..max_sfb].iter_mut().enumerate() {
-            let lines = &lines[bands.offset(sfb)..bands.offset(sfb + 1)];
-            let largest = lines.iter().map(|line| line.unsigned_abs()).max();
-            *class = match intensity.codebook(sfb) {
-                Some(codebook) => {
-                    debug_assert!(largest == Some(0), "lines in an intensity band");
-                    intensity_class(codebook)
-                }
-                None => self::class(largest.expect("a band holds lines"))?,
-            };
-        }
-        // A merged section takes the higher class of the two, so no section
-        // takes a class above the group's highest.
-        let top = (classes[..max_sfb].iter().copied())
-            .filter(|&class| class < CLASSES.len())
-            .max()
-            .unwrap_or(0);
-        let mut counted = Counted {
-            bands,
-            max_sfb,
-            top,
-            bits_below: [[0; 12]; MAX_BANDS + 1],
-            zero_bands_below: [0; MAX_BANDS + 1],
-            classes,
-            least_bits: 0,
-        };
-        for (sfb, &class) in classes[..max_sfb].iter().enumerate() {
-            let lines = &lines[bands.offset(sfb)..bands.offset(sfb + 1)];
-            let bits = if class < CLASSES.len() {
-                let bits = spectrum::bits_by_codebook(lines, class, top);
-                counted.least_bits += bits.iter().min().expect("a codebook");
-                bits
-            } else {
-                // No spectrum codebook codes an intensity band.
-                [UNCODABLE; 12]
-            };
-            for (codebook, bits) in bits.into_iter().enumerate() {
-                counted.bits_below[sfb + 1][codebook] = counted.bits_below[sfb][codebook] + bits;
-            }
-            counted.zero_bands_below[sfb + 1] =
-                counted.zero_bands_below[sfb] + u8::from(class == 0);
-        }
-        if max_sfb > 0 {
-            // At least one section, of all the bands.
-            counted.least_bits += section_bits(bands.transform(), max_sfb);
-        }
-        Some(counted)
+        let mut counted = Counted::new(bands);
+        counted
+            .count(lines, bands, max_sfb, intensity)
+            .then_some(counted)
     }
 
     pub fn bands(&self) -> GroupBands {
@@ -423,6 +368,95 @@ pub struct Counted {
 }
 
 impl Counted {
+    /// A window group of `bands` with no band counted, to
+    /// [`count`](Self::count) into.
+    pub fn new(bands: GroupBands) -> Self {
+        Self {
+            bands,
+            max_sfb: 0,
+            top: 0,
+            bits_below: [[0; 12]; MAX_BANDS + 1],
+            zero_bands_below: [0; MAX_BANDS + 1],
+            classes: [0; MAX_BANDS],
+            least_bits: 0,
+        }
+    }
+
+    /// Counts a window group's bands as [`Sections::count_with_intensity`]
+    /// does, in place of what was counted before, whose memory it reuses:
+    /// whether each line is one that a codebook codes. Where one is not,
+    /// what is left is to be counted again before it is used.
+    ///
+    /// # Panics
+    ///
+    /// As [`Sections::count`].
+    pub fn count(
+        &mut self,
+        lines: &[i32],
+        bands: GroupBands,
+        max_sfb: usize,
+        intensity: IntensityBands,
+    ) -> bool {
+        assert_eq!(lines.len(), bands.lines(), "a group's lines fill its bands");
+        assert!(
+            max_sfb <= bands.num_swb(),
+            "max_sfb {max_sfb} exceeds num_swb {}",
+            bands.num_swb()
+        );
+        debug_assert!(
+            lines[bands.offset(max_sfb)..].iter().all(|&line| line == 0),
+            "lines above max_sfb are not sent"
+        );
+        assert!(intensity.end() <= max_sfb, "intensity bands above max_sfb");
+        (self.bands, self.max_sfb, self.least_bits) = (bands, max_sfb, 0);
+        for (sfb, class) in self.classes[..max_sfb].iter_mut().enumerate() {
+            let lines = &lines[bands.offset(sfb)..bands.offset(sfb + 1)];
+            let largest = lines.iter().map(|line| line.unsigned_abs()).max();
+            *class = match intensity.codebook(sfb) {
+                Some(codebook) => {
+                    debug_assert!(largest == Some(0), "lines in an intensity band");
+                    intensity_class(codebook)
+                }
+                None => match self::class(largest.expect("a band holds lines")) {
+                    Some(class) => class,
+                    None => return false,
+                },
+            };
+        }
+        // A merged section takes the higher class of the two, so no section
+        // takes a class above the group's highest.
+        self.top = (self.classes[..max_sfb].iter().copied())
+            .filter(|&class| class < CLASSES.len())
+            .max()
+            .unwrap_or(0);
+        // The first row of `bits_below` and of `zero_bands_below`, of no
+        // bands, is never written, and stays 0.
+        for sfb in 0..max_sfb {
+            let class = self.classes[sfb];
+            let lines = &lines[bands.offset(sfb)..bands.offset(sfb + 1)];
+            let bits = if class < CLASSES.len() {
+                let (bits, least) = spectrum::bits_by_codebook(lines, class, self.top);
+                self.least_bits += least;
+                bits
+            } else {
+                // No spectrum codebook codes an intensity band.
+                [UNCODABLE; 12]
+            };
+            let [below, row] = &mut self.bits_below[sfb..sfb + 2] else {
+                unreachable!("two rows")
+            };
+            for ((row, below), bits) in row.iter_mut().zip(&*below).zip(bits) {
+                *row = below + bits;
+            }
+            self.zero_bands_below[sfb + 1] = self.zero_bands_below[sfb] + u8::from(class == 0);
+        }
+        if max_sfb > 0 {
+            // At least one section, of all the bands.
+            self.least_bits += section_bits(bands.transform(), max_sfb);
+        }
+        true
+    }
+
     /// The fewest bits that the `section_data()` and `spectral_data()` of
     /// any sections of the group can take: each band in the codebook that
     /// codes it in the fewest bits, in one section. The sections that
@@ -455,7 +489,7 @@ impl Counted {
         if class == 0 {
             return;
         }
-        let new = spectrum::bits_by_codebook(lines, class, self.top);
+        let (new, _) = spectrum::bits_by_codebook(lines, class, self.top);
         let old: [u32; 12] =
             std::array::from_fn(|cb| self.bits_below[sfb + 1][cb] - self.bits_below[sfb][cb]);
         for below in &mut self.bits_below[sfb + 1..=self.max_sfb] {
