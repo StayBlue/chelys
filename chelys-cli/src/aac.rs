@@ -39,8 +39,11 @@ AAC in the Low Complexity profile (AAC-LC) to stdout, each frame in ADTS
                      11 to 1851; the lowest from 1 in mono at 8 kHz to 24
                      in 7.1 at 96 kHz, and the highest 6144 bits a frame
                      for each channel but the LFE; with --crc, the lowest
-                     is up to 2 higher (default 128, or the highest the
-                     sample rate and channels allow where that is lower)
+                     is up to 2 higher (default 128 in mono and stereo,
+                     and 64 for each channel but the LFE in more: 192 in
+                     3 channels, 320 in 5.1, 448 in 7.1; or the highest
+                     the sample rate and channels allow where that is
+                     lower)
   --crc              protect each frame's header and the start of its audio
                      with a CRC-16 check word, 16 bits a frame (default:
                      off)
@@ -56,8 +59,8 @@ The decoded output starts with 1024 samples before the input and ends with
 fewer than 1024 after it, near silence to be discarded: ADTS has no field
 that tells a decoder so.";
 
-/// The bitrate without `--bitrate`, in kbit/s, where the sample rate and
-/// channels allow it: that of `chelys mp3`.
+/// The bitrate without `--bitrate` in mono and stereo, in kbit/s, where the
+/// sample rate allows it: that of `chelys mp3`.
 const DEFAULT_KBPS: u32 = 128;
 
 pub struct Options {
@@ -128,12 +131,24 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> 
     Ok(options)
 }
 
-/// [`DEFAULT_KBPS`], or the highest whole bitrate the sample rate and
-/// channels allow where that is lower, with the CRC if `crc`.
+/// The bitrate without `--bitrate`, in kbit/s, for each channel but the
+/// LFE, where there are more than two.
+const DEFAULT_KBPS_PER_CHANNEL: u32 = 64;
+
+/// [`DEFAULT_KBPS`] in mono and stereo, and [`DEFAULT_KBPS_PER_CHANNEL`]
+/// for each channel but the LFE in more, or the highest whole bitrate the
+/// sample rate and channels allow where that is lower, with the CRC if
+/// `crc`.
 fn default_kbps(sample_rate: u32, channels: usize, crc: bool) -> u32 {
-    match config(sample_rate, channels, DEFAULT_KBPS).crc(crc).check() {
-        Err(ConfigError::UnsupportedBitrate { max, .. }) if max < DEFAULT_KBPS * 1000 => max / 1000,
-        _ => DEFAULT_KBPS,
+    let kbps = match channels {
+        1 | 2 => DEFAULT_KBPS,
+        // 5.1 and 7.1, whose last channel is the LFE.
+        6 | 8 => DEFAULT_KBPS_PER_CHANNEL * (channels as u32 - 1),
+        _ => DEFAULT_KBPS_PER_CHANNEL * channels as u32,
+    };
+    match config(sample_rate, channels, kbps).crc(crc).check() {
+        Err(ConfigError::UnsupportedBitrate { max, .. }) if max < kbps * 1000 => max / 1000,
+        _ => kbps,
     }
 }
 
@@ -365,7 +380,7 @@ mod tests {
     }
 
     #[test]
-    fn the_default_bitrate_is_128_where_the_sample_rate_allows() {
+    fn the_default_bitrate_is_128_or_64_a_channel_where_the_sample_rate_allows() {
         let kbps = |rate: &str, channels| {
             parse(&["--sample-rate", rate, "--channels", channels])
                 .unwrap()
@@ -377,7 +392,12 @@ mod tests {
         assert_eq!(kbps("8000", "1"), 47);
         assert_eq!(kbps("8000", "2"), 95);
         assert_eq!(kbps("16000", "1"), 95);
-        assert_eq!(kbps("48000", "6"), 128);
-        assert_eq!(kbps("8000", "8"), 128);
+        assert_eq!(kbps("44100", "3"), 192);
+        assert_eq!(kbps("44100", "4"), 256);
+        assert_eq!(kbps("48000", "5"), 320);
+        assert_eq!(kbps("48000", "6"), 320);
+        assert_eq!(kbps("48000", "8"), 448);
+        assert_eq!(kbps("8000", "6"), 239);
+        assert_eq!(kbps("8000", "8"), 335);
     }
 }
