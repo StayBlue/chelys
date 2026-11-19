@@ -6,7 +6,7 @@
 //! rest of each frame's windows: the grouping of its short windows and its
 //! window shape.
 
-use super::middle_side::MidSideModel;
+use super::imaging::MidSideModel;
 use super::{Analysis, Model};
 use crate::sampling_frequency::SamplingFrequency;
 use crate::stream::FRAME_SAMPLES;

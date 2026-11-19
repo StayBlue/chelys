@@ -13,7 +13,7 @@ use crate::loops::{self, ChannelCoding};
 use crate::noiseless::pulses::Pulses;
 use crate::noiseless::sections::Sections;
 use crate::psychoacoustic::Analysis;
-use crate::psychoacoustic::middle_side::MidSideModel;
+use crate::psychoacoustic::imaging::MidSideModel;
 use crate::psychoacoustic::switching::{self, Attacks, BlockSwitching};
 use crate::raw_data_block::element::{CodedElement, LFE_LINES};
 use crate::sampling_frequency::SamplingFrequency;

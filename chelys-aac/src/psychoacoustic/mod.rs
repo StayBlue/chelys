@@ -8,7 +8,7 @@
 //! 15); and the choice between long and short blocks (step 13), which
 //! [`switching`] makes a frame ahead.
 
-pub mod middle_side;
+pub mod imaging;
 pub mod partitions;
 pub mod switching;
 
