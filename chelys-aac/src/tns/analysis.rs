@@ -256,9 +256,11 @@ impl TargetRange {
     /// and filters none above `TNS_MAX_BANDS` (clause 14.3); so the filter
     /// is sent with the bands from the range's first to `num_swb`, and
     /// filters those of the range. Settled by decoding with ffmpeg (black
-    /// box): clicks, pulse trains and struck bars so shaped, in long and
-    /// short windows, decode in place at their level at every sampling
-    /// frequency from 8 to 96 kHz, and so do pairs whose range is cut at
+    /// box): clicks and pulse trains so shaped, in long and short windows,
+    /// decode in place at their level at every sampling frequency from 8
+    /// to 96 kHz, as do struck bars at every one but 96 kHz, where they
+    /// reach the threshold of the prediction gain in no window and are not
+    /// shaped (see `gain_threshold`), and so do pairs whose range is cut at
     /// `top` with a first filter of order 0; the conformance test is
     /// `temporal_noise_shaping_decodes_in_place`.
     ///
