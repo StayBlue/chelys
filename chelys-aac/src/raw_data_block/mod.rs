@@ -93,6 +93,22 @@ pub struct Block {
 /// bits of the second ICS are protected twice, each time in order of their
 /// appearance".
 ///
+/// Spec gap: where the first stream ends at the Nth bit with N below 64,
+/// the element's 192 bits hold 192 - N bits of the second stream, more
+/// than the 128 of its own pass, and the clause's "the first (192 – N)
+/// bits of the second ICS are protected twice" would protect all of them
+/// twice; its example, of the 190th bit, fits either. The rules of 192 and
+/// 128 bits are taken as what is protected, and the sentence as their
+/// consequence where N is 64 or more: the second pass is 128 bits, so that
+/// only they are protected twice. For example, in a pair at 48 kHz and 320
+/// kbit/s whose left channel is silent and right one a tone of 1 kHz at
+/// half of full scale, the second frame's second stream starts after 43
+/// bits of the element, and its `crc_check` is D458, where feeding all 149
+/// bits of the second stream within the 192 again would give FC83. No
+/// decoder settles it, as ffmpeg does not check the CRC (see
+/// [`adts::crc_check`](crate::adts::crc_check)); the test of this reading
+/// is `a_second_stream_from_before_bit_64_is_protected_again_for_128_bits`.
+///
 /// # Panics
 ///
 /// If the element is not the one `configuration` gives: a caller's error.

@@ -370,4 +370,83 @@ mod tests {
         };
         assert_eq!(flips(all), [22, 26, 27]);
     }
+
+    /// The CRC of `bits` through the shift register of figure A.9 of
+    /// ISO/IEC 11172-3 as drawn, its stages one by one, written apart from
+    /// `chelys_core::crc`: each bit is added to the output of b15, and the
+    /// sum is fed into b0 and added into the inputs of b2 and b15, for
+    /// G(X) = X^16 + X^15 + X^2 + 1, from all ones. The word is b15..b0.
+    fn figure_a9(bits: impl IntoIterator<Item = bool>) -> u16 {
+        let mut stages = [true; 16];
+        for bit in bits {
+            let feedback = bit ^ stages[15];
+            for i in (1..16).rev() {
+                stages[i] = stages[i - 1];
+            }
+            stages[0] = feedback;
+            stages[2] ^= feedback;
+            stages[15] ^= feedback;
+        }
+        (0..16).fold(0, |word, i| word | (u16::from(stages[i]) << i))
+    }
+
+    /// Where a pair's first stream ends at the Nth bit with N below 64, the
+    /// element's 192 bits hold 192 - N bits of the second stream, more than
+    /// the 128 of its own pass (see [`raw_data_block::write`]'s reading):
+    /// the frame's `crc_check` is that of the 192 bits of the element and
+    /// then the first 128 of the second stream, not 192 - N of them. Here
+    /// the left channel is silent and the right one a tone of 1 kHz, at
+    /// 48 kHz and 320 kbit/s, so that the second stream starts at bit 43 of
+    /// the element, or 38, and runs past bit 192.
+    #[test]
+    fn a_second_stream_from_before_bit_64_is_protected_again_for_128_bits() {
+        use crate::config::Framing;
+        use crate::raw_data_block::decoder::{adts_frame, raw_data_block};
+        use crate::stream::{StreamConfig, StreamEncoder};
+
+        let fs = SamplingFrequency::Hz48000;
+        let right: Vec<f64> = (0..8 * 1024)
+            .map(|t| 0.5 * (std::f64::consts::TAU * 1000.0 * t as f64 / 48_000.0).sin())
+            .collect();
+        let left = vec![0.0; right.len()];
+        let config = StreamConfig {
+            sampling_frequency: fs,
+            channel_configuration: ChannelConfiguration::Stereo,
+            bits_per_second: 320_000,
+            framing: Framing::Adts,
+            flags: Flags::default(),
+            crc_protected: true,
+        };
+        let mut stream = Vec::new();
+        let mut encoder = StreamEncoder::new(config);
+        encoder.encode(&[&left, &right], &mut stream);
+        encoder.finish(&mut stream);
+        let mut cases = 0;
+        let mut rest = stream.as_slice();
+        while !rest.is_empty() {
+            let frame = adts_frame(rest);
+            rest = &rest[frame.aac_frame_length..];
+            let block = raw_data_block(frame.raw_data_block, fs);
+            let start = block.element_bits.start;
+            let second = block.second_channel_start.unwrap();
+            let n = second - start;
+            if n >= 64 || block.element_bits.end - second < 192 - n {
+                continue;
+            }
+            cases += 1;
+            let digits = binary_digits(frame.raw_data_block);
+            let bits = |range: std::ops::Range<usize>| {
+                digits[range].chars().map(|c| c == '1').collect::<Vec<_>>()
+            };
+            let header: Vec<bool> = (binary_digits(frame.header).chars())
+                .map(|c| c == '1')
+                .collect();
+            let element = bits(start..start + 192);
+            let crc_of_second =
+                |len| figure_a9([&header[..], &element, &bits(second..second + len)].concat());
+            assert_eq!(frame.crc_check, Some(crc_of_second(128)), "N = {n}");
+            assert_ne!(frame.crc_check, Some(crc_of_second(192 - n)), "N = {n}");
+        }
+        assert!(cases > 0);
+    }
 }
