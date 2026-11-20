@@ -104,14 +104,32 @@ fn read(
         .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
         .collect();
     let stream = std::fs::read(encoded).map_err(|e| format!("reading {encoded}: {e}"))?;
-    let info = ffmpeg::probe_mp3(&stream);
+    let aac = is_aac(encoded);
+    let info = if aac {
+        ffmpeg::probe_aac(&stream).0
+    } else {
+        ffmpeg::probe_mp3(&stream)
+    };
     if info.sample_rate != sample_rate || info.channels != channels {
         return Err(format!(
             "{encoded} has {} channel(s) at {} Hz, not {channels} at {sample_rate} Hz",
             info.channels, info.sample_rate
         ));
     }
-    Ok((original_samples, ffmpeg::decode_mp3(&stream).samples))
+    let decoded = if aac {
+        ffmpeg::decode_aac(&stream)
+    } else {
+        ffmpeg::decode_mp3(&stream)
+    };
+    Ok((original_samples, decoded.samples))
+}
+
+/// Whether `encoded` is to be read as AAC in ADTS, by its extension `.aac`,
+/// rather than as MP3.
+pub fn is_aac(encoded: &str) -> bool {
+    std::path::Path::new(encoded)
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("aac"))
 }
 
 /// The delay, in samples per channel from 0 to [`MAX_LAG`], by which

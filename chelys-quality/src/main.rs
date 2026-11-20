@@ -6,8 +6,8 @@
 //! trial, one of the two at random (X), and counts how often the listener
 //! tells which X is; or by PEAQ's grade. The encoding is decoded with
 //! ffmpeg, played with ffplay and graded with GstPEAQ, all as black boxes.
-//! Another encoder's output, such as LAME's when it is the benchmark, is
-//! judged the same way, lined up by its own delay.
+//! Another encoder's output, such as LAME's or ffmpeg's AAC encoder's when
+//! it is the benchmark, is judged the same way, lined up by its own delay.
 
 mod abx;
 mod clip;
@@ -34,7 +34,8 @@ usage: chelys-quality abx --sample-rate HZ --channels N [--trials N]
 
 ORIGINAL.f32 is interleaved 32-bit little-endian float PCM, as the chelys
 encoder reads it, and ENCODED.mp3 is what an encoder made of it: chelys, or
-another encoder judged beside it. ffmpeg decodes the MP3, ffplay plays the
+another encoder judged beside it; an encoding named .aac is read as AAC in
+ADTS instead. ffmpeg decodes the encoding, ffplay plays the
 sound, and GstPEAQ grades it, through gst-launch-1.0; each must be installed
 for the commands that use it.
 
@@ -59,7 +60,8 @@ for the commands that use it.
   --to SECONDS      use only the part up to this time (default: the end)
   --delay SAMPLES   the samples per channel by which ffmpeg's decoding of
                     the encoding lags the original (default: chelys's
-                    1057, which ffmpeg does not remove)
+                    1057 for MP3 and 1024 for AAC, which ffmpeg does not
+                    remove)
 
 To learn what coding noise sounds like, first take the test with an encoding
 at a low bitrate, such as 32 kbit/s, and raise the bitrate from there.";
@@ -139,6 +141,11 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
     };
     let [original, encoded] = <[String; 2]>::try_from(paths)
         .map_err(|_| "give the original and the encoding, in that order".to_owned())?;
+    let delay = delay.unwrap_or(if clip::is_aac(&encoded) {
+        chelys::aac::DELAY
+    } else {
+        chelys::mp3::DELAY
+    });
     Ok(Options {
         command,
         sample_rate,
@@ -147,7 +154,7 @@ fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
         encoded,
         from,
         to,
-        delay: delay.unwrap_or(chelys::mp3::DELAY),
+        delay,
     })
 }
 
