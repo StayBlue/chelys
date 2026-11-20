@@ -10,6 +10,7 @@ use chelys_core::bitstream::BitWriter;
 
 use crate::channel::FRAME_LINES;
 use crate::loops::inner;
+use crate::noise_substitution::Noise;
 use crate::sampling_frequency::SamplingFrequency;
 use crate::scalefactor_bands::MAX_BANDS;
 use crate::stereo::BandCoding;
@@ -77,7 +78,11 @@ pub fn matrix(
 ///
 /// The bands `intensity` codes in intensity stereo are coded neither way
 /// (clause 12.1.3), and their flags are 0, which leaves each band's phase
-/// as its codebook gives it (clause 12.2.3).
+/// as its codebook gives it (clause 12.2.3). Nor are the bands `noise`
+/// codes by perceptual noise substitution, which "M/S stereo coding and
+/// noise substitution coding are mutually exclusive" (ISO/IEC 14496-3,
+/// clause 4.6.13.3); their flags are 0, and are set afterwards where the
+/// pair's noise is to be the same in both channels.
 ///
 /// Spec reading: with `ms_mask_present` 2, `invert_intensity` is +1 for
 /// every band (clause 12.2.3), and the bands in intensity stereo are not
@@ -103,13 +108,14 @@ pub fn choose(
     weights: [&[f64; FRAME_LINES]; 4],
     allowed: [&[[f64; MAX_BANDS]]; 4],
     intensity: &Intensity,
+    noise: &Noise,
 ) -> MsMask {
     let mut mask = MsMask::NONE;
     let mut ties = MsMask::NONE;
     let (mut any_left_right, mut any_mid_side) = (false, false);
     let mut scratch = inner::BandScratch::default();
-    for band in super::bands(windows, sampling_frequency, MsMask::NONE, intensity) {
-        if band.coding == BandCoding::Intensity {
+    for band in super::bands(windows, sampling_frequency, MsMask::NONE, intensity, noise) {
+        if matches!(band.coding, BandCoding::Intensity | BandCoding::Noise) {
             continue;
         }
         let (g, sfb, range) = (band.group, band.sfb, band.lines);

@@ -82,6 +82,7 @@ mod tests {
             sections,
             scalefactors: vec![101],
             positions: Vec::new(),
+            noise_energies: Vec::new(),
         };
         let channel = CodedChannel::new(
             Windows::LONG_SINE,
@@ -120,6 +121,7 @@ mod tests {
             sections: Sections::choose(&sent, bands, max_sfb).unwrap(),
             scalefactors: vec![100; max_sfb],
             positions: Vec::new(),
+            noise_energies: Vec::new(),
         };
         CodedChannel::new(
             Windows::LONG_SINE,
@@ -153,7 +155,7 @@ mod tests {
         write_individual_channel_stream(&channel, false, &mut w);
         let bytes = w.into_bytes();
         let mut r = BitReader::new(&bytes);
-        let ics = individual_channel_stream(&mut r, fs, None, false);
+        let ics = individual_channel_stream(&mut r, fs, None, false, false);
         assert_eq!(r.position(), bits.len());
         assert_eq!(
             ics.pulses,
@@ -205,7 +207,8 @@ mod tests {
                 write_individual_channel_stream(&channel, false, &mut w);
                 assert_eq!(w.bit_len() as u32, channel.bits(false));
                 let bytes = w.into_bytes();
-                let ics = individual_channel_stream(&mut BitReader::new(&bytes), fs, None, false);
+                let ics =
+                    individual_channel_stream(&mut BitReader::new(&bytes), fs, None, false, false);
                 assert_eq!(ics.lines, [lines.to_vec()], "{fs:?}, pulses at {at:?}");
             }
         }

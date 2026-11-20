@@ -12,7 +12,7 @@ use crate::noiseless::clipping::{self, Clipping};
 use crate::noiseless::codebooks::MAX_MAGNITUDE;
 use crate::noiseless::pulses::Pulses;
 use crate::noiseless::scalefactors;
-use crate::noiseless::sections::{self, Counted, IntensityBands, Sections};
+use crate::noiseless::sections::{self, BandValue, Counted, PseudoBands, Sections};
 use crate::noiseless::spectrum;
 use crate::scalefactor_bands::{GroupBands, MAX_BANDS, Transform};
 
@@ -465,19 +465,21 @@ impl<'a> Counting<'a> {
             least_max_sfb,
             ..
         } = self.coding;
-        let intensity = self.coding.intensity;
-        let intensity_end = intensity.map_or(0, |intensity| {
-            (intensity.bands.iter())
-                .map(|bands| bands.end())
-                .max()
-                .unwrap_or(0)
-        });
+        let (intensity, noise) = (self.coding.intensity, self.coding.noise);
+        let pseudo = |g: usize| {
+            let intensity = intensity.map_or(PseudoBands::NONE, |i| i.bands[g]);
+            intensity.union(noise.map_or(PseudoBands::NONE, |n| n.bands[g]))
+        };
+        let pseudo_end = (0..self.largest.len())
+            .map(|g| pseudo(g).end())
+            .max()
+            .unwrap_or(0);
         let max_sfb = (self.largest.iter())
             .map(|largest| sections::max_sfb_of_largest(largest))
             .max()
             .unwrap_or(0)
             .max(least_max_sfb)
-            .max(intensity_end);
+            .max(pseudo_end);
         let element_bits = self.coding.element_bits[max_sfb];
         let tns = self.coding.tns;
         let mut least_bits =
@@ -488,7 +490,7 @@ impl<'a> Counting<'a> {
         let clip = self.coding.spectrum_clipping && windows.sequence.transform() == Transform::Long;
         for (g, (start, bands)) in self.groups().enumerate() {
             let lines = &self.x_quant[start..start + bands.lines()];
-            let intensity = intensity.map_or(IntensityBands::NONE, |i| i.bands[g]);
+            let pseudo = pseudo(g);
             let group = &mut self.counted[g];
             // The coding cannot fit once the least bits of the bands counted
             // exceed those left, but where clipping may lower them.
@@ -513,7 +515,7 @@ impl<'a> Counting<'a> {
                 }
                 (count.bits, count.least)
             };
-            if !group.count_with(lines, bands, max_sfb, intensity, largest, budget, band_bits) {
+            if !group.count_with(lines, bands, max_sfb, pseudo, largest, budget, band_bits) {
                 return false;
             }
             let mut least = group.least_bits();
@@ -547,9 +549,14 @@ impl<'a> Counting<'a> {
             }
             self.sf_decoder[g] = sf_decoder;
         }
-        let positions = |g: usize| intensity.map_or(&[][..], |i| &i.positions[g][..]);
-        let groups = (self.sections.iter().zip(&self.sf_decoder).enumerate())
-            .map(|(g, (sections, sf_decoder))| (sections, sf_decoder.as_slice(), positions(g)));
+        let groups = (self.sections.iter().zip(&self.sf_decoder).enumerate()).map(
+            |(g, (sections, sf_decoder))| scalefactors::Group {
+                sections,
+                scalefactors: sf_decoder,
+                positions: intensity.map_or(&[][..], |i| &i.positions[g][..]),
+                noise_energies: noise.map_or(&[][..], |n| &n.energies[g][..]),
+            },
+        );
         let Some(scalefactor_bits) = scalefactors::bits(self.global_gain(common_gain), groups)
         else {
             return false;
@@ -569,15 +576,26 @@ impl<'a> Counting<'a> {
 
     /// `global_gain` for the sections and scalefactors counted last: the
     /// scalefactor of the first band that sends one and has a line that is
-    /// not zero, or, where no band has, `common_gain`, which no band then
-    /// uses.
+    /// not zero; or, where no band has, the one that sends the first noise
+    /// energy best (see [`scalefactors::noise_global_gain`]), or, without
+    /// noise, `common_gain`, which no band then uses.
     fn global_gain(&self, common_gain: u8) -> u8 {
-        (self.sections.iter().zip(&self.sf_decoder))
-            .find_map(|(sections, sf_decoder)| {
+        let first_scalefactor =
+            (self.sections.iter().zip(&self.sf_decoder)).find_map(|(sections, sf_decoder)| {
                 (sections.bands_with_scalefactors())
                     .find(|&sb| !sections.is_zero_band(sb))
                     .map(|sb| sf_decoder[sb])
+            });
+        let first_noise = || {
+            let noise = self.coding.noise?;
+            self.sections.iter().enumerate().find_map(|(g, sections)| {
+                (sections.bands_with_values())
+                    .find(|&(_, value)| value == BandValue::NoiseEnergy)
+                    .map(|(sb, _)| scalefactors::noise_global_gain(noise.energies[g][sb]))
             })
+        };
+        first_scalefactor
+            .or_else(first_noise)
             .unwrap_or(common_gain)
     }
 
@@ -611,6 +629,8 @@ impl<'a> Counting<'a> {
                 positions: (self.coding.intensity).map_or(Vec::new(), |i| {
                     i.positions[g][..sections.max_sfb()].to_vec()
                 }),
+                noise_energies: (self.coding.noise)
+                    .map_or(Vec::new(), |n| n.energies[g][..sections.max_sfb()].to_vec()),
                 sections,
                 scalefactors,
             })

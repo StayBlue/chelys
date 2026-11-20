@@ -54,6 +54,7 @@ pub struct Config {
     framing: Framing,
     flags: Flags,
     crc: bool,
+    noise_substitution: bool,
     data_stream_bytes_per_frame: usize,
 }
 
@@ -131,6 +132,7 @@ impl Config {
             framing: Framing::default(),
             flags: Flags::default(),
             crc: false,
+            noise_substitution: false,
             data_stream_bytes_per_frame: 0,
         }
     }
@@ -148,6 +150,27 @@ impl Config {
     /// 8.1.3.2.1). The word's 16 bits count towards the rate. ADTS only.
     pub fn crc(mut self, on: bool) -> Self {
         self.crc = on;
+        self
+    }
+
+    /// Codes noise-like bands by perceptual noise substitution (ISO/IEC
+    /// 14496-3, clause 4.6.13) where bits are few: sends the energy of their
+    /// noise in place of their lines, for the decoder to generate noise of
+    /// that energy in their place, which saves bits for the bands that need
+    /// them. Off by default.
+    ///
+    /// It is used at rates of up to 1.3 bits for each sample of each
+    /// channel but the LFE, about 115 kbit/s in stereo at 44.1 kHz, above
+    /// which it costs more than it saves.
+    ///
+    /// Perceptual noise substitution is a tool of MPEG-4 AAC, which MPEG-2
+    /// AAC does not have: where it is used, each ADTS header says that the
+    /// stream is MPEG-4 (`ID` 0), and a decoder of MPEG-2 AAC alone may not
+    /// decode it. Raw frames are described by the
+    /// [`Encoder::audio_specific_config`](super::Encoder::audio_specific_config),
+    /// which is MPEG-4's either way.
+    pub fn noise_substitution(mut self, on: bool) -> Self {
+        self.noise_substitution = on;
         self
     }
 
@@ -238,6 +261,7 @@ impl Config {
             framing: self.framing,
             flags: self.flags,
             crc_protected: self.crc,
+            noise_substitution: self.noise_substitution,
         };
         if !config.is_valid() {
             return Err(ConfigError::UnsupportedBitrate {
@@ -380,6 +404,36 @@ mod tests {
                 max
             })
         );
+    }
+
+    /// The `ID` bit of each ADTS frame of a stereo stream at 44.1 kHz at
+    /// `kbps`, with perceptual noise substitution if `noise`: 1 for MPEG-2
+    /// AAC, 0 for MPEG-4.
+    fn ids(kbps: u32, noise: bool) -> Vec<u8> {
+        let config = Config::new(
+            44_100,
+            2,
+            Rate::Constant {
+                bits_per_second: kbps * 1000,
+            },
+        )
+        .noise_substitution(noise);
+        let mut encoder = Encoder::new(config).unwrap();
+        let mut frames = Vec::new();
+        let mut out = |frame: &[u8]| frames.push(frame.to_vec());
+        encoder.encode_interleaved(&[0.0f32; 2 * 4096], &mut out);
+        encoder.finish(&mut out);
+        // The bit after the 12 bits of the syncword.
+        frames.iter().map(|frame| (frame[1] >> 3) & 1).collect()
+    }
+
+    #[test]
+    fn noise_substitution_makes_the_stream_mpeg_4_where_it_is_used() {
+        assert!(ids(96, false).iter().all(|&id| id == 1));
+        assert!(ids(96, true).iter().all(|&id| id == 0));
+        // 1.3 bits a sample, 114.66 kbit/s, and no more.
+        assert!(ids(114, true).iter().all(|&id| id == 0));
+        assert!(ids(115, true).iter().all(|&id| id == 1));
     }
 
     #[test]

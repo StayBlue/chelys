@@ -353,6 +353,10 @@ impl Tables {
                 .map(|b| nb[b] / self.partitions[b].lines().len() as f64)
                 .fold(f64::INFINITY, f64::min);
             out.npart[band] = thr * lines.len() as f64;
+            out.tonality[band] = (range.clone())
+                .map(|b| tonality(block.cb[b]))
+                .fold(0.0, f64::max);
+            out.flatness[band] = flatness(&energy[lines]);
         }
     }
 }
@@ -505,6 +509,14 @@ pub struct Threshold {
     pub epart: [f64; MAX_BANDS],
     /// `npart(n)`: the noise level each band allows.
     pub npart: [f64; MAX_BANDS],
+    /// The tonality `tb(b)` (step 7) of each band: the most of the
+    /// partitions its lines fall in, for perceptual noise substitution
+    /// (see [`noise_like`](crate::noise_substitution::noise_like)).
+    pub tonality: [f64; MAX_BANDS],
+    /// The spectral flatness of each band: the geometric mean of its FFT
+    /// lines' energies over their arithmetic mean, for perceptual noise
+    /// substitution (see [`noise_like`](crate::noise_substitution::noise_like)).
+    pub flatness: [f64; MAX_BANDS],
     /// `PE`.
     pub perceptual_entropy: f64,
     bands: GroupBands,
@@ -515,6 +527,8 @@ impl Threshold {
         Self {
             epart: [0.0; MAX_BANDS],
             npart: [0.0; MAX_BANDS],
+            tonality: [0.0; MAX_BANDS],
+            flatness: [0.0; MAX_BANDS],
             perceptual_entropy: 0.0,
             bands,
         }
@@ -671,6 +685,19 @@ impl Analysis {
         }
         audible
     }
+}
+
+/// The spectral flatness of `energies`: their geometric mean over their
+/// arithmetic mean, from 0, where one line holds all the energy or any
+/// holds none, to 1, where all hold the same; 0 for lines without energy.
+fn flatness(energies: &[f64]) -> f64 {
+    let n = energies.len() as f64;
+    let mean = energies.iter().sum::<f64>() / n;
+    if mean == 0.0 || energies.contains(&0.0) {
+        return 0.0;
+    }
+    let log_mean = energies.iter().map(|e| e.ln()).sum::<f64>() / n;
+    log_mean.exp() / mean
 }
 
 /// Step 7: the tonality `tb(b)` of a partition of normalized
@@ -941,6 +968,17 @@ mod tests {
             })
             .max();
         assert_eq!(most, Some(MAX_PARTITIONS));
+    }
+
+    #[test]
+    fn flatness_is_one_for_equal_energies_and_falls_with_peaks() {
+        assert_eq!(flatness(&[2.0; 8]), 1.0);
+        assert_eq!(flatness(&[0.0, 1.0, 1.0]), 0.0);
+        assert_eq!(flatness(&[0.0; 4]), 0.0);
+        // A line of 100 among 7 of 1.
+        let peak = flatness(&[100.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]);
+        let expected = 100f64.powf(1.0 / 8.0) / (107.0 / 8.0);
+        assert!((peak - expected).abs() < 1e-12);
     }
 
     #[test]

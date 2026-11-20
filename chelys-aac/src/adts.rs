@@ -55,6 +55,9 @@ pub struct Header {
     /// Whether an `adts_error_check()` follows the header:
     /// `protection_absent` 0.
     pub protected: bool,
+    /// Whether the stream is MPEG-4 AAC rather than MPEG-2 AAC: whether it
+    /// uses a tool MPEG-4 adds, perceptual noise substitution.
+    pub mpeg4: bool,
 }
 
 impl Header {
@@ -80,7 +83,18 @@ impl Header {
         // The copyright identification is not offered (see below).
         // adts_fixed_header()
         w.write(0xFFF, 12); // syncword
-        w.write(1, 1); // ID: "set to '1'" (clause 8.1.3.2.2)
+        // ID: "set to '1'" (clause 8.1.3.2.2), "if the audio data in the
+        // ADTS stream is MPEG-2 AAC", and "'0' if the audio data is MPEG-4"
+        // (ISO/IEC 14496-3, clause 1.A.4.3).
+        //
+        // Spec reading: ISO/IEC 13818-7 defines ADTS for MPEG-2 AAC alone,
+        // and its `ID` is always 1. The meaning of 0 is given only in Annex
+        // 1.A of ISO/IEC 14496-3, which is informative; it is followed for
+        // a stream that uses perceptual noise substitution, a tool of
+        // MPEG-4 alone, whose codebook ISO/IEC 13818-7 reserves (Table 59).
+        // The `profile` that follows, `profile_ObjectType` where `ID` is 0,
+        // is the same: the object type of AAC LC, 2, less 1.
+        w.write(u32::from(!self.mpeg4), 1);
         w.write(0b00, 2); // layer: "Set to '00'"
         w.write_bool(!self.protected); // protection_absent
         w.write(LOW_COMPLEXITY, 2); // profile
@@ -157,6 +171,7 @@ mod tests {
             channel_configuration: configuration,
             flags: Flags::default(),
             protected: true,
+            mpeg4: false,
         };
         let block = raw_data_block::write(configuration, std::slice::from_ref(element), &[], len);
         let mut w = BitWriter::new();
@@ -171,6 +186,7 @@ mod tests {
             channel_configuration: ChannelConfiguration::Mono,
             flags: Flags::default(),
             protected: true,
+            mpeg4: false,
         };
         assert_eq!(header.bytes(), 9);
         let mut w = BitWriter::new();
@@ -257,6 +273,7 @@ mod tests {
                 framing: Framing::Adts,
                 flags: Flags::default(),
                 crc_protected: true,
+                noise_substitution: false,
             };
             let channels = vec![input.as_slice(); channel_configuration.channels()];
             let mut stream = Vec::new();
@@ -306,6 +323,7 @@ mod tests {
             channel_configuration: ChannelConfiguration::Stereo,
             flags: Flags::default(),
             protected: false,
+            mpeg4: false,
         };
         let mut w = BitWriter::new();
         header.write(&mut w, 0x1ABC, 0x123);
@@ -343,6 +361,7 @@ mod tests {
                 channel_configuration: ChannelConfiguration::Mono,
                 flags,
                 protected: false,
+                mpeg4: false,
             };
             let mut w = BitWriter::new();
             header.write(&mut w, HEADER_LEN, 0);
@@ -425,6 +444,7 @@ mod tests {
             framing: Framing::Adts,
             flags: Flags::default(),
             crc_protected: true,
+            noise_substitution: false,
         };
         let mut stream = Vec::new();
         let mut encoder = StreamEncoder::new(config);

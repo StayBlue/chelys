@@ -65,6 +65,7 @@ mod config;
 mod encoder;
 mod filterbank;
 mod loops;
+mod noise_substitution;
 mod noiseless;
 mod psychoacoustic;
 mod raw_data_block;
@@ -105,6 +106,7 @@ pub mod internals {
         channel_configuration,
         filterbank,
         loops,
+        noise_substitution,
         noiseless,
         psychoacoustic,
         raw_data_block,

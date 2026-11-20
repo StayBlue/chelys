@@ -51,6 +51,7 @@ fn channel(fs: SamplingFrequency, pulses: Pulses, lines: [i32; FRAME_LINES]) -> 
         sections: Sections::choose(&sent, bands, max_sfb).expect("codable lines"),
         scalefactors: vec![200; max_sfb],
         positions: Vec::new(),
+        noise_energies: Vec::new(),
     };
     CodedChannel::new(
         Windows::LONG_SINE,
@@ -261,6 +262,7 @@ fn ffmpeg_decodes_streams_coded_with_spectrum_clipping() {
             framing: Framing::Adts,
             flags: Default::default(),
             crc_protected: false,
+            noise_substitution: false,
         };
         let encode = |on: bool| {
             let mut encoder = StreamEncoder::new(config).spectrum_clipping(on);

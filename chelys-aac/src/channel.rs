@@ -37,22 +37,28 @@ const FIXED_BITS: u32 = 8 + 1;
 /// `faad_decodes_silence_at_every_sample_rate`.
 const SILENT_GLOBAL_GAIN: u8 = 0;
 
-/// A window group as a channel codes it: its sections, and the scalefactor
-/// and intensity stereo position of each of its bands below `max_sfb`, of
-/// which those of bands that send none are not used (see
-/// [`scalefactors`]); a group without bands in intensity stereo may have
-/// no positions.
+/// A window group as a channel codes it: its sections, and the
+/// scalefactor, intensity stereo position and noise energy of each of its
+/// bands below `max_sfb`, of which those of bands that send none are not
+/// used (see [`scalefactors`]); a group without bands in intensity stereo
+/// may have no positions, and one without bands of noise no energies.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CodedGroup {
     pub sections: Sections,
     pub scalefactors: Vec<u8>,
     pub positions: Vec<i8>,
+    pub noise_energies: Vec<i16>,
 }
 
 impl CodedGroup {
     /// What `scale_factor_data()` sends of the group.
     pub fn scalefactor_data(&self) -> scalefactors::Group<'_> {
-        (&self.sections, &self.scalefactors, &self.positions)
+        scalefactors::Group {
+            sections: &self.sections,
+            scalefactors: &self.scalefactors,
+            positions: &self.positions,
+            noise_energies: &self.noise_energies,
+        }
     }
 }
 
@@ -82,7 +88,8 @@ impl CodedChannel {
     /// `windows`, shaped by the filters of `tns`, with the lines of
     /// `pulses` clipped, each group with its sections chosen for its lines
     /// and its scalefactors; or `None` if a difference of scalefactors has
-    /// no codeword (see [`scalefactors::bits`]).
+    /// no codeword, or the first noise energy no value (see
+    /// [`scalefactors::bits`]).
     ///
     /// # Panics
     ///
@@ -155,6 +162,7 @@ impl CodedChannel {
                     .expect("zeros are codable"),
                 scalefactors: Vec::new(),
                 positions: Vec::new(),
+                noise_energies: Vec::new(),
             })
             .collect();
         Self::new(
@@ -335,6 +343,7 @@ mod tests {
             sections,
             scalefactors: vec![120, 118, 121],
             positions: Vec::new(),
+            noise_energies: Vec::new(),
         };
         let sf_bits = scalefactors::bits(120, [group.scalefactor_data()]).unwrap();
         let channel = CodedChannel::new(
@@ -393,6 +402,7 @@ mod tests {
             sections,
             scalefactors: vec![200],
             positions: Vec::new(),
+            noise_energies: Vec::new(),
         };
         assert_eq!(
             CodedChannel::new(

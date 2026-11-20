@@ -25,9 +25,11 @@ pub(super) const ESC_FLAG: u32 = 16;
 
 /// A section's codebook, `sect_cb` (Table 17): `ZERO_HCB`, for a section
 /// whose lines are all zero and send nothing; one of the spectrum Huffman
-/// codebooks 1 to `ESC_HCB` (Table 59); or, in the right channel of a pair
+/// codebooks 1 to `ESC_HCB` (Table 59); in the right channel of a pair
 /// that shares its window, one of the intensity codebooks, which code no
-/// spectrum but the band's intensity stereo position (clause 12.2.3).
+/// spectrum but the band's intensity stereo position (clause 12.2.3); or
+/// `NOISE_HCB`, which codes no spectrum but the energy of the noise the
+/// decoder puts in the band's place (ISO/IEC 14496-3, clause 4.6.13).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Codebook(u8);
 
@@ -36,6 +38,9 @@ impl Codebook {
     pub const ZERO: Self = Self(0);
     /// `ESC_HCB`.
     pub const ESC: Self = Self(11);
+    /// `NOISE_HCB`: perceptual noise substitution (ISO/IEC 14496-3, clause
+    /// 4.6.13.3), which ISO/IEC 13818-7 reserves (Table 59).
+    pub const NOISE: Self = Self(13);
     /// `INTENSITY_HCB2`: intensity stereo out of phase.
     pub const INTENSITY_OUT_OF_PHASE: Self = Self(14);
     /// `INTENSITY_HCB`: intensity stereo in phase.
@@ -56,7 +61,19 @@ impl Codebook {
     /// Whether the bands of a section with this codebook send a scalefactor
     /// (Table 18): those of a spectrum codebook.
     pub fn sends_scalefactor(self) -> bool {
-        self != Self::ZERO && !self.is_intensity()
+        self.spectrum().is_some()
+    }
+
+    /// Whether this is a codebook that codes no lines, but something in
+    /// their place: an intensity codebook or `NOISE_HCB`.
+    pub fn is_pseudo(self) -> bool {
+        self.is_intensity() || self.is_noise()
+    }
+
+    /// Whether this is `NOISE_HCB`, whose bands send a noise energy in
+    /// place of a scalefactor (ISO/IEC 14496-3, Table 4.55).
+    pub fn is_noise(self) -> bool {
+        self == Self::NOISE
     }
 
     /// Whether this is an intensity codebook, whose bands send an intensity
@@ -73,8 +90,8 @@ impl Codebook {
             .map_or(0, SpectrumCodebook::largest_magnitude)
     }
 
-    /// The spectrum Huffman codebook, or `None` for `ZERO_HCB` and the
-    /// intensity codebooks.
+    /// The spectrum Huffman codebook, or `None` for `ZERO_HCB`, `NOISE_HCB`
+    /// and the intensity codebooks.
     pub(super) fn spectrum(self) -> Option<&'static SpectrumCodebook> {
         usize::from(self.0)
             .checked_sub(1)

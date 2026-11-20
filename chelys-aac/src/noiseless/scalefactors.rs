@@ -8,11 +8,15 @@
 //! and among them, in the bands coded in intensity stereo, the intensity
 //! stereo position of each, as its difference from the position sent
 //! before it, or from 0 for the first (clause 12.2.3), in the same
-//! codebook.
+//! codebook; and in the bands coded by perceptual noise substitution, the
+//! noise energy of each, as its difference from the energy sent before it
+//! in the same codebook, but for the first, sent in 9 bits from
+//! `global_gain` (ISO/IEC 14496-3, clause 4.6.13.3 and Table 4.55).
 //!
-//! The scalefactors and positions of a group are given for its bands
-//! `0..max_sfb`, of which those of bands that send none are not used; a
-//! group without bands in intensity stereo may give no positions.
+//! The scalefactors, positions and noise energies of a group are given for
+//! its bands `0..max_sfb`, of which those of bands that send none are not
+//! used; a group without bands in intensity stereo may give no positions,
+//! and one without bands of noise no energies.
 //!
 //! Spec gap: a band of zeros in a section with a spectrum codebook sends a
 //! scalefactor (Table 18), which scales nothing, and the standard leaves
@@ -24,7 +28,7 @@
 use chelys_core::bitstream::BitWriter;
 
 use super::codebooks::{Codeword, SCALEFACTOR_CODEWORDS};
-use super::sections::Sections;
+use super::sections::{BandValue, Sections};
 
 /// `index_offset` (Table 58): a difference of scalefactors is its codeword
 /// index plus this.
@@ -46,22 +50,69 @@ fn codeword(difference: i32) -> Option<Codeword> {
 /// costs in a section with a spectrum codebook.
 pub(super) const REPEATED_BITS: u32 = SCALEFACTOR_CODEWORDS[(0 - INDEX_OFFSET) as usize].len;
 
-/// A window group as `scale_factor_data()` sends it: its sections, its
-/// scalefactors and its intensity stereo positions.
-pub type Group<'a> = (&'a Sections, &'a [u8], &'a [i8]);
+/// `NOISE_OFFSET` (ISO/IEC 14496-3, clause 4.6.13.3).
+const NOISE_OFFSET: i32 = 90;
+
+/// The bits of the first noise energy sent, `dpcm_noise_nrg` where
+/// `noise_pcm_flag` is set (ISO/IEC 14496-3, Table 4.55).
+const NOISE_PCM_BITS: u32 = 9;
+
+/// The noise energy from which the first one sent is counted, less
+/// `global_gain`: the decoder starts its noise energies at `global_gain -
+/// NOISE_OFFSET - 256` and adds the first one sent, unsigned (ISO/IEC
+/// 14496-3, clause 4.6.13.3).
+const NOISE_PCM_START: i32 = -NOISE_OFFSET - 256;
+
+/// The `global_gain` of a channel that sends no scalefactor, whose first
+/// noise energy sent is `energy`: the one that sends it in the middle of
+/// the range of its 9 bits.
+///
+/// Spec gap: a channel whose bands send no scalefactor leaves `global_gain`
+/// to the encoder, as the start of its noise energies alone (ISO/IEC
+/// 14496-3, clause 4.6.13.3).
+pub fn noise_global_gain(energy: i16) -> u8 {
+    let centred = i32::from(energy) - NOISE_PCM_START - (1 << (NOISE_PCM_BITS - 1));
+    centred.clamp(0, 255) as u8
+}
+
+/// A window group as `scale_factor_data()` sends it: its sections, and the
+/// scalefactors, intensity stereo positions and noise energies of its
+/// bands.
+#[derive(Clone, Copy, Debug)]
+pub struct Group<'a> {
+    pub sections: &'a Sections,
+    pub scalefactors: &'a [u8],
+    pub positions: &'a [i8],
+    /// `noise_nrg[g][sfb]`: each band's noise energy, in steps of 1.5 dB
+    /// (ISO/IEC 14496-3, clause 4.6.13.3).
+    pub noise_energies: &'a [i16],
+}
+
+/// A field of `scale_factor_data()`.
+#[derive(Clone, Copy)]
+enum Field {
+    /// A difference in the scalefactor codebook.
+    Difference(i32),
+    /// The first noise energy, in [`NOISE_PCM_BITS`].
+    NoisePcm(u32),
+}
 
 /// The bits of `scale_factor_data()` for the window groups `groups`, each
-/// with its sections, scalefactors and positions, from `global_gain`; or
-/// `None` if a difference falls outside the codebook's range.
+/// with its sections, scalefactors, positions and noise energies, from
+/// `global_gain`; or `None` if a difference falls outside the codebook's
+/// range, or the first noise energy outside the range of its 9 bits.
 ///
 /// # Panics
 ///
-/// If a group has fewer scalefactors, or positions where it sends any,
-/// than its sections span bands: a caller's error.
+/// If a group has fewer scalefactors, or positions or noise energies where
+/// it sends any, than its sections span bands: a caller's error.
 pub fn bits<'a>(global_gain: u8, groups: impl IntoIterator<Item = Group<'a>>) -> Option<u32> {
     let mut bits = 0;
-    for_each_difference(global_gain, groups, |difference| {
-        bits += codeword(difference)?.len;
+    for_each_field(global_gain, groups, |field| {
+        bits += match field {
+            Field::Difference(difference) => codeword(difference)?.len,
+            Field::NoisePcm(_) => NOISE_PCM_BITS,
+        };
         Some(())
     })?;
     Some(bits)
@@ -83,39 +134,67 @@ pub fn write<'a>(
         bits(global_gain, groups.clone()).is_some(),
         "a difference of scalefactors has no codeword"
     );
-    for_each_difference(global_gain, groups, |difference| {
-        let codeword = codeword(difference)?;
-        w.write(codeword.bits, codeword.len);
+    for_each_field(global_gain, groups, |field| {
+        match field {
+            Field::Difference(difference) => {
+                let codeword = codeword(difference)?;
+                w.write(codeword.bits, codeword.len);
+            }
+            Field::NoisePcm(value) => w.write(value, NOISE_PCM_BITS),
+        }
         Some(())
     })
     .expect("differences with codewords");
 }
 
-/// Calls `f` with each difference sent, from the running scalefactor that
-/// starts at `global_gain` (clause 11.3.2) and the running position that
-/// starts at 0 (clause 12.2.3), until it returns `None`.
-fn for_each_difference<'a>(
+/// Calls `f` with each field sent, from the running scalefactor that
+/// starts at `global_gain` (clause 11.3.2), the running position that
+/// starts at 0 (clause 12.2.3) and the running noise energy that starts at
+/// `global_gain - NOISE_OFFSET - 256` (ISO/IEC 14496-3, clause 4.6.13.3),
+/// until it returns `None`; or returns `None` itself where the first noise
+/// energy lies beyond the reach of its 9 bits.
+fn for_each_field<'a>(
     global_gain: u8,
     groups: impl IntoIterator<Item = Group<'a>>,
-    mut f: impl FnMut(i32) -> Option<()>,
+    mut f: impl FnMut(Field) -> Option<()>,
 ) -> Option<()> {
     let mut last = global_gain;
     let mut last_position = 0;
-    for (sections, scalefactors, positions) in groups {
-        for (sfb, position) in sections.bands_with_scalefactors_or_positions() {
-            let difference = if position {
-                let position = i32::from(positions[sfb]);
-                let difference = position - last_position;
-                last_position = position;
-                difference
-            } else if sections.is_zero_band(sfb) {
-                0
-            } else {
-                let difference = i32::from(scalefactors[sfb]) - i32::from(last);
-                last = scalefactors[sfb];
-                difference
+    let mut last_noise: Option<i32> = None;
+    for group in groups {
+        let sections = group.sections;
+        for (sfb, value) in sections.bands_with_values() {
+            let field = match value {
+                BandValue::Position => {
+                    let position = i32::from(group.positions[sfb]);
+                    let difference = position - last_position;
+                    last_position = position;
+                    Field::Difference(difference)
+                }
+                BandValue::NoiseEnergy => {
+                    let energy = i32::from(group.noise_energies[sfb]);
+                    let field = match last_noise {
+                        Some(last) => Field::Difference(energy - last),
+                        None => {
+                            let start = i32::from(global_gain) + NOISE_PCM_START;
+                            let value = u32::try_from(energy - start).ok()?;
+                            if value >= 1 << NOISE_PCM_BITS {
+                                return None;
+                            }
+                            Field::NoisePcm(value)
+                        }
+                    };
+                    last_noise = Some(energy);
+                    field
+                }
+                BandValue::Scalefactor if sections.is_zero_band(sfb) => Field::Difference(0),
+                BandValue::Scalefactor => {
+                    let difference = i32::from(group.scalefactors[sfb]) - i32::from(last);
+                    last = group.scalefactors[sfb];
+                    Field::Difference(difference)
+                }
             };
-            f(difference)?;
+            f(field)?;
         }
     }
     Some(())
@@ -124,7 +203,8 @@ fn for_each_difference<'a>(
 #[cfg(test)]
 mod tests {
     use super::super::codebooks::Codebook;
-    use super::super::decoder::{BitReader, Noise, scale_factor_data, section_data};
+    use super::super::decoder::{BitReader, Noise, Running, scale_factor_data, section_data};
+    use super::super::sections::PseudoBands;
     use super::*;
     use crate::sampling_frequency::SamplingFrequency;
     use crate::scalefactor_bands::GroupBands;
@@ -145,7 +225,7 @@ mod tests {
     /// Writes the sections and scalefactors of each group, then decodes
     /// them, checking the bits counted and the scalefactors decoded.
     fn round_trip(global_gain: u8, groups: &[(Sections, Vec<u8>)]) {
-        let groups_ref = || groups.iter().map(|(s, sf)| (s, sf.as_slice(), &[][..]));
+        let groups_ref = || groups.iter().map(|(s, sf)| group(s, sf));
         let mut w = BitWriter::new();
         let mut counted = 0;
         for (sections, _) in groups {
@@ -162,10 +242,10 @@ mod tests {
                 section_data(&mut r, sections.bands().transform(), sections.max_sfb())
             })
             .collect();
-        let mut last_sf = i32::from(global_gain);
+        let mut running = Running::new(i32::from(global_gain));
         let mut expected_last = i32::from(global_gain);
         for ((sections, scalefactors), decoded) in groups.iter().zip(&decoded) {
-            let sf = scale_factor_data(&mut r, decoded, &mut last_sf, &mut 0, false);
+            let sf = scale_factor_data(&mut r, decoded, &mut running, false, false);
             for (sfb, &sf) in sf.iter().enumerate() {
                 let codebook = (sections.iter())
                     .find(|s| (s.start..s.end).contains(&sfb))
@@ -218,6 +298,17 @@ mod tests {
         }
     }
 
+    /// A group of `sections` and `scalefactors`, without positions or noise
+    /// energies.
+    fn group<'a>(sections: &'a Sections, scalefactors: &'a [u8]) -> Group<'a> {
+        Group {
+            sections,
+            scalefactors,
+            positions: &[],
+            noise_energies: &[],
+        }
+    }
+
     fn two_bands_of_ones() -> Sections {
         let mut lines = vec![0; 1024];
         lines[0] = 1;
@@ -230,10 +321,10 @@ mod tests {
         let sections = two_bands_of_ones();
         let sixty = codeword(60).unwrap().len;
         assert_eq!(
-            bits(100, [(&sections, &[160, 220][..], &[][..])]),
+            bits(100, [group(&sections, &[160, 220][..])]),
             Some(2 * sixty)
         );
-        assert_eq!(bits(100, [(&sections, &[161, 161][..], &[][..])]), None);
+        assert_eq!(bits(100, [group(&sections, &[161, 161][..])]), None);
     }
 
     #[test]
@@ -242,7 +333,7 @@ mod tests {
         let sections = two_bands_of_ones();
         write(
             100,
-            [(&sections, &[161, 161][..], &[][..])],
+            [group(&sections, &[161, 161][..])],
             &mut BitWriter::new(),
         );
     }
@@ -251,21 +342,122 @@ mod tests {
     #[test]
     fn bits_counted_are_the_bits_written() {
         let sections = two_bands_of_ones();
-        let groups = [(&sections, &[220, 180][..], &[][..])];
+        let groups = [group(&sections, &[220, 180][..])];
         let counted = bits(240, groups).unwrap();
         let mut w = BitWriter::new();
         write(240, groups, &mut w);
         assert_eq!(w.bit_len() as u32, counted);
         let bytes = w.into_bytes();
         let decoded = [(1, 0, 2)];
-        let mut last_sf = 240;
         let sf = scale_factor_data(
             &mut BitReader::new(&bytes),
             &decoded,
-            &mut last_sf,
-            &mut 0,
+            &mut Running::new(240),
+            false,
             false,
         );
         assert_eq!(sf, [220, 180]);
+    }
+
+    /// Sections of a long window at 48 kHz whose bands 0 and 4 have a line
+    /// of 1 each, and bands 2, 3 and 6 noise.
+    fn sections_with_noise() -> Sections {
+        let mut lines = vec![0; 1024];
+        lines[0] = 1;
+        lines[16] = 1;
+        let mut pseudo = PseudoBands::NONE;
+        for sfb in [2, 3, 6] {
+            pseudo.set(sfb, Some(Codebook::NOISE));
+        }
+        let bands = GroupBands::long(SamplingFrequency::Hz48000);
+        Sections::count_with_pseudo(&lines, bands, 7, pseudo)
+            .unwrap()
+            .choose()
+    }
+
+    #[test]
+    fn noise_energies_follow_their_first_sent_in_9_bits() {
+        let sections = sections_with_noise();
+        assert_eq!(
+            (sections.iter())
+                .map(|s| (s.codebook.number(), s.start, s.end))
+                .filter(|&(cb, _, _)| cb == 13)
+                .collect::<Vec<_>>(),
+            [(13, 2, 4), (13, 6, 7)]
+        );
+        // From global_gain 100, the energies start at 100 - 90 - 256 =
+        // -246, so 30 is sent as 276.
+        let scalefactors = [100, 0, 0, 0, 104, 0, 0];
+        let energies = [0, 0, 30, 20, 0, 0, 79];
+        let group = Group {
+            sections: &sections,
+            scalefactors: &scalefactors,
+            positions: &[],
+            noise_energies: &energies,
+        };
+        let counted = bits(100, [group]).unwrap();
+        let mut w = BitWriter::new();
+        write(100, [group], &mut w);
+        assert_eq!(w.bit_len() as u32, counted);
+        // Scalefactors 0 and +4, the first energy in 9 bits, then -10 and
+        // +59, and a difference of 0 for each band of zeros in a section
+        // with a spectrum codebook.
+        let codewords = [0, 4, -10, 59].map(|d| codeword(d).unwrap().len);
+        let repeated = (sections.bands_with_scalefactors())
+            .filter(|&sfb| sections.is_zero_band(sfb))
+            .count() as u32;
+        assert_eq!(
+            counted,
+            codewords.iter().sum::<u32>() + 9 + repeated * REPEATED_BITS
+        );
+        let bytes = w.into_bytes();
+        let decoded: Vec<_> = (sections.iter())
+            .map(|s| (s.codebook.number(), s.start, s.end))
+            .collect();
+        let values = scale_factor_data(
+            &mut BitReader::new(&bytes),
+            &decoded,
+            &mut Running::new(100),
+            false,
+            true,
+        );
+        // A band of zeros repeats the scalefactor before it, or has 0.
+        let zero = |sfb: usize, before: i32| {
+            if sections.bands_with_scalefactors().any(|b| b == sfb) {
+                before
+            } else {
+                0
+            }
+        };
+        assert_eq!(values, [100, zero(1, 100), 30, 20, 104, zero(5, 104), 79]);
+    }
+
+    #[test]
+    fn a_first_noise_energy_beyond_9_bits_is_counted_as_none() {
+        let sections = sections_with_noise();
+        let scalefactors = [100, 0, 0, 0, 100, 0, 0];
+        let group = |first: i16| {
+            let energies = [0, 0, first, first, 0, 0, first];
+            bits(
+                100,
+                [Group {
+                    sections: &sections,
+                    scalefactors: &scalefactors,
+                    positions: &[],
+                    noise_energies: &energies,
+                }],
+            )
+        };
+        // 0 to 511 from -246.
+        assert!(group(-246).is_some() && group(265).is_some());
+        assert_eq!(group(-247), None);
+        assert_eq!(group(266), None);
+    }
+
+    #[test]
+    fn a_global_gain_for_noise_alone_sends_it_mid_range() {
+        assert_eq!(noise_global_gain(30), 120);
+        assert_eq!(noise_global_gain(-400), 0);
+        assert_eq!(noise_global_gain(400), 255);
     }
 }

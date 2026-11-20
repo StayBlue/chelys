@@ -13,6 +13,7 @@ use super::audio_specific_config::audio_specific_config;
 use super::channel::CodedChannel;
 use super::channel_configuration::{ChannelConfiguration, ElementKind};
 use super::config::Framing;
+use super::noise_substitution;
 use super::raw_data_block;
 use super::raw_data_block::data_stream::{self, DataStreamQueue};
 use super::raw_data_block::element::CodedElement;
@@ -53,6 +54,46 @@ pub const FRAME_SAMPLES: usize = 1024;
 /// untested.
 pub const INTENSITY_BITS_PER_SAMPLE: f64 = 0.75;
 
+/// The most bits for each sample of each channel at which channels are
+/// coded by perceptual noise substitution, where the stream codes them so
+/// (see [`noise_substitution::noise_like`]).
+///
+/// Spec gap: Annex 4.B.11 of ISO/IEC 14496-3 does not say when. Perceptual
+/// noise substitution gives up a band's waveform for the bits it saves,
+/// which pays only where bits are few. Graded as for the limits of
+/// [`noise_substitution::noise_like`] (PEAQ, black box, with the encoder's
+/// bandwidth cut alike with and without it, at 10, 13, 14 and 15 kHz at
+/// 64, 96, 112 and 128 kbit/s), the 10 excerpts on which they were chosen
+/// gained 0.226 at 112 kbit/s, 9 of them, and lost 0.129 at 128 kbit/s,
+/// all but one; 10 others, of other tracks of the same albums, gained
+/// 0.300, 0.477 and 0.253 at 64, 96 and 112 kbit/s, every one at each.
+/// The limit lies between 112 and 128 kbit/s, 1.27 and 1.45 bits a
+/// sample, set per sample as for [`INTENSITY_BITS_PER_SAMPLE`], untested
+/// at other sampling frequencies.
+///
+/// With the bandwidth uncut, PEAQ grades it far higher, as it fills with
+/// noise the treble that is otherwise lost, which PEAQ's measures of
+/// bandwidth weigh heavily: the 10 other excerpts graded -2.117, -0.960 and
+/// -0.805 at 64, 96 and 112 kbit/s, against -3.564, -2.451 and -1.615
+/// without it, their bandwidth 20.7 to 20.9 kHz against 12.3, 15.0 and
+/// 15.9 kHz. That gain is not counted here: on the excerpts whose measures
+/// were examined, PEAQ's measures of noise grew with it.
+///
+/// Of 5 synthetic signals of 15 s, with the bandwidth uncut, its tonal
+/// ones lost 0.15 at most at 64, 96 and 112 kbit/s: the chord of
+/// [`noise_substitution::FLATNESS_LIMIT`], a harpsichord of plucked
+/// harmonic notes and castanets of clicks; its noise-like ones gained,
+/// cymbals of decaying noise by 0.82, 2.78 and 2.84, and sibilants of
+/// noise bursts over a tone by 0.61, 0.95 and 0.31.
+///
+/// The grade at 128 kbit/s, and those that chose the limits of
+/// [`noise_substitution::noise_like`], were taken while a pair's noise
+/// that is to be the same in both channels was sent with `ms_used`, which
+/// ffmpeg, which decoded them, takes as noise of each channel's own (see
+/// `ElementEncoder::noise_substitution`); sent in intensity stereo, as it
+/// is, the music's grades moved by 0.02 at most.
+pub const NOISE_BITS_PER_SAMPLE: f64 = 1.3;
+
 /// What the stream is: what its headers say, its rate and its framing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StreamConfig {
@@ -65,6 +106,10 @@ pub struct StreamConfig {
     /// Whether each ADTS frame has an `adts_error_check()`; raw frames
     /// have none.
     pub crc_protected: bool,
+    /// Whether channels are coded by perceptual noise substitution, at
+    /// rates of up to [`NOISE_BITS_PER_SAMPLE`], which makes the stream
+    /// MPEG-4 AAC (see [`noise_substitution::noise_like`]).
+    pub noise_substitution: bool,
 }
 
 impl StreamConfig {
@@ -75,6 +120,7 @@ impl StreamConfig {
             channel_configuration: self.channel_configuration,
             flags: self.flags,
             protected: self.crc_protected,
+            mpeg4: self.noise_border().is_some(),
         })
     }
 
@@ -189,10 +235,23 @@ impl StreamConfig {
     /// the stream has at most [`INTENSITY_BITS_PER_SAMPLE`] bits for each
     /// sample of each channel of the NCC.
     fn intensity_border(&self) -> Option<f64> {
+        (self.bits_per_sample() <= INTENSITY_BITS_PER_SAMPLE).then_some(intensity::BORDER_HZ)
+    }
+
+    /// The lower border frequency above which channels are coded by
+    /// perceptual noise substitution, if they are: Annex 4.B.11's (see
+    /// [`noise_substitution::BORDER_HZ`]), where the stream codes them so
+    /// and has at most [`NOISE_BITS_PER_SAMPLE`] bits for each sample of
+    /// each channel of the NCC.
+    fn noise_border(&self) -> Option<f64> {
+        (self.noise_substitution && self.bits_per_sample() <= NOISE_BITS_PER_SAMPLE)
+            .then_some(noise_substitution::BORDER_HZ)
+    }
+
+    /// The bits for each sample of each channel of the NCC.
+    fn bits_per_sample(&self) -> f64 {
         let ncc = self.channel_configuration.ncc() as f64;
-        let bits_per_sample =
-            f64::from(self.bits_per_second) / (ncc * f64::from(self.sampling_frequency.hz()));
-        (bits_per_sample <= INTENSITY_BITS_PER_SAMPLE).then_some(intensity::BORDER_HZ)
+        f64::from(self.bits_per_second) / (ncc * f64::from(self.sampling_frequency.hz()))
     }
 
     /// Whether every frame of a stream so configured can be written.
@@ -277,7 +336,12 @@ impl StreamEncoder {
             .unwrap_or_else(|| panic!("a stream that cannot be written: {config:?}"));
         let elements = (config.channel_configuration.elements().iter())
             .map(|&kind| {
-                ElementEncoder::new(config.sampling_frequency, kind, config.intensity_border())
+                ElementEncoder::new(
+                    config.sampling_frequency,
+                    kind,
+                    config.intensity_border(),
+                    config.noise_border(),
+                )
             })
             .collect();
         Self {
@@ -344,6 +408,19 @@ impl StreamEncoder {
     pub fn spectrum_clipping(mut self, on: bool) -> Self {
         for element in &mut self.elements {
             element.spectrum_clipping(on);
+        }
+        self
+    }
+
+    /// The encoder, but with the noise of a pair's bands that is to be the
+    /// same in both channels sent as noise in both, with `ms_used` set, as
+    /// clause 4.6.13.3 of ISO/IEC 14496-3 has it, rather than in intensity
+    /// stereo in the right channel, for comparing the two in tests (see
+    /// `ElementEncoder::noise_substitution`).
+    #[cfg(any(test, feature = "unstable"))]
+    pub fn noise_shared_by_ms_used(mut self) -> Self {
+        for element in &mut self.elements {
+            element.noise_shared_by_ms_used();
         }
         self
     }
@@ -587,6 +664,7 @@ mod tests {
             framing,
             flags: Flags::default(),
             crc_protected: false,
+            noise_substitution: false,
         }
     }
 
@@ -661,6 +739,7 @@ mod tests {
                         framing,
                         flags: Flags::default(),
                         crc_protected,
+                        noise_substitution: false,
                     };
                     let (min, max) = (config.min_bits_per_second(), config.max_bits_per_second());
                     for bits_per_second in [min - 1, min, max, max + 1] {
@@ -799,6 +878,7 @@ mod tests {
             framing: Framing::Adts,
             flags: Flags::default(),
             crc_protected: false,
+            noise_substitution: false,
         };
         let min = config.min_bits_per_second();
         let mut input = vec![0.0; 12 * FRAME_SAMPLES];
@@ -832,6 +912,7 @@ mod tests {
             framing: Framing::Adts,
             flags: Flags::default(),
             crc_protected: false,
+            noise_substitution: false,
         };
         // Silence, which takes the shortest frames and fills the
         // reservoir, then white noise, whose perceptual entropy asks for
@@ -926,6 +1007,7 @@ mod tests {
             framing: Framing::Adts,
             flags: Flags::default(),
             crc_protected: true,
+            noise_substitution: false,
         };
         let mut input = vec![0.0; 38 * FRAME_SAMPLES];
         let gap = 6 * FRAME_SAMPLES..6 * FRAME_SAMPLES + 600;
@@ -973,6 +1055,7 @@ mod tests {
             framing: Framing::Adts,
             flags: Flags::default(),
             crc_protected: true,
+            noise_substitution: false,
         };
         let mut encoder = StreamEncoder::new(config).with_data_stream(124);
         let data_bits = data_stream::bits(124);
@@ -1083,6 +1166,7 @@ mod tests {
                     framing: Framing::Adts,
                     flags: Flags::default(),
                     crc_protected: true,
+                    noise_substitution: false,
                 };
                 let min = config.min_bits_per_second();
                 assert_eq!(config.max_data_stream_bytes(), 0);
@@ -1162,6 +1246,7 @@ mod tests {
                 framing: Framing::Raw,
                 flags: Flags::default(),
                 crc_protected: false,
+                noise_substitution: false,
             };
             // Channel c a steady tone at the centre of line 40 + 37c, and a
             // low frequency enhancement channel, last, at line 5, among the
@@ -1238,6 +1323,7 @@ mod tests {
                 framing: Framing::Raw,
                 flags: Flags::default(),
                 crc_protected: false,
+                noise_substitution: false,
             };
             let mut input = noise(10 * FRAME_SAMPLES, 13);
             for (t, x) in input.iter_mut().enumerate() {
@@ -1306,6 +1392,7 @@ mod tests {
                 framing: Framing::Raw,
                 flags: Flags::default(),
                 crc_protected: false,
+                noise_substitution: false,
             };
             if bits_per_second == 0 {
                 config.bits_per_second = config.max_bits_per_second();
@@ -1360,6 +1447,7 @@ mod tests {
             framing: Framing::Adts,
             flags: Flags::default(),
             crc_protected: true,
+            noise_substitution: false,
         };
         let tone = |frequency: f64, amplitude: f64| -> Vec<f64> {
             (0..3 * 48_000)
@@ -1408,6 +1496,7 @@ mod tests {
                     framing: Framing::Adts,
                     flags: Flags::default(),
                     crc_protected,
+                    noise_substitution: false,
                 };
                 let max = config.max_bits_per_second();
                 let ncc = channel_configuration.ncc() as u64;
@@ -1457,6 +1546,7 @@ mod tests {
                     framing,
                     flags: Flags::default(),
                     crc_protected: false,
+                    noise_substitution: false,
                 };
                 if bits_per_second == 0 {
                     config.bits_per_second = StreamConfig {

@@ -11,6 +11,7 @@ pub mod outer;
 use inner::{Counting, Lines};
 
 use crate::channel::{CodedChannel, FRAME_LINES};
+use crate::noise_substitution::Noise;
 use crate::sampling_frequency::SamplingFrequency;
 use crate::scalefactor_bands::MAX_BANDS;
 use crate::stereo::intensity::Intensity;
@@ -90,6 +91,9 @@ pub struct ChannelCoding<'a> {
     /// For the right channel of a pair that shares its window, the bands it
     /// codes in intensity stereo, whose lines are to be zero.
     pub intensity: Option<&'a Intensity>,
+    /// The bands the channel codes by perceptual noise substitution, whose
+    /// lines are to be zero, with their noise energies.
+    pub noise: Option<&'a Noise>,
     /// The filters that shaped the channel's lines, which it sends.
     pub tns: &'a Tns,
     /// Whether the lines of a long window are clipped where that saves
@@ -115,6 +119,7 @@ impl<'a> ChannelCoding<'a> {
             least_max_sfb: 0,
             element_bits: [0; MAX_BANDS + 1],
             intensity: None,
+            noise: None,
             tns,
             spectrum_clipping: SPECTRUM_CLIPPING,
         }

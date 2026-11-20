@@ -18,6 +18,9 @@ use crate::sampling_frequency::SamplingFrequency;
 pub struct AdtsFrame<'a> {
     /// The 7 bytes of `adts_fixed_header()` and `adts_variable_header()`.
     pub header: &'a [u8],
+    /// `ID`: 1 for MPEG-2 AAC, 0 for MPEG-4 (ISO/IEC 14496-3, clause
+    /// 1.A.4.3).
+    pub id: u32,
     pub protection_absent: bool,
     pub profile: u32,
     pub sampling_frequency_index: u32,
@@ -40,7 +43,7 @@ pub fn adts_frame(stream: &[u8]) -> AdtsFrame<'_> {
     let mut r = BitReader::new(stream);
     // adts_fixed_header()
     assert_eq!(r.read(12), 0xFFF, "syncword");
-    assert_eq!(r.read(1), 1, "ID");
+    let id = r.read(1);
     assert_eq!(r.read(2), 0, "layer");
     let protection_absent = r.read(1) == 1;
     let profile = r.read(2);
@@ -60,6 +63,7 @@ pub fn adts_frame(stream: &[u8]) -> AdtsFrame<'_> {
     let start = r.position() / 8;
     AdtsFrame {
         header: &stream[..7],
+        id,
         protection_absent,
         profile,
         sampling_frequency_index,
@@ -113,8 +117,14 @@ pub struct Block {
 /// `single_channel_element()`s, `channel_pair_element()`s and
 /// `lfe_channel_element()`s, one at least,
 /// any `data_stream_element()`s and `fill_element()`s, and `ID_END`, then
-/// aligns to its byte (Table 12), which must be its last.
+/// aligns to its byte (Table 12), which must be its last: of MPEG-2 AAC.
 pub fn raw_data_block(block: &[u8], fs: SamplingFrequency) -> Block {
+    raw_data_block_of(block, fs, false)
+}
+
+/// [`raw_data_block`], of MPEG-4 AAC where `mpeg4`, whose channels may
+/// code bands by perceptual noise substitution.
+pub fn raw_data_block_of(block: &[u8], fs: SamplingFrequency, mpeg4: bool) -> Block {
     let mut r = BitReader::new(block);
     let mut elements = Vec::new();
     let mut data_streams = Vec::new();
@@ -125,7 +135,7 @@ pub fn raw_data_block(block: &[u8], fs: SamplingFrequency) -> Block {
         let start = r.position();
         match id {
             0 | 1 | 3 => {
-                let (element, second_channel_start) = element_after_id(&mut r, fs, id);
+                let (element, second_channel_start) = element_after_id(&mut r, fs, id, mpeg4);
                 elements.push(BlockElement {
                     id_syn_ele: id,
                     element,

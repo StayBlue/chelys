@@ -1,7 +1,7 @@
 // Copyright (c) 2026 StayBlue
 // SPDX-License-Identifier: MIT
 
-//! `chelys aac`: MPEG-2 AAC in the Low Complexity profile, in ADTS.
+//! `chelys aac`: AAC in the Low Complexity profile, in ADTS.
 
 use chelys::aac::{Config, ConfigError, Encoder, Rate};
 
@@ -10,11 +10,13 @@ use crate::{pcm, value};
 
 pub const USAGE: &str = "\
 usage: chelys aac --sample-rate HZ --channels N [--bitrate KBPS]
+                  [--noise-substitution]
                   [--crc] [--private-bit] [--original-copy] [--home]
                   < input.f32 > output.aac
 
-Reads interleaved 32-bit little-endian float PCM from stdin and writes MPEG-2
-AAC in the Low Complexity profile (AAC-LC) to stdout, each frame in ADTS.
+Reads interleaved 32-bit little-endian float PCM from stdin and writes AAC in
+the Low Complexity profile (AAC-LC) to stdout, each frame in ADTS: MPEG-2 AAC,
+or MPEG-4 AAC where --noise-substitution is used.
 
   --sample-rate HZ   96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050,
                      16000, 12000, 11025 or 8000
@@ -43,6 +45,14 @@ AAC in the Low Complexity profile (AAC-LC) to stdout, each frame in ADTS.
                      LFE in more: 192 in 3 channels, 320 in 5.1, 448 in
                      7.1; or the highest the sample rate and channels
                      allow where that is lower)
+  --noise-substitution
+                     code noise-like bands as the energy of noise that the
+                     decoder generates in their place, saving bits for the
+                     others, at up to 1.3 bits a sample of each channel but
+                     the LFE (about 115 in stereo at 44.1 kHz); a tool of
+                     MPEG-4 AAC, which makes the stream MPEG-4 AAC-LC where
+                     it is used, and which a decoder of MPEG-2 AAC alone may
+                     not decode (default: off)
   --crc              protect each frame's header and the start of its audio
                      with a CRC-16 check word, 16 bits a frame (default:
                      off)
@@ -66,6 +76,7 @@ pub struct Options {
     sample_rate: u32,
     channels: usize,
     kbps: u32,
+    noise_substitution: bool,
     crc: bool,
     private_bit: bool,
     original_copy: bool,
@@ -75,6 +86,7 @@ pub struct Options {
 impl Options {
     fn config(&self) -> Config {
         config(self.sample_rate, self.channels, self.kbps)
+            .noise_substitution(self.noise_substitution)
             .crc(self.crc)
             .private_bit(self.private_bit)
             .original_copy(self.original_copy)
@@ -92,6 +104,7 @@ fn config(sample_rate: u32, channels: usize, kbps: u32) -> Config {
 pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
     let (mut sample_rate, mut channels, mut bitrate) = (None, None, None);
     let (mut crc, mut private_bit, mut original_copy, mut home) = (false, false, false, false);
+    let mut noise_substitution = false;
     let mut args = args.into_iter();
     while let Some(flag) = args.next() {
         let args = &mut args;
@@ -99,6 +112,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> 
             "--sample-rate" => sample_rate = Some(value::<u32>(args, &flag)?),
             "--channels" => channels = Some(value::<u32>(args, &flag)?),
             "--bitrate" => bitrate = Some(value::<u32>(args, &flag)?),
+            "--noise-substitution" => noise_substitution = true,
             "--crc" => crc = true,
             "--private-bit" => private_bit = true,
             "--original-copy" => original_copy = true,
@@ -118,6 +132,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> 
         sample_rate,
         channels,
         kbps,
+        noise_substitution,
         crc,
         private_bit,
         original_copy,

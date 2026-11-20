@@ -330,6 +330,7 @@ fn temporal_noise_shaping_costs_a_sweep_little() {
             framing: chelys::aac::Framing::Adts,
             flags: Default::default(),
             crc_protected: false,
+            noise_substitution: false,
         };
         let snrs = |tns: bool| {
             let mut encoder = StreamEncoder::new(config);
@@ -733,6 +734,7 @@ fn short_windows_hold_back_the_noise_before_an_attack() {
         framing: chelys::aac::Framing::Adts,
         flags: Default::default(),
         crc_protected: false,
+        noise_substitution: false,
     };
     let len = 3 * sample_rate as usize;
     let (input, onsets) = castanets(sample_rate, len, 10_000, 20_000, 7);
@@ -1438,6 +1440,7 @@ fn temporal_noise_shaping_holds_back_the_noise_before_attacks() {
             framing: chelys::aac::Framing::Adts,
             flags: Default::default(),
             crc_protected: false,
+            noise_substitution: false,
         };
         let len = 3 * sample_rate as usize;
         for (name, input, onsets) in transients(sample_rate, len) {

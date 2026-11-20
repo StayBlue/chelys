@@ -15,6 +15,7 @@ use std::ops::Range;
 use intensity::Intensity;
 use middle_side::MsMask;
 
+use crate::noise_substitution::Noise;
 use crate::sampling_frequency::SamplingFrequency;
 use crate::scalefactor_bands::GroupBands;
 use crate::window::{SHORT_WINDOWS, Windows};
@@ -28,6 +29,10 @@ pub enum BandCoding {
     MidSide,
     /// In intensity stereo (clause 12.2), whatever its `ms_used` flag.
     Intensity,
+    /// By perceptual noise substitution in each channel coded (ISO/IEC
+    /// 14496-3, clause 4.6.13), whose `ms_used` flag says whether the noise
+    /// of a pair is the same in both channels.
+    Noise,
 }
 
 /// A scalefactor band of a window group, as [`bands`] gives it.
@@ -61,19 +66,22 @@ impl Band {
 }
 
 /// Each scalefactor band of each window group of `windows`, in the order
-/// they are sent, with how a pair codes it: in intensity stereo where
-/// `intensity` codes it, else as middle and side where `ms` sets its flag,
-/// else plain.
-pub fn bands(
+/// they are sent, with how a pair, or a single channel, codes it: in
+/// intensity stereo where `intensity` codes it, by perceptual noise
+/// substitution where `noise` does, else as middle and side where `ms`
+/// sets its flag, else plain.
+pub fn bands<'a>(
     windows: Windows,
     sampling_frequency: SamplingFrequency,
     ms: MsMask,
-    intensity: &Intensity,
-) -> Bands<'_> {
+    intensity: &'a Intensity,
+    noise: &'a Noise,
+) -> Bands<'a> {
     Bands {
         groups: windows.groups(sampling_frequency).enumerate(),
         ms,
         intensity,
+        noise,
         group: None,
         start: 0,
         first_window: 0,
@@ -86,6 +94,7 @@ pub struct Bands<'a> {
     groups: Enumerate<Take<array::IntoIter<GroupBands, SHORT_WINDOWS>>>,
     ms: MsMask,
     intensity: &'a Intensity,
+    noise: &'a Noise,
     /// The group whose bands are being given, `g` and its bands, if any.
     group: Option<(usize, GroupBands)>,
     /// The group's first line among the frame's.
@@ -108,6 +117,8 @@ impl Iterator for Bands<'_> {
                     let band = bands.band(sfb);
                     let coding = if self.intensity.bands[g].codebook(sfb).is_some() {
                         BandCoding::Intensity
+                    } else if self.noise.is_noise(g, sfb) {
+                        BandCoding::Noise
                     } else if self.ms.is_used(g, sfb) {
                         BandCoding::MidSide
                     } else {

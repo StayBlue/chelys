@@ -6,10 +6,12 @@
 //! takes scaled by its intensity stereo position.
 
 use crate::channel::FRAME_LINES;
+use crate::noise_substitution::Noise;
 use crate::noiseless::codebooks::Codebook;
-use crate::noiseless::sections::IntensityBands;
+use crate::noiseless::sections::PseudoBands;
 use crate::sampling_frequency::SamplingFrequency;
 use crate::scalefactor_bands::MAX_BANDS;
+use crate::stereo::BandCoding;
 use crate::stereo::middle_side::MsMask;
 use crate::window::{SHORT_WINDOWS, Windows};
 
@@ -18,16 +20,32 @@ use crate::window::{SHORT_WINDOWS, Windows};
 /// (clause 12.2.3).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Intensity {
-    pub bands: [IntensityBands; SHORT_WINDOWS],
+    pub bands: [PseudoBands; SHORT_WINDOWS],
     pub positions: [[i8; MAX_BANDS]; SHORT_WINDOWS],
 }
 
 impl Intensity {
     /// No band coded in intensity stereo.
     pub const NONE: Self = Self {
-        bands: [IntensityBands::NONE; SHORT_WINDOWS],
+        bands: [PseudoBands::NONE; SHORT_WINDOWS],
         positions: [[0; MAX_BANDS]; SHORT_WINDOWS],
     };
+
+    /// Codes the bands of `other` too, with their positions.
+    ///
+    /// # Panics
+    ///
+    /// If both code a band: a caller's error.
+    pub fn merge(&mut self, other: &Self) {
+        for g in 0..SHORT_WINDOWS {
+            self.bands[g] = self.bands[g].union(other.bands[g]);
+            for sfb in 0..MAX_BANDS {
+                if other.bands[g].codebook(sfb).is_some() {
+                    self.positions[g][sfb] = other.positions[g][sfb];
+                }
+            }
+        }
+    }
 
     /// The bands of each group below `max_sfb`, with their positions,
     /// which, all within [`MAX_POSITION`] of 0, need no change to stay
@@ -49,7 +67,8 @@ pub const MAX_POSITION: i8 = 30;
 /// most types of signals" (clause C.6.2).
 pub const BORDER_HZ: f64 = 6000.0;
 
-/// Codes the bands of each window group of `windows` from `first` up in
+/// Codes the bands of each window group of `windows` from `first` up, but
+/// those that `noise` codes by perceptual noise substitution, in
 /// intensity stereo as clause C.6.2 describes, in the pair's lines `left`
 /// and `right`, and the allowed distortion of their bands, `xmin`: puts the
 /// intensity signal in place of the left channel's lines and zeros in place
@@ -102,12 +121,19 @@ pub fn code(
     windows: Windows,
     sampling_frequency: SamplingFrequency,
     first: usize,
+    noise: &Noise,
     [left, right]: [&mut [f64; FRAME_LINES]; 2],
     [left_xmin, right_xmin]: [&mut [[f64; MAX_BANDS]]; 2],
 ) -> Intensity {
     let mut intensity = Intensity::NONE;
-    let bands = super::bands(windows, sampling_frequency, MsMask::NONE, &Intensity::NONE);
-    for band in bands.filter(|band| band.sfb >= first) {
+    let bands = super::bands(
+        windows,
+        sampling_frequency,
+        MsMask::NONE,
+        &Intensity::NONE,
+        noise,
+    );
+    for band in bands.filter(|band| band.sfb >= first && band.coding != BandCoding::Noise) {
         let (g, sfb) = (band.group, band.sfb);
         let (l, r) = (&mut left[band.lines.clone()], &mut right[band.lines]);
         let energy = |lines: &[f64]| lines.iter().map(|x| x * x).sum::<f64>();

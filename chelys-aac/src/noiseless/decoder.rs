@@ -3,10 +3,12 @@
 
 //! A decoder of the audio channel elements, written from the syntax of
 //! Tables 13 to 21 and from clauses 7.1.6, 8.3.5, 9.3, 10.3, 11.3, 12.1.3,
-//! 12.2.3 and 14.3 apart from the encoder, for tests to decode what it
-//! writes: the fields of a `single_channel_element()` or
-//! `channel_pair_element()`, and the spectra they reconstruct. It shares
-//! only the codebooks and the scalefactor band tables.
+//! 12.2.3 and 14.3, and for perceptual noise substitution from Table 4.55
+//! and clause 4.6.13.3 of ISO/IEC 14496-3, apart from the encoder, for
+//! tests to decode what it writes: the fields of a
+//! `single_channel_element()` or `channel_pair_element()`, and the spectra
+//! they reconstruct. It shares only the codebooks and the scalefactor band
+//! tables.
 
 use super::codebooks::{Codebook, Codeword, SCALEFACTOR_CODEWORDS};
 use super::tables;
@@ -85,28 +87,60 @@ pub fn section_data(
     sections
 }
 
-/// `ZERO_HCB`, `INTENSITY_HCB2` and `INTENSITY_HCB` (Table 59).
+/// `ZERO_HCB`, `NOISE_HCB`, `INTENSITY_HCB2` and `INTENSITY_HCB` (Table
+/// 59; ISO/IEC 14496-3, Table 4.169).
 const ZERO_HCB: u8 = 0;
+const NOISE_HCB: u8 = 13;
 const INTENSITY_HCB2: u8 = 14;
 const INTENSITY_HCB: u8 = 15;
 
+/// `NOISE_OFFSET` (ISO/IEC 14496-3, clause 4.6.13.3).
+const NOISE_OFFSET: i32 = 90;
+
+/// The running values of a channel's `scale_factor_data()` through its
+/// groups: the scalefactor, from `global_gain` (clause 11.3.2), the
+/// intensity stereo position, from 0 (clause 12.2.3), and the noise
+/// energy, from `global_gain - NOISE_OFFSET - 256`, whose first difference
+/// is sent in 9 bits, `noise_pcm_flag` (ISO/IEC 14496-3, Table 4.55 and
+/// clause 4.6.13.3).
+pub struct Running {
+    pub sf: i32,
+    pub is: i32,
+    pub noise: i32,
+    noise_pcm: bool,
+}
+
+impl Running {
+    pub fn new(global_gain: i32) -> Self {
+        Self {
+            sf: global_gain,
+            is: 0,
+            noise: global_gain - NOISE_OFFSET - 256,
+            noise_pcm: true,
+        }
+    }
+}
+
 /// The scalefactors `sf[g][sfb]` of one group (Table 18, clause 11.3.2),
-/// from `last_sf`, which they leave at the last one decoded; and in the
-/// bands of an intensity codebook, `is_position[g][sfb]` in their place,
-/// from `last_is`, likewise (clause 12.2.3), where the group is of the
-/// right channel of a pair that shares its window, which alone may take
-/// them, as `intensity` says. A band of `ZERO_HCB` has 0.
+/// from `running`, which they leave at the last one decoded; in the bands
+/// of an intensity codebook, `is_position[g][sfb]` in their place
+/// (clause 12.2.3), where the group is of the right channel of a pair that
+/// shares its window, which alone may take them, as `intensity` says; and
+/// in the bands of `NOISE_HCB`, `noise_nrg[g][sfb]` in their place
+/// (ISO/IEC 14496-3, clause 4.6.13.3), where `noise` allows them. A band
+/// of `ZERO_HCB` has 0.
 pub fn scale_factor_data(
     r: &mut BitReader,
     sections: &[(u8, usize, usize)],
-    last_sf: &mut i32,
-    last_is: &mut i32,
+    running: &mut Running,
     intensity: bool,
+    noise: bool,
 ) -> Vec<i32> {
     let mut sf = Vec::new();
     for &(sect_cb, start, end) in sections {
         let is_intensity = sect_cb == INTENSITY_HCB || sect_cb == INTENSITY_HCB2;
-        assert!(!matches!(sect_cb, 12 | 13), "a reserved codebook");
+        assert_ne!(sect_cb, 12, "a reserved codebook");
+        assert!(noise || sect_cb != NOISE_HCB, "NOISE_HCB in MPEG-2 AAC");
         assert!(
             intensity || !is_intensity,
             "intensity outside a pair's right channel"
@@ -116,15 +150,24 @@ pub fn scale_factor_data(
                 sf.push(0);
                 continue;
             }
+            if sect_cb == NOISE_HCB && running.noise_pcm {
+                running.noise_pcm = false;
+                running.noise += r.read(9) as i32;
+                sf.push(running.noise);
+                continue;
+            }
             // Table 58: index_offset -60.
             let dpcm = r.decode(&SCALEFACTOR_CODEWORDS) as i32 - 60;
             if is_intensity {
-                *last_is += dpcm;
-                sf.push(*last_is);
+                running.is += dpcm;
+                sf.push(running.is);
+            } else if sect_cb == NOISE_HCB {
+                running.noise += dpcm;
+                sf.push(running.noise);
             } else {
-                *last_sf += dpcm;
-                assert!((0..=255).contains(last_sf));
-                sf.push(*last_sf);
+                running.sf += dpcm;
+                assert!((0..=255).contains(&running.sf));
+                sf.push(running.sf);
             }
         }
     }
@@ -564,12 +607,13 @@ impl Ics {
 /// Reads an `individual_channel_stream()` (Table 16) of the Low Complexity
 /// profile at `fs`, with its own `ics_info()`, or that of its pair,
 /// `common`, whose right channel it is, and so may take intensity
-/// positions, if `right`.
+/// positions, if `right`; and bands of noise where `mpeg4`.
 pub fn individual_channel_stream(
     r: &mut BitReader,
     fs: SamplingFrequency,
     common: Option<&IcsInfo>,
     right: bool,
+    mpeg4: bool,
 ) -> Ics {
     let global_gain = r.read(8) as i32;
     let info = match common {
@@ -579,11 +623,11 @@ pub fn individual_channel_stream(
     let sections: Vec<_> = (info.group_lengths.iter())
         .map(|_| section_data(r, info.transform(), info.max_sfb))
         .collect();
-    let (mut last_sf, mut last_is) = (global_gain, 0);
+    let mut running = Running::new(global_gain);
     let scalefactors = (sections.iter())
         .map(|sections| {
             let intensity = right && common.is_some();
-            scale_factor_data(r, sections, &mut last_sf, &mut last_is, intensity)
+            scale_factor_data(r, sections, &mut running, intensity, mpeg4)
         })
         .collect();
     let pulses = (r.read(1) == 1).then(|| pulse_data(r));
@@ -624,19 +668,26 @@ pub struct Element {
 
 /// Reads an element, from its `id_syn_ele`: a `single_channel_element()`,
 /// a `channel_pair_element()` or an `lfe_channel_element()` of the Low
-/// Complexity profile at `fs`.
+/// Complexity profile at `fs`, of MPEG-2 AAC.
 pub fn element(r: &mut BitReader, fs: SamplingFrequency) -> Element {
-    let id_syn_ele = r.read(3);
-    element_after_id(r, fs, id_syn_ele).0
+    element_of(r, fs, false)
 }
 
-/// Reads an element whose `id_syn_ele` is read, as [`element`] does, and
-/// gives where a pair's second `individual_channel_stream()` starts in the
-/// reader.
+/// [`element`], of MPEG-4 AAC where `mpeg4`, whose channels may code bands
+/// by perceptual noise substitution.
+pub fn element_of(r: &mut BitReader, fs: SamplingFrequency, mpeg4: bool) -> Element {
+    let id_syn_ele = r.read(3);
+    element_after_id(r, fs, id_syn_ele, mpeg4).0
+}
+
+/// Reads an element whose `id_syn_ele` is read, as [`element_of`] does,
+/// and gives where a pair's second `individual_channel_stream()` starts in
+/// the reader.
 pub fn element_after_id(
     r: &mut BitReader,
     fs: SamplingFrequency,
     id_syn_ele: u32,
+    mpeg4: bool,
 ) -> (Element, Option<usize>) {
     let element_instance_tag = r.read(4);
     match id_syn_ele {
@@ -645,7 +696,7 @@ pub fn element_after_id(
         0 | 3 => (
             Element {
                 element_instance_tag,
-                channels: vec![individual_channel_stream(r, fs, None, false)],
+                channels: vec![individual_channel_stream(r, fs, None, false, mpeg4)],
                 common_window: false,
                 ms_mask_present: 0,
                 ms_used: Vec::new(),
@@ -668,9 +719,9 @@ pub fn element_after_id(
                 }
                 info = Some(common);
             }
-            let left = individual_channel_stream(r, fs, info.as_ref(), false);
+            let left = individual_channel_stream(r, fs, info.as_ref(), false, mpeg4);
             let second = r.position();
-            let right = individual_channel_stream(r, fs, info.as_ref(), true);
+            let right = individual_channel_stream(r, fs, info.as_ref(), true, mpeg4);
             let element = Element {
                 element_instance_tag,
                 channels: vec![left, right],
@@ -705,7 +756,15 @@ impl Element {
     }
 
     /// [`spectra`](Self::spectra) before temporal noise shaping is decoded.
+    ///
+    /// The bands of `NOISE_HCB` are filled with noise from a generator of
+    /// its own, scaled in each window to the energy its noise energy gives,
+    /// `2^(noise_nrg / 2)`; those of a pair whose `ms_used` is set, or whose
+    /// `ms_mask_present` is 2, in both channels with the same noise, and
+    /// neither decoded as middle and side (ISO/IEC 14496-3, clause
+    /// 4.6.13.3).
     pub fn joint_spectra(&self, fs: SamplingFrequency) -> Vec<Vec<f64>> {
+        let mut random = Random(0x2545_f491_4f6c_dd1d);
         let mut spectra: Vec<Vec<f64>> = (self.channels.iter())
             .map(|ics| {
                 let mut spectrum = Vec::new();
@@ -717,7 +776,7 @@ impl Element {
                         let scaled = match sfb {
                             Some(sfb) if sfb < ics.info.max_sfb => {
                                 let cb = ics.codebook(g, sfb);
-                                if cb == ZERO_HCB || cb >= INTENSITY_HCB2 {
+                                if cb == ZERO_HCB || cb >= NOISE_HCB {
                                     0.0
                                 } else {
                                     let sf = ics.scalefactors[g][sfb];
@@ -734,6 +793,52 @@ impl Element {
                 spectrum
             })
             .collect();
+        // Noise in each window of each band of NOISE_HCB: in a pair that
+        // shares its window, the left channel's taken by the right where
+        // its noise is to be the same.
+        let mut vectors = Vec::new();
+        for (c, (spectrum, ics)) in spectra.iter_mut().zip(&self.channels).enumerate() {
+            let mut start = 0;
+            for (g, &len) in ics.info.group_lengths.iter().enumerate() {
+                let offsets = ics.info.offsets(fs, len);
+                for sfb in 0..ics.info.max_sfb {
+                    if ics.codebook(g, sfb) != NOISE_HCB {
+                        continue;
+                    }
+                    let shared = c == 1
+                        && self.common_window
+                        && self.channels[0].codebook(g, sfb) == NOISE_HCB
+                        && (self.ms_mask_present == 2
+                            || self.ms_used.get(g).is_some_and(|used| used[sfb]));
+                    let width = usize::from(offsets[sfb + 1] - offsets[sfb]) / len;
+                    let nrg = ics.scalefactors[g][sfb];
+                    for win in 0..len {
+                        let first = start + usize::from(offsets[sfb]) + win * width;
+                        let lines = &mut spectrum[first..first + width];
+                        if shared {
+                            let vector: &Vec<f64> = (vectors.iter())
+                                .find(|(key, _)| *key == (g, sfb, win))
+                                .map(|(_, v)| v)
+                                .expect("the left channel's noise");
+                            lines.copy_from_slice(vector);
+                        } else {
+                            for x in lines.iter_mut() {
+                                *x = random.signed();
+                            }
+                        }
+                        let energy: f64 = lines.iter().map(|x| x * x).sum();
+                        let scale = (0.25 * f64::from(nrg)).exp2() / energy.sqrt();
+                        if c == 0 {
+                            vectors.push(((g, sfb, win), lines.to_vec()));
+                        }
+                        for x in lines.iter_mut() {
+                            *x *= scale;
+                        }
+                    }
+                }
+                start += usize::from(*offsets.last().expect("bands"));
+            }
+        }
         if let ([left, right], true) = (&mut spectra[..], self.common_window) {
             let info = &self.channels[0].info;
             let right_ics = &self.channels[1];
@@ -744,6 +849,7 @@ impl Element {
                     let band =
                         start + usize::from(offsets[sfb])..start + usize::from(offsets[sfb + 1]);
                     let ms_used = self.ms_used.get(g).is_some_and(|used| used[sfb]);
+                    let noise = (self.channels.iter()).any(|ics| ics.codebook(g, sfb) == NOISE_HCB);
                     let is_intensity = match right_ics.codebook(g, sfb) {
                         INTENSITY_HCB => 1.0,
                         INTENSITY_HCB2 => -1.0,
@@ -761,7 +867,7 @@ impl Element {
                         for i in band {
                             right[i] = scale * left[i];
                         }
-                    } else if ms_used || self.ms_mask_present == 2 {
+                    } else if !noise && (ms_used || self.ms_mask_present == 2) {
                         for i in band {
                             let (l, r) = (left[i] + right[i], left[i] - right[i]);
                             (left[i], right[i]) = (l, r);
@@ -772,6 +878,21 @@ impl Element {
             }
         }
         spectra
+    }
+}
+
+/// The generator of the decoder's noise (xorshift): `gen_rand_vector` of
+/// ISO/IEC 14496-3, clause 4.6.13.3, which leaves the generator to the
+/// decoder.
+struct Random(u64);
+
+impl Random {
+    /// A value in -1 to 1.
+    fn signed(&mut self) -> f64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        (self.0 >> 11) as f64 / (1u64 << 52) as f64 - 1.0
     }
 }
 

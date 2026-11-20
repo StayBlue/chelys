@@ -10,7 +10,9 @@ use crate::channel::{self, CodedChannel, CodedGroup, FRAME_LINES};
 use crate::channel_configuration::ElementKind;
 use crate::filterbank::Filterbank;
 use crate::loops::{self, ChannelCoding};
+use crate::noise_substitution::{self, BandSet, Noise};
 use crate::noiseless::pulses::Pulses;
+use crate::noiseless::scalefactors;
 use crate::noiseless::sections::Sections;
 use crate::psychoacoustic::Analysis;
 use crate::psychoacoustic::imaging::MidSideModel;
@@ -93,8 +95,11 @@ pub struct PreparedChannel {
     pub bit_allocation: f64,
     /// The perceptual entropy (clause C.1.4, steps 12 and 15).
     pub perceptual_entropy: f64,
-    /// Whether every line is zero, so that the channel is coded without
-    /// any.
+    /// The bands coded by perceptual noise substitution, whose lines in
+    /// `spectrum` are zero.
+    pub noise: Noise,
+    /// Whether every line is zero and no band is coded by perceptual noise
+    /// substitution, so that the channel is coded without any.
     pub silent: bool,
 }
 
@@ -110,6 +115,7 @@ impl PreparedChannel {
             xmin: Vec::with_capacity(SHORT_WINDOWS),
             bit_allocation: 0.0,
             perceptual_entropy: 0.0,
+            noise: Noise::NONE,
             silent: true,
         }
     }
@@ -224,6 +230,17 @@ pub struct ElementEncoder {
     /// The bands of the frame being coded that a pair that shares its
     /// window codes in intensity stereo.
     intensity: Intensity,
+    /// The bands of noise of the frame being coded that a pair that shares
+    /// its window codes in intensity stereo in its right channel, from the
+    /// left channel's noise.
+    noise_intensity: Intensity,
+    /// Whether such bands are sent as noise in both channels with
+    /// `ms_used` set instead, and those of the frame being coded, for tests.
+    noise_by_ms_used: bool,
+    noise_ms_used: BandSet,
+    /// The lower border frequency above which bands are coded by perceptual
+    /// noise substitution, if they are (see [`noise_substitution`]).
+    noise_border: Option<f64>,
     /// Whether the channels' lines are shaped by temporal noise shaping,
     /// and the memory it works in.
     tns: bool,
@@ -288,11 +305,14 @@ struct MidSide {
 
 impl ElementEncoder {
     /// The element `kind` at `sampling_frequency`, a pair coded in
-    /// intensity stereo above `intensity_border` Hz, if given.
+    /// intensity stereo above `intensity_border` Hz, if given, and its
+    /// channels by perceptual noise substitution above `noise_border` Hz,
+    /// if given.
     pub fn new(
         sampling_frequency: SamplingFrequency,
         kind: ElementKind,
         intensity_border: Option<f64>,
+        noise_border: Option<f64>,
     ) -> Self {
         let channels = kind.channels();
         Self {
@@ -313,6 +333,10 @@ impl ElementEncoder {
             ms: MsMask::NONE,
             intensity_border,
             intensity: Intensity::NONE,
+            noise_intensity: Intensity::NONE,
+            noise_by_ms_used: false,
+            noise_ms_used: [0; SHORT_WINDOWS],
+            noise_border,
             tns: true,
             spectrum_clipping: loops::SPECTRUM_CLIPPING,
             shaping: Shaping::default(),
@@ -335,6 +359,15 @@ impl ElementEncoder {
     #[cfg(any(test, feature = "unstable"))]
     pub fn without_tns(&mut self) {
         self.tns = false;
+    }
+
+    /// The element, but with the noise of a pair's bands that is to be the
+    /// same in both channels sent as noise in both, with `ms_used` set, for
+    /// comparing with intensity stereo in tests (see
+    /// [`noise_substitution`](Self::noise_substitution)).
+    #[cfg(any(test, feature = "unstable"))]
+    pub fn noise_shared_by_ms_used(&mut self) {
+        self.noise_by_ms_used = true;
     }
 
     /// The element, but with spectrum clipping on or off, for comparing the
@@ -462,6 +495,7 @@ impl ElementEncoder {
     fn prepare_spectra(&mut self, shape: bool) {
         self.temporal_noise_shaping(shape);
         self.thresholds();
+        self.noise_substitution();
         self.joint();
         self.find_silence();
         self.count_lineless();
@@ -638,8 +672,115 @@ impl ElementEncoder {
         }
     }
 
+    /// Each channel's bands coded by perceptual noise substitution, where
+    /// the stream codes them so (see [`noise_substitution`]): those that
+    /// are noise-like, their lines set to zero; and of a pair that shares
+    /// its window, the bands whose noise is to be the same in both channels,
+    /// which the right channel takes from the left in intensity stereo.
+    ///
+    /// Spec gap: Annex 4.B.11 of ISO/IEC 14496-3 describes the choice for
+    /// one channel. A pair that shares its window codes by perceptual noise
+    /// substitution only the bands that are noise-like in both of its
+    /// channels, which are then not coded as middle and side, nor in
+    /// intensity stereo as [`intensity_bands`](Self::intensity_bands) codes
+    /// a pair: in a band of noise in one channel only, `ms_used` is "not
+    /// evaluated" (clause 4.6.13.3), so that the other channel's band could
+    /// not be coded as middle and side either.
+    ///
+    /// Spec reading: where a pair's noise is to be the same in both
+    /// channels, clause 4.6.13.3 has both channels send the band as noise
+    /// and sets its `ms_used`. Such a band is instead sent as noise in the
+    /// left channel alone, and in intensity stereo in the right, which the
+    /// decoder takes from the left channel's noise, scaled by the band's
+    /// position, as it applies perceptual noise substitution before
+    /// intensity stereo (clause 4.1.1.2 and Figure 4.2): the same noise in
+    /// both channels by either coding.
+    ///
+    /// Spec gap: ISO/IEC 14496-3 does not say how perceptual noise
+    /// substitution and temporal noise shaping combine, whose filters the
+    /// decoder applies after it generates the noise (clause 4, figure 2 of
+    /// ISO/IEC 13818-7). A band spanned by a filter is substituted by
+    /// noise of its lines' energy as the filter shaped them, which the
+    /// decoder's filter shapes back as it shapes their quantization noise;
+    /// where the right channel takes the left channel's noise, its own
+    /// filters shape it.
+    ///
+    /// No low frequency enhancement channel is coded so: it sends only its
+    /// lowest lines, below any border.
+    fn noise_substitution(&mut self) {
+        self.noise_intensity = Intensity::NONE;
+        self.noise_ms_used = [0; SHORT_WINDOWS];
+        for prepared in &mut self.prepared {
+            prepared.noise = Noise::NONE;
+        }
+        let Some(border) = self.noise_border.filter(|_| self.kind != ElementKind::Lfe) else {
+            return;
+        };
+        let fs = self.sampling_frequency;
+        let mut sets = [[0; SHORT_WINDOWS]; 2];
+        for ((channel, prepared), set) in self.channels.iter().zip(&self.prepared).zip(&mut sets) {
+            *set = noise_substitution::noise_like(
+                prepared.windows,
+                fs,
+                &prepared.spectrum,
+                channel.switching.current(),
+                border,
+            );
+        }
+        if let ([left, right], true) = (&mut self.prepared[..], self.common_window) {
+            let windows = left.windows;
+            let mut set: BandSet = std::array::from_fn(|g| sets[0][g] & sets[1][g]);
+            let mut shared =
+                noise_substitution::shared(windows, fs, &set, [&left.spectrum, &right.spectrum]);
+            if self.noise_by_ms_used {
+                let mut set = set;
+                loop {
+                    let l = noise_substitution::reachable(windows, fs, &set, &left.spectrum);
+                    let both = noise_substitution::reachable(windows, fs, &l, &right.spectrum);
+                    if both == set {
+                        break;
+                    }
+                    set = both;
+                }
+                shared.keep(&set);
+                self.noise_ms_used = shared.set;
+                for (prepared, own) in self.prepared.iter_mut().zip([set, set]) {
+                    prepared.noise =
+                        noise_substitution::substitute(windows, fs, &own, &mut prepared.spectrum);
+                }
+                return;
+            }
+            // Bands within reach in both channels, the right channel's
+            // without those it takes from the left, until none is dropped.
+            loop {
+                let own: BandSet = std::array::from_fn(|g| set[g] & !shared.set[g]);
+                let l = noise_substitution::reachable(windows, fs, &set, &left.spectrum);
+                let r = noise_substitution::reachable(windows, fs, &own, &right.spectrum);
+                let both = std::array::from_fn(|g| l[g] & (r[g] | shared.set[g]));
+                if both == set {
+                    break;
+                }
+                set = both;
+                shared.keep(&set);
+            }
+            for (g, (start, bands)) in windows.groups_with_start(fs).enumerate() {
+                for sfb in (0..bands.num_swb()).filter(|&sfb| (shared.set[g] >> sfb) & 1 == 1) {
+                    let band = bands.band(sfb);
+                    right.spectrum[start + band.start..start + band.end].fill(0.0);
+                }
+            }
+            sets = [set, std::array::from_fn(|g| set[g] & !shared.set[g])];
+            self.noise_intensity = shared.intensity;
+        }
+        for (prepared, set) in self.prepared.iter_mut().zip(&sets) {
+            prepared.noise =
+                noise_substitution::substitute(prepared.windows, fs, set, &mut prepared.spectrum);
+        }
+    }
+
     /// A pair that shares its window coded in intensity stereo and as
-    /// middle and side.
+    /// middle and side, with the bands of noise that its right channel
+    /// takes from the left in intensity stereo.
     fn joint(&mut self) {
         self.ms = MsMask::NONE;
         self.intensity = Intensity::NONE;
@@ -647,18 +788,29 @@ impl ElementEncoder {
             if let Some(first) = self.intensity_from() {
                 self.intensity_bands(first);
             }
+            self.intensity.merge(&self.noise_intensity);
             self.middle_side_bands();
+            for g in 0..SHORT_WINDOWS {
+                for sfb in 0..MAX_BANDS {
+                    if (self.noise_ms_used[g] >> sfb) & 1 == 1 {
+                        self.ms.set(g, sfb, true);
+                    }
+                }
+            }
         }
     }
 
     /// Which channels are silent, as they are coded.
     fn find_silence(&mut self) {
-        // A right channel with bands in intensity stereo sends them, even
-        // where its lines are all zero.
+        // A right channel with bands in intensity stereo sends them, and a
+        // channel with bands of noise sends those, even where its lines are
+        // all zero.
         let in_intensity = self.in_intensity();
         for (c, prepared) in self.prepared.iter_mut().enumerate() {
             let sends_positions = c == 1 && in_intensity;
-            prepared.silent = !sends_positions && prepared.spectrum.iter().all(|&x| x == 0.0);
+            prepared.silent = !sends_positions
+                && !prepared.noise.is_present()
+                && prepared.spectrum.iter().all(|&x| x == 0.0);
         }
     }
 
@@ -679,6 +831,7 @@ impl ElementEncoder {
             windows,
             fs,
             first,
+            &left.noise,
             [&mut left.spectrum, &mut right.spectrum],
             [&mut left.xmin, &mut right.xmin],
         );
@@ -754,9 +907,10 @@ impl ElementEncoder {
                 &side.xmin[..],
             ],
             &self.intensity,
+            &left.noise,
         );
         let mut lines_mid_side = 0;
-        for band in stereo::bands(windows, fs, self.ms, &self.intensity) {
+        for band in stereo::bands(windows, fs, self.ms, &self.intensity, &left.noise) {
             if band.coding == BandCoding::MidSide {
                 let (g, sfb, range) = (band.group, band.sfb, band.lines);
                 lines_mid_side += range.len();
@@ -905,7 +1059,8 @@ impl ElementEncoder {
         let gains = &self.prepared[c].gains;
         let windows = channels[c].windows();
         let max_sfb = channels[c].max_sfb();
-        for band in stereo::bands(windows, fs, self.ms, &self.intensity) {
+        let noise = &self.prepared[c].noise;
+        for band in stereo::bands(windows, fs, self.ms, &self.intensity, noise) {
             if band.sfb >= max_sfb {
                 continue;
             }
@@ -935,10 +1090,11 @@ impl ElementEncoder {
         }
         let fs = self.sampling_frequency;
         let windows = self.prepared[c].windows;
-        for band in stereo::bands(windows, fs, self.ms, &self.intensity) {
+        let noise = self.prepared[c].noise.clone();
+        for band in stereo::bands(windows, fs, self.ms, &self.intensity, &noise) {
             let range = band.lines;
             match band.coding {
-                BandCoding::Intensity => {}
+                BandCoding::Intensity | BandCoding::Noise => {}
                 BandCoding::MidSide => {
                     let [left, right] = &mut self.prepared[..] else {
                         unreachable!("a pair")
@@ -962,6 +1118,8 @@ impl ElementEncoder {
             }
         }
         let prepared = &mut self.prepared[c];
+        let unshaped = &*prepared.unshaped;
+        noise_substitution::measure(windows, fs, &mut prepared.noise, unshaped);
         prepared.tns = Tns::NONE;
         prepared.gains = NoiseGains::NONE;
         self.lineless.channels_with_tns[c] = self.lineless.channels_without_tns[c];
@@ -978,7 +1136,8 @@ impl ElementEncoder {
             gains.weights(prepared.windows, fs, &mut prepared.weights);
         }
         if let ([left, right], true) = (&mut self.prepared[..], self.common_window) {
-            for band in stereo::bands(left.windows, fs, self.ms, &self.intensity) {
+            let noise = &left.noise;
+            for band in stereo::bands(left.windows, fs, self.ms, &self.intensity, noise) {
                 if band.coding == BandCoding::MidSide {
                     for i in band.lines {
                         let weight = left.weights[i].max(right.weights[i]);
@@ -1038,10 +1197,18 @@ impl ElementEncoder {
         };
         let mut order: Vec<usize> = (0..self.prepared.len()).collect();
         // A pair in intensity stereo codes its left channel first, which the
-        // right channel's bands in intensity stereo scale.
+        // right channel's bands in intensity stereo scale, and whose
+        // `max_sfb` sets which of them it sends; but not for the bands of
+        // noise alone, which the left channel sends whatever its lines.
         let in_intensity = self.in_intensity();
+        let left_first = (0..SHORT_WINDOWS).any(|g| {
+            let noise = self.noise_intensity.bands[g];
+            (0..MAX_BANDS).any(|sfb| {
+                self.intensity.bands[g].codebook(sfb).is_some() && noise.codebook(sfb).is_none()
+            })
+        });
         order.sort_by(|&a, &b| {
-            if in_intensity {
+            if left_first {
                 return a.cmp(&b);
             }
             let key = |c: usize| {
@@ -1071,6 +1238,7 @@ impl ElementEncoder {
                 let ms = self.ms;
                 let mut coding = ChannelCoding {
                     common_window: true,
+                    intensity: (first == 1 && in_intensity).then_some(&self.intensity),
                     ..ChannelCoding::new(windows, fs, budget(first), &a.tns)
                 };
                 let (mut a_channel, intensity, b_coding) = loop {
@@ -1089,11 +1257,19 @@ impl ElementEncoder {
                             a_channel.extension_bits(m) + ms.flag_bits(groups, m);
                     }
                     // The bands in intensity stereo that the left channel
-                    // sends.
-                    let intensity = self.intensity.below(least_max_sfb);
-                    let b_least = least_channel(windows, fs, least_max_sfb, &intensity, &b.tns)
-                        .bits(true)
-                        + b_coding.element_bits[least_max_sfb];
+                    // sends, where the right channel is second, and the
+                    // second channel's bands of noise, which it sends
+                    // whatever the first sends.
+                    let intensity = if second == 1 {
+                        self.intensity.below(least_max_sfb)
+                    } else {
+                        Intensity::NONE
+                    };
+                    let least_sfb = least_max_sfb.max(b.noise.end());
+                    let b_least =
+                        least_channel(windows, fs, least_sfb, &intensity, &b.noise, &b.tns)
+                            .bits(true)
+                            + b_coding.element_bits[least_sfb];
                     let floor = lineless.channels_with_tns[first];
                     if b_least <= b_coding.available_bits || coding.available_bits <= floor {
                         break (a_channel, intensity, b_coding);
@@ -1109,7 +1285,7 @@ impl ElementEncoder {
                     budgets: budget(first) + budget(second),
                 };
                 let b_coding = ChannelCoding {
-                    intensity: in_intensity.then_some(&intensity),
+                    intensity: (second == 1 && in_intensity).then_some(&intensity),
                     ..b_coding
                 };
                 let mut b_channel = self.code(b, b_coding);
@@ -1153,6 +1329,7 @@ impl ElementEncoder {
         } else {
             let coding = ChannelCoding {
                 spectrum_clipping: self.spectrum_clipping,
+                noise: prepared.noise.is_present().then_some(&prepared.noise),
                 ..coding
             };
             loops::quantize_channel(
@@ -1167,23 +1344,24 @@ impl ElementEncoder {
 
 /// The fewest bits a channel of `windows` shaped by `tns` can be coded in,
 /// as the second of a pair that shares its window: without lines, its
-/// groups spanning `max_sfb` bands, with the bands of `intensity`, all
-/// below it.
+/// groups spanning `max_sfb` bands, with the bands of `intensity` and of
+/// `noise`, all below it.
 fn least_channel(
     windows: Windows,
     sampling_frequency: SamplingFrequency,
     max_sfb: usize,
     intensity: &Intensity,
+    noise: &Noise,
     tns: &Tns,
 ) -> CodedChannel {
     let lines = [0; FRAME_LINES];
     let groups = (windows.groups(sampling_frequency).enumerate())
         .map(|(g, bands)| {
-            let sections = Sections::count_with_intensity(
+            let sections = Sections::count_with_pseudo(
                 &lines[..bands.lines()],
                 bands,
                 max_sfb,
-                intensity.bands[g],
+                intensity.bands[g].union(noise.bands[g]),
             )
             .expect("zeros are codable")
             .choose();
@@ -1191,19 +1369,26 @@ fn least_channel(
                 sections,
                 scalefactors: vec![0; max_sfb],
                 positions: intensity.positions[g][..max_sfb].to_vec(),
+                noise_energies: noise.energies[g][..max_sfb].to_vec(),
             }
         })
         .collect();
+    let first_noise = (noise.bands.iter().zip(&noise.energies)).find_map(|(bands, energies)| {
+        (0..MAX_BANDS)
+            .find(|&sfb| bands.is_noise(sfb))
+            .map(|sfb| energies[sfb])
+    });
+    let global_gain = first_noise.map_or(0, scalefactors::noise_global_gain);
     CodedChannel::new(
         windows,
         sampling_frequency,
-        0,
+        global_gain,
         *tns,
         Pulses::NONE,
         lines,
         groups,
     )
-    .expect("positions within the codebook's reach")
+    .expect("positions and noise energies within the codebook's reach")
 }
 
 /// Whether the channels of a pair share their attacks, so that a frame
@@ -1229,7 +1414,7 @@ mod tests {
     use chelys_core::bitstream::BitWriter;
 
     use super::*;
-    use crate::noiseless::decoder::{BitReader, Element, element};
+    use crate::noiseless::decoder::{BitReader, Element, element_of};
     use crate::scalefactor_bands::{GroupBands, Transform};
 
     /// `INTENSITY_HCB` and `INTENSITY_HCB2`.
@@ -1276,7 +1461,7 @@ mod tests {
         intensity_border: Option<f64>,
         block_switching: bool,
     ) -> Vec<(Element, Vec<Vec<f64>>)> {
-        let encoder = ElementEncoder::new(fs, kind(input.len()), intensity_border);
+        let encoder = ElementEncoder::new(fs, kind(input.len()), intensity_border, None);
         round_trip_encoder(encoder, input, bits, block_switching)
     }
 
@@ -1309,7 +1494,7 @@ mod tests {
             w.write(0x7, 3);
             let bytes = w.into_bytes();
             let mut r = BitReader::new(&bytes);
-            let decoded = element(&mut r, fs);
+            let decoded = element_of(&mut r, fs, encoder.noise_border.is_some());
             assert_eq!(r.position(), len, "the bits written are those read");
             frames.push((decoded, original));
             start += FRAME_SAMPLES;
@@ -1424,7 +1609,7 @@ mod tests {
         let pair = [clicks(5), clicks(6)];
         let (mut pulses, mut short) = (0, 0);
         for (input, bits) in [(&pair[..1], 500), (&pair[..1], 1500), (&pair[..], 3000)] {
-            let mut encoder = ElementEncoder::new(fs, kind(input.len()), None);
+            let mut encoder = ElementEncoder::new(fs, kind(input.len()), None, None);
             encoder.spectrum_clipping(true);
             // round_trip_encoder checks the bits and decodes each frame.
             for (element, _) in round_trip_encoder(encoder, input, bits, true) {
@@ -1607,7 +1792,7 @@ mod tests {
             sequence: WindowSequence::EightShort { grouping },
             shape: crate::window::WindowShape::Sine,
         };
-        let channel = least_channel(windows, fs, 5, &below, &Tns::NONE);
+        let channel = least_channel(windows, fs, 5, &below, &Noise::NONE, &Tns::NONE);
         let groups: Vec<_> = channel
             .groups()
             .map(|(group, _)| group.scalefactor_data())
@@ -1634,7 +1819,7 @@ mod tests {
         // The bits of each frame's element at 23 kbit/s, less the header,
         // id_syn_ele and ID_END.
         let bits = 23_000 * 1024 / 64_000 - 56 - 6;
-        let mut encoder = ElementEncoder::new(fs, ElementKind::Pair, None);
+        let mut encoder = ElementEncoder::new(fs, ElementKind::Pair, None, None);
         let channels: Vec<&[f64]> = input.iter().map(Vec::as_slice).collect();
         encoder.push(&channels);
         encoder.prime();
@@ -1661,5 +1846,113 @@ mod tests {
             start += FRAME_SAMPLES;
         }
         assert!(retries > 0, "no frame quantized its first channel again");
+    }
+
+    /// The energy of each band of each group of `spectrum`, a channel's
+    /// lines of `windows` in the order they are sent, in dB.
+    fn band_levels(fs: SamplingFrequency, windows: Windows, spectrum: &[f64]) -> Vec<Vec<f64>> {
+        (windows.groups_with_start(fs))
+            .map(|(start, bands)| {
+                (0..bands.num_swb())
+                    .map(|sfb| {
+                        let band = bands.band(sfb);
+                        let lines = &spectrum[start + band.start..start + band.end];
+                        10.0 * lines.iter().map(|x| x * x).sum::<f64>().log10()
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Noise is coded by perceptual noise substitution above the border,
+    /// and decodes at the level of the lines it stands for.
+    #[test]
+    fn noise_is_substituted_above_the_border_at_its_level() {
+        let fs = SamplingFrequency::Hz44100;
+        let input = [noise(16 * FRAME_SAMPLES, 7)];
+        let encoder = ElementEncoder::new(fs, kind(1), None, Some(noise_substitution::BORDER_HZ));
+        let frames = round_trip_encoder(encoder, &input, 1500, true);
+        let first = first_band_above(fs, Transform::Long, noise_substitution::BORDER_HZ);
+        let mut substituted = 0;
+        for (decoded, original) in &frames[2..] {
+            let ics = &decoded.channels[0];
+            let windows = Windows {
+                sequence: match ics.info.window_sequence {
+                    2 => WindowSequence::EIGHT_SHORT,
+                    _ => WindowSequence::OnlyLong,
+                },
+                ..Windows::LONG_SINE
+            };
+            if windows.sequence != WindowSequence::OnlyLong {
+                continue;
+            }
+            let decoded_levels = band_levels(fs, windows, &decoded.spectra(fs)[0]);
+            let original_levels = band_levels(fs, windows, &original[0]);
+            for sfb in 0..ics.info.max_sfb {
+                if ics.codebook(0, sfb) != 13 {
+                    continue;
+                }
+                assert!(sfb >= first, "band {sfb} below the border");
+                substituted += 1;
+                let error = decoded_levels[0][sfb] - original_levels[0][sfb];
+                assert!(error.abs() <= 0.76, "band {sfb} off by {error:.2} dB");
+            }
+        }
+        assert!(substituted > 100, "{substituted} bands substituted");
+    }
+
+    /// A pair that shares its window makes its noise the same in both
+    /// channels where they are alike, the right channel taking the left
+    /// channel's in intensity stereo, and not where they are not.
+    #[test]
+    fn a_pair_shares_its_noise_where_its_channels_are_alike() {
+        let fs = SamplingFrequency::Hz48000;
+        let len = 12 * FRAME_SAMPLES;
+        let left = noise(len, 11);
+        let half: Vec<f64> = left.iter().map(|x| 0.5 * x).collect();
+        let other = noise(len, 12);
+        for (right, alike) in [(half, true), (other, false)] {
+            let encoder =
+                ElementEncoder::new(fs, kind(2), None, Some(noise_substitution::BORDER_HZ));
+            let frames = round_trip_encoder(encoder, &[left.clone(), right], 3000, false);
+            let (mut substituted, mut shared) = (0, 0);
+            for (decoded, _) in &frames[2..] {
+                assert!(decoded.common_window);
+                let [l, r] = &decoded.channels[..] else {
+                    unreachable!("a pair")
+                };
+                let spectra = decoded.spectra(fs);
+                let offsets = crate::scalefactor_bands::swb_offsets(fs, Transform::Long);
+                for sfb in 0..l.info.max_sfb {
+                    let codebooks = (l.codebook(0, sfb), r.codebook(0, sfb));
+                    match codebooks {
+                        (13, 13) => substituted += 1,
+                        (13, INTENSITY_HCB) => {
+                            substituted += 1;
+                            shared += 1;
+                            let band = usize::from(offsets[sfb])..usize::from(offsets[sfb + 1]);
+                            let (a, b) = (&spectra[0][band.clone()], &spectra[1][band]);
+                            let product: f64 = a.iter().zip(b).map(|(a, b)| a * b).sum();
+                            let norm = (a.iter().map(|x| x * x).sum::<f64>()
+                                * b.iter().map(|x| x * x).sum::<f64>())
+                            .sqrt();
+                            assert!((product / norm - 1.0).abs() < 1e-9);
+                        }
+                        // Only bands of noise in both channels, or noise
+                        // the right channel takes from the left.
+                        (a, b) => assert!(a != 13 && b != 13, "band {sfb}: {codebooks:?}"),
+                    }
+                }
+            }
+            assert!(substituted > 50, "{substituted} bands substituted");
+            if alike {
+                assert_eq!(shared, substituted);
+            } else {
+                assert!(
+                    20 * shared < substituted,
+                    "{shared} of {substituted} shared"
+                );
+            }
+        }
     }
 }

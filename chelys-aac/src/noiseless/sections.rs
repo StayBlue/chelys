@@ -35,55 +35,67 @@ pub struct Sections {
     spectral_bits: u32,
 }
 
-/// The bands of a window group of the right channel of a pair that are
-/// coded in intensity stereo (clause 12.2), each with its intensity
-/// codebook: their lines are not sent.
+/// The bands of a window group that a pseudo codebook codes, each with its
+/// codebook: in the right channel of a pair that shares its window, those
+/// coded in intensity stereo (clause 12.2), with an intensity codebook;
+/// and those coded by perceptual noise substitution, with `NOISE_HCB`
+/// (ISO/IEC 14496-3, clause 4.6.13). Their lines are not sent.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct IntensityBands {
+pub struct PseudoBands {
     in_phase: u64,
     out_of_phase: u64,
+    noise: u64,
 }
 
-impl IntensityBands {
-    /// No band coded in intensity stereo.
+impl PseudoBands {
+    /// No band coded by a pseudo codebook.
     pub const NONE: Self = Self {
         in_phase: 0,
         out_of_phase: 0,
+        noise: 0,
     };
 
-    /// Codes band `sfb` in intensity stereo, in phase or out of phase, or,
-    /// with `None`, not.
+    /// Codes band `sfb` with `codebook`, a pseudo codebook, or, with
+    /// `None`, with none.
     ///
     /// # Panics
     ///
-    /// If `codebook` is not an intensity codebook: a caller's error.
+    /// If `codebook` is not a pseudo codebook: a caller's error.
     pub fn set(&mut self, sfb: usize, codebook: Option<Codebook>) {
         let bit = 1 << sfb;
         self.in_phase &= !bit;
         self.out_of_phase &= !bit;
+        self.noise &= !bit;
         match codebook {
             Some(Codebook::INTENSITY) => self.in_phase |= bit,
             Some(Codebook::INTENSITY_OUT_OF_PHASE) => self.out_of_phase |= bit,
+            Some(Codebook::NOISE) => self.noise |= bit,
             None => {}
-            Some(other) => panic!("codebook {other:?} is not an intensity codebook"),
+            Some(other) => panic!("codebook {other:?} is not a pseudo codebook"),
         }
     }
 
-    /// The intensity codebook of band `sfb`, if it is coded in intensity
-    /// stereo.
+    /// The pseudo codebook of band `sfb`, if a pseudo codebook codes it.
     pub fn codebook(self, sfb: usize) -> Option<Codebook> {
         if (self.in_phase >> sfb) & 1 == 1 {
             Some(Codebook::INTENSITY)
         } else if (self.out_of_phase >> sfb) & 1 == 1 {
             Some(Codebook::INTENSITY_OUT_OF_PHASE)
+        } else if (self.noise >> sfb) & 1 == 1 {
+            Some(Codebook::NOISE)
         } else {
             None
         }
     }
 
-    /// One past the highest band coded in intensity stereo, or 0.
+    /// Whether band `sfb` is coded by perceptual noise substitution.
+    pub fn is_noise(self, sfb: usize) -> bool {
+        (self.noise >> sfb) & 1 == 1
+    }
+
+    /// One past the highest band coded by a pseudo codebook, or 0.
     pub fn end(self) -> usize {
-        64 - (self.in_phase | self.out_of_phase).leading_zeros() as usize
+        64 - (self.in_phase | self.out_of_phase | self.noise).leading_zeros() as usize
     }
 
     /// Those of the bands below `max_sfb`.
@@ -96,8 +108,35 @@ impl IntensityBands {
         Self {
             in_phase: self.in_phase & bands,
             out_of_phase: self.out_of_phase & bands,
+            noise: self.noise & bands,
         }
     }
+
+    /// The bands of both, which code no band alike.
+    ///
+    /// # Panics
+    ///
+    /// If both code a band: a caller's error.
+    pub fn union(self, other: Self) -> Self {
+        let bands = |b: Self| b.in_phase | b.out_of_phase | b.noise;
+        assert_eq!(bands(self) & bands(other), 0, "a band coded twice");
+        Self {
+            in_phase: self.in_phase | other.in_phase,
+            out_of_phase: self.out_of_phase | other.out_of_phase,
+            noise: self.noise | other.noise,
+        }
+    }
+}
+
+/// What `scale_factor_data()` sends for a band (Table 18; ISO/IEC 14496-3,
+/// Table 4.55).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BandValue {
+    Scalefactor,
+    /// An intensity stereo position.
+    Position,
+    /// A noise energy.
+    NoiseEnergy,
 }
 
 impl Sections {
@@ -107,15 +146,15 @@ impl Sections {
         Self::count(lines, bands, max_sfb).map(|counted| counted.choose())
     }
 
-    /// [`count`](Self::count), but for the bands `intensity` codes in
-    /// intensity stereo, whose lines are to be zero.
-    pub fn count_with_intensity(
+    /// [`count`](Self::count), but for the bands `pseudo` codes with a
+    /// pseudo codebook, whose lines are to be zero.
+    pub fn count_with_pseudo(
         lines: &[i32],
         bands: GroupBands,
         max_sfb: usize,
-        intensity: IntensityBands,
+        pseudo: PseudoBands,
     ) -> Option<Counted> {
-        Self::count_bands(lines, bands, max_sfb, intensity)
+        Self::count_bands(lines, bands, max_sfb, pseudo)
     }
 
     /// Counts the bits of a window group's bands `0..max_sfb` in each
@@ -137,18 +176,18 @@ impl Sections {
     /// If there are not as many lines as the bands hold, or `max_sfb`
     /// exceeds their `num_swb`: a caller's error.
     pub fn count(lines: &[i32], bands: GroupBands, max_sfb: usize) -> Option<Counted> {
-        Self::count_bands(lines, bands, max_sfb, IntensityBands::NONE)
+        Self::count_bands(lines, bands, max_sfb, PseudoBands::NONE)
     }
 
     fn count_bands(
         lines: &[i32],
         bands: GroupBands,
         max_sfb: usize,
-        intensity: IntensityBands,
+        pseudo: PseudoBands,
     ) -> Option<Counted> {
         let mut counted = Counted::new(bands);
         counted
-            .count(lines, bands, max_sfb, intensity)
+            .count(lines, bands, max_sfb, pseudo)
             .then_some(counted)
     }
 
@@ -186,14 +225,21 @@ impl Sections {
             .flat_map(|section| section.start..section.end)
     }
 
-    /// The bands that send a scalefactor or an intensity stereo position
-    /// (Table 18), in order, each with whether it sends a position.
-    pub fn bands_with_scalefactors_or_positions(&self) -> impl Iterator<Item = (usize, bool)> + '_ {
+    /// The bands that send a scalefactor, an intensity stereo position or
+    /// a noise energy (Table 18; ISO/IEC 14496-3, Table 4.55), in order,
+    /// each with what it sends.
+    pub fn bands_with_values(&self) -> impl Iterator<Item = (usize, BandValue)> + '_ {
         (self.iter())
             .filter(|section| section.codebook != Codebook::ZERO)
             .flat_map(|section| {
-                let position = section.codebook.is_intensity();
-                (section.start..section.end).map(move |sfb| (sfb, position))
+                let value = if section.codebook.is_intensity() {
+                    BandValue::Position
+                } else if section.codebook.is_noise() {
+                    BandValue::NoiseEnergy
+                } else {
+                    BandValue::Scalefactor
+                };
+                (section.start..section.end).map(move |sfb| (sfb, value))
             })
     }
 
@@ -393,7 +439,7 @@ impl Counted {
         }
     }
 
-    /// Counts a window group's bands as [`Sections::count_with_intensity`]
+    /// Counts a window group's bands as [`Sections::count_with_pseudo`]
     /// does, in place of what was counted before, whose memory it reuses:
     /// whether each line is one that a codebook codes. Where one is not,
     /// what is left is to be counted again before it is used.
@@ -406,7 +452,7 @@ impl Counted {
         lines: &[i32],
         bands: GroupBands,
         max_sfb: usize,
-        intensity: IntensityBands,
+        pseudo: PseudoBands,
     ) -> bool {
         assert_eq!(lines.len(), bands.lines(), "a group's lines fill its bands");
         assert!(
@@ -425,15 +471,7 @@ impl Counted {
         }
         let band_bits =
             |_, class, top, lines: &[i32]| spectrum::bits_by_codebook(lines, class, top);
-        self.count_with(
-            lines,
-            bands,
-            max_sfb,
-            intensity,
-            &largest,
-            u32::MAX,
-            band_bits,
-        )
+        self.count_with(lines, bands, max_sfb, pseudo, &largest, u32::MAX, band_bits)
     }
 
     /// [`count`](Self::count), given the largest magnitude of each band's
@@ -448,7 +486,7 @@ impl Counted {
         lines: &[i32],
         bands: GroupBands,
         max_sfb: usize,
-        intensity: IntensityBands,
+        pseudo: PseudoBands,
         largest: &[u32],
         budget: u32,
         mut band_bits: impl FnMut(usize, usize, usize, &[i32]) -> ([u32; 12], u32),
@@ -463,7 +501,10 @@ impl Counted {
             lines[bands.offset(max_sfb)..].iter().all(|&line| line == 0),
             "lines above max_sfb are not sent"
         );
-        assert!(intensity.end() <= max_sfb, "intensity bands above max_sfb");
+        assert!(
+            pseudo.end() <= max_sfb,
+            "pseudo codebook bands above max_sfb"
+        );
         (self.bands, self.max_sfb, self.least_bits) = (bands, max_sfb, 0);
         for (sfb, class) in self.classes[..max_sfb].iter_mut().enumerate() {
             let largest = largest[sfb];
@@ -474,10 +515,10 @@ impl Counted {
                     .max(),
                 "the largest magnitude of band {sfb}"
             );
-            *class = match intensity.codebook(sfb) {
+            *class = match pseudo.codebook(sfb) {
                 Some(codebook) => {
-                    debug_assert!(largest == 0, "lines in an intensity band");
-                    intensity_class(codebook)
+                    debug_assert!(largest == 0, "lines in a band of a pseudo codebook");
+                    pseudo_class(codebook)
                 }
                 None => match self::class(largest) {
                     Some(class) => class,
@@ -508,7 +549,7 @@ impl Counted {
                 }
                 bits
             } else {
-                // No spectrum codebook codes an intensity band.
+                // No spectrum codebook codes a band of a pseudo codebook.
                 [UNCODABLE; 12]
             };
             let [below, row] = &mut self.bits_below[sfb..sfb + 2] else {
@@ -650,7 +691,7 @@ impl Counted {
         for (i, section) in sections[..section_count].iter().enumerate() {
             chosen.codebooks[i] = section.codebook;
             chosen.ends[i] = section.end;
-            if !section.codebook.is_intensity() {
+            if !section.codebook.is_pseudo() {
                 let (start, end) = (usize::from(section.start), usize::from(section.end));
                 chosen.spectral_bits += self.spectral_bits(start, end, section.codebook);
             }
@@ -677,9 +718,10 @@ impl Counted {
     /// The section of bands `start..end` with the codebook of `class` that
     /// costs the fewest bits, the lower on a tie: those of its
     /// `section_data()` and `spectral_data()`, and of the scalefactors of
-    /// its bands of zeros if the codebook sends them; for an intensity class,
-    /// with its intensity codebook, which sends no lines (the positions its
-    /// bands send are counted with the scalefactors).
+    /// its bands of zeros if the codebook sends them; for the class of a
+    /// pseudo codebook, with that codebook, which sends no lines (the
+    /// positions and noise energies its bands send are counted with the
+    /// scalefactors).
     fn section(&self, start: usize, end: usize, class: usize) -> Candidate {
         let header = section_bits(self.bands.transform(), end - start);
         let candidate = |codebook, bits| Candidate {
@@ -689,7 +731,7 @@ impl Counted {
             codebook,
             bits,
         };
-        if let Some(codebook) = class.checked_sub(CLASSES.len()).map(intensity_codebook) {
+        if let Some(codebook) = class.checked_sub(CLASSES.len()).map(pseudo_codebook) {
             return candidate(codebook, header);
         }
         // The codebooks of a class differ only in their spectral bits.
@@ -711,13 +753,13 @@ impl Counted {
         }
     }
 
-    /// Sections `a` and `b`, neighbours, merged into one. Bands in
-    /// intensity stereo merge only with bands of the same intensity
-    /// codebook: any other merge costs more than any coding.
+    /// Sections `a` and `b`, neighbours, merged into one. Bands of a pseudo
+    /// codebook merge only with bands of the same codebook: any other merge
+    /// costs more than any coding.
     fn merge(&self, a: Candidate, b: Candidate) -> Candidate {
         debug_assert_eq!(a.end, b.start);
-        let intensity = |class: u8| usize::from(class) >= CLASSES.len();
-        if (intensity(a.class) || intensity(b.class)) && a.class != b.class {
+        let pseudo = |class: u8| usize::from(class) >= CLASSES.len();
+        if (pseudo(a.class) || pseudo(b.class)) && a.class != b.class {
             return Candidate {
                 start: a.start,
                 end: b.end,
@@ -765,20 +807,26 @@ impl Default for Candidate {
     }
 }
 
-/// The class [`Counted`] gives a band of `codebook`, an intensity codebook:
-/// one past [`CLASSES`] for each.
-fn intensity_class(codebook: Codebook) -> usize {
-    CLASSES.len() + usize::from(codebook == Codebook::INTENSITY_OUT_OF_PHASE)
+/// The pseudo codebooks, each with the class [`Counted`] gives its bands:
+/// [`CLASSES`]`.len()` plus its place here.
+const PSEUDO_CODEBOOKS: [Codebook; 3] = [
+    Codebook::INTENSITY,
+    Codebook::INTENSITY_OUT_OF_PHASE,
+    Codebook::NOISE,
+];
+
+/// The class [`Counted`] gives a band of `codebook`, a pseudo codebook.
+fn pseudo_class(codebook: Codebook) -> usize {
+    let place = (PSEUDO_CODEBOOKS.iter())
+        .position(|&pseudo| pseudo == codebook)
+        .expect("a pseudo codebook");
+    CLASSES.len() + place
 }
 
-/// The intensity codebook of the class `intensity_class` gives, less
+/// The pseudo codebook of the class `pseudo_class` gives, less
 /// [`CLASSES`]`.len()`.
-fn intensity_codebook(class: usize) -> Codebook {
-    if class == 0 {
-        Codebook::INTENSITY
-    } else {
-        Codebook::INTENSITY_OUT_OF_PHASE
-    }
+fn pseudo_codebook(class: usize) -> Codebook {
+    PSEUDO_CODEBOOKS[class]
 }
 
 /// `sect_len_incr`'s bits and `sect_esc_val` (Table 17).
