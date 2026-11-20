@@ -257,7 +257,10 @@ fn change(energies: impl Iterator<Item = f64>) -> f64 {
 /// vector by `scale *= 2.0^(0.25*noise_nrg[g][sfb]) / sqrt_nrg`, with
 /// `scale` set nowhere; it is read as `scale =`, which gives each window's
 /// band the energy that its noise energy states, `2^(0.5 noise_nrg)`, in
-/// steps of 1.5 dB, as the clause says.
+/// steps of 1.5 dB, as the clause says. Settled by decoding with ffmpeg
+/// and FAAD2 (black box): white noise so coded decodes at its level within
+/// 1 dB in each range above the border; the conformance test is
+/// `ffmpeg_and_faad_decode_noise_at_its_energy`.
 pub fn energy_index(energy: f64) -> i16 {
     (2.0 * energy.log2()).round() as i16
 }

@@ -93,7 +93,10 @@ impl Header {
         // a stream that uses perceptual noise substitution, a tool of
         // MPEG-4 alone, whose codebook ISO/IEC 13818-7 reserves (Table 59).
         // The `profile` that follows, `profile_ObjectType` where `ID` is 0,
-        // is the same: the object type of AAC LC, 2, less 1.
+        // is the same: the object type of AAC LC, 2, less 1. Settled by
+        // decoding with ffmpeg and FAAD2 (black box): both decode such
+        // streams, their bands of noise included, without complaint; the
+        // conformance test is `ffmpeg_and_faad_decode_noise_at_its_energy`.
         w.write(u32::from(!self.mpeg4), 1);
         w.write(0b00, 2); // layer: "Set to '00'"
         w.write_bool(!self.protected); // protection_absent
