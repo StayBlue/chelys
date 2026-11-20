@@ -20,7 +20,9 @@
 //!
 //! LAME's encoder is run as a black box too, as a benchmark: only the PEAQ
 //! grades of its decoded output are compared with chelys's. The benchmark
-//! was run with LAME 4.0 (64-bit).
+//! was run with LAME 4.0 (64-bit). For AAC, ffmpeg's native AAC encoder is
+//! the benchmark, run alike at its default settings apart from the bitrate,
+//! with ffmpeg n9.0.2.
 
 pub mod faad;
 pub mod ffmpeg;
