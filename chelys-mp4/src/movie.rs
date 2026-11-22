@@ -254,6 +254,11 @@ fn write_track_header(out: &mut Vec<u8>, track: &AudioTrack) {
 /// which the file does not hold the frames the encoder reports
 /// ([`Finished::frames`](chelys_aac::Finished::frames)). Only decoding
 /// shows which reading a reader takes.
+///
+/// Settled by decoding with ffmpeg (black box): it decodes a file of no
+/// samples to none, and files of a sample or so either side of a frame's
+/// length to exactly their samples; the conformance test is
+/// `ffmpeg_reads_empty_and_short_mp4_files`.
 fn write_edit(out: &mut Vec<u8>, track: &AudioTrack) {
     let duration = track.length;
     let media_time = u64::from(track.delay);
