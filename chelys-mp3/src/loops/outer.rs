@@ -161,10 +161,11 @@ pub const SAVING_NOISE_DB: f64 = 4.0;
 /// [`noise_db`](Saving::noise_db), as long as it still uses at least its
 /// [`least`](Saving::least) bits; the bits it leaves are the bit
 /// reservoir's, for granules short of bits.
-/// Spec reading: clause C.1.5.4.4 has the inner loop take the finest step
-/// that fits whatever the distortion, so that a granule spends all the bits
-/// it is given, and the reservoir gains only what a granule cannot spend
-/// (clause C.1.5.4.2.2). This deliberately departs from that. In a track at
+/// Spec reading: the inner loop takes the finest step that fits whatever
+/// the distortion (clause C.1.5.4.4), so that a granule uses "as many of
+/// the available bits as possible" (clause C.1.5.4.2.1), and the reservoir
+/// gains only what a granule cannot spend (clauses C.1.5.4.1 and
+/// C.1.5.4.2.2). This deliberately departs from that. In a track at
 /// 128 kbit/s, three granules in four met their allowance from the first
 /// iteration and spent their bits lowering noise the model had already
 /// judged inaudible, while the rest went short. The least is what the

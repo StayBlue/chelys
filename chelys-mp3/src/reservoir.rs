@@ -22,6 +22,11 @@ const BORROW_ABOVE: f64 = 100.0;
 /// The share of the reservoir a granule asking for more bits may take.
 const BORROW_SHARE: f64 = 0.6;
 
+/// The noise offset, in dB, of [`Reservoir::noise_offset_db`] when the
+/// reservoir is empty, and when it is full.
+const OFFSET_EMPTY_DB: f64 = 4.0;
+const OFFSET_FULL_DB: f64 = 0.0;
+
 /// Tracks the reservoir across granules and frames.
 ///
 /// The fill is kept in bits, and can dip below zero within a frame for
@@ -161,6 +166,20 @@ impl Reservoir {
         mean_bits + 8 * extra.min(held)
     }
 
+    /// How much more noise than the psychoacoustic model allows, in dB, a
+    /// granule coded now first aims for at a constant or mean bitrate (see
+    /// `quantize_frame` in `stream::coding::model`): from 4 dB when the
+    /// reservoir is empty down to 0 when it is full, in proportion to its
+    /// fill. A frame whose length leaves no room for a reservoir aims for
+    /// the model's allowance itself.
+    pub fn noise_offset_db(&self) -> f64 {
+        if self.max_bytes == 0 {
+            return OFFSET_FULL_DB;
+        }
+        let fill = (self.bits as f64 / (8 * self.max_bytes) as f64).clamp(0.0, 1.0);
+        OFFSET_EMPTY_DB + (OFFSET_FULL_DB - OFFSET_EMPTY_DB) * fill
+    }
+
     /// The fewest bits a granule with the share `mean_bits` must use for the
     /// reservoir to hold what it leaves unused: below that, the bits it
     /// leaves would end up as stuffing.
@@ -247,6 +266,20 @@ mod tests {
         assert_eq!(reservoir.least_use(1000), 120);
         assert_eq!(reservoir.least_use(500), 0);
         assert_eq!(Reservoir::disabled().least_use(500), 500);
+    }
+
+    /// The offset falls from 4 dB when the reservoir is empty to 0 when it
+    /// is full, and is 0 where there is no reservoir.
+    #[test]
+    fn the_noise_offset_falls_as_the_reservoir_fills() {
+        let mut reservoir = Reservoir::new(800, Version::Mpeg1);
+        assert_eq!(reservoir.max_bytes(), 160);
+        assert_eq!(reservoir.noise_offset_db(), 4.0);
+        reservoir.granule_done(8 * 80, 0);
+        assert!((reservoir.noise_offset_db() - 2.0).abs() < 1e-12);
+        reservoir.granule_done(8 * 200, 0);
+        assert_eq!(reservoir.noise_offset_db(), 0.0);
+        assert_eq!(Reservoir::disabled().noise_offset_db(), 0.0);
     }
 
     #[test]
