@@ -31,7 +31,7 @@ pub struct AudioTrack<'a> {
     pub length: u64,
     /// The number of frames before a frame that are to be decoded before
     /// it for it to decode correctly, as a negative `roll_distance`
-    /// (clause 10.1), for every frame but the first.
+    /// (clause 10.1), for every frame.
     pub roll_distance: i16,
 }
 
@@ -472,7 +472,7 @@ fn write_sample_entry(out: &mut Vec<u8>, track: &AudioTrack) {
     });
 }
 
-/// The pre-roll of every frame but the first, as a sample group of
+/// The pre-roll of every frame, as a sample group of
 /// `grouping_type` `'roll'` (clause 10.1): its `SampleToGroupBox` and
 /// `SampleGroupDescriptionBox` (clauses 8.9.2 and 8.9.3).
 ///
@@ -492,10 +492,18 @@ fn write_sample_entry(out: &mut Vec<u8>, track: &AudioTrack) {
 /// is a `'roll'`, of `roll_distance` −1, "the number of samples before the
 /// sample that is a group member that need to be decoded".
 ///
-/// Spec reading: the first frame is in no group (`group_description_index`
-/// 0): there is no frame before it, and it decodes correctly from the
-/// silence a decoder starts with, which the encoder took to precede the
-/// input. The others are members of the one group.
+/// Spec reading: the first frame is a member of the group too, although
+/// there is no frame before it and it decodes correctly from the silence a
+/// decoder starts with, which the encoder took to precede the input.
+/// ISO/IEC 14496-12 neither requires nor forbids that. Apple's QuickTime File
+/// Format documentation does require it ("All AAC packets including the
+/// encoder delay must be associated with the sample group", in
+/// "Representing encoder delay with track structures"; its "Sample-to-group
+/// atom" gives one entry "describing all the AAC packets in the track"),
+/// and "Using track structures to represent encoder delay explicitly" warns
+/// that "An incomplete implementation will result in unspecified
+/// interpretation by Apple software and tools". So the `SampleToGroupBox`
+/// has the one entry it describes, of every frame.
 ///
 /// The `SampleGroupDescriptionBox` is of version 1, with the entries'
 /// `default_length`, as version 0 entries are "deprecated" (clause
@@ -508,12 +516,8 @@ fn write_sample_groups(out: &mut Vec<u8>, track: &AudioTrack, count: u32) {
     const ROLL: &FourCc = b"roll";
     write_full_box(out, b"sbgp", 0, 0, |out| {
         out.extend_from_slice(ROLL); // grouping_type
-        let mut entries = vec![(count.min(1), 0)];
-        if count > 1 {
-            entries.push((count - 1, 1));
-        }
-        entries.retain(|&(samples, _)| samples > 0);
-        put_entries(out, &entries);
+        let entries: &[(u32, u32)] = if count > 0 { &[(count, 1)] } else { &[] };
+        put_entries(out, entries);
     });
     write_full_box(out, b"sgpd", 1, 0, |out| {
         out.extend_from_slice(ROLL); // grouping_type
@@ -770,13 +774,9 @@ mod tests {
     }
 
     #[test]
-    fn every_frame_but_the_first_rolls_back_one() {
+    fn every_frame_rolls_back_one() {
         let stbl = [b"moov", b"trak", b"mdia", b"minf", b"stbl"];
-        for (frames, expected) in [
-            (1, vec![(1, 0)]),
-            (2, vec![(1, 0), (1, 1)]),
-            (9, vec![(1, 0), (8, 1)]),
-        ] {
+        for (frames, expected) in [(1, vec![(1, 1)]), (2, vec![(2, 1)]), (9, vec![(9, 1)])] {
             let sizes = vec![1; frames];
             let file = write(&track(&sizes, 44_100, 0), &vec![0; frames]);
             let sbgp = find(&file, &[&stbl[..], &[b"sbgp"]].concat());

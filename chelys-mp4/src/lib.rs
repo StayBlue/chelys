@@ -39,7 +39,7 @@
 //!           stsc        one chunk of every frame
 //!           stsz        each frame's size
 //!           stco        where the chunk starts
-//!           sbgp        every frame but the first ...
+//!           sbgp        every frame ...
 //!           sgpd        ... is to be decoded after the one before it
 //! mdat                  the frames, raw_data_block()s, one after another
 //! ```
