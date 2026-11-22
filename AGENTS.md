@@ -219,3 +219,17 @@ next to the decoders'.
 
 *User, 2026-11-19, when asked whether chelys's AAC encoder is competitive with
 FFmpeg's: the wording was proposed by the agent and approved by the user.*
+
+## MP4
+
+chelys writes MP4 files from ISO/IEC 14496-12:2026, ISO/IEC 14496-14:2020,
+ISO/IEC 14496-1:2026 and ISO/IEC 14496-34:2025, and their official corrigenda,
+only, under the same clean-room rules as the standards named under "Clean
+room". Only what an audio-only file needs is implemented. Other MP4 writers and
+readers, for example ffmpeg's MOV/MP4 muxer, GPAC/MP4Box, Bento4 and mp4v2,
+fall under "Clean room" as the codecs named there do. Where the standards leave
+something open, black-box decoding with ffmpeg may settle it, documented as for
+the standards.
+
+*User, 2026-11-21, when the standards were given: the wording was proposed by
+the agent and approved by the user.*
