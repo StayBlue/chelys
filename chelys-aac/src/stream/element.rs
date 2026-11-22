@@ -14,9 +14,9 @@ use crate::noise_substitution::{self, BandSet, Noise};
 use crate::noiseless::pulses::Pulses;
 use crate::noiseless::scalefactors;
 use crate::noiseless::sections::Sections;
-use crate::psychoacoustic::Analysis;
 use crate::psychoacoustic::imaging::MidSideModel;
 use crate::psychoacoustic::switching::{self, Attacks, BlockSwitching};
+use crate::psychoacoustic::{Analysis, QuietThreshold};
 use crate::raw_data_block::element::{CodedElement, LFE_LINES};
 use crate::sampling_frequency::SamplingFrequency;
 use crate::scalefactor_bands::{MAX_BANDS, Transform, first_band_above};
@@ -44,10 +44,14 @@ struct ChannelEncoder {
 impl ChannelEncoder {
     /// A channel of an element of `kind`: a low frequency enhancement
     /// channel's model finds no attacks (see [`ElementEncoder`]).
-    fn new(sampling_frequency: SamplingFrequency, kind: ElementKind) -> Self {
+    fn new(
+        sampling_frequency: SamplingFrequency,
+        kind: ElementKind,
+        quiet: QuietThreshold,
+    ) -> Self {
         let switching = match kind {
-            ElementKind::Lfe => BlockSwitching::long_only(sampling_frequency),
-            _ => BlockSwitching::new(sampling_frequency),
+            ElementKind::Lfe => BlockSwitching::long_only(sampling_frequency, quiet),
+            _ => BlockSwitching::new(sampling_frequency, quiet),
         };
         Self {
             pcm: Vec::with_capacity(2 * FRAME_SAMPLES),
@@ -123,9 +127,14 @@ impl PreparedChannel {
     /// The channel's allowed distortions, perceptual entropy and
     /// `bit_allocation`, from its lines before temporal noise shaping and
     /// `analysis`, its model's thresholds.
-    fn thresholds(&mut self, analysis: &Analysis) {
-        (self.bit_allocation, self.perceptual_entropy) =
-            thresholds(analysis, self.windows, &self.unshaped, &mut self.xmin);
+    fn thresholds(&mut self, analysis: &Analysis, quiet: QuietThreshold) {
+        (self.bit_allocation, self.perceptual_entropy) = thresholds(
+            analysis,
+            self.windows,
+            &self.unshaped,
+            &mut self.xmin,
+            quiet,
+        );
     }
 }
 
@@ -166,9 +175,9 @@ impl MidSideChannel {
     /// The channel's allowed distortions, perceptual entropy and
     /// `bit_allocation` in `windows`, from its lines before temporal noise
     /// shaping and `analysis`, its model's thresholds.
-    fn thresholds(&mut self, windows: Windows, analysis: &Analysis) {
+    fn thresholds(&mut self, windows: Windows, analysis: &Analysis, quiet: QuietThreshold) {
         (self.bit_allocation, self.perceptual_entropy) =
-            thresholds(analysis, windows, &self.unshaped, &mut self.xmin);
+            thresholds(analysis, windows, &self.unshaped, &mut self.xmin, quiet);
     }
 }
 
@@ -181,9 +190,10 @@ fn thresholds(
     windows: Windows,
     unshaped: &[f64; FRAME_LINES],
     xmin: &mut Vec<[f64; MAX_BANDS]>,
+    quiet: QuietThreshold,
 ) -> (f64, f64) {
     analysis.xmin(windows, unshaped, xmin);
-    loops::raise_xmin(xmin);
+    loops::raise_xmin(xmin, quiet);
     (
         analysis.bit_allocation(windows.sequence),
         analysis.perceptual_entropy(windows.sequence),
@@ -241,6 +251,9 @@ pub struct ElementEncoder {
     /// The lower border frequency above which bands are coded by perceptual
     /// noise substitution, if they are (see [`noise_substitution`]).
     noise_border: Option<f64>,
+    /// How the models read the threshold in quiet, and with it how far the
+    /// loops raise `xmin` (see [`loops::raise_xmin`]).
+    quiet: QuietThreshold,
     /// Whether the channels' lines are shaped by temporal noise shaping,
     /// and the memory it works in.
     tns: bool,
@@ -307,12 +320,13 @@ impl ElementEncoder {
     /// The element `kind` at `sampling_frequency`, a pair coded in
     /// intensity stereo above `intensity_border` Hz, if given, and its
     /// channels by perceptual noise substitution above `noise_border` Hz,
-    /// if given.
+    /// if given, whose models read the threshold in quiet as `quiet` asks.
     pub fn new(
         sampling_frequency: SamplingFrequency,
         kind: ElementKind,
         intensity_border: Option<f64>,
         noise_border: Option<f64>,
+        quiet: QuietThreshold,
     ) -> Self {
         let channels = kind.channels();
         Self {
@@ -320,13 +334,13 @@ impl ElementEncoder {
             kind,
             input_end: None,
             channels: (0..channels)
-                .map(|_| ChannelEncoder::new(sampling_frequency, kind))
+                .map(|_| ChannelEncoder::new(sampling_frequency, kind, quiet))
                 .collect(),
             prepared: (0..channels).map(|_| PreparedChannel::new()).collect(),
             common_window: false,
             mid_side: (channels == 2).then(|| {
                 Box::new(MidSide {
-                    model: MidSideModel::new(sampling_frequency),
+                    model: MidSideModel::new(sampling_frequency, quiet),
                     channels: [MidSideChannel::new(), MidSideChannel::new()],
                 })
             }),
@@ -337,6 +351,7 @@ impl ElementEncoder {
             noise_by_ms_used: false,
             noise_ms_used: [0; SHORT_WINDOWS],
             noise_border,
+            quiet,
             tns: true,
             spectrum_clipping: loops::SPECTRUM_CLIPPING,
             shaping: Shaping::default(),
@@ -668,7 +683,7 @@ impl ElementEncoder {
     /// them, graded -1.200 and took half as long again to encode.
     fn thresholds(&mut self) {
         for (channel, prepared) in self.channels.iter().zip(&mut self.prepared) {
-            prepared.thresholds(channel.switching.current());
+            prepared.thresholds(channel.switching.current(), self.quiet);
         }
     }
 
@@ -808,16 +823,71 @@ impl ElementEncoder {
     }
 
     /// Which channels are silent, as they are coded.
+    ///
+    /// A channel of a pair that shares its window is set to zero, and coded
+    /// silent, where its own lines are all zero, so that it is left with
+    /// lines only by the side or middle of bands coded as middle and side,
+    /// none of its bands has energy beyond its allowed distortion `xmin`,
+    /// it has no filters of temporal noise shaping, and the other channel
+    /// has a band beyond its own.
+    ///
+    /// Spec gap: Annex C does not say how a pair's channels share the
+    /// frame's bits (see [`code_element`](Self::code_element)), and its
+    /// loops quantize a channel at the finest step that fits whatever its
+    /// bands need, as the outer loop stops at once where no band exceeds
+    /// its allowance (figure C.7). Each band of such a channel can be
+    /// quantized to zero within its allowance, as the choice of M/S stereo
+    /// counts it (see [`band_bits`](crate::loops::inner::band_bits)); yet,
+    /// coded with lines, it took an equal share of the frame and spent it on
+    /// them, which the other channel then lacked. At 48 kHz in stereo at 96
+    /// kbit/s, six tones beside silence ending abruptly were coded in the
+    /// two frames of their end with 500 and 800 bits of the silent channel's
+    /// share spent so, and the noise of the tones' last 1024 samples 8 dB
+    /// louder; the short window that held their end left noise 26 dB below
+    /// them for 5 ms after it (the conformance test
+    /// `stereo_pairs_decode_each_channel_in_place`).
+    ///
+    /// The rule is kept to channels whose own lines are zero. Applied to
+    /// every channel within its allowance, it cut quiet signals to silence
+    /// beside louder ones: at 128 kbit/s, a tone of 1 kHz in the left
+    /// channel beside loud noise in the right was coded at an SNR of 82 dB
+    /// at -70 dBFS and not at all at -80 dBFS, and in the fade of a piano
+    /// the silenced channel alternated between left and right; and, where
+    /// the right channel's bands in intensity stereo were taken as its need,
+    /// the left channel of quiet noise in intensity stereo was silenced with
+    /// the right channel's bands that it scales. Applied to every channel
+    /// whose lines lay only in bands coded as middle and side, it dropped
+    /// the side of quiet frames coded so in every band, as in the same fade,
+    /// decoded with both channels alike and an error 9 to 19 dB louder. A
+    /// channel with filters is left as it is: its filters would be sent for
+    /// no lines, or, where they span bands coded as middle and side, would
+    /// have shaped the lines of its pair that it decodes.
     fn find_silence(&mut self) {
         // A right channel with bands in intensity stereo sends them, and a
         // channel with bands of noise sends those, even where its lines are
         // all zero.
         let in_intensity = self.in_intensity();
+        let sends = |c: usize, prepared: &PreparedChannel| {
+            (c == 1 && in_intensity) || prepared.noise.is_present()
+        };
+        if self.common_window {
+            let fs = self.sampling_frequency;
+            let exceeds: Vec<bool> = (self.prepared.iter())
+                .map(|prepared| exceeds_allowance(prepared, fs))
+                .collect();
+            for c in 0..2 {
+                let prepared = &self.prepared[c];
+                if exceeds[c] || !exceeds[1 - c] || sends(c, prepared) || prepared.tns.is_present()
+                {
+                    continue;
+                }
+                if prepared.unshaped.iter().all(|&x| x == 0.0) {
+                    self.prepared[c].spectrum.fill(0.0);
+                }
+            }
+        }
         for (c, prepared) in self.prepared.iter_mut().enumerate() {
-            let sends_positions = c == 1 && in_intensity;
-            prepared.silent = !sends_positions
-                && !prepared.noise.is_present()
-                && prepared.spectrum.iter().all(|&x| x == 0.0);
+            prepared.silent = !sends(c, prepared) && prepared.spectrum.iter().all(|&x| x == 0.0);
         }
     }
 
@@ -890,7 +960,7 @@ impl ElementEncoder {
         }
         let analyses = mid_side.model.current(windows.sequence.transform());
         for (channel, analysis) in [&mut *mid, &mut *side].into_iter().zip(analyses) {
-            channel.thresholds(windows, analysis);
+            channel.thresholds(windows, analysis, self.quiet);
         }
         self.ms = middle_side::choose(
             windows,
@@ -1349,6 +1419,20 @@ impl ElementEncoder {
     }
 }
 
+/// Whether any band of `prepared` has energy beyond its allowed distortion
+/// `xmin`, its lines weighed as the loops weigh them.
+fn exceeds_allowance(prepared: &PreparedChannel, sampling_frequency: SamplingFrequency) -> bool {
+    let groups = prepared.windows.groups_with_start(sampling_frequency);
+    groups.zip(&prepared.xmin).any(|((start, bands), xmin)| {
+        (0..bands.num_swb()).any(|sfb| {
+            let range = bands.band(sfb);
+            let lines = (prepared.spectrum[start + range.start..start + range.end].iter())
+                .zip(&prepared.weights[start + range.start..start + range.end]);
+            lines.map(|(x, w)| x * x * w).sum::<f64>() > xmin[sfb]
+        })
+    })
+}
+
 /// The fewest bits a channel of `windows` shaped by `tns` can be coded in,
 /// as the second of a pair that shares its window: without lines, its
 /// groups spanning `max_sfb` bands, with the bands of `intensity` and of
@@ -1468,7 +1552,13 @@ mod tests {
         intensity_border: Option<f64>,
         block_switching: bool,
     ) -> Vec<(Element, Vec<Vec<f64>>)> {
-        let encoder = ElementEncoder::new(fs, kind(input.len()), intensity_border, None);
+        let encoder = ElementEncoder::new(
+            fs,
+            kind(input.len()),
+            intensity_border,
+            None,
+            QuietThreshold::Noise,
+        );
         round_trip_encoder(encoder, input, bits, block_switching)
     }
 
@@ -1616,7 +1706,8 @@ mod tests {
         let pair = [clicks(5), clicks(6)];
         let (mut pulses, mut short) = (0, 0);
         for (input, bits) in [(&pair[..1], 500), (&pair[..1], 1500), (&pair[..], 3000)] {
-            let mut encoder = ElementEncoder::new(fs, kind(input.len()), None, None);
+            let mut encoder =
+                ElementEncoder::new(fs, kind(input.len()), None, None, QuietThreshold::Noise);
             encoder.spectrum_clipping(true);
             // round_trip_encoder checks the bits and decodes each frame.
             for (element, _) in round_trip_encoder(encoder, input, bits, true) {
@@ -1826,7 +1917,8 @@ mod tests {
         // The bits of each frame's element at 23 kbit/s, less the header,
         // id_syn_ele and ID_END.
         let bits = 23_000 * 1024 / 64_000 - 56 - 6;
-        let mut encoder = ElementEncoder::new(fs, ElementKind::Pair, None, None);
+        let mut encoder =
+            ElementEncoder::new(fs, ElementKind::Pair, None, None, QuietThreshold::Noise);
         let channels: Vec<&[f64]> = input.iter().map(Vec::as_slice).collect();
         encoder.push(&channels);
         encoder.prime();
@@ -1877,7 +1969,13 @@ mod tests {
     fn noise_is_substituted_above_the_border_at_its_level() {
         let fs = SamplingFrequency::Hz44100;
         let input = [noise(16 * FRAME_SAMPLES, 7)];
-        let encoder = ElementEncoder::new(fs, kind(1), None, Some(noise_substitution::BORDER_HZ));
+        let encoder = ElementEncoder::new(
+            fs,
+            kind(1),
+            None,
+            Some(noise_substitution::BORDER_HZ),
+            QuietThreshold::Noise,
+        );
         let frames = round_trip_encoder(encoder, &input, 1500, true);
         let first = first_band_above(fs, Transform::Long, noise_substitution::BORDER_HZ);
         let mut substituted = 0;
@@ -1919,8 +2017,13 @@ mod tests {
         let half: Vec<f64> = left.iter().map(|x| 0.5 * x).collect();
         let other = noise(len, 12);
         for (right, alike) in [(half, true), (other, false)] {
-            let encoder =
-                ElementEncoder::new(fs, kind(2), None, Some(noise_substitution::BORDER_HZ));
+            let encoder = ElementEncoder::new(
+                fs,
+                kind(2),
+                None,
+                Some(noise_substitution::BORDER_HZ),
+                QuietThreshold::Noise,
+            );
             let frames = round_trip_encoder(encoder, &[left.clone(), right], 3000, false);
             let (mut substituted, mut shared) = (0, 0);
             for (decoded, _) in &frames[2..] {

@@ -7,7 +7,7 @@
 //! window shape.
 
 use super::imaging::MidSideModel;
-use super::{Analysis, Model};
+use super::{Analysis, Model, QuietThreshold};
 use crate::sampling_frequency::SamplingFrequency;
 use crate::stream::FRAME_SAMPLES;
 use crate::window::{Grouping, SHORT_WINDOWS, WindowSequence, WindowShape};
@@ -172,9 +172,11 @@ pub struct Attacks {
 }
 
 impl BlockSwitching {
-    pub fn new(sampling_frequency: SamplingFrequency) -> Self {
+    /// The block switching of a channel at `sampling_frequency`, whose
+    /// model reads the threshold in quiet as `quiet` asks.
+    pub fn new(sampling_frequency: SamplingFrequency, quiet: QuietThreshold) -> Self {
         Self {
-            model: Model::new(sampling_frequency),
+            model: Model::new(sampling_frequency, quiet),
             current: Box::new(Analysis::new(sampling_frequency)),
             ahead: Box::new(Analysis::new(sampling_frequency)),
             primed: false,
@@ -185,10 +187,10 @@ impl BlockSwitching {
     /// [`new`](Self::new), for a channel coded with long windows whatever
     /// its attacks, whose model analyzes its long blocks alone, and finds
     /// none (see [`Model::long_only`]).
-    pub fn long_only(sampling_frequency: SamplingFrequency) -> Self {
+    pub fn long_only(sampling_frequency: SamplingFrequency, quiet: QuietThreshold) -> Self {
         Self {
-            model: Model::new(sampling_frequency).long_only(),
-            ..Self::new(sampling_frequency)
+            model: Model::new(sampling_frequency, quiet).long_only(),
+            ..Self::new(sampling_frequency, quiet)
         }
     }
 
@@ -473,7 +475,7 @@ mod tests {
     #[test]
     fn windows_of_like_energy_are_grouped() {
         let fs = SamplingFrequency::Hz44100;
-        let mut model = Model::new(fs);
+        let mut model = Model::new(fs, QuietThreshold::Noise);
         let mut analysis = Analysis::new(fs);
         let mut state = 1u64;
         for block in 0..3 {
@@ -517,7 +519,7 @@ mod tests {
             _ => 0.5 * (TAU * 20.0 * duration / k * ((k * t / duration).exp() - 1.0)).sin(),
         };
         for name in ["tone", "sweep"] {
-            let mut switching = BlockSwitching::new(fs);
+            let mut switching = BlockSwitching::new(fs, QuietThreshold::Noise);
             for block in 0..frames {
                 let samples: [f64; FRAME_SAMPLES] = std::array::from_fn(|t| {
                     signal(name, (block * FRAME_SAMPLES + t) as f64 / rate)
@@ -541,7 +543,7 @@ mod tests {
     #[test]
     fn a_faint_impulse_in_silence_is_an_attack() {
         let fs = SamplingFrequency::Hz8000;
-        let mut switching = BlockSwitching::new(fs);
+        let mut switching = BlockSwitching::new(fs, QuietThreshold::Noise);
         let mut found = Vec::new();
         for block in 0..8 {
             let samples: [f64; FRAME_SAMPLES] =
@@ -563,7 +565,7 @@ mod tests {
     #[test]
     fn an_attack_switches_to_short_windows() {
         let fs = SamplingFrequency::Hz44100;
-        let mut switching = BlockSwitching::new(fs);
+        let mut switching = BlockSwitching::new(fs, QuietThreshold::Noise);
         let mut state = 3u64;
         let mut sequences = Vec::new();
         for block in 0..16 {

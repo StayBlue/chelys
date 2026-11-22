@@ -1423,10 +1423,28 @@ fn temporal_noise_shaping_decodes_in_place() {
 /// attacks of transient signals, which a long window spreads over its
 /// span: the error of the decoded output over the 1024 samples before each
 /// attack, short of the last 64, coded with long windows alone, is less
-/// with it than without, by 3.6 to 11.9 dB. Where the frames of the
+/// with it than without, by 1.1 to 10.5 dB. Where the frames of the
 /// attacks are coded with short windows, which hold back most of the noise
 /// themselves (see `short_windows_hold_back_the_noise_before_an_attack`),
-/// the error is less too, by up to 6.1 dB, or about as much.
+/// the error is less too, by up to 8.9 dB, or about as much, 1.5 dB more
+/// at most.
+///
+/// Since the encoder took the threshold in quiet as noise has it, and
+/// raised `xmin` by no offset, above 0.8 bits a sample (see
+/// `StreamConfig::quiet_threshold`), the loops spend more of a frame's bits
+/// on its higher bands, and the least of these gains fell. With long
+/// windows alone, the least fell from 3.0 dB to 1.1 dB, on the clicks at
+/// 44.1 kHz and 96 kbit/s, which had gained 5.0 dB: their error with
+/// temporal noise shaping rose from 0.74 to 1.82, while it stayed at 2.3
+/// without. The offset accounted for it: with 3 dB, it was 0.44. Coding
+/// long windows alone is a setting of this test only. As the encoder
+/// codes, with short windows at attacks, the same clicks' error fell from
+/// 0.054 to 0.050. Among the other signals and rates, the error with
+/// temporal noise shaping moved by -2.9 to +3.8 dB, the reading more than
+/// the offset; that of the pulses at 44.1 kHz and 96 kbit/s rose from
+/// 2.1e-4 to 4.1e-4, 1.45 dB more than without temporal noise shaping
+/// (2.9e-4). Over 51 tracks of music, the grades of PEAQ rose at these
+/// rates (see `StreamConfig::quiet_threshold`).
 #[test]
 fn temporal_noise_shaping_holds_back_the_noise_before_attacks() {
     use chelys::aac::internals::channel_configuration::ChannelConfiguration;
@@ -1469,7 +1487,7 @@ fn temporal_noise_shaping_holds_back_the_noise_before_attacks() {
                         .sum::<f64>()
                 };
                 let gain = 10.0 * (pre_echo(false) / pre_echo(true)).log10();
-                let least = if switching { -1.0 } else { 2.0 };
+                let least = if switching { -2.0 } else { 0.5 };
                 assert!(
                     gain > least,
                     "{context}: {gain:.1} dB less error before the attacks"

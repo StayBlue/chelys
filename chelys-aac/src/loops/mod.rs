@@ -12,6 +12,7 @@ use inner::{Counting, Lines};
 
 use crate::channel::{CodedChannel, FRAME_LINES};
 use crate::noise_substitution::Noise;
+use crate::psychoacoustic::QuietThreshold;
 use crate::sampling_frequency::SamplingFrequency;
 use crate::scalefactor_bands::MAX_BANDS;
 use crate::stereo::intensity::Intensity;
@@ -19,7 +20,8 @@ use crate::tns::Tns;
 use crate::window::Windows;
 
 /// The offset in dB that every allowed distortion `xmin` is raised by
-/// before the loops (clause C.7.4.4).
+/// before the loops (clause C.7.4.4), where the model takes the threshold
+/// in quiet as printed (see [`raise_xmin`]).
 ///
 /// Spec gap: clause C.7.4.4 says the outer loop's procedure "is only valid
 /// in the case the number of available bits is equal to the number of
@@ -58,9 +60,24 @@ pub const XMIN_OFFSET_DB: f64 = 3.0;
 /// for each clipping too.
 pub const SPECTRUM_CLIPPING: bool = false;
 
-/// Raises each allowed distortion `xmin` by [`XMIN_OFFSET_DB`], as the
-/// loops take it.
-pub fn raise_xmin(xmin: &mut [[f64; MAX_BANDS]]) {
+/// Raises each allowed distortion `xmin` as the loops take it: by
+/// [`XMIN_OFFSET_DB`] where the model took the threshold in quiet as
+/// printed, and not at all where it took it as noise has it.
+///
+/// Spec gap: clause C.7.4.4 asks for an offset wherever the bits available
+/// are more or fewer than the perceptual entropy requires, and none only
+/// where they are equal, but gives neither its size nor its sign (see
+/// [`XMIN_OFFSET_DB`]). The offset of 3 dB was chosen with the threshold in
+/// quiet as printed, which leaves the highest bands of most frames without
+/// lines whatever the offset. With the threshold taken as noise has it (see
+/// [`QuietThreshold::Noise`]), no offset grades best, better than 3 dB
+/// either way (see [`StreamConfig::quiet_threshold`] for the grades).
+///
+/// [`StreamConfig::quiet_threshold`]: crate::stream::StreamConfig::quiet_threshold
+pub fn raise_xmin(xmin: &mut [[f64; MAX_BANDS]], quiet: QuietThreshold) {
+    if quiet == QuietThreshold::Noise {
+        return;
+    }
     let offset = 10f64.powf(XMIN_OFFSET_DB / 10.0);
     for xmin in xmin.iter_mut().flatten() {
         *xmin *= offset;

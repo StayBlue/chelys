@@ -106,14 +106,96 @@ fn hann(iblen: usize) -> Vec<f64> {
 ///
 /// Spec reading: step 11 compares `qsthr(b)` with `nb(b)`, the threshold
 /// of the whole partition, and step 14 divides that among its lines. The
-/// tables' `qsthr` rises with a partition's width by its share of the
-/// lines, as Table C.1 gives 33.82 dB to the 9 lines of partition 10 and
-/// 34.28 dB, 0.46 dB more, to the 10 of partition 11, beside it: each is
-/// a partition's threshold in quiet, the line's level times its lines, and
-/// is compared as printed.
+/// tables' `qsthr` is a level for each line times the partition's lines:
+/// where that level holds from one partition to the next, `qsthr` rises
+/// with the lines alone, as Table C.1 (8 kHz, long FFT) gives 33.82 dB to
+/// the 9 lines of partition 10 and 34.28 dB, 0.46 dB more, to the 10 of
+/// partition 11, beside it, and Table C.15 (44.1 kHz, long FFT) puts every
+/// line of partitions 9 to 52, of 2 to 20 lines, at 22.28 dB. Below and
+/// above, the level for each line changes too: partitions 0 to 9 of Table
+/// C.15, of 2 lines each, fall from 37.28 dB in steps of 2 to 5 dB, and
+/// from partition 53 up it climbs in steps of 3 to 10 dB, to 57.78 dB. As
+/// printed, `qsthr(b)` is compared as the threshold in quiet of the whole
+/// partition (but see [`QuietThreshold::Noise`]).
 fn quiet_reference(iblen: usize) -> f64 {
     (iblen as f64 / 4.0).powi(2)
 }
+
+/// How the model takes the threshold in quiet `qsthr(b)` of the tables
+/// (step 11).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QuietThreshold {
+    /// As printed: each partition's `qsthr(b)`.
+    Printed,
+    /// As noise is heard: each partition's `qsthr(b)` for one line, times
+    /// the partition's width in Bark (see `noise_in_quiet`).
+    Noise,
+}
+
+/// The threshold in quiet of each of `partitions` as an energy, from their
+/// `qsthr(b)` put at `reference` (see [`quiet_reference`]) and read as
+/// `quiet` asks.
+///
+/// Spec reading: with [`QuietThreshold::Noise`], this deliberately departs
+/// from step 11, which compares `qsthr(b)` as printed with the threshold of
+/// the whole partition. The printed `qsthr(b)` is the level of a line
+/// times the partition's lines (see [`quiet_reference`]), so a partition of
+/// noise at the threshold in every line is allowed as many times a tone's
+/// energy at threshold as it has lines; yet within a critical band, noise
+/// is heard at about the energy a tone is, a property of hearing that the
+/// standard does not state. The partitions are about a third of a Bark
+/// wide, or one line where that is wider (clause C.1.4, step 5), and as printed,
+/// the threshold allows noise 7 dB above a tone's threshold over a Bark in
+/// the lowest partitions of the long FFT at 44.1 kHz, of 2 lines and 0.43
+/// Bark each, and 21 to 22 dB above it from 12 to 15 kHz, where music has
+/// little energy. In one of the analog recordings, from 1966 to 1978, of the
+/// tracks graded for [`StreamConfig::quiet_threshold`], it set the
+/// threshold of every partition from 11.3 kHz up in every long block, and
+/// of those from 9.2 kHz in nine blocks of ten, which the loops then left
+/// without lines. Taken as noise has it, as chelys's MP3 encoder takes the
+/// threshold in quiet of ISO/IEC 11172-3, the threshold of a partition is
+/// the level of one of its lines times its width in Bark: half the
+/// distance between the `bval(b)` of its neighbours, or the distance to its
+/// one neighbour at either end.
+///
+/// Spec gap: the tables of 32 kHz and above cap `bval(b)` at 24.00, from
+/// 15.2 kHz up in the long FFT at 44.1 kHz (partition 65 of Table C.15), at
+/// 14.9 kHz at 48 kHz (partition 63 of Table C.17), and elsewhere at other
+/// sampling frequencies; those of 8 to 24 kHz never reach it. From the cap
+/// up, the width of a partition is not given, and its threshold is taken
+/// as printed. The partition below the cap takes its width from its lower
+/// neighbour alone, as at the end of the scale: against the capped
+/// `bval(b)` above it, the width of partition 64 of Table C.15, of 53 lines
+/// from 14.1 kHz, would be 0.21 Bark, against 0.33 from below, as wide as
+/// its neighbours. (See [`StreamConfig::quiet_threshold`] for the grades.)
+///
+/// [`StreamConfig::quiet_threshold`]: crate::stream::StreamConfig::quiet_threshold
+fn noise_in_quiet(partitions: &[Row], reference: f64, quiet: QuietThreshold) -> Vec<f64> {
+    let bval = |b: usize| partitions[b].bval;
+    // The last partition below the cap, the end of the scale.
+    let last = (partitions.iter())
+        .position(|p| p.bval >= TOP_BARK)
+        .unwrap_or(partitions.len())
+        - 1;
+    (partitions.iter().enumerate())
+        .map(|(b, p)| {
+            let printed = reference * 10f64.powf(p.qsthr / 10.0);
+            if quiet == QuietThreshold::Printed || b > last {
+                return printed;
+            }
+            let bark = match b {
+                0 => bval(1) - bval(0),
+                _ if b == last => bval(last) - bval(last - 1),
+                _ => (bval(b + 1) - bval(b - 1)) / 2.0,
+            };
+            printed / p.lines().len() as f64 * bark
+        })
+        .collect()
+}
+
+/// The highest `bval(b)` of the tables, at which those of the highest
+/// partitions stop rising.
+const TOP_BARK: f64 = 24.0;
 
 /// What the model computes once for each sampling frequency and FFT.
 #[derive(Debug)]
@@ -139,7 +221,11 @@ struct Tables {
 }
 
 impl Tables {
-    fn new(sampling_frequency: SamplingFrequency, transform: Transform) -> Self {
+    fn new(
+        sampling_frequency: SamplingFrequency,
+        transform: Transform,
+        quiet: QuietThreshold,
+    ) -> Self {
         let partitions = partitions::table(sampling_frequency, transform);
         let n = partitions.len();
         let mut spreading = vec![0.0; n * n];
@@ -169,10 +255,7 @@ impl Tables {
             })
             .collect();
         // The FFT's shift length is its window's lines.
-        let reference = quiet_reference(transform.lines());
-        let quiet = (partitions.iter())
-            .map(|p| reference * 10f64.powf(p.qsthr / 10.0))
-            .collect();
+        let quiet = noise_in_quiet(partitions, quiet_reference(transform.lines()), quiet);
         let bands = match transform {
             Transform::Long => GroupBands::long(sampling_frequency),
             Transform::Short => GroupBands::short(sampling_frequency, 1),
@@ -196,11 +279,17 @@ impl Tables {
         }
     }
 
-    fn get(sampling_frequency: SamplingFrequency, transform: Transform) -> &'static Self {
-        static TABLES: [[OnceLock<Tables>; 2]; 12] = [const { [const { OnceLock::new() }; 2] }; 12];
+    fn get(
+        sampling_frequency: SamplingFrequency,
+        transform: Transform,
+        quiet: QuietThreshold,
+    ) -> &'static Self {
+        static TABLES: [[[OnceLock<Tables>; 2]; 2]; 12] =
+            [const { [const { [const { OnceLock::new() }; 2] }; 2] }; 12];
         let index = usize::from(transform == Transform::Short);
-        TABLES[sampling_frequency.index() as usize][index]
-            .get_or_init(|| Self::new(sampling_frequency, transform))
+        let reading = usize::from(quiet == QuietThreshold::Noise);
+        TABLES[sampling_frequency.index() as usize][index][reading]
+            .get_or_init(|| Self::new(sampling_frequency, transform, quiet))
     }
 
     /// Two partitions' values convolved with the spreading function (step
@@ -766,10 +855,11 @@ impl Model {
     /// The model of a channel at `sampling_frequency`, before its first
     /// frame: the block before it and the blocks its predictions start from
     /// silent, as the filterbank takes them (see
-    /// [`Filterbank::new`](crate::filterbank::Filterbank::new)).
-    pub fn new(sampling_frequency: SamplingFrequency) -> Self {
-        let long = Tables::get(sampling_frequency, Transform::Long);
-        let short = Tables::get(sampling_frequency, Transform::Short);
+    /// [`Filterbank::new`](crate::filterbank::Filterbank::new)), with the
+    /// threshold in quiet read as `quiet` asks.
+    pub fn new(sampling_frequency: SamplingFrequency, quiet: QuietThreshold) -> Self {
+        let long = Tables::get(sampling_frequency, Transform::Long, quiet);
+        let short = Tables::get(sampling_frequency, Transform::Short, quiet);
         Self {
             long,
             short,
@@ -1015,7 +1105,7 @@ mod tests {
     }
 
     fn run(fs: SamplingFrequency, input: &[f64]) -> Vec<Analysis> {
-        let mut model = Model::new(fs);
+        let mut model = Model::new(fs, QuietThreshold::Noise);
         input
             .chunks_exact(FRAME_SAMPLES)
             .map(|block| {
@@ -1081,6 +1171,24 @@ mod tests {
     }
 
     #[test]
+    fn the_threshold_in_quiet_as_noise_is_a_lines_level_times_its_width_in_bark() {
+        let fs = SamplingFrequency::Hz44100;
+        let printed = Tables::get(fs, Transform::Long, QuietThreshold::Printed);
+        let noise = Tables::get(fs, Transform::Long, QuietThreshold::Noise);
+        let lowered = |b: usize| 10.0 * (printed.quiet[b] / noise.quiet[b]).log10();
+        // Partition 0, of 2 lines, 0.43 Bark wide; partition 63, from 13.1
+        // kHz, of 47 lines, 0.33 Bark wide between its neighbours; and
+        // partition 64, from 14.1 kHz, of 53 lines, below the cap, 0.33
+        // Bark wide from its lower neighbour alone.
+        assert!((lowered(0) - 10.0 * (2.0 / 0.43f64).log10()).abs() < 1e-9);
+        assert!((lowered(63) - 10.0 * (47.0 / 0.33f64).log10()).abs() < 1e-9);
+        assert!((lowered(64) - 10.0 * (53.0 / 0.33f64).log10()).abs() < 1e-9);
+        // From 15.2 kHz, where bval stops rising, as printed.
+        assert_eq!(printed.partitions[65].bval, TOP_BARK);
+        assert!((65..printed.partitions.len()).all(|b| lowered(b) == 0.0));
+    }
+
+    #[test]
     fn an_attack_after_silence_is_held_near_the_quiet_threshold() {
         let fs = SamplingFrequency::Hz44100;
         let mut input = vec![0.0; 4 * FRAME_SAMPLES];
@@ -1090,7 +1198,7 @@ mod tests {
         // last block's threshold, of silence, and so at the threshold in
         // quiet; the frames after it take their own.
         let band = 20; // lines 132 to 143, 2842 to 3101 Hz
-        let tables = Tables::get(fs, Transform::Long);
+        let tables = Tables::get(fs, Transform::Long, QuietThreshold::Noise);
         let quiet = (tables.band_partitions[band].clone())
             .map(|b| tables.quiet[b] / tables.partitions[b].lines().len() as f64)
             .fold(f64::INFINITY, f64::min)

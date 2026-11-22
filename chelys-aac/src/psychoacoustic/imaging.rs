@@ -10,7 +10,8 @@ use std::f64::consts::PI;
 use chelys_core::fft::Complex;
 
 use super::{
-    Analysis, Block, BlockThreshold, MAX_PARTITIONS, Model, RPELEV_LONG, RPELEV_SHORT, Tables,
+    Analysis, Block, BlockThreshold, MAX_PARTITIONS, Model, QuietThreshold, RPELEV_LONG,
+    RPELEV_SHORT, Tables,
 };
 use crate::sampling_frequency::SamplingFrequency;
 use crate::scalefactor_bands::Transform;
@@ -64,9 +65,9 @@ struct Frame {
 }
 
 impl MidSideModel {
-    pub fn new(sampling_frequency: SamplingFrequency) -> Self {
-        let long = Tables::get(sampling_frequency, Transform::Long);
-        let short = Tables::get(sampling_frequency, Transform::Short);
+    pub fn new(sampling_frequency: SamplingFrequency, quiet: QuietThreshold) -> Self {
+        let long = Tables::get(sampling_frequency, Transform::Long, quiet);
+        let short = Tables::get(sampling_frequency, Transform::Short, quiet);
         let bmaxes = |tables: &Tables| tables.partitions.iter().map(|p| bmax(p.bval)).collect();
         let frame = || {
             let analysis = || Box::new(Analysis::new(sampling_frequency));
@@ -407,14 +408,14 @@ mod tests {
         let samples: [f64; FRAME_SAMPLES] =
             std::array::from_fn(|t| 0.3 * (t as f64 * 0.07).sin() + 0.1 * (t as f64 * 1.3).sin());
         let negated = samples.map(|x| -x);
-        let mut alone = Model::new(fs);
+        let mut alone = Model::new(fs, QuietThreshold::Noise);
         alone.blocks(&samples);
         for (right_samples, which) in [(samples, 0), (negated, 1)] {
-            let mut left = Model::new(fs);
-            let mut right = Model::new(fs);
+            let mut left = Model::new(fs, QuietThreshold::Noise);
+            let mut right = Model::new(fs, QuietThreshold::Noise);
             left.blocks(&samples);
             right.blocks(&right_samples);
-            let mut pair = MidSideModel::new(fs);
+            let mut pair = MidSideModel::new(fs, QuietThreshold::Noise);
             let tables = pair.long;
             let mut blocks = [
                 Block::new(super::super::LONG_IBLEN),

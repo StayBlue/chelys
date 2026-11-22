@@ -14,6 +14,7 @@ use super::channel::CodedChannel;
 use super::channel_configuration::{ChannelConfiguration, ElementKind};
 use super::config::Framing;
 use super::noise_substitution;
+use super::psychoacoustic::QuietThreshold;
 use super::raw_data_block;
 use super::raw_data_block::data_stream::{self, DataStreamQueue};
 use super::raw_data_block::element::CodedElement;
@@ -93,6 +94,11 @@ pub const INTENSITY_BITS_PER_SAMPLE: f64 = 0.75;
 /// `ElementEncoder::noise_substitution`); sent in intensity stereo, as it
 /// is, the music's grades moved by 0.02 at most.
 pub const NOISE_BITS_PER_SAMPLE: f64 = 1.3;
+
+/// The most bits for each sample of each channel at which the model takes
+/// the threshold in quiet as printed; above, it takes it as noise has it
+/// (see [`StreamConfig::quiet_threshold`]).
+pub const PRINTED_QUIET_BITS_PER_SAMPLE: f64 = 0.8;
 
 /// What the stream is: what its headers say, its rate and its framing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -248,6 +254,62 @@ impl StreamConfig {
             .then_some(noise_substitution::BORDER_HZ)
     }
 
+    /// How the model reads the threshold in quiet: as noise has it (see
+    /// [`QuietThreshold::Noise`]) where the stream has more than
+    /// [`PRINTED_QUIET_BITS_PER_SAMPLE`] bits for each sample of each
+    /// channel of the NCC, and as printed where it has that many or fewer,
+    /// as 5.1 at 48 kHz and 192 kbit/s has exactly. With it, the
+    /// loops raise `xmin` by the offset of clause C.7.4.4 only where it is
+    /// read as printed (see [`raise_xmin`](crate::loops::raise_xmin)).
+    ///
+    /// Spec gap: Annex C reads the threshold in quiet one way at every rate;
+    /// the reading as noise departs from it (see
+    /// [`QuietThreshold::Noise`]), and where bits are few it does not pay.
+    /// Graded with PEAQ (GstPEAQ 0.6.1, black box), on 51 tracks of 9 kinds
+    /// of music (rock, pop, hip-hop, electronic, acoustic, piano, orchestral,
+    /// analog recordings from 1966 to 1978, and live) at 44.1 kHz in stereo,
+    /// the means were, with the threshold as printed and `xmin` raised by
+    /// [`XMIN_OFFSET_DB`](crate::loops::XMIN_OFFSET_DB), 3 dB; as noise with
+    /// that offset; as noise without it; and as noise with `xmin` lowered by
+    /// 3 dB:
+    ///
+    /// | kbit/s | printed, 3 dB | noise, 3 dB | noise, 0 dB | noise, -3 dB |
+    /// |-------:|--------------:|------------:|------------:|-------------:|
+    /// |     64 |        -3.357 |      -3.389 |      -3.391 |       -3.393 |
+    /// |    128 |        -1.149 |      -1.101 |      -1.067 |       -1.088 |
+    /// |    192 |        -0.222 |      -0.212 |      -0.211 |       -0.234 |
+    ///
+    /// Those grades were taken with the partition below the cap of `bval(b)`
+    /// as wide as the distance to the capped value above it, and before a
+    /// silent channel left with lines by bands coded as middle and side was
+    /// coded silent (see `ElementEncoder::find_silence`). As coded now, the
+    /// means are -3.357, -1.074 and -0.213 at 64, 128 and 192 kbit/s. At
+    /// 128 kbit/s, every kind of music gained, analog recordings the most,
+    /// 0.187, and their worst track rose from -2.472 to -1.681. At 96 and
+    /// 80 kbit/s, the means are -2.332 and -3.071, against -2.500 and
+    /// -3.082 as printed, 47 and 25 tracks of the 51 better. At 64 kbit/s,
+    /// 0.73 bits a sample, the reading as noise loses, and the loss lies in
+    /// PEAQ's bandwidth of the coding, which rises with the reading: near
+    /// the bottom of its scale, PEAQ's network of BS.1387 grades a wider
+    /// band of coarse noise lower. The limit lies between 64 and 80 kbit/s,
+    /// 0.73 and 0.91 bits a sample; it is set per sample, as for
+    /// [`INTENSITY_BITS_PER_SAMPLE`], untested at other sampling
+    /// frequencies.
+    ///
+    /// The partitions at 24 Bark keep the threshold as printed (see
+    /// [`QuietThreshold::Noise`]). Without any threshold in quiet there,
+    /// with the offset of 3 dB, the means were -3.465, -0.832 and -0.254 at
+    /// 64, 128 and 192 kbit/s, the bandwidth PEAQ measured rising from 16.2
+    /// to 19.1 kHz at 128 kbit/s: content above 15 kHz that the threshold
+    /// in quiet takes as inaudible, coded for PEAQ's measures of bandwidth.
+    pub fn quiet_threshold(&self) -> QuietThreshold {
+        if self.bits_per_sample() > PRINTED_QUIET_BITS_PER_SAMPLE {
+            QuietThreshold::Noise
+        } else {
+            QuietThreshold::Printed
+        }
+    }
+
     /// The bits for each sample of each channel of the NCC.
     fn bits_per_sample(&self) -> f64 {
         let ncc = self.channel_configuration.ncc() as f64;
@@ -341,6 +403,7 @@ impl StreamEncoder {
                     kind,
                     config.intensity_border(),
                     config.noise_border(),
+                    config.quiet_threshold(),
                 )
             })
             .collect();
@@ -955,12 +1018,14 @@ mod tests {
         let reservoir = config.reservoir().unwrap();
         // Noise falling with frequency, whose perceptual entropy asks for no
         // bits beyond the mean, and which takes all it is given, but for
-        // what the loops leave.
+        // what the loops leave: quiet enough, at some -46 dB below full
+        // scale, that the threshold in quiet, taken as noise has it, keeps
+        // its perceptual entropy low.
         let red = |seed| {
             let mut y = 0.0;
             (noise(301 * FRAME_SAMPLES, seed).into_iter())
                 .map(|x| {
-                    y = 0.99 * y + 0.1 * x;
+                    y = 0.99 * y + 0.01 * x;
                     y
                 })
                 .collect::<Vec<f64>>()
