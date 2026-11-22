@@ -447,6 +447,17 @@ impl StreamEncoder {
         )
     }
 
+    /// The sampling frequency in Hz.
+    pub fn sample_rate(&self) -> u32 {
+        self.config.sampling_frequency.hz()
+    }
+
+    /// The bits of the decoder's input buffer (clause 8.2.3.1), within
+    /// which the bit reservoir keeps the stream.
+    pub fn decoder_buffer_bits(&self) -> u32 {
+        reservoir::buffer_bits(self.config.channel_configuration)
+    }
+
     /// Takes `channels`, the next samples of each channel at full scale
     /// 1.0, in the order of the elements that carry them (see
     /// [`ChannelConfiguration::elements`]), and gives `out` the frames they

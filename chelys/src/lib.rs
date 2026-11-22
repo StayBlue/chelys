@@ -3,7 +3,7 @@
 
 //! Research audio encoders implemented from their specifications, one
 //! crate each, offered here as a module each behind a feature of the same
-//! name.
+//! name, and the MP4 file format, which holds AAC as `mp4`.
 //!
 //! ```
 //! # #[cfg(feature = "mp3")] {
@@ -23,3 +23,6 @@ pub use chelys_aac as aac;
 #[cfg(feature = "mp3")]
 #[doc(inline)]
 pub use chelys_mp3 as mp3;
+#[cfg(feature = "mp4")]
+#[doc(inline)]
+pub use chelys_mp4 as mp4;

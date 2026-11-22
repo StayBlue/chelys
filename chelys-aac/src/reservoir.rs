@@ -13,6 +13,13 @@ use super::stream::FRAME_SAMPLES;
 /// 8.2.3.1).
 const BUFFER_BITS_PER_CHANNEL: u64 = 6144;
 
+/// The bits of the decoder's input buffer of a stream of
+/// `channel_configuration`: [`BUFFER_BITS_PER_CHANNEL`] for each channel
+/// of its NCC.
+pub fn buffer_bits(channel_configuration: ChannelConfiguration) -> u32 {
+    (BUFFER_BITS_PER_CHANNEL * channel_configuration.ncc() as u64) as u32
+}
+
 /// The longest `adts_frame()` written, in bytes, its header and
 /// `adts_error_check()` included, as the reservoir counts them (see
 /// [`BitReservoir::new`]).

@@ -1,9 +1,13 @@
 // Copyright (c) 2026 StayBlue
 // SPDX-License-Identifier: MIT
 
-//! `chelys aac`: AAC in the Low Complexity profile, in ADTS.
+//! `chelys aac`: AAC in the Low Complexity profile, in ADTS or in an MP4
+//! file.
 
-use chelys::aac::{Config, ConfigError, Encoder, Rate};
+use std::io::Write;
+
+use chelys::aac::{Config, ConfigError, Encoder, Framing, Rate};
+use chelys::mp4;
 
 use crate::output::Output;
 use crate::{pcm, value};
@@ -13,10 +17,14 @@ usage: chelys aac --sample-rate HZ --channels N [--bitrate KBPS]
                   [--noise-substitution]
                   [--crc] [--private-bit] [--original-copy] [--home]
                   < input.f32 > output.aac
+       chelys aac --mp4 --sample-rate HZ --channels N [--bitrate KBPS]
+                  [--noise-substitution]
+                  < input.f32 > output.mp4
 
 Reads interleaved 32-bit little-endian float PCM from stdin and writes AAC in
 the Low Complexity profile (AAC-LC) to stdout, each frame in ADTS: MPEG-2 AAC,
-or MPEG-4 AAC where --noise-substitution is used.
+or MPEG-4 AAC where --noise-substitution is used. With --mp4, it writes an
+MP4 file instead, which tells a player the input's exact length.
 
   --sample-rate HZ   96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050,
                      16000, 12000, 11025 or 8000
@@ -40,7 +48,10 @@ or MPEG-4 AAC where --noise-substitution is used.
                      11 to 1587; the lowest from 1 in mono at 8 kHz to 24
                      in 7.1 at 96 kHz, and the highest 6144 bits a frame
                      for each channel but the LFE, or 4608 bytes in 7.1;
-                     with --crc, the lowest is up to 2 higher (default 128
+                     with --crc, the lowest is up to 2 higher; with --mp4,
+                     which counts the frames alone, the lowest is up to 6
+                     lower, and the highest in 7.1 that of 6144 bits a
+                     frame, 2015 at 48 kHz and 1851 at 44.1 kHz (default 128
                      in mono and stereo, and 64 for each channel but the
                      LFE in more: 192 in 3 channels, 320 in 5.1, 448 in
                      7.1; or the highest the sample rate and channels
@@ -63,10 +74,16 @@ or MPEG-4 AAC where --noise-substitution is used.
   --home             set each header's home bit, which the standard defines
                      as MPEG-1 Audio's original/copy bit, set where the
                      stream is an original (default: off)
+  --mp4              write an MP4 file (ISO/IEC 14496-14) of the stream
+                     instead of ADTS; the four options above set fields of
+                     ADTS headers, which an MP4 file does not have, and are
+                     refused with it; the file is written once the input
+                     has ended, so it is held in memory until then, about
+                     the bitrate times the duration
 
 The decoded output starts with 1024 samples before the input and ends with
 fewer than 1024 after it, near silence to be discarded: ADTS has no field
-that tells a decoder so.";
+that tells a decoder so, where an MP4 file's edit list does.";
 
 /// The bitrate without `--bitrate` in mono and stereo, in kbit/s, where the
 /// sample rate allows it: that of `chelys mp3`.
@@ -81,17 +98,25 @@ pub struct Options {
     private_bit: bool,
     original_copy: bool,
     home: bool,
+    mp4: bool,
 }
 
 impl Options {
     fn config(&self) -> Config {
         config(self.sample_rate, self.channels, self.kbps)
+            .framing(framing(self.mp4))
             .noise_substitution(self.noise_substitution)
             .crc(self.crc)
             .private_bit(self.private_bit)
             .original_copy(self.original_copy)
             .home(self.home)
     }
+}
+
+/// Raw frames for an MP4 file, which carries them as they are, and ADTS
+/// otherwise.
+fn framing(mp4: bool) -> Framing {
+    if mp4 { Framing::Raw } else { Framing::Adts }
 }
 
 fn config(sample_rate: u32, channels: usize, kbps: u32) -> Config {
@@ -104,7 +129,7 @@ fn config(sample_rate: u32, channels: usize, kbps: u32) -> Config {
 pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
     let (mut sample_rate, mut channels, mut bitrate) = (None, None, None);
     let (mut crc, mut private_bit, mut original_copy, mut home) = (false, false, false, false);
-    let mut noise_substitution = false;
+    let (mut noise_substitution, mut mp4) = (false, false);
     let mut args = args.into_iter();
     while let Some(flag) = args.next() {
         let args = &mut args;
@@ -117,6 +142,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> 
             "--private-bit" => private_bit = true,
             "--original-copy" => original_copy = true,
             "--home" => home = true,
+            "--mp4" => mp4 = true,
             // An empty message asks for the usage text alone.
             "-h" | "--help" => return Err(String::new()),
             other => return Err(format!("unknown argument: {other}")),
@@ -127,7 +153,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> 
         n @ (1..=6 | 8) => n as usize,
         n => return Err(format!("unsupported channel count: {n}")),
     };
-    let kbps = bitrate.unwrap_or_else(|| default_kbps(sample_rate, channels, crc));
+    let kbps = bitrate.unwrap_or_else(|| default_kbps(sample_rate, channels, crc, mp4));
     let options = Options {
         sample_rate,
         channels,
@@ -137,6 +163,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> 
         private_bit,
         original_copy,
         home,
+        mp4,
     };
     options
         .config()
@@ -152,15 +179,16 @@ const DEFAULT_KBPS_PER_CHANNEL: u32 = 64;
 /// [`DEFAULT_KBPS`] in mono and stereo, and [`DEFAULT_KBPS_PER_CHANNEL`]
 /// for each channel but the LFE in more, or the highest whole bitrate the
 /// sample rate and channels allow where that is lower, with the CRC if
-/// `crc`.
-fn default_kbps(sample_rate: u32, channels: usize, crc: bool) -> u32 {
+/// `crc`, in an MP4 file if `mp4`.
+fn default_kbps(sample_rate: u32, channels: usize, crc: bool, mp4: bool) -> u32 {
     let kbps = match channels {
         1 | 2 => DEFAULT_KBPS,
         // 5.1 and 7.1, whose last channel is the LFE.
         6 | 8 => DEFAULT_KBPS_PER_CHANNEL * (channels as u32 - 1),
         _ => DEFAULT_KBPS_PER_CHANNEL * channels as u32,
     };
-    match config(sample_rate, channels, kbps).crc(crc).check() {
+    let config = config(sample_rate, channels, kbps).framing(framing(mp4));
+    match config.crc(crc).check() {
         Err(ConfigError::UnsupportedBitrate { max, .. }) if max < kbps * 1000 => max / 1000,
         _ => kbps,
     }
@@ -186,12 +214,21 @@ fn describe(error: ConfigError, options: &Options) -> String {
                 max / 1000,
             )
         }
+        ConfigError::AdtsOnly => {
+            "--crc, --private-bit, --original-copy and --home set fields of ADTS headers, \
+             which --mp4 does not write"
+                .to_owned()
+        }
         error => error.to_string(),
     }
 }
 
-/// Encodes stdin to stdout as it arrives.
+/// Encodes stdin to stdout as it arrives, or with `--mp4` writes the file
+/// once stdin has ended.
 pub fn encode(options: &Options) -> Result<(), String> {
+    if options.mp4 {
+        return encode_mp4(options);
+    }
     let mut output = Output::stdout();
     let mut encoder = Encoder::new(options.config()).map_err(|e| e.to_string())?;
     let mut stream = Vec::new();
@@ -202,6 +239,21 @@ pub fn encode(options: &Options) -> Result<(), String> {
     encoder.finish(&mut stream);
     output.write(&mut stream)?;
     output.flush()
+}
+
+/// Encodes stdin into an MP4 file, which is written to stdout whole once
+/// stdin has ended: its sample tables, which come first, describe every
+/// frame. Written in one pass, it needs no seekable stdout.
+fn encode_mp4(options: &Options) -> Result<(), String> {
+    let mut encoder = mp4::aac::Encoder::new(options.config()).map_err(|e| e.to_string())?;
+    pcm::read(encoder.channels(), |samples| {
+        encoder.encode_interleaved(samples);
+        Ok(())
+    })?;
+    let mut stdout = std::io::stdout().lock();
+    let error = |e: std::io::Error| format!("writing stdout: {e}");
+    encoder.finish(&mut stdout).map_err(error)?;
+    stdout.flush().map_err(error)
 }
 
 #[cfg(test)]
@@ -368,6 +420,58 @@ mod tests {
                 let low = |range: String| range.split(' ').next().unwrap().parse::<u32>().unwrap();
                 let rise = low(lowest(&["--crc"])) - low(lowest(&[]));
                 assert!(rise <= 2, "{rate} {channels}");
+            }
+        }
+    }
+
+    #[test]
+    fn mp4_refuses_the_options_of_adts_headers() {
+        let args = ["--mp4", "--sample-rate", "44100", "--channels", "2"];
+        assert!(parse(&args).is_ok());
+        for flag in ["--crc", "--private-bit", "--original-copy", "--home"] {
+            assert_eq!(
+                error(&[&args[..], &[flag]].concat()),
+                "--crc, --private-bit, --original-copy and --home set fields of ADTS headers, \
+                 which --mp4 does not write",
+                "{flag}"
+            );
+        }
+    }
+
+    /// The ranges the usage gives with --mp4, and that the lowest is at
+    /// most 6 lower than in ADTS.
+    #[test]
+    fn mp4_ranges_count_the_frames_alone() {
+        let range = |rate: &str, channels: &str, mp4: &[&str]| {
+            let args = [
+                &[
+                    "--sample-rate",
+                    rate,
+                    "--channels",
+                    channels,
+                    "--bitrate",
+                    "0",
+                ],
+                mp4,
+            ];
+            let error = error(&args.concat());
+            let range = error.rsplit("it takes ").next().unwrap().to_owned();
+            let ends: Vec<u32> = range.split(" to ").map(|n| n.parse().unwrap()).collect();
+            (ends[0], ends[1])
+        };
+        assert_eq!(range("48000", "8", &["--mp4"]), (9, 2015));
+        assert_eq!(range("44100", "8", &["--mp4"]), (9, 1851));
+        for rate in SAMPLE_RATES {
+            for channels in ["1", "2", "3", "4", "5", "6", "8"] {
+                let rate = rate.to_string();
+                let (adts, mp4) = (
+                    range(&rate, channels, &[]),
+                    range(&rate, channels, &["--mp4"]),
+                );
+                assert!(adts.0 - mp4.0 <= 6, "{rate} {channels}");
+                if channels != "8" {
+                    assert_eq!(adts.1, mp4.1, "{rate} {channels}");
+                }
             }
         }
     }

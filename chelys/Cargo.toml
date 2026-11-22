@@ -10,12 +10,15 @@ publish = false
 [dependencies]
 chelys-aac = { path = "../chelys-aac", optional = true }
 chelys-mp3 = { path = "../chelys-mp3", optional = true }
+chelys-mp4 = { path = "../chelys-mp4", optional = true }
 
 [features]
-default = ["aac", "mp3"]
+default = ["aac", "mp3", "mp4"]
 # AAC-LC: see chelys-aac's documentation.
 aac = ["dep:chelys-aac"]
 mp3 = ["dep:chelys-mp3"]
+# MP4 files of AAC-LC: see chelys-mp4's documentation.
+mp4 = ["dep:chelys-mp4", "aac"]
 # Each codec's building blocks, for chelys's own conformance tests.
 unstable = ["chelys-aac?/unstable", "chelys-mp3?/unstable"]
 

@@ -100,6 +100,18 @@ impl Encoder {
         self.stream.audio_specific_config()
     }
 
+    /// The sample rate in Hz.
+    pub fn sample_rate(&self) -> u32 {
+        self.stream.sample_rate()
+    }
+
+    /// The bytes of the decoder's input buffer (clause 8.2.3.1): 768, 6144
+    /// bits, for each channel but the low frequency enhancement channel,
+    /// within which the bit reservoir keeps the stream (clause 8.2.3.2).
+    pub fn decoder_buffer_bytes(&self) -> u32 {
+        self.stream.decoder_buffer_bits() / 8
+    }
+
     /// Encodes interleaved samples, one of each channel in turn, and gives
     /// `out` the frames they complete.
     ///

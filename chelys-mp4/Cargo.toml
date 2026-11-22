@@ -1,0 +1,11 @@
+[package]
+name = "chelys-mp4"
+description = "Writes chelys's AAC-LC streams in MP4 files, from ISO/IEC 14496-12, 14496-14, 14496-1 and 14496-34."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+chelys-aac = { path = "../chelys-aac" }

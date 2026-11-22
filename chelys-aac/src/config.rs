@@ -29,6 +29,18 @@ pub enum Rate {
     Constant { bits_per_second: u32 },
 }
 
+impl Rate {
+    /// Whether the stream is coded at a constant rate: the frames' lengths
+    /// vary about their mean only as the bit reservoir lends and keeps bits.
+    /// An MP4 file gives the measured average of such a stream, and none for
+    /// a stream of variable rate (see `chelys-mp4`).
+    pub fn is_constant(self) -> bool {
+        match self {
+            Self::Constant { .. } => true,
+        }
+    }
+}
+
 /// How each frame is given to the [`FrameSink`](super::FrameSink).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Framing {
@@ -135,6 +147,11 @@ impl Config {
             noise_substitution: false,
             data_stream_bytes_per_frame: 0,
         }
+    }
+
+    /// How the frames' lengths are chosen.
+    pub fn rate(&self) -> Rate {
+        self.rate
     }
 
     /// How each frame is given: in ADTS, the default, or raw.
