@@ -206,3 +206,85 @@ pub fn audio_specific_config_from_adts(stream: &[u8]) -> Vec<u8> {
         })
         .collect()
 }
+
+/// Decodes the first audio stream of an MP4 file, with `input_options`
+/// before the file, as `-ss` or `-ignore_editlist`.
+fn decode_mp4_with(file: &[u8], input_options: &[&str]) -> Decoded {
+    let file = TempFile::new("mp4", file);
+    let output = run(Command::new("ffmpeg")
+        .args(["-nostdin", "-v", "error", "-err_detect", "crccheck"])
+        .args(input_options)
+        .arg("-i")
+        .arg(file.path())
+        .args(["-map", "0:a:0", "-f", "f32le", "-acodec", "pcm_f32le", "-"]));
+    Decoded {
+        samples: output
+            .stdout
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect(),
+        diagnostics: String::from_utf8_lossy(&output.stderr).into_owned(),
+    }
+}
+
+/// Decodes the first audio stream of an MP4 file, as a player would: its
+/// edit list applied.
+pub fn decode_mp4(file: &[u8]) -> Decoded {
+    decode_mp4_with(file, &[])
+}
+
+/// Decodes the first audio stream of an MP4 file with its edit list
+/// ignored (ffmpeg's `ignore_editlist` option): every sample of every
+/// frame.
+pub fn decode_mp4_ignoring_edits(file: &[u8]) -> Decoded {
+    decode_mp4_with(file, &["-ignore_editlist", "1"])
+}
+
+/// Decodes the first audio stream of an MP4 file from where ffmpeg seeks
+/// to for `from` seconds, given as an input option, so that ffmpeg seeks
+/// in the file rather than decode from its start.
+pub fn decode_mp4_seeking(file: &[u8], from: f64) -> Decoded {
+    decode_mp4_with(file, &["-ss", &from.to_string()])
+}
+
+/// What ffprobe reports of the first audio stream of an MP4 file.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Mp4Stream {
+    pub info: StreamInfo,
+    pub profile: String,
+    /// The channel layout, as ffmpeg names it, such as "5.1".
+    pub channel_layout: String,
+    /// The stream's duration in its time base's units.
+    pub duration_ts: u64,
+    /// The stream's time base, such as "1/44100".
+    pub time_base: String,
+}
+
+/// Describes the first audio stream of an MP4 file, as ffprobe reports
+/// it.
+pub fn probe_mp4(file: &[u8]) -> Mp4Stream {
+    let file = TempFile::new("mp4", file);
+    let output = run(Command::new("ffprobe")
+        .args(["-v", "error", "-select_streams", "a:0", "-show_entries"])
+        .arg("stream=codec_name,profile,sample_rate,channels,channel_layout,duration_ts,time_base")
+        .args(["-of", "default=noprint_wrappers=1"])
+        .arg(file.path()));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let field = |key: &str| {
+        stdout
+            .lines()
+            .find_map(|line| line.strip_prefix(key)?.strip_prefix('='))
+            .unwrap_or_else(|| panic!("ffprobe did not report {key}: {stdout:?}"))
+    };
+    Mp4Stream {
+        info: StreamInfo {
+            codec_name: field("codec_name").to_owned(),
+            sample_rate: field("sample_rate").parse().unwrap(),
+            channels: field("channels").parse().unwrap(),
+        },
+        profile: field("profile").to_owned(),
+        channel_layout: field("channel_layout").to_owned(),
+        duration_ts: field("duration_ts").parse().unwrap(),
+        time_base: field("time_base").to_owned(),
+    }
+}

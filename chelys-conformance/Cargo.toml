@@ -8,4 +8,4 @@ license.workspace = true
 publish = false
 
 [dependencies]
-chelys = { path = "../chelys", features = ["aac", "unstable"] }
+chelys = { path = "../chelys", features = ["aac", "mp4", "unstable"] }
