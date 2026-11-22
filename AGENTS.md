@@ -233,3 +233,20 @@ the standards.
 
 *User, 2026-11-21, when the standards were given: the wording was proposed by
 the agent and approved by the user.*
+
+## QuickTime File Format
+
+Apple's "QuickTime File Format" documentation
+(https://developer.apple.com/documentation/quicktime-file-format, as read on
+2026-11-21) is a source for chelys's MP4 files only for its constraints on
+representing AAC encoder delay (its appendix "Audio priming – handling encoder
+delay in AAC"). It is used under the same clean-room rules as the standards
+named under "Clean room". Where it and ISO/IEC 14496-12 or 14496-14 differ, the
+code says so with a `Spec reading:` marker. Where it leaves something open,
+black-box decoding with ffmpeg may settle it, documented as for the standards.
+
+*User, 2026-11-21, when the documentation was given: the wording was proposed
+by the agent and approved by the user.*
+*User, 2026-11-21: narrowed to encoder delay, as chelys is not to write tags
+(lofty exists for that); the wording was proposed by the agent and approved by
+the user.*
