@@ -417,7 +417,7 @@ impl StreamEncoder {
     /// clause 4.6.13.3 of ISO/IEC 14496-3 has it, rather than in intensity
     /// stereo in the right channel, for comparing the two in tests (see
     /// `ElementEncoder::noise_substitution`).
-    #[cfg(any(test, feature = "unstable"))]
+    #[cfg(feature = "unstable")]
     pub fn noise_shared_by_ms_used(mut self) -> Self {
         for element in &mut self.elements {
             element.noise_shared_by_ms_used();

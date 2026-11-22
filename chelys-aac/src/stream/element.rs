@@ -365,7 +365,7 @@ impl ElementEncoder {
     /// same in both channels sent as noise in both, with `ms_used` set, for
     /// comparing with intensity stereo in tests (see
     /// [`noise_substitution`](Self::noise_substitution)).
-    #[cfg(any(test, feature = "unstable"))]
+    #[cfg(feature = "unstable")]
     pub fn noise_shared_by_ms_used(&mut self) {
         self.noise_by_ms_used = true;
     }

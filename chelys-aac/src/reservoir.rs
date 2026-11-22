@@ -11,7 +11,7 @@ use super::stream::FRAME_SAMPLES;
 
 /// The bits of the decoder's input buffer per channel of the NCC (clause
 /// 8.2.3.1).
-const BUFFER_BITS_PER_CHANNEL: u64 = 6144;
+pub const BUFFER_BITS_PER_CHANNEL: u64 = 6144;
 
 /// The bits of the decoder's input buffer of a stream of
 /// `channel_configuration`: [`BUFFER_BITS_PER_CHANNEL`] for each channel
