@@ -54,7 +54,7 @@
 //!
 //! let config = Config::new(44_100, 2, Rate::Constant { bits_per_second: 128_000 });
 //! let mut encoder = Encoder::new(config)?;
-//! encoder.encode_interleaved(&[0.0f32; 2 * 44_100]);
+//! encoder.encode_interleaved(&[0.0f32; 2 * 44_100])?;
 //! let mut mp4 = Vec::new();
 //! let finished = encoder.finish(&mut mp4)?;
 //! assert_eq!(finished.samples, 44_100);

@@ -10,11 +10,12 @@
 //! use chelys::mp3::{ChannelMode, Config, Encoder, Rate};
 //!
 //! let config = Config::new(44_100, ChannelMode::Mono, Rate::Constant { kbps: 64 });
-//! let mut encoder = Encoder::new(config).unwrap();
+//! let mut encoder = Encoder::new(config)?;
 //! let mut mp3 = Vec::new();
-//! encoder.encode_interleaved(&[0.0f32; 44_100], &mut mp3);
+//! encoder.encode_interleaved(&[0.0f32; 44_100], &mut mp3)?;
 //! encoder.finish(&mut mp3);
 //! # }
+//! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
 #[cfg(feature = "aac")]

@@ -56,7 +56,7 @@ fn encode(config: Config, input: &[Vec<f64>]) -> (Vec<u8>, Vec<usize>, Finished)
         stream.extend_from_slice(frame);
     };
     let channels: Vec<&[f64]> = input.iter().map(Vec::as_slice).collect();
-    encoder.encode_planar(&channels, &mut out);
+    encoder.encode_planar(&channels, &mut out).unwrap();
     let finished = encoder.finish(&mut out);
     (stream, lens, finished)
 }
@@ -264,7 +264,7 @@ fn ffmpeg_decodes_mp4_files_at_variable_and_mean_rates() {
             .collect();
         let mut encoder =
             chelys::mp4::aac::Encoder::new(Config::new(sample_rate, channels, rate)).unwrap();
-        encoder.encode_interleaved(&pcm);
+        encoder.encode_interleaved(&pcm).unwrap();
         let mut file = Vec::new();
         let finished = encoder.finish(&mut file).unwrap();
         let all = ffmpeg::decode_mp4_ignoring_edits(&file);

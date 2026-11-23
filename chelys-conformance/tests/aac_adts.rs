@@ -31,7 +31,7 @@ fn encode(config: Config, channels: usize, pcm: &[f32], data: &[u8]) -> (Vec<u8>
     assert_eq!(encoder.channels(), channels);
     encoder.push_data_stream(data);
     let mut stream = Vec::new();
-    encoder.encode_interleaved(pcm, &mut stream);
+    encoder.encode_interleaved(pcm, &mut stream).unwrap();
     let finished = encoder.finish(&mut stream);
     (stream, finished)
 }

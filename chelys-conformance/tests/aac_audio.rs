@@ -32,7 +32,7 @@ fn encode(sample_rate: u32, input: &[Vec<f64>], bits_per_second: u32) -> Encoded
         stream.extend_from_slice(frame);
     };
     let channels: Vec<&[f64]> = input.iter().map(Vec::as_slice).collect();
-    encoder.encode_planar(&channels, &mut out);
+    encoder.encode_planar(&channels, &mut out).unwrap();
     let finished = encoder.finish(&mut out);
     Encoded {
         stream,

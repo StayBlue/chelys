@@ -182,7 +182,9 @@ impl Case {
         let tag_len = encoder.info_tag_len();
         let slices: Vec<&[S]> = pcm.iter().map(Vec::as_slice).collect();
         let mut stream = Vec::new();
-        encoder.encode_planar(&slices, &mut stream);
+        encoder
+            .encode_planar(&slices, &mut stream)
+            .expect("finite samples");
         let finished = encoder.finish(&mut stream);
 
         let interleaved: Vec<S> = (0..pcm[0].len())
@@ -194,7 +196,9 @@ impl Case {
         let mut rest = interleaved.as_slice();
         for &chunk in &self.chunks {
             let (part, after) = rest.split_at((chunk * channels).min(rest.len()));
-            encoder.encode_interleaved(part, &mut parts);
+            encoder
+                .encode_interleaved(part, &mut parts)
+                .expect("finite samples");
             rest = after;
         }
         let parts_finished = encoder.finish(&mut parts);

@@ -34,7 +34,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .collect();
 
     let mut mp3 = Vec::new();
-    encoder.encode_interleaved(&pcm, &mut mp3);
+    encoder.encode_interleaved(&pcm, &mut mp3)?;
     // The stream is complete only once the encoder has finished it.
     encoder.finish(&mut mp3);
 

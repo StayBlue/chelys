@@ -56,9 +56,9 @@
 //!     .flat_map(|x| [x, x])
 //!     .collect();
 //! let mut aac = Vec::new(); // in ADTS
-//! encoder.encode_interleaved(&pcm, &mut aac);
+//! encoder.encode_interleaved(&pcm, &mut aac)?;
 //! encoder.finish(&mut aac);
-//! # Ok::<(), chelys_aac::ConfigError>(())
+//! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
 mod adts;
@@ -83,7 +83,7 @@ mod stream;
 mod tns;
 mod window;
 
-pub use chelys_core::{Sample, quality};
+pub use chelys_core::{NonFiniteSample, Sample, quality};
 pub use config::{Config, ConfigError, Framing, Rate, SAMPLE_RATES};
 pub use encoder::{Encoder, Finished};
 pub use stream::FrameSink;
@@ -92,6 +92,11 @@ pub use stream::FrameSink;
 /// bitstream's fields, and ways to encode a stream that the public API
 /// does not offer. They follow the code, not a stable API, and may change
 /// in any release.
+///
+/// [`StreamEncoder::encode`](crate::internals::StreamEncoder::encode)
+/// takes samples already converted to `f64` at full scale 1.0, and does
+/// not check them: it is for the caller to keep them finite, and within
+/// [`MAX_MAGNITUDE`](chelys_core::sample::MAX_MAGNITUDE).
 #[cfg(feature = "unstable")]
 pub mod internals {
     pub use super::stream::*;

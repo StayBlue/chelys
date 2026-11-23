@@ -33,7 +33,7 @@ fn encode(config: Config, input: &[Vec<f64>]) -> (Vec<u8>, Finished) {
     let mut encoder = Encoder::new(config).unwrap();
     let mut stream = Vec::new();
     let channels: Vec<&[f64]> = input.iter().map(Vec::as_slice).collect();
-    encoder.encode_planar(&channels, &mut stream);
+    encoder.encode_planar(&channels, &mut stream).unwrap();
     let finished = encoder.finish(&mut stream);
     if let Some(tag) = &finished.info_tag {
         stream[..tag.len()].copy_from_slice(tag);

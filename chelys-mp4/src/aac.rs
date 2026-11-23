@@ -7,7 +7,7 @@
 
 use std::io::{self, Write};
 
-use chelys_aac::{Config, ConfigError, Finished, FrameSink, Framing, Sample};
+use chelys_aac::{Config, ConfigError, Finished, FrameSink, Framing, NonFiniteSample, Sample};
 
 use super::bitrate::{avg_bitrate, max_bitrate};
 use super::descriptor::{AUDIO_ISO_IEC_14496_3, AUDIO_STREAM, DecoderConfig, es_descriptor};
@@ -72,21 +72,33 @@ impl Encoder {
 
     /// Encodes interleaved samples, as [`chelys_aac::Encoder::encode_interleaved`].
     ///
+    /// # Errors
+    ///
+    /// [`NonFiniteSample`], as [`chelys_aac::Encoder::encode_interleaved`], if a
+    /// sample is NaN or infinite: none of the call is taken. No frame is
+    /// added to the file, and the encoder is as it was before the call.
+    ///
     /// # Panics
     ///
     /// As [`chelys_aac::Encoder::encode_interleaved`].
-    pub fn encode_interleaved<S: Sample>(&mut self, samples: &[S]) {
-        self.encoder.encode_interleaved(samples, &mut self.frames);
+    pub fn encode_interleaved<S: Sample>(&mut self, samples: &[S]) -> Result<(), NonFiniteSample> {
+        self.encoder.encode_interleaved(samples, &mut self.frames)
     }
 
     /// Encodes one slice of samples per channel, as
     /// [`chelys_aac::Encoder::encode_planar`].
     ///
+    /// # Errors
+    ///
+    /// [`NonFiniteSample`], as [`chelys_aac::Encoder::encode_planar`], if a
+    /// sample is NaN or infinite: none of the call is taken. No frame is
+    /// added to the file, and the encoder is as it was before the call.
+    ///
     /// # Panics
     ///
     /// As [`chelys_aac::Encoder::encode_planar`].
-    pub fn encode_planar<S: Sample>(&mut self, channels: &[&[S]]) {
-        self.encoder.encode_planar(channels, &mut self.frames);
+    pub fn encode_planar<S: Sample>(&mut self, channels: &[&[S]]) -> Result<(), NonFiniteSample> {
+        self.encoder.encode_planar(channels, &mut self.frames)
     }
 
     /// Queues `bytes` for the data streams of the frames coded from now on,
@@ -195,9 +207,9 @@ mod tests {
         let pcm: Vec<f32> = (0..2 * 5000)
             .map(|i| ((i as f32) * 0.01).sin() * 0.3)
             .collect();
-        encoder.encode_interleaved(&pcm);
+        encoder.encode_interleaved(&pcm).unwrap();
         let mut frames = Vec::new();
-        raw.encode_interleaved(&pcm, &mut frames);
+        raw.encode_interleaved(&pcm, &mut frames).unwrap();
         let asc = raw.audio_specific_config();
         raw.finish(&mut frames);
         let mut file = Vec::new();
@@ -226,7 +238,9 @@ mod tests {
     #[test]
     fn the_decoder_config_gives_the_buffer_and_bitrates() {
         let mut encoder = Encoder::new(config(44_100, 6)).unwrap();
-        encoder.encode_interleaved(&vec![0.0f32; 6 * 44_100]);
+        encoder
+            .encode_interleaved(&vec![0.0f32; 6 * 44_100])
+            .unwrap();
         let mut file = Vec::new();
         let frames = encoder.finish(&mut file).unwrap().frames;
         let at = position(&file, &[0x04, 17, 0x40, 0x15]) + 4;
@@ -249,7 +263,7 @@ mod tests {
         let pcm: Vec<f32> = (0..2 * len)
             .map(|i| ((i / 2) as f32 * 0.05).sin() * 0.3)
             .collect();
-        encoder.encode_interleaved(&pcm);
+        encoder.encode_interleaved(&pcm).unwrap();
         let mut file = Vec::new();
         encoder.finish(&mut file).unwrap();
         let at = position(&file, &[0x04, 17, 0x40, 0x15]) + 4;
@@ -283,13 +297,81 @@ mod tests {
             let pcm: Vec<f32> = (0..2 * 44_100)
                 .map(|i| ((i / 2) as f32 * 0.05).sin() * 0.3)
                 .collect();
-            encoder.encode_interleaved(&pcm);
+            encoder.encode_interleaved(&pcm).unwrap();
             let mut file = Vec::new();
             encoder.finish(&mut file).unwrap();
             let at = position(&file, &[0x04, 17, 0x40, 0x15]) + 4;
             let field = |at: usize| u32::from_be_bytes(file[at..at + 4].try_into().unwrap());
             assert!(field(at + 3) > 0, "{rate:?}");
             assert_eq!(field(at + 7), 0, "{rate:?}");
+        }
+    }
+
+    /// A call refused for a sample that is not finite, though it holds
+    /// whole frames before the sample, leaves the file as if it had not
+    /// been made, whether more samples follow it or the stream ends there.
+    #[test]
+    fn a_refused_call_leaves_the_file_unchanged() {
+        let tone = |len: usize, phase: usize| -> Vec<f32> {
+            (0..2 * len)
+                .map(|i| ((phase + i / 2) as f32 * 0.03 + (i % 2) as f32).sin() * 0.3)
+                .collect()
+        };
+        let (a, b) = (tone(1500, 0), tone(2000, 1500));
+        let mut refused = tone(3000, 7000);
+        refused[2 * 2500 + 1] = f32::NAN;
+        let refused_planar: Vec<Vec<f32>> = (0..2)
+            .map(|c| refused.iter().copied().skip(c).step_by(2).collect())
+            .collect();
+
+        // The data stream's bytes are queued before the refused call, and
+        // the frames after it carry them, a few to each.
+        let file = |data: &[u8],
+                    refuse: &dyn Fn(&mut Encoder) -> Option<NonFiniteSample>,
+                    rest: Option<&[f32]>| {
+            let config = config(48_000, 2).data_stream_bytes_per_frame(4);
+            let mut encoder = Encoder::new(config).unwrap();
+            encoder.encode_interleaved(&a).unwrap();
+            encoder.push_data_stream(data);
+            let pending = encoder.data_stream_pending();
+            if let Some(error) = refuse(&mut encoder) {
+                assert_eq!((error.channel, error.sample), (1, 2500));
+            }
+            assert_eq!(encoder.data_stream_pending(), pending);
+            if let Some(rest) = rest {
+                encoder.encode_interleaved(rest).unwrap();
+            }
+            let mut file = Vec::new();
+            let finished = encoder.finish(&mut file).unwrap();
+            assert_eq!(finished.data_stream_dropped, 0);
+            file
+        };
+        for rest in [Some(&b[..]), None] {
+            let whole = file(b"chelys", &|_| None, rest);
+            // The comparisons below would see a change in the queued bytes.
+            assert!(
+                file(b"chelyz", &|_| None, rest) != whole,
+                "{}",
+                rest.is_some()
+            );
+            let interleaved = file(
+                b"chelys",
+                &|encoder| Some(encoder.encode_interleaved(&refused).unwrap_err()),
+                rest,
+            );
+            let planar = file(
+                b"chelys",
+                &|encoder| {
+                    Some(
+                        encoder
+                            .encode_planar(&[&refused_planar[0], &refused_planar[1]])
+                            .unwrap_err(),
+                    )
+                },
+                rest,
+            );
+            assert!(interleaved == whole, "interleaved, {}", rest.is_some());
+            assert!(planar == whole, "planar, {}", rest.is_some());
         }
     }
 }

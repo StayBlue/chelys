@@ -7,7 +7,10 @@
 use std::f64::consts::TAU;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use chelys_mp3::{ChannelMode, Config, ConfigError, DELAY, Encoder, Rate, SAMPLE_RATES, bitrates};
+use chelys_mp3::{
+    ChannelMode, Config, ConfigError, DELAY, Encoder, Finished, NonFiniteSample, Rate,
+    SAMPLE_RATES, bitrates,
+};
 
 const MODES: [ChannelMode; 4] = [
     ChannelMode::Mono,
@@ -38,9 +41,16 @@ fn encode(config: Config, pcm: &[Vec<f64>]) -> Vec<u8> {
     let mut encoder = Encoder::new(config).unwrap();
     let slices: Vec<&[f64]> = pcm.iter().map(Vec::as_slice).collect();
     let mut stream = Vec::new();
-    encoder.encode_planar(&slices, &mut stream);
+    encoder.encode_planar(&slices, &mut stream).unwrap();
     encoder.finish(&mut stream);
     stream
+}
+
+/// One sample of each channel in turn.
+fn interleave(pcm: &[Vec<f64>]) -> Vec<f64> {
+    (0..pcm[0].len())
+        .flat_map(|t| pcm.iter().map(move |channel| channel[t]))
+        .collect()
 }
 
 /// Rates to try at `sample_rate`, valid and not.
@@ -143,7 +153,7 @@ fn sweep(sample_rate: u32) -> usize {
                     encoder.push_ancillary(&[0xA5; 4096]);
                     let slices: Vec<&[f64]> = pcm.iter().map(Vec::as_slice).collect();
                     let mut stream = Vec::new();
-                    encoder.encode_planar(&slices, &mut stream);
+                    encoder.encode_planar(&slices, &mut stream).unwrap();
                     encoder.finish(&mut stream);
                 }));
                 assert!(encoded.is_ok(), "{case}");
@@ -240,9 +250,7 @@ fn every_form_of_the_same_input_gives_the_same_stream() {
         .collect();
     let planar = encode(config, &pcm);
 
-    let interleaved: Vec<f64> = (0..pcm[0].len())
-        .flat_map(|t| [pcm[0][t], pcm[1][t]])
-        .collect();
+    let interleaved = interleave(&pcm);
     type Feed = dyn Fn(&mut Encoder, &[f64], &mut Vec<u8>);
     let in_chunks = |chunk: usize, samples: &Feed| {
         let mut encoder = Encoder::new(config).unwrap();
@@ -253,14 +261,16 @@ fn every_form_of_the_same_input_gives_the_same_stream() {
         encoder.finish(&mut stream);
         stream
     };
-    let f64s = |e: &mut Encoder, part: &[f64], out: &mut Vec<u8>| e.encode_interleaved(part, out);
+    let f64s = |e: &mut Encoder, part: &[f64], out: &mut Vec<u8>| {
+        e.encode_interleaved(part, out).unwrap();
+    };
     let f32s = |e: &mut Encoder, part: &[f64], out: &mut Vec<u8>| {
         let part: Vec<f32> = part.iter().map(|&x| x as f32).collect();
-        e.encode_interleaved(&part, out);
+        e.encode_interleaved(&part, out).unwrap();
     };
     let i16s = |e: &mut Encoder, part: &[f64], out: &mut Vec<u8>| {
         let part: Vec<i16> = part.iter().map(|&x| (x * 32_768.0) as i16).collect();
-        e.encode_interleaved(&part, out);
+        e.encode_interleaved(&part, out).unwrap();
     };
     assert!(in_chunks(interleaved.len(), &f64s) == planar);
     assert!(in_chunks(2 * 377, &f64s) == planar);
@@ -282,7 +292,9 @@ fn finishing_gives_the_tag_and_the_counts() {
     let pcm = tone(22_050, 5_000, 1);
     let mut stream = Vec::new();
     encoder.push_ancillary(&[0xFF; 1_000]);
-    encoder.encode_planar(&[pcm[0].as_slice()], &mut stream);
+    encoder
+        .encode_planar(&[pcm[0].as_slice()], &mut stream)
+        .unwrap();
     let finished = encoder.finish(&mut stream);
     let tag = finished.info_tag.unwrap();
     assert_eq!(tag.len(), tag_len);
@@ -298,9 +310,9 @@ fn finishing_gives_the_tag_and_the_counts() {
     assert_eq!(Encoder::new(untagged).unwrap().info_tag_len(), None);
 }
 
-/// Samples far beyond full scale are clamped, and not a number is refused.
+/// Samples far beyond full scale are clamped.
 #[test]
-fn samples_are_finite_and_clamped() {
+fn samples_far_beyond_full_scale_are_clamped() {
     let config = Config::new(32_000, ChannelMode::Mono, Rate::Constant { kbps: 64 });
     let shape = tone(32_000, 4_000, 1).remove(0);
     let loud: Vec<f64> = shape
@@ -309,11 +321,170 @@ fn samples_are_finite_and_clamped() {
         .collect();
     let louder: Vec<f64> = shape.iter().map(|&x| x * 1e12).collect();
     assert!(encode(config, &[louder]) == encode(config, &[loud]));
+}
 
-    let mut nan = shape;
-    nan[100] = f64::NAN;
-    let refused = catch_unwind(|| encode(config, &[nan]));
+/// A stereo stream with the Xing/Info tag and ancillary data, so that a
+/// refused call has every part of the encoder's state to leave alone.
+fn refusal_config() -> Config {
+    Config::new(
+        32_000,
+        ChannelMode::JointStereo {
+            ms_stereo: true,
+            intensity_stereo: false,
+        },
+        Rate::Constant { kbps: 64 },
+    )
+    .info_tag(true)
+    .ancillary_bits_per_frame(8)
+}
+
+fn refusal_encoder() -> Encoder {
+    let mut encoder = Encoder::new(refusal_config()).unwrap();
+    encoder.push_ancillary(&[0x5A; 64]);
+    encoder
+}
+
+/// Gives `pcm` to `encoder`, planar and interleaved, expecting both calls
+/// to be refused for the sample at `at`, as (channel, sample), and to
+/// leave `out` and the ancillary data queued as they were.
+fn refuse(encoder: &mut Encoder, pcm: &[Vec<f64>], at: (usize, usize), out: &mut Vec<u8>) {
+    let before = out.clone();
+    let pending = encoder.ancillary_pending();
+    let slices: Vec<&[f64]> = pcm.iter().map(Vec::as_slice).collect();
+    let planar: NonFiniteSample = encoder.encode_planar(&slices, out).unwrap_err();
+    let interleaved = encoder
+        .encode_interleaved(&interleave(pcm), out)
+        .unwrap_err();
+    assert_eq!(planar, interleaved);
+    assert_eq!((planar.channel, planar.sample), at);
+    assert!(*out == before);
+    assert_eq!(encoder.ancillary_pending(), pending);
+}
+
+/// Gives each part of `parts` in turn, interleaved, and finishes.
+fn encode_parts(
+    mut encoder: Encoder,
+    parts: &[&[Vec<f64>]],
+    mut out: Vec<u8>,
+) -> (Vec<u8>, Finished) {
+    for part in parts {
+        encoder
+            .encode_interleaved(&interleave(part), &mut out)
+            .unwrap();
+    }
+    let finished = encoder.finish(&mut out);
+    (out, finished)
+}
+
+/// Splits each channel of `pcm` at `at`.
+fn split(pcm: &[Vec<f64>], at: usize) -> [Vec<Vec<f64>>; 2] {
+    [
+        pcm.iter().map(|c| c[..at].to_vec()).collect(),
+        pcm.iter().map(|c| c[at..].to_vec()).collect(),
+    ]
+}
+
+/// A sample that is NaN or infinite refuses the whole call, in either
+/// layout, naming the first such sample to be played.
+#[test]
+fn a_sample_not_finite_refuses_the_call() {
+    let pcm = tone(32_000, 3_000, 2);
+    for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        let mut refused = pcm.clone();
+        refused[1][2_900] = bad;
+        let mut encoder = refusal_encoder();
+        let mut out = vec![0xAA; 7];
+        refuse(&mut encoder, &refused, (1, 2_900), &mut out);
+    }
+
+    // The planar scan meets channel 0's sample first, but channel 1's is
+    // played first; of samples played at once, the lower channel's.
+    let mut refused = pcm.clone();
+    refused[0][2_000] = f64::NAN;
+    refused[1][1_000] = f64::INFINITY;
+    refused[1][2_500] = f64::NAN;
+    refuse(
+        &mut refusal_encoder(),
+        &refused,
+        (1, 1_000),
+        &mut Vec::new(),
+    );
+    refused[0][1_000] = f64::NEG_INFINITY;
+    refuse(
+        &mut refusal_encoder(),
+        &refused,
+        (0, 1_000),
+        &mut Vec::new(),
+    );
+}
+
+/// A refused call leaves the encoder as it was: the stream and what
+/// finishing gives are those of the calls around it alone, whether it is
+/// the first call, which would have written the Xing/Info tag's
+/// placeholder, or a later one, and whether its samples are then skipped,
+/// or cleaned and given again, or the stream finished at once.
+#[test]
+fn a_refused_call_changes_nothing() {
+    let pcm = tone(32_000, 6_000, 2);
+    let [a, rest] = split(&pcm, 2_500);
+    let [b, c] = split(&rest, 1_500);
+    let mut refused = b.clone();
+    refused[1][1_200] = f64::NAN;
+    let control_skipped = encode_parts(refusal_encoder(), &[&a, &c], Vec::new());
+    let control_cleaned = encode_parts(refusal_encoder(), &[&a, &b, &c], Vec::new());
+
+    // Refused first.
+    let mut encoder = refusal_encoder();
+    let mut out = Vec::new();
+    refuse(&mut encoder, &refused, (1, 1_200), &mut out);
+    assert!(out.is_empty());
+    assert!(encode_parts(encoder, &[&a, &c], out) == control_skipped);
+
+    // Refused later, then skipped, or cleaned and given again.
+    for (cleaned, control) in [(None, &control_skipped), (Some(&b), &control_cleaned)] {
+        let mut encoder = refusal_encoder();
+        let mut out = Vec::new();
+        encoder
+            .encode_interleaved(&interleave(&a), &mut out)
+            .unwrap();
+        refuse(&mut encoder, &refused, (1, 1_200), &mut out);
+        let rest: Vec<&[Vec<f64>]> = cleaned
+            .into_iter()
+            .map(Vec::as_slice)
+            .chain([c.as_slice()])
+            .collect();
+        assert!(encode_parts(encoder, &rest, out) == *control);
+    }
+
+    // Refused first or later, then finished at once.
+    let prefixes: [&[&[Vec<f64>]]; 2] = [&[], &[&a]];
+    for prefix in prefixes {
+        let mut encoder = refusal_encoder();
+        let mut out = Vec::new();
+        for part in prefix {
+            encoder
+                .encode_interleaved(&interleave(part), &mut out)
+                .unwrap();
+        }
+        refuse(&mut encoder, &refused, (1, 1_200), &mut out);
+        let control = encode_parts(refusal_encoder(), prefix, Vec::new());
+        assert!(encode_parts(encoder, &[], out) == control);
+    }
+}
+
+/// Planar slices of different lengths panic before anything is written,
+/// even the Xing/Info tag's placeholder.
+#[test]
+fn planar_slices_of_different_lengths_panic_first() {
+    let pcm = tone(32_000, 100, 2);
+    let mut encoder = refusal_encoder();
+    let mut out = vec![0xAA; 7];
+    let refused = catch_unwind(AssertUnwindSafe(|| {
+        // Only a panic from the encoder may pass, not an `Err` unwrapped.
+        let _ = encoder.encode_planar(&[&pcm[0][..], &pcm[1][..99]], &mut out);
+    }));
     assert!(refused.is_err());
+    assert_eq!(out, [0xAA; 7]);
 }
 
 #[test]

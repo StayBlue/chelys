@@ -6,7 +6,10 @@
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use chelys_aac::{Config, ConfigError, DELAY, Encoder, Framing, Rate, SAMPLE_RATES};
+use chelys_aac::{
+    Config, ConfigError, DELAY, Encoder, Finished, FrameSink, Framing, NonFiniteSample, Rate,
+    SAMPLE_RATES,
+};
 
 /// The channel counts the encoder takes.
 const CHANNELS: [usize; 7] = [1, 2, 3, 4, 5, 6, 8];
@@ -25,7 +28,7 @@ fn pcm(len: usize, channels: usize) -> Vec<f64> {
 fn encode_whole(config: Config, pcm: &[f64]) -> Vec<u8> {
     let mut encoder = Encoder::new(config).unwrap();
     let mut stream = Vec::new();
-    encoder.encode_interleaved(pcm, &mut stream);
+    encoder.encode_interleaved(pcm, &mut stream).unwrap();
     encoder.finish(&mut stream);
     stream
 }
@@ -117,7 +120,9 @@ fn finishing_gives_the_counts() {
         let mut encoder = Encoder::new(config).unwrap();
         let mut frames = Vec::new();
         let mut out = |frame: &[u8]| frames.push(frame.len());
-        encoder.encode_interleaved(&pcm(samples, 2), &mut out);
+        encoder
+            .encode_interleaved(&pcm(samples, 2), &mut out)
+            .unwrap();
         let finished = encoder.finish(&mut out);
         let (samples, delay) = (samples as u64, DELAY as u64);
         assert_eq!(finished.samples, samples);
@@ -144,17 +149,19 @@ fn every_form_of_the_same_input_gives_the_same_stream() {
         for frames in [1, 377, 1024, 4801] {
             let mut encoder = Encoder::new(config).unwrap();
             let mut stream = Vec::new();
-            encoder.encode_interleaved::<f64, _>(&[], &mut stream);
+            encoder
+                .encode_interleaved::<f64, _>(&[], &mut stream)
+                .unwrap();
             for (i, part) in input.chunks(2 * frames).enumerate() {
                 match i % 3 {
-                    0 => encoder.encode_interleaved(part, &mut stream),
+                    0 => encoder.encode_interleaved(part, &mut stream).unwrap(),
                     1 => {
                         let part: Vec<f32> = part.iter().map(|&x| x as f32).collect();
-                        encoder.encode_interleaved(&part, &mut stream);
+                        encoder.encode_interleaved(&part, &mut stream).unwrap();
                     }
                     _ => {
                         let part: Vec<i16> = part.iter().map(|&x| (x * 32_768.0) as i16).collect();
-                        encoder.encode_interleaved(&part, &mut stream);
+                        encoder.encode_interleaved(&part, &mut stream).unwrap();
                     }
                 }
             }
@@ -167,7 +174,9 @@ fn every_form_of_the_same_input_gives_the_same_stream() {
         let mut encoder = Encoder::new(config).unwrap();
         let mut stream = Vec::new();
         for (from, to) in [(0, 0), (0, 10), (10, 3000), (3000, 3001), (3001, 9000)] {
-            encoder.encode_planar(&[&left[from..to], &right[from..to]], &mut stream);
+            encoder
+                .encode_planar(&[&left[from..to], &right[from..to]], &mut stream)
+                .unwrap();
         }
         encoder.finish(&mut stream);
         assert!(stream == whole, "{framing:?}, planar");
@@ -186,7 +195,7 @@ fn every_division_of_multichannel_input_gives_the_same_stream() {
             let mut encoder = Encoder::new(config).unwrap();
             let mut stream = Vec::new();
             for part in input.chunks(channels * frames) {
-                encoder.encode_interleaved(part, &mut stream);
+                encoder.encode_interleaved(part, &mut stream).unwrap();
             }
             encoder.finish(&mut stream);
             assert!(stream == whole, "{channels} channels, by {frames}");
@@ -198,32 +207,143 @@ fn every_division_of_multichannel_input_gives_the_same_stream() {
         let mut stream = Vec::new();
         for (from, to) in [(0, 1), (1, 1500), (1500, 6000)] {
             let parts: Vec<&[f64]> = planar.iter().map(|c| &c[from..to]).collect();
-            encoder.encode_planar(&parts, &mut stream);
+            encoder.encode_planar(&parts, &mut stream).unwrap();
         }
         encoder.finish(&mut stream);
         assert!(stream == whole, "{channels} channels, planar");
     }
 }
 
-/// Samples far beyond full scale are clamped, and not a number, or an
-/// infinite one, is refused before any of the call is coded.
+/// Samples far beyond full scale are clamped.
 #[test]
-fn samples_are_finite_and_clamped() {
+fn samples_far_beyond_full_scale_are_clamped() {
     let config = Config::new(32_000, 1, constant(64_000));
     let loud: Vec<f64> = pcm(4_000, 1).iter().map(|&x| x * 1e12).collect();
     let clamped: Vec<f64> = loud.iter().map(|&x| x.clamp(-65_536.0, 65_536.0)).collect();
     assert!(encode_whole(config, &loud) == encode_whole(config, &clamped));
+}
 
-    for refused in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
-        let mut input = pcm(4_000, 1);
-        input[3_000] = refused;
+#[derive(Clone, Copy, Debug)]
+enum Layout {
+    Interleaved,
+    Planar,
+}
+
+const LAYOUTS: [Layout; 2] = [Layout::Interleaved, Layout::Planar];
+
+/// Encodes interleaved `input` in `layout`.
+fn encode<O: FrameSink + ?Sized>(
+    encoder: &mut Encoder,
+    layout: Layout,
+    input: &[f64],
+    out: &mut O,
+) -> Result<(), NonFiniteSample> {
+    match layout {
+        Layout::Interleaved => encoder.encode_interleaved(input, out),
+        Layout::Planar => {
+            let channels = encoder.channels();
+            let planar: Vec<Vec<f64>> = (0..channels)
+                .map(|c| input.iter().copied().skip(c).step_by(channels).collect())
+                .collect();
+            let slices: Vec<&[f64]> = planar.iter().map(Vec::as_slice).collect();
+            encoder.encode_planar(&slices, out)
+        }
+    }
+}
+
+fn position(error: NonFiniteSample) -> (usize, usize) {
+    (error.channel, error.sample)
+}
+
+/// A call with a sample that is not a number, or an infinite one, is
+/// refused whole, though frames before the sample are complete: the sink
+/// is given nothing.
+#[test]
+fn a_sample_not_finite_is_refused_before_any_frame_is_given() {
+    let config = Config::new(32_000, 2, constant(96_000));
+    for layout in LAYOUTS {
+        for refused in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut input = pcm(3_000, 2);
+            input[2 * 2_500 + 1] = refused;
+            let mut encoder = Encoder::new(config).unwrap();
+            let mut calls = 0;
+            let error = encode(&mut encoder, layout, &input, &mut |_: &[u8]| calls += 1);
+            assert_eq!(position(error.unwrap_err()), (1, 2_500));
+            assert_eq!(calls, 0, "{layout:?}, {refused}");
+
+            let mut stream = Vec::new();
+            encode(&mut encoder, layout, &pcm(3_000, 2), &mut stream).unwrap();
+            assert!(!stream.is_empty());
+            let given = stream.clone();
+            let error = encode(&mut encoder, layout, &input, &mut stream);
+            assert_eq!(position(error.unwrap_err()), (1, 2_500));
+            assert!(stream == given, "{layout:?}, {refused}");
+        }
+    }
+}
+
+/// Of several samples that are not finite, both layouts name the first to
+/// be played, and of those played at once the one of the lowest channel.
+#[test]
+fn the_first_sample_not_finite_is_named() {
+    let config = Config::new(32_000, 3, constant(144_000));
+    let mut input = pcm(3_000, 3);
+    for (channel, sample) in [(0, 2_000), (2, 1_500), (1, 1_500), (0, 2_999)] {
+        input[3 * sample + channel] = f64::NAN;
+    }
+    for layout in LAYOUTS {
         let mut encoder = Encoder::new(config).unwrap();
+        let error = encode(&mut encoder, layout, &input, &mut Vec::new());
+        assert_eq!(position(error.unwrap_err()), (1, 1_500), "{layout:?}");
+    }
+}
+
+/// A refused call leaves the encoder as it was, the bytes queued for data
+/// streams with it: the stream goes on, or is finished, as if the call had
+/// not been made, and the samples, made finite, may be given again.
+#[test]
+fn a_refused_call_leaves_the_encoder_as_it_was() {
+    let config = Config::new(32_000, 2, constant(96_000)).data_stream_bytes_per_frame(16);
+    let a = pcm(2_500, 2);
+    let b: Vec<f64> = pcm(3_000, 2).iter().map(|x| -x).collect();
+    let mut refused = pcm(2_000, 2);
+    refused[2 * 1_500 + 1] = f64::INFINITY;
+    let cleaned: Vec<f64> = (refused.iter())
+        .map(|&x| if x.is_finite() { x } else { 0.0 })
+        .collect();
+
+    // Encodes the calls in turn, each refused one's refusal checked.
+    let stream = |layout, calls: &[&[f64]]| -> (Vec<u8>, Finished) {
+        let mut encoder = Encoder::new(config).unwrap();
+        encoder.push_data_stream(&[0x55; 1_000]);
         let mut stream = Vec::new();
-        assert!(panics(|| encoder.encode_interleaved(&input, &mut stream)));
-        assert!(stream.is_empty(), "{refused}");
-        let mut encoder = Encoder::new(config).unwrap();
-        assert!(panics(|| encoder.encode_planar(&[&input[..]], &mut stream)));
-        assert!(stream.is_empty(), "{refused}");
+        for &input in calls {
+            if input.iter().all(|x| x.is_finite()) {
+                encode(&mut encoder, layout, input, &mut stream).unwrap();
+            } else {
+                let (given, pending) = (stream.clone(), encoder.data_stream_pending());
+                assert!(pending > 0);
+                encode(&mut encoder, layout, input, &mut stream).unwrap_err();
+                assert!(stream == given);
+                assert_eq!(encoder.data_stream_pending(), pending);
+            }
+        }
+        let finished = encoder.finish(&mut stream);
+        (stream, finished)
+    };
+    for layout in LAYOUTS {
+        assert!(
+            stream(layout, &[&a, &refused]) == stream(layout, &[&a]),
+            "{layout:?}, finished"
+        );
+        assert!(
+            stream(layout, &[&a, &refused, &b]) == stream(layout, &[&a, &b]),
+            "{layout:?}, skipped"
+        );
+        assert!(
+            stream(layout, &[&a, &refused, &cleaned, &b]) == stream(layout, &[&a, &cleaned, &b]),
+            "{layout:?}, cleaned"
+        );
     }
 }
 
@@ -234,17 +354,19 @@ fn input_must_be_whole_sample_frames() {
     let config = Config::new(48_000, 2, constant(128_000));
     let encoder = || Encoder::new(config).unwrap();
     let mut out = Vec::new();
-    assert!(panics(
-        || encoder().encode_interleaved(&[0.0f32; 3], &mut out)
-    ));
-    assert!(panics(
-        || encoder().encode_planar(&[&[0.0f32; 4][..]], &mut out)
-    ));
+    assert!(panics(|| {
+        let _ = encoder().encode_interleaved(&[0.0f32; 3], &mut out);
+    }));
+    assert!(panics(|| {
+        let _ = encoder().encode_planar(&[&[0.0f32; 4][..]], &mut out);
+    }));
     let three: [&[f32]; 3] = [&[0.0; 4], &[0.0; 4], &[0.0; 4]];
-    assert!(panics(|| encoder().encode_planar(&three, &mut out)));
-    assert!(panics(
-        || encoder().encode_planar(&[&[0.0f32; 4][..], &[0.0; 5]], &mut out)
-    ));
+    assert!(panics(|| {
+        let _ = encoder().encode_planar(&three, &mut out);
+    }));
+    assert!(panics(|| {
+        let _ = encoder().encode_planar(&[&[0.0f32; 4][..], &[0.0; 5]], &mut out);
+    }));
     assert!(out.is_empty());
 }
 
@@ -253,9 +375,15 @@ fn every_sample_type_is_taken() {
     let config = Config::new(44_100, 1, constant(64_000));
     let mut encoder = Encoder::new(config).unwrap();
     let mut stream = Vec::new();
-    encoder.encode_interleaved(&[i16::MIN, i16::MAX], &mut stream);
-    encoder.encode_interleaved(&[f32::MAX, f32::MIN_POSITIVE], &mut stream);
-    encoder.encode_planar(&[&[-1e300, 1e-300][..]], &mut stream);
+    encoder
+        .encode_interleaved(&[i16::MIN, i16::MAX], &mut stream)
+        .unwrap();
+    encoder
+        .encode_interleaved(&[f32::MAX, f32::MIN_POSITIVE], &mut stream)
+        .unwrap();
+    encoder
+        .encode_planar(&[&[-1e300, 1e-300][..]], &mut stream)
+        .unwrap();
     assert_eq!(encoder.finish(&mut stream).samples, 6);
 }
 

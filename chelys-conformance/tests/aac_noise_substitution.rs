@@ -47,7 +47,7 @@ fn encode(input: &[Vec<f64>], bits_per_second: u32) -> Vec<u8> {
     let mut stream = Vec::new();
     let mut out = |frame: &[u8]| stream.extend_from_slice(frame);
     let channels: Vec<&[f64]> = input.iter().map(Vec::as_slice).collect();
-    encoder.encode_planar(&channels, &mut out);
+    encoder.encode_planar(&channels, &mut out).unwrap();
     encoder.finish(&mut out);
     stream
 }

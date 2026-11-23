@@ -4,23 +4,10 @@
 //! The encoder as the library offers it: PCM in, the stream out, as the
 //! PCM arrives.
 
-use chelys_core::sample::{self, Sample};
+use chelys_core::sample::{self, NonFiniteSample, Sample};
 
 use super::config::{Config, ConfigError};
 use super::stream::StreamEncoder;
-
-/// Converts a sample to the encoder's scale, clamped to
-/// [`MAX_MAGNITUDE`](chelys_core::sample::MAX_MAGNITUDE). Lines that need
-/// more bits than their granule has even at the largest step, as from some
-/// hundreds of times full scale at low bitrates, lose their highest
-/// frequencies (see the outer loop).
-///
-/// # Panics
-///
-/// If the sample is NaN or infinite.
-fn convert<S: Sample>(sample: S) -> f64 {
-    sample::convert(sample).expect("a sample is not a finite number")
-}
 
 /// Encodes PCM as MPEG-1 Layer III, or at the lower sampling frequencies
 /// as MPEG-2 Layer III (ISO/IEC 13818-3) or MPEG-2.5, as it arrives.
@@ -41,7 +28,12 @@ fn convert<S: Sample>(sample: S) -> f64 {
 /// and ends with the silence that fills the last frame.
 pub struct Encoder {
     stream: StreamEncoder,
-    /// The input of each channel, converted, reused between calls.
+    /// The input of each channel, converted to the encoder's scale and
+    /// clamped to [`MAX_MAGNITUDE`](chelys_core::sample::MAX_MAGNITUDE),
+    /// reused between calls. Lines that need more bits than their granule
+    /// has even at the largest step, as from some hundreds of times full
+    /// scale at low bitrates, lose their highest frequencies (see the outer
+    /// loop).
     pcm: Vec<Vec<f64>>,
 }
 
@@ -103,20 +95,35 @@ impl Encoder {
     }
 
     /// Encodes interleaved samples, one of each channel in turn, and
-    /// appends to `out` the bytes of the stream that are final.
+    /// appends to `out` the bytes of the stream that are final. Samples
+    /// beyond 65536 times full scale are clamped there.
+    ///
+    /// # Errors
+    ///
+    /// If a sample is NaN or infinite, the call is refused whole, and the
+    /// error names the first such sample to be played. Nothing is appended
+    /// to `out`, and the encoder is as it was: it has taken none of the
+    /// samples and written no Xing/Info tag's placeholder, and the
+    /// ancillary data queued stays queued. The samples may be cleaned and
+    /// given again, or skipped, or the stream finished. `i16` samples are
+    /// always finite.
     ///
     /// # Panics
     ///
     /// If the number of samples is not a multiple of the number of
-    /// channels, or a sample is NaN or infinite. Samples beyond 65536 times
-    /// full scale are clamped there.
-    pub fn encode_interleaved<S: Sample>(&mut self, samples: &[S], out: &mut Vec<u8>) {
+    /// channels.
+    pub fn encode_interleaved<S: Sample>(
+        &mut self,
+        samples: &[S],
+        out: &mut Vec<u8>,
+    ) -> Result<(), NonFiniteSample> {
         let channels = self.channels();
         assert!(
             samples.len() % channels == 0,
             "{} samples are not a whole number of {channels}-channel frames",
             samples.len(),
         );
+        sample::check_interleaved(samples, channels)?;
         for (c, pcm) in self.pcm.iter_mut().enumerate() {
             pcm.clear();
             pcm.extend(
@@ -124,31 +131,50 @@ impl Encoder {
                     .iter()
                     .skip(c)
                     .step_by(channels)
-                    .map(|&s| convert(s)),
+                    .map(|&s| sample::convert(s)),
             );
         }
         self.encode_converted(out);
+        Ok(())
     }
 
     /// Encodes one slice of samples per channel, and appends to `out` the
-    /// bytes of the stream that are final.
+    /// bytes of the stream that are final. Samples beyond 65536 times full
+    /// scale are clamped there.
+    ///
+    /// # Errors
+    ///
+    /// If a sample is NaN or infinite, the call is refused whole, as
+    /// [`encode_interleaved`](Self::encode_interleaved) refuses it: nothing
+    /// is appended to `out`, and the encoder is as it was. The error names
+    /// the same sample as it would in the same samples interleaved.
     ///
     /// # Panics
     ///
-    /// If the number of slices is not the number of channels, the slices
-    /// are of different lengths, or a sample is NaN or infinite. Samples
-    /// beyond 65536 times full scale are clamped there.
-    pub fn encode_planar<S: Sample>(&mut self, channels: &[&[S]], out: &mut Vec<u8>) {
+    /// If the number of slices is not the number of channels, or the slices
+    /// are of different lengths, before anything is appended to `out`.
+    pub fn encode_planar<S: Sample>(
+        &mut self,
+        channels: &[&[S]],
+        out: &mut Vec<u8>,
+    ) -> Result<(), NonFiniteSample> {
         assert_eq!(
             channels.len(),
             self.channels(),
             "one slice of samples per channel"
         );
+        let len = channels[0].len();
+        assert!(
+            channels.iter().all(|c| c.len() == len),
+            "every channel has the same number of samples"
+        );
+        sample::check_planar(channels)?;
         for (pcm, samples) in self.pcm.iter_mut().zip(channels) {
             pcm.clear();
-            pcm.extend(samples.iter().map(|&s| convert(s)));
+            pcm.extend(samples.iter().map(|&s| sample::convert(s)));
         }
         self.encode_converted(out);
+        Ok(())
     }
 
     fn encode_converted(&mut self, out: &mut Vec<u8>) {

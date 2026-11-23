@@ -13,4 +13,4 @@ pub mod fft;
 pub mod quality;
 pub mod sample;
 
-pub use sample::Sample;
+pub use sample::{NonFiniteSample, Sample};

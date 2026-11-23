@@ -324,6 +324,10 @@ impl StreamEncoder {
     /// sampling frequencies), and the frames
     /// after them stay behind until later calls.
     ///
+    /// The samples are to be finite and within
+    /// [`MAX_MAGNITUDE`](chelys_core::sample::MAX_MAGNITUDE), as
+    /// [`Encoder`](crate::Encoder) converts them; they are not checked.
+    ///
     /// # Panics
     ///
     /// If the channel count does not match the configured mode, or the

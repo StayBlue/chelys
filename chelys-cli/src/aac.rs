@@ -306,8 +306,8 @@ pub fn encode(options: &Options) -> Result<(), String> {
     let mut encoder = Encoder::new(options.config()).map_err(|e| e.to_string())?;
     let mut stream = Vec::new();
     pcm::read(encoder.channels(), |samples| {
-        encoder.encode_interleaved(samples, &mut stream);
-        output.write(&mut stream)
+        encoder.encode_interleaved(samples, &mut stream)?;
+        Ok(output.write(&mut stream)?)
     })?;
     encoder.finish(&mut stream);
     output.write(&mut stream)?;
@@ -320,8 +320,7 @@ pub fn encode(options: &Options) -> Result<(), String> {
 fn encode_mp4(options: &Options) -> Result<(), String> {
     let mut encoder = mp4::aac::Encoder::new(options.config()).map_err(|e| e.to_string())?;
     pcm::read(encoder.channels(), |samples| {
-        encoder.encode_interleaved(samples);
-        Ok(())
+        Ok(encoder.encode_interleaved(samples)?)
     })?;
     let mut stdout = std::io::stdout().lock();
     let error = |e: std::io::Error| format!("writing stdout: {e}");

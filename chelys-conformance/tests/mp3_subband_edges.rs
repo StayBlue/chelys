@@ -35,7 +35,7 @@ fn encode(sample_rate: u32, input: &[f64]) -> Vec<u8> {
     };
     let mut encoder = Encoder::new(Config::new(sample_rate, ChannelMode::Mono, rate)).unwrap();
     let mut stream = Vec::new();
-    encoder.encode_planar(&[input], &mut stream);
+    encoder.encode_planar(&[input], &mut stream).unwrap();
     encoder.finish(&mut stream);
     stream
 }

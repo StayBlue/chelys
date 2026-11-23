@@ -54,7 +54,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         // Each call appends the bytes that are final; write them out and
         // reuse the buffer.
-        encoder.encode_interleaved(&chunk, &mut mp3);
+        encoder.encode_interleaved(&chunk, &mut mp3)?;
         file.write_all(&mp3)?;
         mp3.clear();
     }

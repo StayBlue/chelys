@@ -112,7 +112,7 @@ fn decode_tones_with(
     let mut encoder = Encoder::new(config).unwrap();
     let mut stream = Vec::new();
     let planar: Vec<&[f64]> = input.iter().map(Vec::as_slice).collect();
-    encoder.encode_planar(&planar, &mut stream);
+    encoder.encode_planar(&planar, &mut stream).unwrap();
     let finished = encoder.finish(&mut stream);
 
     let expected = StreamInfo {
@@ -301,7 +301,9 @@ fn ffmpeg_names_the_channels_of_its_layouts() {
         );
         let mut encoder = Encoder::new(config).unwrap();
         let mut stream = Vec::new();
-        encoder.encode_interleaved(&vec![0.0f32; 4096 * channels], &mut stream);
+        encoder
+            .encode_interleaved(&vec![0.0f32; 4096 * channels], &mut stream)
+            .unwrap();
         encoder.finish(&mut stream);
         let (_, channels_in_order) = ffmpeg::channel_layout_aac(&stream);
         assert_eq!(channels_in_order, decomposition, "{channels} channels");
@@ -398,7 +400,7 @@ fn faad_decodes_no_frame_longer_than_4608_bytes() {
     );
     let mut encoder = Encoder::new(config).unwrap();
     let mut stream = Vec::new();
-    encoder.encode_interleaved(&pcm, &mut stream);
+    encoder.encode_interleaved(&pcm, &mut stream).unwrap();
     encoder.finish(&mut stream);
     let mut frames = Vec::new();
     let mut rest = stream.as_slice();
@@ -479,7 +481,7 @@ fn decodes_5_1_and_7_1_at_the_ends_of_their_range(
                         .collect();
                     let mut encoder = Encoder::new(config(bits_per_second)).unwrap();
                     let mut stream = Vec::new();
-                    encoder.encode_interleaved(&pcm, &mut stream);
+                    encoder.encode_interleaved(&pcm, &mut stream).unwrap();
                     let finished = encoder.finish(&mut stream);
                     let fs = SamplingFrequency::from_hz(sample_rate).unwrap();
                     let mut rest = stream.as_slice();

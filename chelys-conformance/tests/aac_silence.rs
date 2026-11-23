@@ -15,7 +15,9 @@ fn encode_silence(sample_rate: u32, channels: usize) -> (Vec<u8>, chelys::aac::F
     let config = Config::new(sample_rate, channels, Rate::Constant { bits_per_second });
     let mut encoder = Encoder::new(config).unwrap();
     let mut stream = Vec::new();
-    encoder.encode_interleaved(&vec![0.0f32; SAMPLES * channels], &mut stream);
+    encoder
+        .encode_interleaved(&vec![0.0f32; SAMPLES * channels], &mut stream)
+        .unwrap();
     let finished = encoder.finish(&mut stream);
     (stream, finished)
 }
@@ -91,7 +93,7 @@ fn ffmpeg_reads_the_shortest_streams() {
     );
     let mut encoder = Encoder::new(config).unwrap();
     let mut stream = Vec::new();
-    encoder.encode_interleaved(&[0.0f32], &mut stream);
+    encoder.encode_interleaved(&[0.0f32], &mut stream).unwrap();
     assert_eq!(encoder.finish(&mut stream).frames, 2);
     let (info, profile) = ffmpeg::probe_aac(&stream);
     assert_eq!((info.codec_name.as_str(), profile.as_str()), ("aac", "LC"));

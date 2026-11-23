@@ -496,7 +496,9 @@ mod tests {
         let mut encoder = Encoder::new(config).unwrap();
         let mut frames = Vec::new();
         let mut out = |frame: &[u8]| frames.push(frame.to_vec());
-        encoder.encode_interleaved(&[0.0f32; 2 * 4096], &mut out);
+        encoder
+            .encode_interleaved(&[0.0f32; 2 * 4096], &mut out)
+            .unwrap();
         encoder.finish(&mut out);
         assert_eq!(frames.len(), 5);
         for frame in frames {
@@ -548,7 +550,9 @@ mod tests {
         let mut encoder = Encoder::new(config).unwrap();
         let mut frames = Vec::new();
         let mut out = |frame: &[u8]| frames.push(frame.to_vec());
-        encoder.encode_interleaved(&[0.0f32; 2 * 4096], &mut out);
+        encoder
+            .encode_interleaved(&[0.0f32; 2 * 4096], &mut out)
+            .unwrap();
         encoder.finish(&mut out);
         // The bit after the 12 bits of the syncword.
         frames.iter().map(|frame| (frame[1] >> 3) & 1).collect()

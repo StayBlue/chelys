@@ -35,7 +35,7 @@ fn config(sample_rate: u32, channels: usize, bits_per_second: u32) -> Config {
 /// The MP4 file of `pcm`, and the frames of its stream.
 fn encode(config: Config, pcm: &[f32]) -> (Vec<u8>, u64) {
     let mut encoder = Encoder::new(config).unwrap();
-    encoder.encode_interleaved(pcm);
+    encoder.encode_interleaved(pcm).unwrap();
     let mut file = Vec::new();
     let finished = encoder.finish(&mut file).unwrap();
     (file, finished.frames)
@@ -183,7 +183,7 @@ fn ffmpeg_decodes_mp4_files_of_every_channel_configuration() {
             let (file, _) = encode(config, &pcm);
             let mut adts = Vec::new();
             let mut encoder = chelys::aac::Encoder::new(config).unwrap();
-            encoder.encode_interleaved(&pcm, &mut adts);
+            encoder.encode_interleaved(&pcm, &mut adts).unwrap();
             encoder.finish(&mut adts);
             let (layout, _) = ffmpeg::channel_layout_aac(&adts);
             let stream = ffmpeg::probe_mp4(&file);

@@ -538,7 +538,7 @@ impl FrameSink for Vec<u8> {
 /// let mut encoder = Encoder::new(config).unwrap();
 /// let mut frames = Vec::new();
 /// let mut out = |frame: &[u8]| frames.push(frame.to_vec());
-/// encoder.encode_interleaved(&[0i16; 4096], &mut out);
+/// encoder.encode_interleaved(&[0i16; 4096], &mut out).unwrap();
 /// encoder.finish(&mut out);
 /// assert_eq!(frames.len(), 5);
 /// ```
@@ -735,6 +735,10 @@ impl StreamEncoder {
     /// 1.0, in the order of the elements that carry them (see
     /// [`ChannelConfiguration::elements`]), and gives `out` the frames they
     /// complete, each once the block after it has arrived.
+    ///
+    /// The samples are to be finite and within
+    /// [`MAX_MAGNITUDE`](chelys_core::sample::MAX_MAGNITUDE), as
+    /// [`Encoder`](crate::Encoder) converts them; they are not checked.
     ///
     /// # Panics
     ///

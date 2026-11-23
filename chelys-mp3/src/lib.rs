@@ -16,9 +16,9 @@
 //! let mut encoder = Encoder::new(config)?;
 //! let pcm = vec![0.0f32; 2 * 44_100]; // a second of silence, interleaved
 //! let mut mp3 = Vec::new();
-//! encoder.encode_interleaved(&pcm, &mut mp3);
+//! encoder.encode_interleaved(&pcm, &mut mp3)?;
 //! encoder.finish(&mut mp3);
-//! # Ok::<(), chelys_mp3::ConfigError>(())
+//! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
 mod ancillary;
@@ -40,7 +40,7 @@ mod side_info;
 mod stereo;
 mod stream;
 
-pub use chelys_core::{Sample, quality};
+pub use chelys_core::{NonFiniteSample, Sample, quality};
 pub use config::{ChannelMode, Config, ConfigError, Rate, SAMPLE_RATES, bitrates};
 pub use encoder::{Encoder, Finished};
 
@@ -49,6 +49,12 @@ pub use encoder::{Encoder, Finished};
 /// ways to encode a stream that the public API does not offer, such as
 /// from quantised granules. They follow the code, not a stable API, and
 /// may change in any release.
+///
+/// [`StreamEncoder::encode`](crate::internals::StreamEncoder::encode)
+/// takes samples already converted to `f64` at full scale 1.0, and does
+/// not check them: unlike [`Encoder`]'s methods, it neither refuses a
+/// sample that is NaN or infinite nor clamps one. The samples are to be
+/// finite and within [`MAX_MAGNITUDE`](chelys_core::sample::MAX_MAGNITUDE).
 #[cfg(feature = "unstable")]
 pub mod internals {
     pub use super::granule::*;

@@ -115,7 +115,7 @@ fn encodes_raw_pcm_to_the_adts_stream_the_library_writes() {
     );
     let mut expected = Vec::new();
     let mut encoder = Encoder::new(config).unwrap();
-    encoder.encode_interleaved(&pcm, &mut expected);
+    encoder.encode_interleaved(&pcm, &mut expected).unwrap();
     let finished = encoder.finish(&mut expected);
     assert!(output.stdout == expected, "the library's stream");
 
@@ -163,7 +163,7 @@ fn the_header_options_are_the_library_s() {
     let encode = |config: Config| {
         let mut expected = Vec::new();
         let mut encoder = Encoder::new(config).unwrap();
-        encoder.encode_interleaved(&pcm, &mut expected);
+        encoder.encode_interleaved(&pcm, &mut expected).unwrap();
         encoder.finish(&mut expected);
         expected
     };
@@ -230,7 +230,7 @@ fn encodes_5_1_and_7_1_as_the_library_does() {
         );
         let mut expected = Vec::new();
         let mut encoder = Encoder::new(config).unwrap();
-        encoder.encode_interleaved(&pcm, &mut expected);
+        encoder.encode_interleaved(&pcm, &mut expected).unwrap();
         encoder.finish(&mut expected);
         assert!(output.stdout == expected, "{channels} channels");
         let header = adts_header(&output.stdout);
@@ -310,14 +310,19 @@ fn refuses_input_that_ends_within_a_sample_frame() {
 
 #[test]
 fn refuses_input_that_is_not_a_number() {
-    let input = le_bytes(&[0.0, f32::NAN]);
-    let output = chelys(
-        &["aac", "--sample-rate", "44100", "--channels", "2"],
-        &input,
-    );
-    assert_eq!(output.status.code(), Some(1));
-    assert_eq!(
-        text(&output.stderr),
-        "chelys: input holds a sample that is not a finite number: NaN\n"
-    );
+    // Past the first 64 KiB chelys reads, where the encoder is given the
+    // input in pieces: the sample is named in the whole of it.
+    let mut pcm = stereo_tone(44_100, 0.5);
+    pcm[2 * 20_000 + 1] = f32::NAN;
+    for container in [&[][..], &["--mp4"]] {
+        let mut args = vec!["aac", "--sample-rate", "44100", "--channels", "2"];
+        args.extend(container);
+        let output = chelys(&args, &le_bytes(&pcm));
+        assert_eq!(output.status.code(), Some(1), "{args:?}");
+        assert_eq!(
+            text(&output.stderr),
+            "chelys: input sample 20000 of channel 1 is not a finite number: NaN\n",
+            "{args:?}"
+        );
+    }
 }

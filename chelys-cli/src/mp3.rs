@@ -330,8 +330,8 @@ pub fn encode(options: &Options) -> Result<(), String> {
     let mut encoder = Encoder::new(config).map_err(|e| e.to_string())?;
     let mut stream = Vec::new();
     pcm::read(encoder.channels(), |samples| {
-        encoder.encode_interleaved(samples, &mut stream);
-        output.write(&mut stream)
+        encoder.encode_interleaved(samples, &mut stream)?;
+        Ok(output.write(&mut stream)?)
     })?;
     let tag = encoder.finish(&mut stream).info_tag;
     output.write(&mut stream)?;

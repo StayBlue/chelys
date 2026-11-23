@@ -119,10 +119,13 @@ fn constant_bitrate_streams_are_unchanged() {
                     let mut encoder = Encoder::new(config).unwrap();
                     let [left, right] = input(sample_rate);
                     let mut stream = Vec::new();
-                    match mode {
-                        ChannelMode::Mono => encoder.encode_planar(&[&left], &mut stream),
-                        _ => encoder.encode_planar(&[&left, &right], &mut stream),
-                    }
+                    let channels: &[&[f64]] = match mode {
+                        ChannelMode::Mono => &[&left],
+                        _ => &[&left, &right],
+                    };
+                    encoder
+                        .encode_planar(channels, &mut stream)
+                        .expect("finite samples");
                     encoder.finish(&mut stream);
                     (stream.len(), fnv1a(&stream))
                 })
