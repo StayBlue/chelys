@@ -1,17 +1,15 @@
 // Copyright (c) 2026 StayBlue
 // SPDX-License-Identifier: MIT
 
-//! AAC-LC from chelys's encoder in an MP4 file: its raw frames as the
-//! samples of an `'mp4a'` track, which its `AudioSpecificConfig()`
-//! describes.
+//! The MP4 file written whole once the stream has ended.
 
 use std::io::{self, Write};
 
-use chelys_aac::{Config, ConfigError, Finished, FrameSink, Framing, NonFiniteSample, Sample};
+use chelys_aac::{Config, ConfigError, Finished, FrameSink, NonFiniteSample, Sample};
 
-use super::bitrate::{avg_bitrate, max_bitrate};
-use super::descriptor::{AUDIO_ISO_IEC_14496_3, AUDIO_STREAM, DecoderConfig, es_descriptor};
-use super::movie::{AudioTrack, write_file};
+use super::{Stream, raw_encoder};
+use crate::bitrate::{avg_bitrate, max_bitrate};
+use crate::movie::progressive::write_file;
 
 /// Encodes PCM as AAC-LC, as [`chelys_aac::Encoder`] does, into an MP4
 /// file, which [`finish`](Self::finish) writes whole.
@@ -48,7 +46,7 @@ impl FrameSink for Frames {
 
 impl Encoder {
     /// An encoder of the stream `config` asks for, each frame as its
-    /// `raw_data_block()` (see [`Framing::Raw`]), as ISO/IEC 14496-3 maps
+    /// `raw_data_block()` (see [`Framing::Raw`](chelys_aac::Framing::Raw)), as ISO/IEC 14496-3 maps
     /// each to an access unit, and so an MP4 sample (clause 1.6.2.2.2.1),
     /// whatever framing `config` asks for.
     ///
@@ -59,7 +57,7 @@ impl Encoder {
     /// flag of ADTS.
     pub fn new(config: Config) -> Result<Self, ConfigError> {
         Ok(Self {
-            encoder: chelys_aac::Encoder::new(config.framing(Framing::Raw))?,
+            encoder: raw_encoder(config)?,
             constant_rate: config.rate().is_constant(),
             frames: Frames::default(),
         })
@@ -127,61 +125,28 @@ impl Encoder {
             constant_rate,
             mut frames,
         } = self;
-        let sample_rate = encoder.sample_rate();
-        let channels = encoder.channels();
-        let frame_samples = encoder.samples_per_frame() as u32;
-        let specific_info = encoder.audio_specific_config();
-        let buffer_size = encoder.decoder_buffer_bytes();
+        let stream = Stream::of(&encoder);
         let finished = encoder.finish(&mut frames);
-        // Spec reading: the objectTypeIndication is "Audio ISO/IEC
-        // 14496-3", 0x40, whose DecoderSpecificInfo is the
-        // AudioSpecificConfig() (ISO/IEC 14496-3, clause 1.6.2.1), which
-        // names the stream AAC LC: with perceptual noise substitution it is
-        // MPEG-4 AAC, and without it AAC LC of either standard. That of
-        // ISO/IEC 13818-7's Low Complexity profile, 0x67, would take an
-        // adif_header() as its DecoderSpecificInfo instead (ISO/IEC
-        // 14496-1, clause 6.2.6.7.2).
-        //
-        // Spec reading: bufferSizeDB, "the size of the decoding buffer",
-        // the buffer at the decoder's input (ISO/IEC 14496-1, clause
-        // 6.1.2.4), is that of the decoder's input buffer of ISO/IEC
-        // 13818-7 (clause 8.2.3.1), within which the bit reservoir keeps
-        // the stream.
-        //
         // Spec reading: avgBitrate "shall be set to zero" "For streams with
         // variable bitrate". A stream coded at a constant rate, the bit
         // reservoir (ISO/IEC 13818-7, clause 8.2.3.2) letting its frames
         // vary about the mean, is not one: its average is given, measured
         // over the stream. Rate::is_constant decides which a stream is, so
         // that a rate of another kind is decided there.
+        let (frame_samples, sample_rate) = (stream.frame_samples, stream.sample_rate);
         let avg_bitrate = avg_bitrate(&frames.sizes, frame_samples, sample_rate);
-        let es_descriptor = es_descriptor(&DecoderConfig {
-            object_type_indication: AUDIO_ISO_IEC_14496_3,
-            stream_type: AUDIO_STREAM,
-            buffer_size,
-            max_bitrate: max_bitrate(&frames.sizes, frame_samples, sample_rate),
-            avg_bitrate: if constant_rate { avg_bitrate } else { 0 },
-            specific_info: &specific_info,
-        });
-        let track = AudioTrack {
-            coding_name: *b"mp4a",
-            es_descriptor: &es_descriptor,
-            sample_rate,
-            channels: channels as u16,
-            sizes: &frames.sizes,
-            frame_samples,
-            delay: chelys_aac::DELAY as u32,
-            length: finished.samples,
-            roll_distance: -1,
-        };
-        write_file(&track, &frames.data, out)?;
+        let track = stream.track(
+            max_bitrate(&frames.sizes, frame_samples, sample_rate),
+            if constant_rate { avg_bitrate } else { 0 },
+        );
+        write_file(&track, &frames.sizes, finished.samples, &frames.data, out)?;
         Ok(finished)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use chelys_aac::Rate;
+    use chelys_aac::{Framing, Rate};
 
     use super::*;
 

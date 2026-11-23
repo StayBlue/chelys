@@ -58,6 +58,87 @@ pub fn media_data_header(payload_len: u64) -> Vec<u8> {
     header
 }
 
+/// Reading boxes back, for the tests.
+#[cfg(test)]
+pub mod read {
+    use super::FourCc;
+
+    /// A box found in a file: its type, payload, and where it starts.
+    #[derive(Debug)]
+    pub struct Found<'a> {
+        pub kind: FourCc,
+        pub payload: &'a [u8],
+        pub start: usize,
+    }
+
+    /// The types of boxes found, as text.
+    pub trait FourCcs {
+        fn kinds(&self) -> Vec<String>;
+    }
+
+    impl FourCcs for [Found<'_>] {
+        fn kinds(&self) -> Vec<String> {
+            self.iter()
+                .map(|b| String::from_utf8_lossy(&b.kind).into_owned())
+                .collect()
+        }
+    }
+
+    /// The boxes one after another in `bytes`, which start `base` bytes
+    /// into the file, by their compact sizes.
+    pub fn boxes(bytes: &[u8], base: usize) -> Vec<Found<'_>> {
+        let mut found = Vec::new();
+        let mut at = 0;
+        while at < bytes.len() {
+            let size = u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+            assert!(
+                size >= 8 && at + size <= bytes.len(),
+                "a box past its container"
+            );
+            found.push(Found {
+                kind: bytes[at + 4..at + 8].try_into().unwrap(),
+                payload: &bytes[at + 8..at + size],
+                start: base + at,
+            });
+            at += size;
+        }
+        found
+    }
+
+    /// The boxes within `container`: after the fields that precede them
+    /// in a `SampleDescriptionBox` and an `'mp4a'` sample entry.
+    pub fn children<'a>(container: &Found<'a>) -> Vec<Found<'a>> {
+        // The sample entry's boxes follow its 28 bytes of fields, and
+        // stsd's its version, flags and entry_count.
+        let skip = match &container.kind {
+            b"stsd" => 8,
+            b"mp4a" => 28,
+            _ => 0,
+        };
+        boxes(&container.payload[skip..], container.start + 8 + skip)
+    }
+
+    /// The box of `path` in `file`, each type within the one before: the
+    /// first of its type at each step.
+    pub fn find<'a>(file: &'a [u8], path: &[&[u8; 4]]) -> Found<'a> {
+        let mut found = boxes(file, 0);
+        for (i, kind) in path.iter().enumerate() {
+            let at = (found.iter().position(|b| &b.kind == *kind))
+                .unwrap_or_else(|| panic!("no {}", String::from_utf8_lossy(*kind)));
+            let this = found.swap_remove(at);
+            if i + 1 == path.len() {
+                return this;
+            }
+            found = children(&this);
+        }
+        unreachable!()
+    }
+
+    pub fn u32_at(bytes: &[u8], at: usize) -> u32 {
+        u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
