@@ -22,11 +22,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         .nth(1)
         .unwrap_or_else(|| "sweep.mp3".into());
 
-    let rate = Rate::Variable {
+    let rate = Rate::Quality {
+        // From 0 to 100, higher for better quality and larger frames.
+        level: 80,
         min_kbps: None,
         max_kbps: None,
-        // Above 0 allows more noise than Annex C does, for smaller frames.
-        noise_offset_db: 3.0,
     };
     // The tag is written over the start of the stream once it has ended, so
     // ask for it only where the output can be rewritten, as a file can.

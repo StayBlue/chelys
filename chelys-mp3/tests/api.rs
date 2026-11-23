@@ -65,6 +65,21 @@ fn rates(sample_rate: u32) -> Vec<Rate> {
         Rate::Mean {
             bits_per_second: highest * 1000 + 1,
         },
+        Rate::Quality {
+            level: 0,
+            min_kbps: None,
+            max_kbps: None,
+        },
+        Rate::Quality {
+            level: 100,
+            min_kbps: Some(highest),
+            max_kbps: Some(lowest),
+        },
+        Rate::Quality {
+            level: 101,
+            min_kbps: None,
+            max_kbps: None,
+        },
         variable(None, None, 0.0),
         variable(Some(highest), Some(lowest), 0.0),
         variable(Some(lowest + 1), None, 0.0),
@@ -166,6 +181,15 @@ fn errors_name_what_was_refused() {
             bits_per_second: 128_000,
             in_table: true
         }
+    );
+    let quality = |level| Rate::Quality {
+        level,
+        min_kbps: None,
+        max_kbps: None,
+    };
+    assert_eq!(
+        refused(Config::new(44_100, ChannelMode::Mono, quality(101))),
+        ConfigError::QualityLevel { level: 101 }
     );
     let mixed = Config::new(8_000, ChannelMode::Mono, constant(8)).mixed_blocks(true);
     assert_eq!(

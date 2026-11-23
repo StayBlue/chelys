@@ -451,7 +451,10 @@ impl Case {
                     .min()
                     .unwrap(),
             ),
-            Rate::Variable {
+            Rate::Quality {
+                min_kbps, max_kbps, ..
+            }
+            | Rate::Variable {
                 min_kbps, max_kbps, ..
             } => (min_kbps.unwrap_or(lowest), max_kbps.unwrap_or(highest)),
             Rate::Free { .. } => unreachable!("free format has no bitrate of the table"),
@@ -486,10 +489,21 @@ fn config(random: &mut Random) -> (Config, Rate) {
             },
             2 => {
                 let (a, b) = (random.pick(table), random.pick(table));
-                Rate::Variable {
-                    min_kbps: random.chance(0.7).then_some(a.min(b)),
-                    max_kbps: random.chance(0.7).then_some(a.max(b)),
-                    noise_offset_db: random.between(-12.0, 24.0),
+                let (min_kbps, max_kbps) = (
+                    random.chance(0.7).then_some(a.min(b)),
+                    random.chance(0.7).then_some(a.max(b)),
+                );
+                match random.chance(0.5) {
+                    true => Rate::Variable {
+                        min_kbps,
+                        max_kbps,
+                        noise_offset_db: random.between(-12.0, 24.0),
+                    },
+                    false => Rate::Quality {
+                        level: random.below(101) as u8,
+                        min_kbps,
+                        max_kbps,
+                    },
                 }
             }
             _ => Rate::Free {

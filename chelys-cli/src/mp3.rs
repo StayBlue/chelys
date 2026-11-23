@@ -3,6 +3,7 @@
 
 //! `chelys mp3`: MPEG-1 and MPEG-2 Layer III, and MPEG-2.5.
 
+use chelys::mp3::quality::MAX_LEVEL;
 use chelys::mp3::{ChannelMode, Config, ConfigError, Encoder, Rate, bitrates};
 
 use crate::output::Output;
@@ -10,8 +11,9 @@ use crate::{pcm, value};
 
 pub const USAGE: &str = "\
 usage: chelys mp3 --sample-rate HZ --channels N
-                  [--bitrate KBPS [--free-format] | --vbr [--min-bitrate KBPS]
-                  [--max-bitrate KBPS] [--vbr-noise DB]] [--no-joint-stereo]
+                  [--bitrate KBPS [--free-format] | --vbr [--quality LEVEL |
+                  --vbr-noise DB] [--min-bitrate KBPS] [--max-bitrate KBPS]]
+                  [--no-joint-stereo]
                   [--dual-channel] [--intensity-stereo] [--mixed-blocks]
                   [--crc] [--copyright] [--original] [--private-bit]
                   < input.f32 > output.mp3
@@ -36,12 +38,16 @@ MPEG-2.5 Layer III at 8, 11.025 and 12 kHz (experimental).
                      (default: off)
   --vbr              give each frame the lowest bitrate at which the noise
                      of every band stays within what the psychoacoustic
-                     model allows (experimental)
+                     model allows, at a level of quality (experimental)
+  --quality LEVEL    with --vbr, the level of quality, from 0 to 100,
+                     higher for better quality and mostly larger files
+                     (default 80)
   --min-bitrate KBPS with --vbr, the lowest bitrate a frame may have, from
                      the list above (default: the lowest)
   --max-bitrate KBPS with --vbr, the highest (default: the highest)
-  --vbr-noise DB     with --vbr, allow each band this many dB more noise
-                     than the model does, or less if negative (default 3)
+  --vbr-noise DB     with --vbr, in place of --quality, allow each band
+                     this many dB more noise than the model does, or less
+                     if negative
   --no-joint-stereo  code two channels as left and right throughout
                      (default: code each frame in MS stereo where the
                      channels are alike)
@@ -129,8 +135,12 @@ impl Options {
     }
 }
 
-/// The noise `--vbr` allows each band beyond what the psychoacoustic model
-/// does, in dB, unless `--vbr-noise` says otherwise. The model's own
+/// The level of quality `--vbr` codes at unless `--quality` or `--vbr-noise`
+/// says otherwise. At 44.1 kHz in stereo, level 80 allows each band 2.2 dB
+/// more noise than the psychoacoustic model does, and over 51 tracks of
+/// nine kinds of music averages 211 kbit/s and a grade of -0.12 (PEAQ,
+/// GstPEAQ 0.6.1, black box). That is close to the 3 dB `--vbr` allowed
+/// before the scale (200 kbit/s and -0.160 there), as the model's own
 /// allowance spends more bits than listeners need. 3 dB was chosen while
 /// every frame's bitrate was searched by coding the frame at each bitrate
 /// tried. Graded with PEAQ (GstPEAQ 0.6.1, black box), 22 tracks of pop
@@ -158,11 +168,12 @@ impl Options {
 /// nothing changed, and the gain is taken as quality, most of it on the
 /// worst tracks. A size matched to the search's would be particular to the
 /// tracks it was matched on.
-const DEFAULT_VBR_NOISE_DB: f64 = 3.0;
+const DEFAULT_QUALITY: u8 = 80;
 
 pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
     let (mut sample_rate, mut channels, mut bitrate) = (None, None, None);
     let (mut vbr, mut min_kbps, mut max_kbps, mut vbr_noise) = (false, None, None, None);
+    let mut quality = None;
     let mut free_format = false;
     let (mut copyright, mut original, mut private_bit) = (false, false, false);
     let (mut joint_stereo, mut dual_channel) = (true, false);
@@ -179,6 +190,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> 
             "--vbr" => vbr = true,
             "--min-bitrate" => min_kbps = Some(value::<u32>(args, &flag)?),
             "--max-bitrate" => max_kbps = Some(value::<u32>(args, &flag)?),
+            "--quality" => quality = Some(value::<u32>(args, &flag)?),
             "--vbr-noise" => vbr_noise = Some(value::<f64>(args, &flag)?),
             "--no-joint-stereo" => joint_stereo = false,
             "--dual-channel" => dual_channel = true,
@@ -202,14 +214,32 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> 
         if bitrate.is_some() || free_format {
             return Err("--bitrate and --free-format exclude --vbr".to_owned());
         }
-        Rate::Variable {
-            min_kbps,
-            max_kbps,
-            noise_offset_db: vbr_noise.unwrap_or(DEFAULT_VBR_NOISE_DB),
+        match (quality, vbr_noise) {
+            (Some(_), Some(_)) => {
+                return Err("--quality and --vbr-noise exclude each other".to_owned());
+            }
+            (_, Some(noise_offset_db)) => Rate::Variable {
+                min_kbps,
+                max_kbps,
+                noise_offset_db,
+            },
+            (level, None) => Rate::Quality {
+                level: match level {
+                    None => DEFAULT_QUALITY,
+                    Some(level) if level <= u32::from(MAX_LEVEL) => level as u8,
+                    Some(level) => {
+                        return Err(format!("--quality: not from 0 to {MAX_LEVEL}: {level}"));
+                    }
+                },
+                min_kbps,
+                max_kbps,
+            },
         }
     } else {
-        if min_kbps.is_some() || max_kbps.is_some() || vbr_noise.is_some() {
-            return Err("--min-bitrate, --max-bitrate and --vbr-noise need --vbr".to_owned());
+        if min_kbps.is_some() || max_kbps.is_some() || quality.is_some() || vbr_noise.is_some() {
+            return Err(
+                "--min-bitrate, --max-bitrate, --quality and --vbr-noise need --vbr".to_owned(),
+            );
         }
         let kbps = bitrate.unwrap_or(128);
         let in_table = bitrates(sample_rate).is_none_or(|table| table.contains(&kbps));
@@ -309,5 +339,73 @@ pub fn encode(options: &Options) -> Result<(), String> {
     match tag {
         Some(tag) => output.rewrite_start(&tag, "the Xing/Info tag"),
         None => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<Options, String> {
+        let args = ["--sample-rate", "44100", "--channels", "2"]
+            .iter()
+            .chain(args);
+        super::parse(args.map(|&a| a.to_owned()))
+    }
+
+    fn error(args: &[&str]) -> String {
+        parse(args).err().expect("the arguments are refused")
+    }
+
+    #[test]
+    fn vbr_codes_at_a_level_of_quality_or_a_noise_offset() {
+        let quality = |level| Rate::Quality {
+            level,
+            min_kbps: None,
+            max_kbps: None,
+        };
+        assert_eq!(parse(&["--vbr"]).unwrap().rate, quality(DEFAULT_QUALITY));
+        assert_eq!(
+            parse(&["--vbr", "--quality", "0"]).unwrap().rate,
+            quality(0)
+        );
+        assert_eq!(
+            parse(&["--vbr", "--quality", "100", "--min-bitrate", "128"])
+                .unwrap()
+                .rate,
+            Rate::Quality {
+                level: 100,
+                min_kbps: Some(128),
+                max_kbps: None,
+            }
+        );
+        assert_eq!(
+            parse(&["--vbr", "--vbr-noise", "-1.5"]).unwrap().rate,
+            Rate::Variable {
+                min_kbps: None,
+                max_kbps: None,
+                noise_offset_db: -1.5,
+            }
+        );
+    }
+
+    #[test]
+    fn a_level_of_quality_is_refused_out_of_place() {
+        assert_eq!(
+            error(&["--vbr", "--quality", "101"]),
+            "--quality: not from 0 to 100: 101"
+        );
+        assert_eq!(
+            error(&["--vbr", "--quality", "-1"]),
+            "--quality: not a number: -1"
+        );
+        assert_eq!(
+            error(&["--vbr", "--quality", "80", "--vbr-noise", "3"]),
+            "--quality and --vbr-noise exclude each other"
+        );
+        assert_eq!(
+            error(&["--quality", "80"]),
+            "--min-bitrate, --max-bitrate, --quality and --vbr-noise need --vbr"
+        );
     }
 }

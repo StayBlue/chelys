@@ -233,8 +233,9 @@ pub fn frame(header: &Header, stream: &Stream) -> Vec<u8> {
     // Spec gap: the document gives the quality as "0=best 100=worst" beside
     // the dump, and as LAME's own scale, with 100 the best, in the
     // extension, where it is one byte, "byte $9B", the last of the four the
-    // dump has. The encoder has no such scale, and sends 0, which neither
-    // scale reads as unknown.
+    // dump has. The encoder's levels of quality are of a scale of chelys's
+    // own (see `chelys_core::quality`), which neither reading matches, and
+    // it sends 0, which neither scale reads as unknown.
     tag.extend_from_slice(&0u32.to_be_bytes());
 
     // The extension, from 0x9C of the dump, or 100 bytes before without the

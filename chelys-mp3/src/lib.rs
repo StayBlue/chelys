@@ -22,6 +22,7 @@
 //! ```
 
 mod ancillary;
+mod calibration;
 mod config;
 mod encoder;
 mod filterbank;
@@ -39,7 +40,7 @@ mod side_info;
 mod stereo;
 mod stream;
 
-pub use chelys_core::Sample;
+pub use chelys_core::{Sample, quality};
 pub use config::{ChannelMode, Config, ConfigError, Rate, SAMPLE_RATES, bitrates};
 pub use encoder::{Encoder, Finished};
 

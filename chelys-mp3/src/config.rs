@@ -7,7 +7,8 @@
 
 use std::fmt;
 
-use super::header::{Bitrate, Flags, Mode, SamplingFrequency, Version};
+use super::calibration;
+use super::header::{Bitrate, Flags, Mode, SamplingFrequency};
 use super::rate::{self, MeanRate, VariableRate};
 use super::stream::{StreamConfig, max_ancillary_bits};
 
@@ -18,8 +19,9 @@ pub const SAMPLE_RATES: [u32; 9] = [
 ];
 
 /// The bitrates a frame may have at `sample_rate`, in kbit/s, lowest first:
-/// those of [`Rate::Constant`] and the bounds of [`Rate::Variable`]. `None`
-/// if the sample rate is not one of [`SAMPLE_RATES`].
+/// those of [`Rate::Constant`] and the bounds of [`Rate::Quality`] and
+/// [`Rate::Variable`]. `None` if the sample rate is not one of
+/// [`SAMPLE_RATES`].
 pub fn bitrates(sample_rate: u32) -> Option<&'static [u32]> {
     sampling_frequency(sample_rate).map(|fs| fs.version().table_kbps())
 }
@@ -78,12 +80,35 @@ impl ChannelMode {
 
 /// How each frame's bitrate is chosen (clause 2.4.2.3).
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum Rate {
     /// Every frame at one of the [`bitrates`] of the sample rate.
     Constant { kbps: u32 },
     /// A mean bitrate between the lowest and the highest of the
     /// [`bitrates`], kept by switching between the two nearest to it.
     Mean { bits_per_second: u32 },
+    /// Each frame at the lowest bitrate, from `min_kbps` to `max_kbps`, at
+    /// which the quantisation noise of every band stays within what the
+    /// psychoacoustic model allows it, raised by the noise offset of
+    /// `level`: a level of the [`quality`](crate::quality) scale that
+    /// chelys's encoders share, from 0 to
+    /// [`MAX_LEVEL`](crate::quality::MAX_LEVEL), higher for better quality.
+    ///
+    /// It is [`Rate::Variable`] with the offset the level maps to in the
+    /// stream's channels, calibrated to the scale's grades at 44.1 kHz in
+    /// one channel and in two, and taken over at every other sampling
+    /// frequency. At 32 and 48 kHz the grades are expected to be near the
+    /// scale's, but have not been measured.
+    /// At the lower sampling frequencies PEAQ grades every stream far
+    /// lower, and MPEG-2.5 it cannot grade, but there too a higher level
+    /// allows less noise.
+    Quality {
+        level: u8,
+        /// One of the [`bitrates`]; `None` for the lowest.
+        min_kbps: Option<u32>,
+        /// One of the [`bitrates`]; `None` for the highest.
+        max_kbps: Option<u32>,
+    },
     /// Each frame at the lowest bitrate, from `min_kbps` to `max_kbps`, at
     /// which the quantisation noise of every band stays within what the
     /// psychoacoustic model allows it, raised by `noise_offset_db`.
@@ -236,8 +261,7 @@ impl Config {
         let sample_rate = self.sample_rate;
         let fs = sampling_frequency(sample_rate)
             .ok_or(ConfigError::UnsupportedSampleRate { sample_rate })?;
-        let version = fs.version();
-        let rate = lower_rate(self.rate, sample_rate, version)?;
+        let rate = lower_rate(self.rate, fs, self.mode.channels())?;
         if self.mixed_blocks && fs == SamplingFrequency::Hz8000 {
             return Err(ConfigError::MixedBlocksUnsupported { sample_rate });
         }
@@ -261,9 +285,27 @@ impl Config {
 
 fn lower_rate(
     rate: Rate,
-    sample_rate: u32,
-    version: Version,
+    fs: SamplingFrequency,
+    channels: usize,
 ) -> Result<rate::StreamRate, ConfigError> {
+    let (sample_rate, version) = (fs.hz(), fs.version());
+    let rate = match rate {
+        Rate::Quality {
+            level,
+            min_kbps,
+            max_kbps,
+        } => {
+            if level > crate::quality::MAX_LEVEL {
+                return Err(ConfigError::QualityLevel { level });
+            }
+            Rate::Variable {
+                min_kbps,
+                max_kbps,
+                noise_offset_db: calibration::noise_offset_db(level, channels),
+            }
+        }
+        rate => rate,
+    };
     let table = |kbps: u32| {
         Bitrate::from_kbps(version, kbps)
             .ok_or(ConfigError::UnsupportedBitrate { sample_rate, kbps })
@@ -305,6 +347,7 @@ fn lower_rate(
                 noise_offset_db,
             })
         }
+        Rate::Quality { .. } => unreachable!("lowered to a variable rate"),
         Rate::Free { bits_per_second } => rate::StreamRate::Constant(
             Bitrate::free(version, bits_per_second).ok_or_else(|| {
                 let in_table = bits_per_second % 1000 == 0
@@ -325,7 +368,8 @@ fn lower_rate(
 pub enum ConfigError {
     /// The sample rate is not one of [`SAMPLE_RATES`].
     UnsupportedSampleRate { sample_rate: u32 },
-    /// A bitrate of [`Rate::Constant`] or [`Rate::Variable`] is not one of
+    /// A bitrate of [`Rate::Constant`], [`Rate::Quality`] or
+    /// [`Rate::Variable`] is not one of
     /// the [`bitrates`] of the sample rate.
     UnsupportedBitrate { sample_rate: u32, kbps: u32 },
     /// The mean bitrate is below the lowest of the [`bitrates`] of the
@@ -343,8 +387,12 @@ pub enum ConfigError {
         bits_per_second: u32,
         in_table: bool,
     },
-    /// The lowest bitrate of [`Rate::Variable`] is above its highest.
+    /// The lowest bitrate of [`Rate::Quality`] or [`Rate::Variable`] is
+    /// above its highest.
     BitrateRange { min_kbps: u32, max_kbps: u32 },
+    /// The level of [`Rate::Quality`] is above
+    /// [`MAX_LEVEL`](crate::quality::MAX_LEVEL).
+    QualityLevel { level: u8 },
     /// The noise offset of [`Rate::Variable`] is not a finite number.
     NoiseOffset { noise_offset_db: f64 },
     /// Mixed blocks were asked for at 8 kHz, where they are not used.
@@ -390,6 +438,11 @@ impl fmt::Display for ConfigError {
             Self::BitrateRange { min_kbps, max_kbps } => write!(
                 f,
                 "the lowest bitrate, {min_kbps} kbit/s, is above the highest, {max_kbps} kbit/s"
+            ),
+            Self::QualityLevel { level } => write!(
+                f,
+                "the level of quality is above {}: {level}",
+                crate::quality::MAX_LEVEL
             ),
             Self::NoiseOffset { noise_offset_db } => {
                 write!(

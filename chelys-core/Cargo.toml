@@ -1,6 +1,6 @@
 [package]
 name = "chelys-core"
-description = "What chelys's encoders share: the bit writer, the CRC-16, the PCM samples they take and the FFT."
+description = "What chelys's encoders share: the bit writer, the CRC-16, the PCM samples they take, the FFT and the scale of quality."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
