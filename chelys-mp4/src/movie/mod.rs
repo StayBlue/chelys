@@ -5,8 +5,10 @@
 //! file (ISO/IEC 14496-14): its `FileTypeBox` and its `MovieBox`, which
 //! describes the track, as every layout of the file writes them. Where the
 //! track's samples are, each a frame of the stream, is the layout's: one
-//! `MediaDataBox` after the `MovieBox`, in [`progressive`].
+//! `MediaDataBox` after the `MovieBox`, in [`progressive`], or movie
+//! fragments after it, in [`fragmented`].
 
+pub mod fragmented;
 pub mod progressive;
 
 use super::boxes::{FourCc, write_box, write_full_box};
@@ -38,12 +40,11 @@ pub struct AudioTrack {
 /// are the sample rate.
 #[derive(Clone, Copy, Debug)]
 struct Durations {
-    /// The `edit_duration` of the one edit: the samples it presents. The
-    /// track's `duration` is "the sum of the durations of all of the
-    /// track's edits" (clause 8.3.2.3), and the movie's that of "the
-    /// longest track" (clause 8.2.2.3), the one track, so that both are
-    /// this too.
+    /// The `edit_duration` of the one edit: the samples it presents.
     edit: u64,
+    /// The track's `duration` (clause 8.3.2.3), and the movie's, that of
+    /// "the longest track" (clause 8.2.2.3), the one track.
+    track: u64,
     /// The media's `duration` (clause 8.4.2.3): that of the samples the
     /// `MovieBox` describes.
     media: u64,
@@ -158,11 +159,11 @@ fn movie_box(
 /// Its `timescale` is the sample rate, as the media's is (see
 /// [`write_media`]), so that the track's edit, whose duration is in this
 /// timescale (clause 8.6.6.3), is exact to the sample. Its `duration` is
-/// that of the one track, "the longest track". `rate`, `volume` and
+/// the layout's, that of the one track. `rate`, `volume` and
 /// `matrix` keep their template values, as ISO/IEC 14496-14 requires of an
 /// MP4 file (clauses 4.4 and 7).
 fn write_movie_header(out: &mut Vec<u8>, track: &AudioTrack, durations: Durations) {
-    let duration = durations.edit;
+    let duration = durations.track;
     let version = version(&[CREATION_TIME, duration]);
     write_full_box(out, b"mvhd", version, 0, |out| {
         put_sized(out, version, CREATION_TIME); // creation_time
@@ -198,13 +199,12 @@ fn write_track(
 /// of 1 in all files" (clause 6.4).
 const TRACK_FLAGS: u32 = 0x00_0007;
 
-/// The `TrackHeaderBox` (clause 8.3.2). Its `duration` is "the sum of the
-/// durations of all of the track's edits", of the one edit; `layer`,
-/// `alternate_group`, `volume` and `matrix` keep their template values,
-/// `volume` that of an audio track, 1.0; `width` and `height` are 0, as
-/// "For non-visual tracks (e.g. audio), they should be set to zero".
+/// The `TrackHeaderBox` (clause 8.3.2), its `duration` the layout's;
+/// `layer`, `alternate_group`, `volume` and `matrix` keep their template
+/// values, `volume` that of an audio track, 1.0; `width` and `height` are
+/// 0, as "For non-visual tracks (e.g. audio), they should be set to zero".
 fn write_track_header(out: &mut Vec<u8>, durations: Durations) {
-    let duration = durations.edit;
+    let duration = durations.track;
     let version = version(&[CREATION_TIME, duration]);
     write_full_box(out, b"tkhd", version, TRACK_FLAGS, |out| {
         put_sized(out, version, CREATION_TIME); // creation_time
@@ -323,7 +323,9 @@ fn write_data_information(out: &mut Vec<u8>) {
 /// appends.
 ///
 /// It has no `SyncSampleBox`, so that every sample is a sync sample
-/// (clause 8.5.1.1): each frame is decoded from its own bits, which
+/// (clause 8.5.1.1), in a track that is not fragmented, and in one that is,
+/// whose samples' flags say so (see [`fragmented`]): each frame is decoded
+/// from its own bits, which
 /// clause 10.1 describes of the audio streams an `AudioRollRecoveryEntry`
 /// serves, "in which every sample can be independently decoded".
 fn write_sample_table(
@@ -432,8 +434,8 @@ fn write_sample_tables(out: &mut Vec<u8>, track: &AudioTrack, sizes: &[u32], chu
     });
     // The SampleSizeBox (clause 8.7.3.2), as "the first version is
     // preferred for maximum compatibility" over the CompactSampleSizeBox
-    // (clause 8.7.3.1); with one sample_size where every frame is as
-    // long.
+    // (clauses 8.7.3.1 and 8.7.3.3); with one sample_size where every
+    // frame is as long.
     write_full_box(out, b"stsz", 0, 0, |out| {
         let sample_size = common_size(sizes).unwrap_or(0);
         out.extend_from_slice(&sample_size.to_be_bytes());

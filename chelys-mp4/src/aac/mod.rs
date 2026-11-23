@@ -5,8 +5,10 @@
 //! samples of an `'mp4a'` track, which its `AudioSpecificConfig()`
 //! describes.
 
+mod fragmented;
 mod progressive;
 
+pub use fragmented::{EncodeError, FragmentOptions, FragmentedEncoder, LengthError};
 pub use progressive::Encoder;
 
 use chelys_aac::{Config, ConfigError, Framing};

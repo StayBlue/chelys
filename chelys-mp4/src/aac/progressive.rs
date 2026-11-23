@@ -22,6 +22,8 @@ use crate::movie::progressive::write_file;
 /// The frames are kept in memory until [`finish`](Self::finish) writes the
 /// file, its sample tables before them, as they describe each frame: about
 /// the bitrate times the duration, 4.8 MB for five minutes at 128 kbit/s.
+/// A [`FragmentedEncoder`](super::FragmentedEncoder) writes a file as the
+/// frames come instead.
 pub struct Encoder {
     encoder: chelys_aac::Encoder,
     /// Whether the stream is coded at a constant rate, which sets its

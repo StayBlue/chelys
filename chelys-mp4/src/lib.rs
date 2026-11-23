@@ -44,6 +44,38 @@
 //! mdat                  the frames, raw_data_block()s, one after another
 //! ```
 //!
+//! A fragmented file ([`aac::FragmentedEncoder`]) is written as the frames
+//! come, as an init segment and then fragments of about a second each:
+//!
+//! ```text
+//! ftyp                  as above
+//! moov                  as above, but:
+//!   mvhd                its duration 0, that of the moov's samples
+//!   trak
+//!     tkhd              likewise
+//!     edts
+//!       elst            the samples after the delay: the input's length,
+//!                       if known, or all of them
+//!     mdia
+//!       mdhd            its duration 0: the moov has no samples
+//!       ...
+//!         stbl
+//!           stsd        as above
+//!           stts        ... stco: no entries
+//!           sgpd        the pre-roll, which the fragments map frames to
+//!   mvex
+//!     mehd              the input's length, if known
+//!     trex              each frame's duration and flags
+//! moof                  then for each fragment:
+//!   mfhd                its sequence number, from 1
+//!   traf
+//!     tfhd
+//!     tfdt              the decoding time of its first frame
+//!     trun              its frames' sizes, and where they start
+//!     sbgp              every frame is to be decoded after the one before
+//! mdat                  its frames
+//! ```
+//!
 //! The file has no `ObjectDescriptorBox` (`'iods'`, ISO/IEC 14496-14,
 //! clause 6.2), which is optional, nor tags, such as a song's title: a
 //! `UserDataBox` for them would come last in the `moov`.
@@ -67,3 +99,5 @@ mod bitrate;
 mod boxes;
 mod descriptor;
 mod movie;
+
+pub use movie::fragmented::{FragmentInfo, FragmentSink};

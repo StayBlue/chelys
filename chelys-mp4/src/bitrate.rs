@@ -24,7 +24,7 @@
 /// only, in practice: in a longer stream at a constant rate, some window
 /// holds at least the average.
 pub fn max_bitrate(sizes: &[u32], frame_samples: u32, sample_rate: u32) -> u32 {
-    let window = sample_rate.div_ceil(frame_samples) as usize;
+    let window = window_frames(frame_samples, sample_rate) as usize;
     let bytes = |frames: &[u32]| frames.iter().map(|&size| u64::from(size)).sum::<u64>();
     let mut sum = bytes(&sizes[..window.min(sizes.len())]);
     let mut max = sum;
@@ -34,6 +34,12 @@ pub fn max_bitrate(sizes: &[u32], frame_samples: u32, sample_rate: u32) -> u32 {
     }
     let windowed = u32::try_from(8 * max).unwrap_or(u32::MAX);
     windowed.max(avg_bitrate(sizes, frame_samples, sample_rate))
+}
+
+/// The most frames that a window of one second holds, as [`max_bitrate`]
+/// counts them: those whose decoding times fall within it.
+pub fn window_frames(frame_samples: u32, sample_rate: u32) -> u32 {
+    sample_rate.div_ceil(frame_samples)
 }
 
 /// `avgBitrate`: "the average bitrate in bits per second of this

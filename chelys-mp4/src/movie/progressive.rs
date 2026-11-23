@@ -29,8 +29,9 @@ use crate::boxes;
 /// offset.
 ///
 /// The `MovieBox`'s durations are the input's `length`, which its edit
-/// presents, and the media's, "the largest composition timestamp plus the
-/// duration of that sample" (clause 8.4.2.3), that of all the frames.
+/// presents, and with it the track's and the movie's, and the media's,
+/// "the largest composition timestamp plus the duration of that sample"
+/// (clause 8.4.2.3), that of all the frames.
 ///
 /// Spec reading: an input of no samples is coded in one frame, as the
 /// stream of an encoder that ends at once, and its edit has an
@@ -76,6 +77,9 @@ pub fn write_file<W: Write + ?Sized>(
     let media_data_header = boxes::media_data_header(media_data.len() as u64);
     let durations = Durations {
         edit: length,
+        // "the sum of the durations of all of the track's edits" (clause
+        // 8.3.2.3), of the one edit.
+        track: length,
         media: sizes.len() as u64 * u64::from(track.frame_samples),
     };
     let movie = |chunk_offset: u32| {
