@@ -38,7 +38,7 @@ MPEG-2.5 Layer III at 8, 11.025 and 12 kHz (experimental).
                      (default: off)
   --vbr              give each frame the lowest bitrate at which the noise
                      of every band stays within what the psychoacoustic
-                     model allows, at a level of quality (experimental)
+                     model allows, at a level of quality
   --quality LEVEL    with --vbr, the level of quality, from 0 to 100,
                      higher for better quality and mostly larger files, on
                      a scale shared with chelys aac --vbr (default 80)
