@@ -11,7 +11,7 @@ use super::layout::{FrameWriter, frame_contents, main_data_bits};
 use crate::DELAY;
 use crate::ancillary::AncillaryQueue;
 use crate::granule::{BlockType, GRANULE_LINES, MAX_PART2_3_LENGTH};
-use crate::header::{Bitrate, PaddingSchedule, SamplingFrequency, Version};
+use crate::header::{Bitrate, PaddingSchedule, Version};
 use crate::rate::{MeanRateSchedule, StreamRate};
 use crate::reservoir::Reservoir;
 use crate::{filterbank, rate, scalefactor_bands};
@@ -311,36 +311,44 @@ impl<C: Coding> FrameEncoder<C> {
     }
 
     /// How many of `bitrates`, lowest first, a frame at a variable bitrate
-    /// is coded at: at MPEG-2.5's sampling frequencies, those up to the
-    /// lowest whose main data slot, less `ancillary_bits`, holds
-    /// [`MAX_PART2_3_LENGTH`] bits for every granule of every channel; and
-    /// all of them otherwise.
+    /// is coded at: those up to the lowest whose main data slot, less
+    /// `ancillary_bits`, holds [`MAX_PART2_3_LENGTH`] bits for every granule
+    /// of every channel; or all of them if none does.
     ///
     /// Spec gap: neither standard says how to choose a frame's bitrate (see
     /// [`rate::search_variable`]). A granule of a channel has at most 4095
-    /// bits, as `part2_3_length` has 12 (clause 2.4.1.7): above that
-    /// bitrate no granule can be given more, and the rest of the slot goes
-    /// to the bit reservoir, which keeps at most 255 bytes at the lower
-    /// sampling frequencies, as `main_data_begin` has 8 bits there, or is
-    /// stuffing. The search keeps a frame that is not within its allowance
-    /// at the highest bitrate it tries, and at 8 kHz, where the bands fixed
-    /// at zero (see [`fixed_at_zero`](scalefactor_bands::fixed_at_zero))
-    /// are within it only at a fine step, many are not: over one minute of
-    /// each of nine tracks, one of each kind of music, at level 100 in two
-    /// channels, 28% of the frames were kept at 160 kbit/s, and the mean
-    /// fell from 84.9 kbit/s to 78.9 with them at 128. At 11.025 and 12 kHz
-    /// those tracks kept below it, but tones at the edges of the subbands,
-    /// whose allowance in some band no step meets, reached 160 kbit/s in one
-    /// channel. In one channel at 16 and 32 kHz a slot holds as much below
-    /// the highest bitrate too, and at 32 kHz, of those tracks' 27 streams
-    /// at levels 0, 80 and 100, 6, at 80 and 100, kept a frame above it, at
-    /// 320 kbit/s; but those sampling frequencies keep every bitrate, as
-    /// they were tuned.
+    /// bits, as `part2_3_length` has 12 (clause 2.4.1.7), and at that
+    /// bitrate the slot alone gives every granule as many: above it no
+    /// granule can be given more, and the rest of the slot goes to the bit
+    /// reservoir, which keeps at most 511 bytes, as `main_data_begin` has 9
+    /// bits, or 255 at the lower sampling frequencies, where it has 8; or it
+    /// is stuffing. The search keeps a frame that is not within its
+    /// allowance at the highest bitrate it tries, which is then this one.
+    /// In one channel it is 256 kbit/s at 32 kHz, 128 at 16 kHz, 96 at
+    /// 11.025 and 12 kHz and 64 at 8 kHz, and in two 128 at 8 kHz; at the
+    /// other sampling frequencies and modes no bitrate of the table holds
+    /// that much (at 44.1 kHz, 320 kbit/s gives one channel 8184 bits), and
+    /// every bitrate is kept.
+    ///
+    /// At 8 kHz, where the bands fixed at zero (see
+    /// [`fixed_at_zero`](scalefactor_bands::fixed_at_zero)) are within their
+    /// allowance only at a fine step, many frames are not: over one minute
+    /// of each of nine tracks, one of each kind of music, at level 100 in
+    /// two channels, 28% of the frames were kept at 160 kbit/s, and the mean
+    /// fell from 84.9 kbit/s to 78.9 with them at 128. Of the same tracks'
+    /// streams at levels 0, 80 and 100 in one channel at 32 kHz, 6 of 27
+    /// kept frames at 320 kbit/s, 1 to 7 each, at levels 80 and 100; at 256
+    /// the frame after each but two took 64 to 80 kbit/s more, from the
+    /// reservoir's smaller store, and the streams came out the same length
+    /// to 288 bytes shorter. At 16 kHz none kept a frame above 128 kbit/s,
+    /// but quiet tones at the edges of the subbands, whose allowance in some
+    /// band no step meets, kept 98% of their frames at 160 kbit/s, as at
+    /// 320 at 32 kHz, at every level; the frames at 128 and 256 bring their
+    /// mean down by 20%. Where no bitrate is dropped, at 44.1 and 48 kHz and
+    /// in two channels at 32 and 16 kHz, those tracks and tones came out
+    /// byte for byte as with every bitrate kept.
     fn useful_bitrates(&self, bitrates: &[Bitrate], ancillary_bits: usize) -> usize {
         let fs = self.config.sampling_frequency;
-        if !SamplingFrequency::MPEG25.contains(&fs) {
-            return bitrates.len();
-        }
         let most = fs.version().granules() * self.pcm.len() * MAX_PART2_3_LENGTH;
         (bitrates.iter())
             .position(|&bitrate| {

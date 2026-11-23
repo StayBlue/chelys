@@ -3,7 +3,8 @@
 
 //! MP3 at levels of the quality scale, at the sampling frequencies of
 //! MPEG-2.5 and, to compare, those of ISO/IEC 13818-3, as ffmpeg and mpg123
-//! decode them.
+//! decode them; and the highest bitrate a frame is coded at, at those of
+//! ISO/IEC 11172-3 too.
 
 use std::f64::consts::TAU;
 
@@ -45,6 +46,9 @@ fn encode(config: Config, input: &[Vec<f64>]) -> (Vec<u8>, Finished) {
 /// shares); the frame of the tag, if any, among them.
 fn frame_kbps(stream: &[u8]) -> Vec<u32> {
     const KBPS: [u32; 15] = [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160];
+    const MPEG1_KBPS: [u32; 15] = [
+        0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320,
+    ];
     let mut kbps = Vec::new();
     let mut at = 0;
     while at + 4 <= stream.len() {
@@ -54,19 +58,27 @@ fn frame_kbps(stream: &[u8]) -> Vec<u32> {
             (0xFF, 0xE0),
             "a frame at {at}"
         );
-        let bitrate = KBPS[usize::from(header[2] >> 4)];
+        let mpeg1 = (header[1] >> 3) & 0b11 == 0b11;
+        let bitrate = match mpeg1 {
+            true => MPEG1_KBPS[usize::from(header[2] >> 4)],
+            false => KBPS[usize::from(header[2] >> 4)],
+        };
         let hz = match ((header[1] >> 3) & 0b11, (header[2] >> 2) & 0b11) {
+            (0b11, 0b00) => 44_100,
+            (0b11, 0b01) => 48_000,
+            (0b11, 0b10) => 32_000,
             (0b00, 0b00) => 11_025,
             (0b00, 0b01) => 12_000,
             (0b00, 0b10) => 8_000,
             (0b10, 0b00) => 22_050,
             (0b10, 0b01) => 24_000,
             (0b10, 0b10) => 16_000,
-            other => panic!("not a lower sampling frequency: {other:?}"),
+            other => panic!("not a sampling frequency: {other:?}"),
         };
         let padding = usize::from((header[2] >> 1) & 1);
+        let slots = if mpeg1 { 144_000 } else { 72_000 };
         kbps.push(bitrate);
-        at += 72_000 * bitrate as usize / hz + padding;
+        at += slots * bitrate as usize / hz + padding;
     }
     assert_eq!(at, stream.len());
     kbps
@@ -215,6 +227,85 @@ fn frames_keep_to_the_bitrates_asked_for_at_the_mpeg25_sampling_frequencies() {
                 let case = format!("{sample_rate} Hz, {mode:?}, {min_kbps} to {max_kbps} kbit/s");
                 assert!(
                     kbps.iter().all(|kbps| expected.contains(kbps)),
+                    "{case}: {kbps:?}"
+                );
+                let decoded = ffmpeg::decode_mp3(&stream);
+                assert_eq!(decoded.diagnostics, "", "{case}");
+            });
+        }
+    });
+}
+
+/// A tone of `hz` at -40 dB below full scale, `seconds` of it at
+/// `sample_rate`, in `channels`, planar.
+fn quiet_tone(sample_rate: u32, hz: f64, channels: usize, seconds: f64) -> Vec<Vec<f64>> {
+    let fs = f64::from(sample_rate);
+    let tone: Vec<f64> = (0..(seconds * fs) as usize)
+        .map(|t| 0.01 * (TAU * hz * t as f64 / fs).sin())
+        .collect();
+    vec![tone; channels]
+}
+
+/// No frame goes above the lowest bitrate whose slot holds every granule's
+/// 4095 bits, at the sampling frequencies of ISO/IEC 11172-3 as at the
+/// lower ones. A quiet tone, at -40 dB below full scale, of 3 kHz at
+/// 32 kHz and of 2 kHz at 16 kHz, has more than 90% of its frames at that
+/// bitrate, 256 kbit/s and 128 in one channel, at levels 0, 80 and 100. In
+/// two channels, where no slot of the table holds that much, those frames
+/// go to the highest, 320 kbit/s and 160. ffmpeg and mpg123 decode every stream without complaint, and
+/// mpg123 gives the input's length, from the Xing/Info tag. With the lowest
+/// bitrate asked for at that bitrate or above, every frame is at the lowest.
+#[test]
+fn frames_go_no_higher_than_the_bitrate_that_holds_every_granule() {
+    let cases = [
+        (32_000, 3_000.0, ChannelMode::Mono, 256),
+        (32_000, 3_000.0, JOINT, 320),
+        (16_000, 2_000.0, ChannelMode::Mono, 128),
+        (16_000, 2_000.0, JOINT, 160),
+    ];
+    std::thread::scope(|scope| {
+        for (sample_rate, hz, mode, highest) in cases {
+            for level in [0, 80, 100] {
+                scope.spawn(move || {
+                    let channels = mode.channels();
+                    let input = quiet_tone(sample_rate, hz, channels, 3.0);
+                    let config = Config::new(sample_rate, mode, quality(level)).info_tag(true);
+                    let (stream, _) = encode(config, &input);
+                    let kbps = frame_kbps(&stream);
+                    let case = format!("{sample_rate} Hz, {mode:?}, level {level}");
+                    let at_highest = kbps.iter().filter(|&&kbps| kbps == highest).count();
+                    assert!(kbps.iter().all(|&kbps| kbps <= highest), "{case}: {kbps:?}");
+                    assert!(10 * at_highest > 9 * kbps.len(), "{case}: {kbps:?}");
+                    let decoded = mpg123::decode_mp3(&stream);
+                    assert_eq!(decoded.diagnostics, "", "mpg123, {case}");
+                    let samples = input[0].len() * channels;
+                    assert_eq!(decoded.samples.len(), samples, "mpg123, {case}");
+                    let decoded = ffmpeg::decode_mp3(&stream);
+                    assert_eq!(decoded.diagnostics, "", "ffmpeg, {case}");
+                });
+            }
+        }
+    });
+    let bounds = [
+        (32_000, 256, 320, 256),
+        (32_000, 320, 320, 320),
+        (16_000, 144, 160, 144),
+    ];
+    std::thread::scope(|scope| {
+        for (sample_rate, min_kbps, max_kbps, expected) in bounds {
+            scope.spawn(move || {
+                let rate = Rate::Quality {
+                    level: 80,
+                    min_kbps: Some(min_kbps),
+                    max_kbps: Some(max_kbps),
+                };
+                let input = music(sample_rate, 1, 2.0);
+                let config = Config::new(sample_rate, ChannelMode::Mono, rate);
+                let (stream, _) = encode(config, &input);
+                let kbps = frame_kbps(&stream);
+                let case = format!("{sample_rate} Hz, {min_kbps} to {max_kbps} kbit/s");
+                assert!(
+                    kbps.iter().all(|&kbps| kbps == expected),
                     "{case}: {kbps:?}"
                 );
                 let decoded = ffmpeg::decode_mp3(&stream);
