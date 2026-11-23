@@ -6,6 +6,7 @@
 
 use std::io::Write;
 
+use chelys::aac::quality::MAX_LEVEL;
 use chelys::aac::{Config, ConfigError, Encoder, Framing, Rate};
 use chelys::mp4;
 
@@ -14,12 +15,14 @@ use crate::{pcm, value};
 
 pub const USAGE: &str = "\
 usage: chelys aac --sample-rate HZ --channels N
-                  [--bitrate KBPS [--abr] | --vbr [--vbr-noise DB]]
+                  [--bitrate KBPS [--abr] | --vbr [--quality LEVEL |
+                  --vbr-noise DB]]
                   [--noise-substitution]
                   [--crc] [--private-bit] [--original-copy] [--home]
                   < input.f32 > output.aac
        chelys aac --mp4 --sample-rate HZ --channels N
-                  [--bitrate KBPS [--abr] | --vbr [--vbr-noise DB]]
+                  [--bitrate KBPS [--abr] | --vbr [--quality LEVEL |
+                  --vbr-noise DB]]
                   [--noise-substitution]
                   < input.f32 > output.mp4
 
@@ -64,12 +67,16 @@ MP4 file instead, which tells a player the input's exact length.
                      mean either way (default: a constant bitrate)
   --vbr              give each frame the bits at which the noise of every
                      band stays within what the psychoacoustic model
-                     allows: about 142 kbit/s for music in stereo at
-                     44.1 kHz
-  --vbr-noise DB     with --vbr, allow each band this many dB more noise
-                     than the model does, or less if negative: about 205
-                     kbit/s at -6 and 73 at 6 in stereo at 44.1 kHz
-                     (default 0)
+                     allows, at a level of quality
+  --quality LEVEL    with --vbr, the level of quality, from 0 to 100,
+                     higher for better quality and mostly larger files, on
+                     a scale shared with chelys mp3 --vbr: for music in
+                     stereo at 44.1 kHz about 139 kbit/s at 50, 190 at 80
+                     and 228 at 100 (default 80)
+  --vbr-noise DB     with --vbr, in place of --quality, allow each band
+                     this many dB more noise than the model does, or less
+                     if negative: about 205 kbit/s at -6, 142 at 0 and 73
+                     at 6 in stereo at 44.1 kHz
   --noise-substitution
                      code noise-like bands as the energy of noise that the
                      decoder generates in their place, saving bits for the
@@ -109,8 +116,9 @@ pub struct Options {
     kbps: u32,
     /// With `--abr`, `kbps` is the mean.
     abr: bool,
-    /// With `--vbr`, its noise offset, in place of `kbps`.
-    vbr_noise: Option<f64>,
+    /// With `--vbr`, its rate, a level of quality or a noise offset, in
+    /// place of `kbps`.
+    vbr: Option<Rate>,
     noise_substitution: bool,
     crc: bool,
     private_bit: bool,
@@ -122,8 +130,8 @@ pub struct Options {
 impl Options {
     fn config(&self) -> Config {
         let bits_per_second = self.kbps.saturating_mul(1000);
-        let rate = match self.vbr_noise {
-            Some(noise_offset_db) => Rate::Variable { noise_offset_db },
+        let rate = match self.vbr {
+            Some(rate) => rate,
             None if self.abr => Rate::Mean { bits_per_second },
             None => Rate::Constant { bits_per_second },
         };
@@ -154,7 +162,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> 
     let (mut sample_rate, mut channels, mut bitrate) = (None, None, None);
     let (mut crc, mut private_bit, mut original_copy, mut home) = (false, false, false, false);
     let (mut noise_substitution, mut mp4) = (false, false);
-    let (mut abr, mut vbr, mut vbr_noise) = (false, false, None);
+    let (mut abr, mut vbr, mut quality, mut vbr_noise) = (false, false, None, None);
     let mut args = args.into_iter();
     while let Some(flag) = args.next() {
         let args = &mut args;
@@ -164,6 +172,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> 
             "--bitrate" => bitrate = Some(value::<u32>(args, &flag)?),
             "--abr" => abr = true,
             "--vbr" => vbr = true,
+            "--quality" => quality = Some(value::<u32>(args, &flag)?),
             "--vbr-noise" => vbr_noise = Some(value::<f64>(args, &flag)?),
             "--noise-substitution" => noise_substitution = true,
             "--crc" => crc = true,
@@ -184,16 +193,33 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> 
     if vbr && (bitrate.is_some() || abr) {
         return Err("--bitrate and --abr exclude --vbr".to_owned());
     }
-    if !vbr && vbr_noise.is_some() {
-        return Err("--vbr-noise needs --vbr".to_owned());
+    if !vbr && (quality.is_some() || vbr_noise.is_some()) {
+        return Err("--quality and --vbr-noise need --vbr".to_owned());
     }
+    let vbr = if vbr {
+        Some(match (quality, vbr_noise) {
+            (Some(_), Some(_)) => {
+                return Err("--quality and --vbr-noise exclude each other".to_owned());
+            }
+            (_, Some(noise_offset_db)) => Rate::Variable { noise_offset_db },
+            (None, None) => Rate::Quality {
+                level: DEFAULT_QUALITY,
+            },
+            (Some(level), None) => match u8::try_from(level) {
+                Ok(level) if level <= MAX_LEVEL => Rate::Quality { level },
+                _ => return Err(format!("--quality: not from 0 to {MAX_LEVEL}: {level}")),
+            },
+        })
+    } else {
+        None
+    };
     let kbps = bitrate.unwrap_or_else(|| default_kbps(sample_rate, channels, crc, mp4));
     let options = Options {
         sample_rate,
         channels,
         kbps,
         abr,
-        vbr_noise: vbr.then_some(vbr_noise.unwrap_or(DEFAULT_VBR_NOISE_DB)),
+        vbr,
         noise_substitution,
         crc,
         private_bit,
@@ -208,9 +234,13 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> 
     Ok(options)
 }
 
-/// The noise `--vbr` allows each band beyond what the psychoacoustic model
-/// does, in dB, unless `--vbr-noise` says otherwise.
-const DEFAULT_VBR_NOISE_DB: f64 = 0.0;
+/// The level of quality `--vbr` codes at unless `--quality` or `--vbr-noise`
+/// says otherwise: that of `chelys mp3 --vbr`. At 44.1 kHz in stereo, level
+/// 80 allows each band 4.6 dB less noise than the psychoacoustic model
+/// does, and over 51 tracks of nine kinds of music averages 190 kbit/s and
+/// a grade of -0.12 (PEAQ, GstPEAQ 0.6.1, black box), where `chelys mp3`
+/// averages 210 kbit/s at the same grade.
+const DEFAULT_QUALITY: u8 = 80;
 
 /// The bitrate without `--bitrate`, in kbit/s, for each channel but the
 /// LFE, where there are more than two.
@@ -588,9 +618,17 @@ mod tests {
         );
         assert_eq!(
             rate(&["--vbr"]),
-            Rate::Variable {
-                noise_offset_db: DEFAULT_VBR_NOISE_DB
+            Rate::Quality {
+                level: DEFAULT_QUALITY
             }
+        );
+        assert_eq!(
+            rate(&["--vbr", "--quality", "0"]),
+            Rate::Quality { level: 0 }
+        );
+        assert_eq!(
+            rate(&["--vbr", "--quality", "100"]),
+            Rate::Quality { level: 100 }
         );
         assert_eq!(
             rate(&["--vbr", "--vbr-noise", "-2.5"]),
@@ -614,7 +652,30 @@ mod tests {
             error(&["--vbr", "--abr"]),
             "--bitrate and --abr exclude --vbr"
         );
-        assert_eq!(error(&["--vbr-noise", "3"]), "--vbr-noise needs --vbr");
+        assert_eq!(
+            error(&["--vbr-noise", "3"]),
+            "--quality and --vbr-noise need --vbr"
+        );
+        assert_eq!(
+            error(&["--quality", "80"]),
+            "--quality and --vbr-noise need --vbr"
+        );
+        assert_eq!(
+            error(&["--vbr", "--quality", "80", "--vbr-noise", "3"]),
+            "--quality and --vbr-noise exclude each other"
+        );
+        assert_eq!(
+            error(&["--vbr", "--quality", "101"]),
+            "--quality: not from 0 to 100: 101"
+        );
+        assert_eq!(
+            error(&["--vbr", "--quality", "256"]),
+            "--quality: not from 0 to 100: 256"
+        );
+        assert_eq!(
+            error(&["--vbr", "--quality", "-1"]),
+            "--quality: not a number: -1"
+        );
         assert_eq!(
             error(&["--vbr", "--vbr-noise", "inf"]),
             "--vbr-noise: not a finite number: inf"

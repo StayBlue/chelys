@@ -40,8 +40,8 @@ MPEG-2.5 Layer III at 8, 11.025 and 12 kHz (experimental).
                      of every band stays within what the psychoacoustic
                      model allows, at a level of quality (experimental)
   --quality LEVEL    with --vbr, the level of quality, from 0 to 100,
-                     higher for better quality and mostly larger files
-                     (default 80)
+                     higher for better quality and mostly larger files, on
+                     a scale shared with chelys aac --vbr (default 80)
   --min-bitrate KBPS with --vbr, the lowest bitrate a frame may have, from
                      the list above (default: the lowest)
   --max-bitrate KBPS with --vbr, the highest (default: the highest)

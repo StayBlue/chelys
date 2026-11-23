@@ -8,6 +8,7 @@
 use std::fmt;
 
 use super::adts::Flags;
+use super::calibration;
 use super::channel_configuration::ChannelConfiguration;
 use super::rate::Control;
 use super::sampling_frequency::SamplingFrequency;
@@ -74,6 +75,20 @@ pub enum Rate {
     /// variable rate whose nominal rate is `bits_per_second`, which takes
     /// the range of a constant rate.
     Mean { bits_per_second: u32 },
+    /// A variable rate at `level`: a level of the [`quality`](crate::quality)
+    /// scale that chelys's encoders share, from 0 to
+    /// [`MAX_LEVEL`](crate::quality::MAX_LEVEL), higher for better quality.
+    ///
+    /// It is [`Rate::Variable`] with the noise offset the level maps to,
+    /// calibrated to the scale's grades at 44.1 kHz in one channel and in
+    /// two: music in stereo averages about 139 kbit/s at level 50, 190 at
+    /// 80 and 228 at 100. Configurations of more channels take the offsets
+    /// of two, and every other sampling frequency those of 44.1 kHz. At 32
+    /// and 48 kHz the grades are expected to be near the scale's, but have
+    /// not been measured. At the lower sampling frequencies PEAQ grades
+    /// every stream far lower, but there too a higher level allows less
+    /// noise.
+    Quality { level: u8 },
 }
 
 impl Rate {
@@ -84,7 +99,7 @@ impl Rate {
     pub fn is_constant(self) -> bool {
         match self {
             Self::Constant { .. } => true,
-            Self::Variable { .. } | Self::Mean { .. } => false,
+            Self::Variable { .. } | Self::Mean { .. } | Self::Quality { .. } => false,
         }
     }
 }
@@ -331,8 +346,20 @@ impl Config {
             crc_protected: self.crc,
             noise_substitution: self.noise_substitution,
         };
-        let bits_per_second = match self.rate {
+        let rate = match self.rate {
+            Rate::Quality { level } => {
+                if level > crate::quality::MAX_LEVEL {
+                    return Err(ConfigError::QualityLevel { level });
+                }
+                Rate::Variable {
+                    noise_offset_db: calibration::noise_offset_db(level, self.channels),
+                }
+            }
+            rate => rate,
+        };
+        let bits_per_second = match rate {
             Rate::Constant { bits_per_second } => bits_per_second,
+            Rate::Quality { .. } => unreachable!("lowered to a variable rate"),
             Rate::Variable { noise_offset_db } => {
                 if !noise_offset_db.is_finite() {
                     return Err(ConfigError::NoiseOffset { noise_offset_db });
@@ -392,6 +419,9 @@ pub enum ConfigError {
     DataStreamTooLong { bytes_per_frame: usize, max: usize },
     /// The noise offset of [`Rate::Variable`] is not a finite number.
     NoiseOffset { noise_offset_db: f64 },
+    /// The level of [`Rate::Quality`] is above
+    /// [`MAX_LEVEL`](crate::quality::MAX_LEVEL).
+    QualityLevel { level: u8 },
 }
 
 impl fmt::Display for ConfigError {
@@ -429,6 +459,11 @@ impl fmt::Display for ConfigError {
                     "the noise offset is not a finite number: {noise_offset_db}"
                 )
             }
+            Self::QualityLevel { level } => write!(
+                f,
+                "the level of quality is above {}: {level}",
+                crate::quality::MAX_LEVEL
+            ),
         }
     }
 }

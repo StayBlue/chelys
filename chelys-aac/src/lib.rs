@@ -30,7 +30,9 @@
 //! - a constant rate, with the bit reservoir (clause 8.2.3.2) lending
 //!   frames bits and keeping those they leave, and fill where it is full;
 //!   or a variable rate, each frame as short as keeps its noise within
-//!   what the model allows, raised by an offset, which a mean rate steers;
+//!   what the model allows, raised by an offset, which a mean rate steers,
+//!   or which a level of the quality scale shared with chelys's MP3
+//!   encoder sets;
 //! - each frame in ADTS, with an optional CRC and the header's
 //!   `private_bit`, `original_copy` and `home` as asked, or as its
 //!   `raw_data_block()` alone, for a container that carries the
@@ -61,6 +63,7 @@
 
 mod adts;
 mod audio_specific_config;
+mod calibration;
 mod channel;
 mod channel_configuration;
 mod config;
@@ -80,7 +83,7 @@ mod stream;
 mod tns;
 mod window;
 
-pub use chelys_core::Sample;
+pub use chelys_core::{Sample, quality};
 pub use config::{Config, ConfigError, Framing, Rate, SAMPLE_RATES};
 pub use encoder::{Encoder, Finished};
 pub use stream::FrameSink;
