@@ -154,7 +154,9 @@ pub fn encode_pcm_with_info_tag(config: &StreamConfig, channels: &[&[f64]]) -> V
 /// frame before it, as
 /// [`rate::search_variable`](crate::rate::search_variable) tries them, and
 /// kept at the lowest of those at which their noise stays within its
-/// allowance.
+/// allowance. At the sampling frequencies of MPEG-2.5, none is coded above
+/// the lowest bitrate whose slot holds the most bits that every granule of
+/// every channel can have.
 /// Frames are not padded. Intensity stereo, which gives up the stereo image
 /// above its bound for bits, is tried only at the highest bitrate, where a
 /// larger frame is no longer to be had.
@@ -942,6 +944,56 @@ mod tests {
             })
             .to_vec();
         assert!(lens.windows(2).all(|w| w[0] > w[1]), "{lens:?}");
+    }
+
+    /// At MPEG-2.5's sampling frequencies a frame at a variable bitrate goes
+    /// no higher than the lowest bitrate whose main data slot holds the 4095
+    /// bits that every granule of every channel can have. With an offset so
+    /// low that no frame but those of silence is within its allowance, the
+    /// rest are kept there: at 64 kbit/s in one channel at 8 kHz and 128 in
+    /// two, and at 96 in one at 11.025 and 12 kHz. In two at 11.025 and
+    /// 12 kHz no bitrate of the table holds that much, and the frames go to
+    /// the highest; with 56 bytes of ancillary data in each frame's slot, in
+    /// one channel at 8 kHz, none below 80 kbit/s does. At 16 kHz in one
+    /// channel, where 128 kbit/s would, the frames go to the highest too.
+    #[test]
+    fn frames_go_no_higher_than_the_bitrate_that_holds_every_granule() {
+        use SamplingFrequency::*;
+        let cases = [
+            (Hz8000, Mode::SingleChannel, 0, 64),
+            (Hz8000, MS, 0, 128),
+            (Hz11025, Mode::SingleChannel, 0, 96),
+            (Hz12000, Mode::SingleChannel, 0, 96),
+            (Hz11025, MS, 0, 160),
+            (Hz12000, Mode::Stereo, 0, 160),
+            (Hz8000, Mode::SingleChannel, 448, 80),
+            (Hz16000, Mode::SingleChannel, 0, 160),
+        ];
+        std::thread::scope(|scope| {
+            for (fs, mode, ancillary_bits, highest) in cases {
+                scope.spawn(move || {
+                    let config = StreamConfig {
+                        rate: variable(fs, [8, 160], -60.0),
+                        sampling_frequency: fs,
+                        mode,
+                        crc_protected: false,
+                        flags: Flags::default(),
+                    };
+                    let input = varied(fs, 1.0);
+                    let mut encoder = StreamEncoder::new(config).with_ancillary(ancillary_bits);
+                    let mut stream = Vec::new();
+                    encoder.push_ancillary(&vec![0xA5; 1 << 12]);
+                    let channels: [&[f64]; 2] = [&input[0], &input[1]];
+                    encoder.encode(&channels[..mode.channels()], &mut stream);
+                    encoder.finish(&mut stream);
+                    let kbps: std::collections::BTreeSet<u32> = (check::frames(&stream).iter())
+                        .map(|f| f.bitrate.bits_per_second() / 1000)
+                        .collect();
+                    assert_eq!(kbps.last(), Some(&highest), "{fs:?}, {mode:?}: {kbps:?}");
+                    assert!(kbps.len() >= 2, "{fs:?}, {mode:?}: {kbps:?}");
+                });
+            }
+        });
     }
 
     /// A mean bitrate between two of the table switches between them, and

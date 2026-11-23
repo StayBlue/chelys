@@ -42,6 +42,28 @@ pub(in crate::stream) struct ModelCoding {
     /// them with the noise raised 4 dB, and 140 kbit/s and -0.50 saving them
     /// down to the allowance.
     saving_noise_db: f64,
+    /// Whether a normal block that leaves bits to the reservoir keeps the
+    /// bands fixed at zero within their allowance too (see
+    /// [`loops::Saving::fixed_bands_within`]): at a variable bitrate, but
+    /// not at a constant or mean one.
+    ///
+    /// Spec gap: the bands fixed at zero, at MPEG-2.5's 8 kHz alone, cannot
+    /// be amplified, and the outer loop leaves them out of its test (see
+    /// [`loops::outer_loop`]); their noise follows the step the other bands
+    /// are coded at. At a variable bitrate a frame is kept at a bitrate
+    /// only if they too are within their allowance (see
+    /// [`loops::excess`]). Left out of the saving search as well, a granule
+    /// within its allowance was coarsened past theirs at every bitrate whose
+    /// frame left the reservoir room for the bits saved, and so the frame was
+    /// kept only where it did not: over one minute of each of nine tracks,
+    /// one of each kind of music, the mean bitrate in two channels at levels
+    /// 0, 50, 80 and 100 fell from 22.2 kbit/s to 18.7, 40.7 to 36.0, 60.7
+    /// to 55.6 and 78.9 to 74.7, and in one channel from 14.3 to 13.3, 20.8
+    /// to 20.0, 25.5 to 24.8 and 28.6 to 28.0, with the fixed bands of as
+    /// many frames beyond their allowance as before. At a constant or mean
+    /// bitrate the frame's bits are given, and the bands fixed at zero are
+    /// left out as before.
+    fixed_bands_within: bool,
     /// Whether a granule first aims for the noise offset the reservoir
     /// steers (see [`quantize_frame`]): at a constant or mean bitrate, but
     /// not at a variable one, which has an offset of its own.
@@ -74,6 +96,7 @@ impl ModelCoding {
                 StreamRate::Variable(_) => 0.0,
                 _ => loops::SAVING_NOISE_DB,
             },
+            fixed_bands_within: matches!(config.rate, StreamRate::Variable(_)),
             steered: !matches!(config.rate, StreamRate::Variable(_)),
             sampling_frequency: fs,
             ms_stereo: false,
@@ -185,6 +208,7 @@ impl Coding for ModelCoding {
             prepared: &self.prepared,
             mean_bits,
             saving_noise_db: self.saving_noise_db,
+            fixed_bands_within: self.fixed_bands_within,
             steered: self.steered,
             ms_stereo,
             sampling_frequency: fs,
@@ -267,6 +291,9 @@ struct FrameToQuantize<'a> {
     /// its allowance may be given to leave bits to the reservoir (see
     /// [`loops::outer_loop`]).
     saving_noise_db: f64,
+    /// Whether a normal block that leaves bits to the reservoir keeps the
+    /// bands fixed at zero within their allowance too.
+    fixed_bands_within: bool,
     /// Whether a granule first aims for the noise offset the reservoir
     /// steers (see [`quantize_frame`]).
     steered: bool,
@@ -565,6 +592,7 @@ fn quantize_frame(
         prepared,
         mean_bits,
         saving_noise_db,
+        fixed_bands_within,
         steered,
         ms_stereo,
         sampling_frequency: fs,
@@ -628,6 +656,7 @@ fn quantize_frame(
                 saving: Some(loops::Saving {
                     least: reservoir.least_use(mean_bits),
                     noise_db,
+                    fixed_bands_within,
                 }),
             };
             // Intensity stereo changes the lines from those prepared.

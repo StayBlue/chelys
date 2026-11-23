@@ -53,6 +53,10 @@ pub struct Saving {
     pub least: usize,
     /// How much more noise than its allowance, in dB, it may be given.
     pub noise_db: f64,
+    /// Whether the bands whose scalefactors are fixed at zero (see
+    /// [`fixed_at_zero`](scalefactor_bands::fixed_at_zero)) must stay
+    /// within their allowance too, as the others must.
+    pub fixed_bands_within: bool,
 }
 
 /// A granule quantised by the iteration loops.
@@ -528,7 +532,9 @@ impl ToSave<'_> {
     /// which no band's distortion exceeds its allowance raised as `saving`
     /// says, and which takes between its least bits and `available_bits`.
     /// Every band counts, those taken over with scfsi
-    /// too, but for those fixed at zero. In the right channel of a frame
+    /// too, but for those fixed at zero unless the saving's
+    /// [`fixed_bands_within`](Saving::fixed_bands_within) says. In the
+    /// right channel of a frame
     /// coded in intensity stereo, a step that would mark a band where the
     /// granule had none fails too; at the lower sampling frequencies each
     /// step is first given a value in the band just below the bound where
@@ -577,7 +583,8 @@ impl ToSave<'_> {
             // band until one exceeds its allowance.
             let distortion = band_distortion(amplified, &values, global_gain);
             if (self.bands.iter().enumerate())
-                .any(|(sb, band)| !self.fixed.contains(&sb) && distortion(band) > allowed[sb])
+                .filter(|&(sb, _)| saving.fixed_bands_within || !self.fixed.contains(&sb))
+                .any(|(sb, band)| distortion(band) > allowed[sb])
             {
                 return None;
             }
@@ -1206,6 +1213,7 @@ mod tests {
             Some(Saving {
                 least,
                 noise_db: SAVING_NOISE_DB,
+                fixed_bands_within: false,
             })
         };
         let quantize = |block_type, saving| {
@@ -1232,6 +1240,7 @@ mod tests {
         let unraised = Saving {
             least: 0,
             noise_db: 0.0,
+            fixed_bands_within: false,
         };
         let within = quantize(BlockType::Normal, Some(unraised)).granule;
         assert!(within.global_gain < saved.granule.global_gain);
@@ -1255,6 +1264,56 @@ mod tests {
             outer_loop(&xr, &short_xmin, BlockType::Short, bits, FS, None, None).granule
         };
         assert_eq!(short(saving(0)), short(None));
+    }
+
+    /// At 8 kHz the bands fixed at zero bound the saving only if it says so.
+    /// With lines there as loud as a third of the way up, and allowed the
+    /// noise of eight steps coarser than the finest that fits in the other
+    /// bands but of only two in those, a granule left free of them is given
+    /// the coarser step and leaves them beyond their allowance; kept to it,
+    /// it stops short, every band within its allowance, and still saves
+    /// bits.
+    #[test]
+    fn the_saving_keeps_the_bands_fixed_at_zero_within_if_asked() {
+        let fs = SamplingFrequency::Hz8000;
+        let bands = scalefactor_bands::long_bands(fs);
+        let fixed = scalefactor_bands::fixed_at_zero(BlockType::Normal, fs);
+        assert!(!fixed.is_empty());
+        let mut xr = spectrum();
+        let (low, high) = (bands[fixed.start].start, bands[fixed.end - 1].end());
+        xr.copy_within(low - 300..high - 300, low);
+        let plain = inner_loop(&xr, 1500, BlockType::Normal, fs, None).unwrap();
+        let mut xmin = distortion(&xr, &plain, bands);
+        for gain in plain.global_gain + 1..=plain.global_gain + 8 {
+            let values = quantize(&xr, gain).unwrap();
+            let coarser = QuantizedGranule::new(gain, values, BlockType::Normal, fs);
+            for (sb, noise) in distortion(&xr, &coarser, bands).into_iter().enumerate() {
+                if !fixed.contains(&sb) || gain <= plain.global_gain + 2 {
+                    xmin[sb] = f64::max(xmin[sb], 1.000_001 * noise);
+                }
+            }
+        }
+        let quantize = |saving| {
+            let bits = Bits {
+                available: 1500,
+                saving,
+            };
+            outer_loop(&xr, &xmin, BlockType::Normal, bits, fs, None, None).granule
+        };
+        let saving = |fixed_bands_within| {
+            Some(Saving {
+                least: 0,
+                noise_db: 0.0,
+                fixed_bands_within,
+            })
+        };
+        let spent = quantize(None);
+        let (left_out, kept) = (quantize(saving(false)), quantize(saving(true)));
+        assert!(left_out.global_gain >= plain.global_gain + 8);
+        assert!(excess(&xr, &xmin, &left_out, fs) > 1.0);
+        assert!(excess(&xr, &xmin, &kept, fs) <= 1.0);
+        assert!((plain.global_gain + 2..left_out.global_gain).contains(&kept.global_gain));
+        assert!(kept.bit_len(fs) < spent.bit_len(fs));
     }
 
     /// The conversion to `scalefac_scale` never amplifies a band less.

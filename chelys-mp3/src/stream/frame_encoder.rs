@@ -11,7 +11,7 @@ use super::layout::{FrameWriter, frame_contents, main_data_bits};
 use crate::DELAY;
 use crate::ancillary::AncillaryQueue;
 use crate::granule::{BlockType, GRANULE_LINES, MAX_PART2_3_LENGTH};
-use crate::header::{Bitrate, PaddingSchedule, Version};
+use crate::header::{Bitrate, PaddingSchedule, SamplingFrequency, Version};
 use crate::rate::{MeanRateSchedule, StreamRate};
 use crate::reservoir::Reservoir;
 use crate::{filterbank, rate, scalefactor_bands};
@@ -246,7 +246,9 @@ impl<C: Coding> FrameEncoder<C> {
                 // From the bitrate below the last frame's, at which most
                 // frames within their allowance at the last frame's are
                 // within it too (see `rate::search_variable`).
-                let (bitrates, start) = (bitrates.clone(), previous.saturating_sub(1));
+                let (mut bitrates, start) = (bitrates.clone(), previous.saturating_sub(1));
+                bitrates.truncate(self.useful_bitrates(&bitrates, ancillary_bits));
+                let start = start.min(bitrates.len() - 1);
                 let once = (self.config.sampling_frequency.version() == Version::Mpeg1
                     && block_types.iter().all(|&b| b == BlockType::Normal))
                 .then(|| self.quantize_within(&filtered, &bitrates, ancillary_bits))
@@ -306,6 +308,46 @@ impl<C: Coding> FrameEncoder<C> {
         self.reservoir_bytes = self.reservoir.end_frame(unshared_bits);
         self.writer.keep_unused(self.reservoir_bytes);
         self.frame_lens.push(header.frame_len());
+    }
+
+    /// How many of `bitrates`, lowest first, a frame at a variable bitrate
+    /// is coded at: at MPEG-2.5's sampling frequencies, those up to the
+    /// lowest whose main data slot, less `ancillary_bits`, holds
+    /// [`MAX_PART2_3_LENGTH`] bits for every granule of every channel; and
+    /// all of them otherwise.
+    ///
+    /// Spec gap: neither standard says how to choose a frame's bitrate (see
+    /// [`rate::search_variable`]). A granule of a channel has at most 4095
+    /// bits, as `part2_3_length` has 12 (clause 2.4.1.7): above that
+    /// bitrate no granule can be given more, and the rest of the slot goes
+    /// to the bit reservoir, which keeps at most 255 bytes at the lower
+    /// sampling frequencies, as `main_data_begin` has 8 bits there, or is
+    /// stuffing. The search keeps a frame that is not within its allowance
+    /// at the highest bitrate it tries, and at 8 kHz, where the bands fixed
+    /// at zero (see [`fixed_at_zero`](scalefactor_bands::fixed_at_zero))
+    /// are within it only at a fine step, many are not: over one minute of
+    /// each of nine tracks, one of each kind of music, at level 100 in two
+    /// channels, 28% of the frames were kept at 160 kbit/s, and the mean
+    /// fell from 84.9 kbit/s to 78.9 with them at 128. At 11.025 and 12 kHz
+    /// those tracks kept below it, but tones at the edges of the subbands,
+    /// whose allowance in some band no step meets, reached 160 kbit/s in one
+    /// channel. In one channel at 16 and 32 kHz a slot holds as much below
+    /// the highest bitrate too, and at 32 kHz, of those tracks' 27 streams
+    /// at levels 0, 80 and 100, 6, at 80 and 100, kept a frame above it, at
+    /// 320 kbit/s; but those sampling frequencies keep every bitrate, as
+    /// they were tuned.
+    fn useful_bitrates(&self, bitrates: &[Bitrate], ancillary_bits: usize) -> usize {
+        let fs = self.config.sampling_frequency;
+        if !SamplingFrequency::MPEG25.contains(&fs) {
+            return bitrates.len();
+        }
+        let most = fs.version().granules() * self.pcm.len() * MAX_PART2_3_LENGTH;
+        (bitrates.iter())
+            .position(|&bitrate| {
+                let header = self.config.frame_header(bitrate, false, false, false);
+                main_data_bits(&header).saturating_sub(ancillary_bits) >= most
+            })
+            .map_or(bitrates.len(), |index| index + 1)
     }
 
     /// Quantises a frame once, each granule given all the bits it may have
