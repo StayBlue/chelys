@@ -133,11 +133,12 @@ fn ffmpeg_and_faad_decode_variable_and_mean_rates() {
 /// the left channel, is coded to -100 dB at variable and mean rates, as
 /// ffmpeg decodes it: in each window of 0.1 s, at 0 dB, each channel
 /// within 1.5 dB of its level and the left channel louder than the right
-/// by 8 dB within 2 dB; at 4 dB, where the threshold in quiet is lowered
-/// by 6.7 dB and read between its two readings, within 2 dB of its level
-/// and by 8 dB within 3 dB (the fade's worst windows, from -47 to -62 dB,
-/// were 1.8 and 2.3 dB off at 1 dB, and 1.7 and 2.8 dB at 6 and 7 dB, where
-/// nothing is lowered); at rates of about 0.45 bit a sample, a noise
+/// by 8 dB within 2 dB, and alike at 4 dB, where the threshold in quiet is
+/// lowered by 6.7 dB and read between its two readings (before the bits
+/// the loops leave were spent, its worst windows were 1.7 and 2.1 dB off,
+/// and at 1 dB 1.8 and 2.3 dB; at 6 and 7 dB, where nothing is lowered,
+/// they are 1.4 and 2.7 dB, and 1.5 and 2.9 dB); at rates of about 0.45
+/// bit a sample, a noise
 /// offset of 12 dB and a mean of 40 kbit/s, each channel within 4 dB of
 /// its level and the left channel louder by 8 dB within 5.5 dB, the image
 /// narrowed where the side channel of the pair is allowed most of its
@@ -196,8 +197,8 @@ fn a_panned_fade_keeps_its_image() {
             Rate::Variable {
                 noise_offset_db: 4.0,
             },
+            1.5,
             2.0,
-            3.0,
         ),
         (
             Rate::Variable {
