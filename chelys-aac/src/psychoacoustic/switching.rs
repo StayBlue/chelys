@@ -7,7 +7,7 @@
 //! window shape.
 
 use super::imaging::MidSideModel;
-use super::{Analysis, Model, QuietThreshold};
+use super::{Analysis, Model, Quiet};
 use crate::sampling_frequency::SamplingFrequency;
 use crate::stream::FRAME_SAMPLES;
 use crate::window::{Grouping, SHORT_WINDOWS, WindowSequence, WindowShape};
@@ -173,8 +173,8 @@ pub struct Attacks {
 
 impl BlockSwitching {
     /// The block switching of a channel at `sampling_frequency`, whose
-    /// model reads the threshold in quiet as `quiet` asks.
-    pub fn new(sampling_frequency: SamplingFrequency, quiet: QuietThreshold) -> Self {
+    /// model takes the threshold in quiet as `quiet` asks.
+    pub fn new(sampling_frequency: SamplingFrequency, quiet: impl Into<Quiet>) -> Self {
         Self {
             model: Model::new(sampling_frequency, quiet),
             current: Box::new(Analysis::new(sampling_frequency)),
@@ -187,7 +187,8 @@ impl BlockSwitching {
     /// [`new`](Self::new), for a channel coded with long windows whatever
     /// its attacks, whose model analyzes its long blocks alone, and finds
     /// none (see [`Model::long_only`]).
-    pub fn long_only(sampling_frequency: SamplingFrequency, quiet: QuietThreshold) -> Self {
+    pub fn long_only(sampling_frequency: SamplingFrequency, quiet: impl Into<Quiet>) -> Self {
+        let quiet = quiet.into();
         Self {
             model: Model::new(sampling_frequency, quiet).long_only(),
             ..Self::new(sampling_frequency, quiet)
@@ -398,6 +399,7 @@ pub fn shape(sequence: WindowSequence) -> WindowShape {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::psychoacoustic::QuietThreshold;
     use WindowSequence::*;
 
     fn attacks(this: bool, next: bool) -> Attacks {

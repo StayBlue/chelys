@@ -64,10 +64,10 @@ MP4 file instead, which tells a player the input's exact length.
                      mean either way (default: a constant bitrate)
   --vbr              give each frame the bits at which the noise of every
                      band stays within what the psychoacoustic model
-                     allows: about 123 kbit/s for music in stereo at
+                     allows: about 142 kbit/s for music in stereo at
                      44.1 kHz
   --vbr-noise DB     with --vbr, allow each band this many dB more noise
-                     than the model does, or less if negative: about 180
+                     than the model does, or less if negative: about 205
                      kbit/s at -6 and 73 at 6 in stereo at 44.1 kHz
                      (default 0)
   --noise-substitution

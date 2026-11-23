@@ -40,17 +40,20 @@ pub enum Rate {
     /// The offset scales the noise each band is allowed by
     /// `10^(noise_offset_db / 10)`: above 0 it allows more noise and gives
     /// shorter frames, below 0 less. At 0 each band is allowed what Annex
-    /// C's model allows it. At 44.1 kHz in stereo, music takes about 123
-    /// kbit/s at 0 dB, 180 at -6 dB and 73 at 6 dB.
+    /// C's model allows it. At 44.1 kHz in stereo, music takes about 142
+    /// kbit/s at 0 dB, 205 at -6 dB and 73 at 6 dB.
     ///
     /// The tools chosen by the rate are chosen for the whole stream by the
     /// offset. Perceptual noise substitution, where it is asked for, is
     /// used as at the constant rate such streams take on average at the
-    /// offset. From 3.1 to 9.1 dB the threshold in quiet goes over from its
-    /// reading as noise to its reading as printed, which allows more noise
-    /// in the bands it governs, while the offset raises every band's
-    /// allowance less; and from 3.8 to 7 dB intensity stereo comes in, a band
-    /// at a time from the top. So a stream's length falls with the offset
+    /// offset. Up to 0 dB the threshold in quiet is lowered by 20 dB, as if
+    /// the signal were played louder, so that quiet passages are coded
+    /// further, and from 0 to 6 dB by less and less, and above by none. From
+    /// 3.1 to 9.1 dB the threshold in quiet goes over from its reading as
+    /// noise to its reading as printed, which allows more noise in the bands
+    /// it governs, while the offset raises every band's allowance less; and
+    /// from 3.8 to 7 dB intensity stereo comes in, a band at a time from the
+    /// top. So a stream's length falls with the offset
     /// without a break, but for steps of a few percent as a band's coding
     /// changes; with perceptual noise substitution, it drops where that
     /// comes in.

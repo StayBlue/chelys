@@ -139,6 +139,15 @@ pub enum QuietThreshold {
 }
 
 impl QuietThreshold {
+    /// The reading, with the threshold of the partitions below the cap of
+    /// `bval(b)` lowered by `lowered_db` (see [`Quiet`]).
+    pub fn lowered(self, lowered_db: f64) -> Quiet {
+        Quiet {
+            reading: self,
+            lowered_db,
+        }
+    }
+
     /// How far, in dB, the reading is from the threshold as noise has it
     /// toward the threshold as printed: 0 as noise has it, 1 as printed.
     pub fn printed_share(self) -> f64 {
@@ -150,17 +159,46 @@ impl QuietThreshold {
     }
 }
 
+/// How the model takes the threshold in quiet: the tables' `qsthr(b)` read
+/// as `reading` asks, and that of each partition below the cap of `bval(b)`
+/// (see `noise_in_quiet`) lowered by `lowered_db`, as if the signal were
+/// played that much louder.
+///
+/// Spec gap: step 11 puts `qsthr(b)` relative to the level of a sine wave
+/// of +-1/2 LSB of 16-bit PCM (see `quiet_reference`), whatever level the
+/// signal is played at. At a variable rate, which spends as many bits as
+/// the allowance takes, a quiet passage is coded down to that threshold
+/// and no further (see [`StreamConfig::quiet_lowered_db`]). The partitions
+/// from the cap up keep their threshold, as the threshold as noise has it
+/// keeps them (see [`QuietThreshold::Noise`]), so that the lowering codes
+/// no more above about 15 kHz at 44.1 kHz.
+///
+/// [`StreamConfig::quiet_lowered_db`]: crate::stream::StreamConfig::quiet_lowered_db
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Quiet {
+    pub reading: QuietThreshold,
+    pub lowered_db: f64,
+}
+
+/// The reading, unlowered.
+impl From<QuietThreshold> for Quiet {
+    fn from(reading: QuietThreshold) -> Self {
+        reading.lowered(0.0)
+    }
+}
+
 /// The threshold in quiet of each partition of `sampling_frequency`'s FFT
-/// of `transform` as an energy, read as `quiet` asks: between the two
-/// readings, each partition's in dB the share of the way between its own.
+/// of `transform` as an energy, taken as `quiet` asks: between the two
+/// readings, each partition's in dB the share of the way between its own;
+/// lowered below the cap of `bval(b)` as `quiet` asks.
 fn quiet_energies(
     sampling_frequency: SamplingFrequency,
     transform: Transform,
-    quiet: QuietThreshold,
+    quiet: Quiet,
 ) -> Vec<f64> {
-    let tables = |quiet| Tables::get(sampling_frequency, transform, quiet);
-    match quiet {
-        QuietThreshold::Noise | QuietThreshold::Printed => tables(quiet).quiet.clone(),
+    let tables = |reading| Tables::get(sampling_frequency, transform, reading);
+    let mut energies: Vec<f64> = match quiet.reading {
+        QuietThreshold::Noise | QuietThreshold::Printed => tables(quiet.reading).quiet.clone(),
         QuietThreshold::Between(share) => {
             let (noise, printed) = (
                 tables(QuietThreshold::Noise),
@@ -170,7 +208,17 @@ fn quiet_energies(
                 .map(|(&noise, &printed)| noise.powf(1.0 - share) * printed.powf(share))
                 .collect()
         }
+    };
+    if quiet.lowered_db != 0.0 {
+        let factor = 10f64.powf(-quiet.lowered_db / 10.0);
+        let partitions = tables(quiet.reading).partitions;
+        for (energy, partition) in energies.iter_mut().zip(partitions) {
+            if partition.bval < TOP_BARK {
+                *energy *= factor;
+            }
+        }
     }
+    energies
 }
 
 /// The threshold in quiet of each of `partitions` as an energy, from their
@@ -902,10 +950,11 @@ impl Model {
     /// frame: the block before it and the blocks its predictions start from
     /// silent, as the filterbank takes them (see
     /// [`Filterbank::new`](crate::filterbank::Filterbank::new)), with the
-    /// threshold in quiet read as `quiet` asks.
-    pub fn new(sampling_frequency: SamplingFrequency, quiet: QuietThreshold) -> Self {
-        let long = Tables::get(sampling_frequency, Transform::Long, quiet);
-        let short = Tables::get(sampling_frequency, Transform::Short, quiet);
+    /// threshold in quiet taken as `quiet` asks.
+    pub fn new(sampling_frequency: SamplingFrequency, quiet: impl Into<Quiet>) -> Self {
+        let quiet = quiet.into();
+        let long = Tables::get(sampling_frequency, Transform::Long, quiet.reading);
+        let short = Tables::get(sampling_frequency, Transform::Short, quiet.reading);
         Self {
             long,
             short,

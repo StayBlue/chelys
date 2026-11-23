@@ -16,7 +16,7 @@ use crate::noiseless::scalefactors;
 use crate::noiseless::sections::Sections;
 use crate::psychoacoustic::imaging::MidSideModel;
 use crate::psychoacoustic::switching::{self, Attacks, BlockSwitching};
-use crate::psychoacoustic::{Analysis, QuietThreshold};
+use crate::psychoacoustic::{Analysis, Quiet, QuietThreshold};
 use crate::raw_data_block::element::{CodedElement, LFE_LINES};
 use crate::sampling_frequency::SamplingFrequency;
 use crate::scalefactor_bands::{MAX_BANDS, Transform, first_band_above};
@@ -44,11 +44,7 @@ struct ChannelEncoder {
 impl ChannelEncoder {
     /// A channel of an element of `kind`: a low frequency enhancement
     /// channel's model finds no attacks (see [`ElementEncoder`]).
-    fn new(
-        sampling_frequency: SamplingFrequency,
-        kind: ElementKind,
-        quiet: QuietThreshold,
-    ) -> Self {
+    fn new(sampling_frequency: SamplingFrequency, kind: ElementKind, quiet: Quiet) -> Self {
         let switching = match kind {
             ElementKind::Lfe => BlockSwitching::long_only(sampling_frequency, quiet),
             _ => BlockSwitching::new(sampling_frequency, quiet),
@@ -354,9 +350,10 @@ impl ElementEncoder {
         kind: ElementKind,
         intensity_border: Option<f64>,
         noise_border: Option<f64>,
-        quiet: QuietThreshold,
+        quiet: impl Into<Quiet>,
         within_allowance: bool,
     ) -> Self {
+        let quiet = quiet.into();
         let channels = kind.channels();
         Self {
             sampling_frequency,
@@ -380,7 +377,7 @@ impl ElementEncoder {
             noise_by_ms_used: false,
             noise_ms_used: [0; SHORT_WINDOWS],
             noise_border,
-            quiet,
+            quiet: quiet.reading,
             within_allowance,
             noise_factor: 1.0,
             tns: true,

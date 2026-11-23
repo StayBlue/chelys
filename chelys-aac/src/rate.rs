@@ -51,13 +51,35 @@ pub const BLENDED_QUIET_DB: std::ops::RangeInclusive<f64> = 3.1..=9.1;
 /// border of a pair's bands in intensity stereo falls from half the
 /// sampling frequency to Annex C's (see
 /// [`StreamConfig::intensity_border`]): those at which the tuning set of
-/// 51 tracks at 44.1 kHz in stereo takes 1.0 and 0.75 bits a sample, the
+/// 51 tracks at 44.1 kHz in stereo took 1.0 and 0.75 bits a sample, the
 /// rates between which, at constant rates, the limit of
-/// [`INTENSITY_BITS_PER_SAMPLE`] lies.
+/// [`INTENSITY_BITS_PER_SAMPLE`] lies, before the threshold in quiet was
+/// lowered at low offsets (see [`LOWERED_QUIET_DB`]); with it lowered, 1.11
+/// and 0.74.
 ///
 /// [`StreamConfig::intensity_border`]: crate::stream::StreamConfig::intensity_border
 /// [`INTENSITY_BITS_PER_SAMPLE`]: crate::stream::INTENSITY_BITS_PER_SAMPLE
 pub const INTENSITY_DB: std::ops::RangeInclusive<f64> = 3.8..=7.0;
+
+/// How far, in dB, the threshold in quiet is lowered at a variable or mean
+/// rate, at noise offsets up to the start of [`LOWERED_QUIET_DB`] (see
+/// [`StreamConfig::quiet_lowered_db`]).
+///
+/// [`StreamConfig::quiet_lowered_db`]: crate::stream::StreamConfig::quiet_lowered_db
+pub const QUIET_LOWERING_DB: f64 = 20.0;
+
+/// The noise offsets over which the lowering of the threshold in quiet
+/// falls from [`QUIET_LOWERING_DB`], at the lower end and below, to none,
+/// at the upper end and above, evenly in dB.
+pub const LOWERED_QUIET_DB: std::ops::RangeInclusive<f64> = 0.0..=6.0;
+
+/// How far the threshold in quiet is lowered, in dB, at a variable or mean
+/// rate whose tools are chosen by `noise_offset_db` (see
+/// [`LOWERED_QUIET_DB`]).
+pub fn quiet_lowered_db(noise_offset_db: f64) -> f64 {
+    let (low, high) = LOWERED_QUIET_DB.into_inner();
+    QUIET_LOWERING_DB * ((high - noise_offset_db) / (high - low)).clamp(0.0, 1.0)
+}
 
 /// How far the noise offset of a variable or mean rate is lowered before it
 /// raises the allowed distortion where the model takes the threshold in
@@ -86,7 +108,8 @@ pub const PRINTED_QUIET_SHIFT_DB: f64 = 6.2;
 /// a constant rate, the bits the rate brings still code such content; at
 /// a variable rate, nothing would, and fades and the tails of notes would
 /// end early, their stereo image narrowing as they do. Of the tuning set of
-/// 51 tracks at 44.1 kHz in stereo, the frames so raised took 0.2% more
+/// 51 tracks at 44.1 kHz in stereo, before the threshold in quiet was
+/// lowered (see [`LOWERED_QUIET_DB`]), the frames so raised took 0.2% more
 /// bits at 0 dB.
 ///
 /// Settled by decoding with ffmpeg (black box): pink noise panned 8 dB to
@@ -150,15 +173,17 @@ pub fn nominal_noise_offset_db(bits_per_sample: f64) -> f64 {
 /// Pairs of a noise offset in dB and the bits a sample it takes (see
 /// [`nominal_bits_per_sample`]), the offset rising: the logarithm of the
 /// bits is taken to be linear between them, and beyond the ends.
-const NOMINAL: [(f64, f64); 15] = [
-    (-9.0, 2.373),
-    (-6.0, 2.036),
-    (-3.0, 1.710),
-    (0.0, 1.396),
-    (3.0, 1.091),
-    (3.8, 1.018),
-    (4.6, 0.947),
-    (5.4, 0.880),
+const NOMINAL: [(f64, f64); 17] = [
+    (-15.0, 3.504),
+    (-12.0, 3.079),
+    (-9.0, 2.687),
+    (-6.0, 2.322),
+    (-3.0, 1.963),
+    (0.0, 1.615),
+    (3.0, 1.200),
+    (3.8, 1.107),
+    (4.6, 1.009),
+    (5.4, 0.904),
     (6.1, 0.814),
     (7.0, 0.736),
     (7.6, 0.698),

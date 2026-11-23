@@ -10,8 +10,8 @@ use std::f64::consts::PI;
 use chelys_core::fft::Complex;
 
 use super::{
-    Analysis, Block, BlockThreshold, MAX_PARTITIONS, Model, QuietThreshold, RPELEV_LONG,
-    RPELEV_SHORT, Tables, quiet_energies,
+    Analysis, Block, BlockThreshold, MAX_PARTITIONS, Model, Quiet, RPELEV_LONG, RPELEV_SHORT,
+    Tables, quiet_energies,
 };
 use crate::sampling_frequency::SamplingFrequency;
 use crate::scalefactor_bands::Transform;
@@ -69,9 +69,10 @@ struct Frame {
 }
 
 impl MidSideModel {
-    pub fn new(sampling_frequency: SamplingFrequency, quiet: QuietThreshold) -> Self {
-        let long = Tables::get(sampling_frequency, Transform::Long, quiet);
-        let short = Tables::get(sampling_frequency, Transform::Short, quiet);
+    pub fn new(sampling_frequency: SamplingFrequency, quiet: impl Into<Quiet>) -> Self {
+        let quiet = quiet.into();
+        let long = Tables::get(sampling_frequency, Transform::Long, quiet.reading);
+        let short = Tables::get(sampling_frequency, Transform::Short, quiet.reading);
         let bmaxes = |tables: &Tables| tables.partitions.iter().map(|p| bmax(p.bval)).collect();
         let frame = || {
             let analysis = || Box::new(Analysis::new(sampling_frequency));
@@ -343,6 +344,7 @@ fn imaging_control(bmax: &[f64], [left, right, mid, side]: [&mut BlockThreshold;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::psychoacoustic::QuietThreshold;
     use crate::stream::FRAME_SAMPLES;
 
     #[test]

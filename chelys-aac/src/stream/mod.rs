@@ -15,7 +15,7 @@ use super::channel::CodedChannel;
 use super::channel_configuration::{ChannelConfiguration, ElementKind};
 use super::config::Framing;
 use super::noise_substitution;
-use super::psychoacoustic::QuietThreshold;
+use super::psychoacoustic::{Quiet, QuietThreshold};
 use super::rate::{self, Control};
 use super::raw_data_block;
 use super::raw_data_block::data_stream::{self, DataStreamQueue};
@@ -438,6 +438,69 @@ impl StreamConfig {
         }
     }
 
+    /// How far, in dB, the model lowers the threshold in quiet below the cap
+    /// of `bval(b)` (see [`Quiet`](crate::psychoacoustic::Quiet)): at a
+    /// variable or mean rate, by [`rate::QUIET_LOWERING_DB`] where the noise
+    /// offset, or at a mean rate the offset of its nominal rate, is at the
+    /// lower end of [`rate::LOWERED_QUIET_DB`] or below, by none at its upper
+    /// end or above, and in dB evenly between; at a constant rate, by none.
+    ///
+    /// Spec gap: Annex C puts the threshold in quiet at a level relative to
+    /// an LSB of 16-bit PCM (step 11), and does not say at what level the
+    /// signal is played. At a constant rate, the bits the rate brings code
+    /// what lies below it where the music leaves them spare; at a variable
+    /// rate, a frame takes only the bits its allowance needs, and a quiet or
+    /// sparse passage, whose bands the threshold in quiet governs, takes
+    /// few. PEAQ (GstPEAQ 0.6.1, black box), which takes full scale to be
+    /// played at 92 dB, louder than the threshold assumes, heard what those
+    /// frames left out: on the tuning set of 51 tracks of 9 kinds of music
+    /// at 44.1 kHz in stereo, the variable rate whose streams averaged 192
+    /// kbit/s graded -0.272, against -0.211 at a constant 192 kbit/s, and a
+    /// quiet piano track -1.781 at 73 kbit/s, its bandwidth as PEAQ
+    /// measured it 6.9 kHz.
+    ///
+    /// Lowered by 20 dB at offsets up to 0 dB, and by none from 6 dB, the
+    /// variable rate graded -0.108 at 192.2 kbit/s and -0.959 at 128.3
+    /// kbit/s, against -0.272 and -1.053 at 192.2 and 127.7 kbit/s
+    /// unlowered, and better than at constant 192 and 128 kbit/s on 44 and
+    /// 38 tracks of the 51, and on every analog and acoustic one; and the
+    /// piano track -0.198. At 96 and 80 kbit/s it graded -1.962 and -2.534,
+    /// against -1.969 and -2.552 unlowered, and -2.328 and -3.069 at
+    /// constant rates; at 64 kbit/s, about 7.2 dB, it is not lowered, and
+    /// graded -3.029 at 63.7 kbit/s, against -3.356 at a constant rate. A
+    /// mean rate of 128 and 192 kbit/s graded -1.021 and -0.141, against
+    /// -1.094 and -0.228 unlowered. Lowered by 10 dB, the variable rate
+    /// graded -0.149 and -0.972 at 193.0 and 128.5 kbit/s; by 30 dB, -0.107
+    /// and -0.926 at 192.3 and 129.6 kbit/s; by 20 dB from -4 dB to none
+    /// from 4 dB, -0.105 at 192.7 kbit/s and -0.973 at 128.6 kbit/s, the
+    /// less lowered at 128 kbit/s the lower. Lowered by 20 dB at every
+    /// offset, an earlier variable rate lost 0.18 at 64 kbit/s, where bits
+    /// are few, as the reading of the threshold as noise loses at constant
+    /// rates there (see [`Self::quiet_threshold`]). Those grades of 80 and
+    /// 96 kbit/s, and of other lowerings, were taken before the nominal
+    /// rates were measured again with the threshold lowered (see
+    /// [`rate::nominal_bits_per_sample`]), which sets each frame's least
+    /// bits.
+    ///
+    /// The partitions from the cap of `bval(b)` up, from about 15 kHz, keep
+    /// their threshold: lowered too, the variable rate graded -0.062 at
+    /// 192.4 kbit/s and -0.919 at 128.8 kbit/s, the bandwidth PEAQ measured
+    /// at 192 kbit/s rising from 16.0 to 17.0 kHz, content above 15 kHz
+    /// that the threshold takes as inaudible coded for PEAQ's measures of
+    /// bandwidth, as without the threshold there (see
+    /// [`Self::quiet_threshold`]).
+    ///
+    /// The lowering falls with the offset, so that the allowance of a band
+    /// that the threshold in quiet governs rises with the offset, by 4.3 dB
+    /// for each dB over [`rate::LOWERED_QUIET_DB`], and a stream's length
+    /// falls with it without a break; as it falls fastest where the stream
+    /// is quiet, the test `the_length_falls_with_the_offset_without_a_break`
+    /// sweeps quiet noise in steps of 0.1 dB.
+    pub fn quiet_lowered_db(&self) -> f64 {
+        self.variable_offset_db()
+            .map_or(0.0, rate::quiet_lowered_db)
+    }
+
     /// The bits for each sample of each channel of the NCC.
     pub fn bits_per_sample(&self) -> f64 {
         let ncc = self.channel_configuration.ncc() as f64;
@@ -521,6 +584,13 @@ impl StreamEncoder {
     ///
     /// If the configuration is not [valid](StreamConfig::is_valid).
     pub fn new(config: StreamConfig) -> Self {
+        let quiet = config.quiet_threshold();
+        Self::with_quiet(config, quiet.lowered(config.quiet_lowered_db()))
+    }
+
+    /// [`new`](Self::new), the models taking the threshold in quiet as
+    /// `quiet` asks.
+    fn with_quiet(config: StreamConfig, quiet: Quiet) -> Self {
         let rate = FrameRate::new(&config)
             .unwrap_or_else(|| panic!("a stream that cannot be written: {config:?}"));
         let elements = (config.channel_configuration.elements().iter())
@@ -530,7 +600,7 @@ impl StreamEncoder {
                     kind,
                     config.intensity_border(),
                     config.noise_border(),
-                    config.quiet_threshold(),
+                    quiet,
                     config.control.is_variable(),
                 )
             })
@@ -1927,7 +1997,8 @@ mod tests {
     /// makes every ADTS header MPEG-4's, by its nominal rate; intensity
     /// stereo from a border that falls with the offset to Annex C's; and
     /// the threshold in quiet, read as noise has it, then between the two
-    /// readings, then as printed.
+    /// readings, then as printed, and lowered less and less, then not at
+    /// all, as at a constant rate.
     #[test]
     fn the_offset_chooses_the_tools() {
         let border = |offset| variable(Framing::Adts, offset).intensity_border();
@@ -1942,6 +2013,12 @@ mod tests {
         assert!((share - 0.5).abs() < 1e-9, "{share}");
         assert!(matches!(quiet(6.1), QuietThreshold::Between(_)));
         assert_eq!(quiet(9.1), QuietThreshold::Printed);
+        let lowered = |offset| variable(Framing::Adts, offset).quiet_lowered_db();
+        assert_eq!(lowered(-3.0), rate::QUIET_LOWERING_DB);
+        assert_eq!(lowered(0.0), rate::QUIET_LOWERING_DB);
+        assert!((lowered(3.0) - rate::QUIET_LOWERING_DB / 2.0).abs() < 1e-9);
+        assert_eq!(lowered(6.0), 0.0);
+        assert_eq!(config(Framing::Adts, 128_000).quiet_lowered_db(), 0.0);
         for (offset, few) in [(-3.0, false), (12.0, true)] {
             let config = StreamConfig {
                 noise_substitution: true,
@@ -1952,16 +2029,21 @@ mod tests {
         }
     }
 
-    /// As the noise offset rises across the offsets over which the reading
-    /// of the threshold in quiet goes from the one to the other (see
-    /// [`StreamConfig::quiet_threshold`]), the length of a stream falls
-    /// without a break: by at most 20% from one offset to the next, 0.2 dB
-    /// above it, and it rises by at most 6%, as a band's coding changes, or
-    /// as the loops fit frames to their least bits in coarse steps; of
-    /// partly correlated loud noise, of tones and of noise 50 dB below full
-    /// scale. Over the 8 dB swept, each falls by a quarter at least. Switched at a nominal rate of 0.8 bits a sample,
-    /// with the offset lowered by 6.2 dB, the reading made a second of such
-    /// loud noise 55% longer from 6.10 to 6.11 dB.
+    /// As the noise offset rises across the offsets over which the
+    /// threshold in quiet is lowered less and less (see
+    /// [`StreamConfig::quiet_lowered_db`]) and its reading goes from the one
+    /// to the other (see [`StreamConfig::quiet_threshold`]), the length of a
+    /// stream falls without a break: by at most 20% from one offset to the
+    /// next, 0.1 dB above it, and it rises by at most 6%, as a band's coding
+    /// changes, or as the loops fit frames to their least bits in coarse
+    /// steps; of partly correlated loud noise, of tones and of noise 50 dB
+    /// below full scale. Over the 11 dB swept, each falls by a quarter at
+    /// least. Where the threshold in quiet is lowered less and read more as
+    /// printed at once, from 3.1 to 6 dB, the quiet noise falls by up to 12%
+    /// a step, and fell by 21% in a step of 0.2 dB. Switched at a nominal
+    /// rate of 0.8 bits a sample, with the offset lowered by 6.2 dB, the
+    /// reading made a second of such loud noise 55% longer from 6.10 to 6.11
+    /// dB.
     #[test]
     fn the_length_falls_with_the_offset_without_a_break() {
         let len = 6 * FRAME_SAMPLES;
@@ -1982,7 +2064,12 @@ mod tests {
             ],
             [scale(&a, 0.012), scale(&a, 0.005)],
         ];
-        let (low, high) = rate::BLENDED_QUIET_DB.into_inner();
+        let low = rate::BLENDED_QUIET_DB
+            .start()
+            .min(*rate::LOWERED_QUIET_DB.start());
+        let high = rate::BLENDED_QUIET_DB
+            .end()
+            .max(*rate::LOWERED_QUIET_DB.end());
         for (k, [left, right]) in inputs.iter().enumerate() {
             let (mut first, mut last): (Option<usize>, Option<usize>) = (None, None);
             let mut offset = low - 1.0;
@@ -1998,11 +2085,47 @@ mod tests {
                 }
                 first = first.or(Some(len));
                 last = Some(len);
-                offset += 0.2;
+                offset += 0.1;
             }
             let (first, last) = (first.unwrap(), last.unwrap());
             assert!(4 * last <= 3 * first, "input {k}: {first} to {last} bytes");
         }
+    }
+
+    /// At a variable rate at a low offset, noise some 60 dB below full
+    /// scale, whose bands the threshold in quiet governs, is coded with the
+    /// threshold lowered, in frames more than twice as long as without (2177
+    /// bytes against 780); at a constant rate nothing is lowered.
+    #[test]
+    fn quiet_noise_is_coded_further_where_the_threshold_is_lowered() {
+        let len = 6 * FRAME_SAMPLES;
+        let [left, right] = [noise(len, 12), noise(len, 13)]
+            .map(|x| x.iter().map(|x| 0.003 * x).collect::<Vec<_>>());
+        let bytes = |config: StreamConfig, lowered: bool| {
+            let quiet = config.quiet_threshold();
+            let quiet = if lowered {
+                quiet.lowered(config.quiet_lowered_db())
+            } else {
+                quiet.into()
+            };
+            let mut stream = Vec::new();
+            let mut encoder = StreamEncoder::with_quiet(config, quiet);
+            encoder.encode(&[&left, &right], &mut stream);
+            encoder.finish(&mut stream);
+            stream
+        };
+        let variable = variable(Framing::Adts, -3.0);
+        assert_eq!(variable.quiet_lowered_db(), rate::QUIET_LOWERING_DB);
+        let (lowered, unlowered) = (bytes(variable, true), bytes(variable, false));
+        assert_eq!(frames_of(variable, &[&left, &right]).concat(), lowered);
+        assert!(
+            lowered.len() > 2 * unlowered.len(),
+            "{} against {} bytes",
+            lowered.len(),
+            unlowered.len()
+        );
+        let constant = config(Framing::Adts, 128_000);
+        assert_eq!(bytes(constant, true), bytes(constant, false));
     }
 
     /// At a mean rate, a second of loud noise, which takes far more than
