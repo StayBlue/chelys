@@ -176,10 +176,7 @@ impl Coding for ModelCoding {
         for granule in frame.iter_mut() {
             for filtered in granule.iter_mut() {
                 let (masking, xmin) = &mut filtered.analysis;
-                *xmin = masking.allowed_distortion(&filtered.xr, fs);
-                for xmin in xmin.iter_mut() {
-                    *xmin *= self.noise_factor;
-                }
+                *xmin = masking.allowed_distortion(&filtered.xr, fs, self.noise_factor);
             }
         }
         self.ms_stereo = self.ms_allowed && middle_side_frame(frame);

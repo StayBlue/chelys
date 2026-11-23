@@ -425,7 +425,7 @@ fn noise_to_mask(
         if g < 4 || g + 4 > granules {
             continue;
         }
-        let xmin = masking.allowed_distortion(&xr, judge);
+        let xmin = masking.allowed_distortion(&xr, judge, 1.0);
         for (band, xmin) in bands.iter().zip(xmin) {
             if band.end() as f64 > cutoff || xmin == 0.0 {
                 continue;

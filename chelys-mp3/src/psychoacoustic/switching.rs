@@ -69,16 +69,19 @@ impl SwitchedMasking {
         &self,
         xr: &[f64; GRANULE_LINES],
         sampling_frequency: SamplingFrequency,
+        noise_factor: f64,
     ) -> Vec<f64> {
         match self {
-            Self::Normal(masking) | Self::Start(masking) | Self::Stop(masking) => {
-                masking.allowed_distortion(xr, sampling_frequency).to_vec()
-            }
-            Self::Short(masking) => masking.allowed_distortion(xr, sampling_frequency).to_vec(),
+            Self::Normal(masking) | Self::Start(masking) | Self::Stop(masking) => masking
+                .allowed_distortion(xr, sampling_frequency, noise_factor)
+                .to_vec(),
+            Self::Short(masking) => masking
+                .allowed_distortion(xr, sampling_frequency, noise_factor)
+                .to_vec(),
             Self::Mixed(long, short) => {
                 let long_bands = scalefactor_bands::mixed_long_bands(sampling_frequency);
-                let long = long.allowed_distortion(xr, sampling_frequency);
-                let short = short.allowed_distortion(xr, sampling_frequency);
+                let long = long.allowed_distortion(xr, sampling_frequency, noise_factor);
+                let short = short.allowed_distortion(xr, sampling_frequency, noise_factor);
                 // The short bands lie where they would in a short block.
                 (long[..long_bands].iter())
                     .chain(&short[MIXED_SHORT_START * SHORT_WINDOWS..])

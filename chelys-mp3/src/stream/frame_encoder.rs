@@ -340,11 +340,17 @@ impl<C: Coding> FrameEncoder<C> {
     /// kept frames at 320 kbit/s, 1 to 7 each, at levels 80 and 100; at 256
     /// the frame after each but two took 64 to 80 kbit/s more, from the
     /// reservoir's smaller store, and the streams came out the same length
-    /// to 288 bytes shorter. At 16 kHz none kept a frame above 128 kbit/s,
-    /// but a quiet tone of 2 kHz there, at the edge of a subband, whose
-    /// allowance in the band below it no step meets, keeps almost every
-    /// frame at the highest bitrate it is given at every level, 128 kbit/s
-    /// in one channel in place of 160. Where no bitrate is dropped, at 44.1 and 48 kHz and
+    /// to 288 bytes shorter. At 16 kHz none kept a frame above 128 kbit/s.
+    /// Quiet tones at the edges of the subbands, whose allowance in some band
+    /// no step met, kept 98% of their frames at the highest bitrate at every
+    /// level; with the partitions converted to the bands at their own
+    /// frequencies and the threshold in quiet as the least a band is allowed
+    /// (see [`Masking::allowed_distortion`](crate::psychoacoustic::Masking::allowed_distortion)),
+    /// they take 8 to 38 kbit/s. Since then, of one minute of each of
+    /// those nine tracks at 32 kHz in one channel, 3 streams kept 4 frames
+    /// at 256 kbit/s at level 80 and 5 kept 9 at level 100, none at 16 kHz,
+    /// and at 8 kHz in two channels at level 100, 15% of the frames were
+    /// kept at 128. Where no bitrate is dropped, at 44.1 and 48 kHz and
     /// in two channels at 32 and 16 kHz, those tracks and tones came out
     /// byte for byte as with every bitrate kept.
     fn useful_bitrates(&self, bitrates: &[Bitrate], ancillary_bits: usize) -> usize {

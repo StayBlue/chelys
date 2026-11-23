@@ -65,6 +65,23 @@ const RPELEV2: f64 = 16.0;
 /// 60 dB lower.
 const PCM_SCALE: f64 = 32_768.0;
 
+/// The energy that the lines of `xr` give a signal, for each unit of energy
+/// that the lines of the model's FFTs give it, over the same frequencies,
+/// for noise and tones alike, and for long and short blocks alike.
+///
+/// A signal of variance `v` has, by Parseval's theorem, the energy
+/// `PCM_SCALE^2 * 3/8 * v` over all the lines of an FFT of the model: the
+/// samples are scaled by `PCM_SCALE`, the squares of the Hann window average
+/// 3/8, and the transform is normalised by `1 / N`. Half of it lies in the
+/// lines from DC up, which the model uses: `PCM_SCALE^2 * 3/16 * v`, except
+/// at DC and at half the sampling frequency, whose lines have no mirror
+/// below DC and so hold all of their energy, not half. In the
+/// lines of `xr`, scaled to the decoder's requantised values (see
+/// `LONG_BLOCK_GAIN` in [`crate::filterbank`]), each block, long or short,
+/// gives the same signal the energy `2 v`: a tone of amplitude `a` the
+/// energy `a^2`. The test `xr_and_fft_energies_agree` measures both.
+const XR_PER_FFT_ENERGY: f64 = 2.0 / (PCM_SCALE * PCM_SCALE * 3.0 / 16.0);
+
 /// The samples the model keeps: the current granule and the two before it.
 const HISTORY: usize = 3 * GRANULE_LINES;
 
@@ -127,6 +144,10 @@ pub struct Masking {
     /// [`partitions::partitions`] (figure C.6.b), on the scale of
     /// [`spectrum`](Self::spectrum).
     pub threshold: Vec<f64>,
+    /// The least allowed distortion of each long scalefactor band, as an
+    /// energy per line of `xr`: its threshold in quiet (see
+    /// `quiet_allowance`).
+    pub quiet: [f64; LONG_BANDS],
 }
 
 impl Masking {
@@ -138,10 +159,36 @@ impl Masking {
     /// line on the scale of the distortion `xfsf` it is compared with (clause
     /// C.1.5.4.3.3). Spec gap: a band whose lines are all zero allows none,
     /// where its ratio would make the product undefined.
+    ///
+    /// The product is scaled by `noise_factor`, the offset of a variable
+    /// bitrate (see [`VariableRate`](crate::rate::VariableRate)), 1
+    /// otherwise.
+    ///
+    /// Spec reading: no other band is allowed less than
+    /// [`quiet`](Self::quiet), its threshold in quiet, which clause
+    /// C.1.5.4.1 does not ask for (see `quiet_allowance`), whatever
+    /// `noise_factor`: the floor is applied after the offset, so that it
+    /// stays at the threshold of hearing at every level of the quality
+    /// scale. Applied before it, it moved with the offset, 12 dB above the
+    /// threshold in quiet at level 0, 8.6 dB at 30 and 7 dB at 50 in two
+    /// channels, and 9 dB at level 0 in one; and at the threshold in quiet
+    /// itself, it then raised the allowance of quiet passages whose bands
+    /// lie near it. A fade of noise below 3.6 kHz panned 8 dB to the left,
+    /// near -70 dB below full scale, decoded up to 3.3 dB off its level and
+    /// 5.3 dB off its panning at 8 and 11.025 kHz at level 0, and 1.6 dB off
+    /// its level at 8 kHz at level 30, and a tone of 700 Hz at -80 dB
+    /// decoded 1.3 dB high at 22.05 kHz at level 0 (the tests
+    /// `a_panned_fade_keeps_its_image_as_at_the_lower_sampling_frequencies`
+    /// and
+    /// `quiet_and_sparse_signals_keep_their_level_as_at_the_lower_sampling_frequencies`);
+    /// at levels 80 and 100, where the offset is small, they kept within
+    /// those tests' bounds. Applied after the offset, at the threshold in
+    /// quiet itself, they all keep within them, with no margin below it.
     pub fn allowed_distortion(
         &self,
         xr: &[f64; GRANULE_LINES],
         sampling_frequency: SamplingFrequency,
+        noise_factor: f64,
     ) -> [f64; LONG_BANDS] {
         let bands = scalefactor_bands::long_bands(sampling_frequency);
         std::array::from_fn(|sb| {
@@ -150,7 +197,11 @@ impl Masking {
             if energy == 0.0 {
                 0.0
             } else {
-                self.ratio[sb] * energy / band.width as f64
+                floored(
+                    self.ratio[sb] * energy / band.width as f64,
+                    self.quiet[sb],
+                    noise_factor,
+                )
             }
         })
     }
@@ -171,11 +222,15 @@ pub struct ShortMasking {
     /// As [`Masking::spectrum`]: the long FFT is computed whatever the block
     /// type.
     pub spectrum: Vec<f64>,
+    /// As [`Masking::quiet`], for each short scalefactor band, the same in
+    /// every window.
+    pub quiet: [f64; SHORT_BANDS],
 }
 
 impl ShortMasking {
     /// The allowed distortion of each short scalefactor band of each window,
-    /// `xmin = ratio * en / bw` as for long blocks (see
+    /// `xmin = ratio * en / bw` scaled by `noise_factor` as for long blocks,
+    /// and no less than [`quiet`](Self::quiet) (see
     /// [`Masking::allowed_distortion`]), in the order the scalefactors are
     /// sent: `3 * sfb + window`. `xr` holds the lines in the order they are
     /// sent too (see
@@ -184,19 +239,32 @@ impl ShortMasking {
         &self,
         xr: &[f64; GRANULE_LINES],
         sampling_frequency: SamplingFrequency,
+        noise_factor: f64,
     ) -> [f64; SHORT_BANDS * SHORT_WINDOWS] {
         let bands = scalefactor_bands::coding_bands(BlockType::Short, sampling_frequency);
         std::array::from_fn(|index| {
             let band = bands[index];
             let energy: f64 = xr[band.start..band.end()].iter().map(|x| x * x).sum();
-            let ratio = self.ratio[index % SHORT_WINDOWS][index / SHORT_WINDOWS];
+            let sb = index / SHORT_WINDOWS;
+            let ratio = self.ratio[index % SHORT_WINDOWS][sb];
             if energy == 0.0 {
                 0.0
             } else {
-                ratio * energy / band.width as f64
+                floored(
+                    ratio * energy / band.width as f64,
+                    self.quiet[sb],
+                    noise_factor,
+                )
             }
         })
     }
+}
+
+/// `xmin`, the allowed distortion of a band as the model gives it, scaled
+/// by `noise_factor`, and no less than `quiet`, the band's threshold in
+/// quiet (see [`Masking::allowed_distortion`]).
+fn floored(xmin: f64, quiet: f64, noise_factor: f64) -> f64 {
+    (xmin * noise_factor).max(quiet)
 }
 
 /// What [`PsychoacousticModel::analyse`] keeps of a granule for its
@@ -354,6 +422,10 @@ pub struct PsychoacousticModel {
     /// short partition: see [`noise_in_quiet`].
     noise_in_quiet: Vec<f64>,
     short_noise_in_quiet: Vec<f64>,
+    /// The threshold in quiet of each long and short scalefactor band: see
+    /// [`quiet_allowance`].
+    quiet: [f64; LONG_BANDS],
+    short_quiet: [f64; SHORT_BANDS],
     history: [f64; HISTORY],
     long: Analysis,
     short: Analysis,
@@ -382,19 +454,36 @@ impl PsychoacousticModel {
                 .collect(),
             Version::Mpeg2 => short_partitions.iter().map(|p| p.norm).collect(),
         };
+        let short_noise_in_quiet =
+            noise_in_quiet(short_partitions.iter().map(|p| (p.qthr, p.width, p.bval)));
+        let noise_in_quiet = noise_in_quiet(partitions.iter().map(|p| (p.qthr, p.width, p.bval)));
+        let band_weights = partitions::band_weights(sampling_frequency);
+        let short_band_weights = partitions::short_band_weights(sampling_frequency);
+        let quiet = quiet_allowance(
+            &band_weights,
+            &noise_in_quiet,
+            partitions.iter().map(|p| p.width),
+            LONG_FFT as f64 / 2.0 / GRANULE_LINES as f64,
+        );
+        let short_quiet = quiet_allowance(
+            &short_band_weights,
+            &short_noise_in_quiet,
+            short_partitions.iter().map(|p| p.width),
+            SHORT_FFT as f64 / 2.0 / (GRANULE_LINES / SHORT_WINDOWS) as f64,
+        );
         Self {
             partitions,
-            band_weights: partitions::band_weights(sampling_frequency),
+            band_weights,
             spread_into: spread_into(&spreading_matrix(partitions.iter().map(|p| p.bval))),
             short_partitions,
-            short_band_weights: partitions::short_band_weights(sampling_frequency),
+            short_band_weights,
             short_spread_into: spread_into(&short_spreading),
             short_norm,
             short_snr: short_partitions.iter().map(|p| p.snr.ratio()).collect(),
-            noise_in_quiet: noise_in_quiet(partitions.iter().map(|p| (p.qthr, p.width, p.bval))),
-            short_noise_in_quiet: noise_in_quiet(
-                short_partitions.iter().map(|p| (p.qthr, p.width, p.bval)),
-            ),
+            noise_in_quiet,
+            short_noise_in_quiet,
+            quiet,
+            short_quiet,
             history: [0.0; HISTORY],
             long: Analysis::new(LONG_FFT, LONG_CW_LINES),
             // The lines of the short FFT that stand for the long FFT's
@@ -543,6 +632,7 @@ impl PsychoacousticModel {
             perceptual_entropy,
             spectrum: spectrum.clone(),
             threshold: thr,
+            quiet: self.quiet,
         };
         let short = ShortSpectra {
             energy: energy_short,
@@ -560,6 +650,7 @@ impl PsychoacousticModel {
             ratio: spectra.energy.map(|energy| self.short_ratio(&energy)),
             perceptual_entropy: spectra.perceptual_entropy,
             spectrum: spectra.spectrum,
+            quiet: self.short_quiet,
         }
     }
 
@@ -696,15 +787,71 @@ fn spreading_matrix(bval: impl Iterator<Item = f64> + Clone) -> Vec<Vec<f64>> {
 /// table of Table D.3. A partition that does not exist adds nothing; the
 /// band collects the partitions after `bu` in full.
 fn band_ratio<const N: usize>(bands: &[BandWeights; N], thr: &[f64], eb: &[f64]) -> [f64; N] {
+    bands.map(|band| collect(band, thr) / collect(band, eb))
+}
+
+/// What a scalefactor band collects of a value of each partition
+/// (figure C.6.c), as [`band_ratio`] does.
+fn collect(band: BandWeights, values: &[f64]) -> f64 {
+    band.w1 * values[band.bu]
+        + values[band.bu + 1..band.bo.min(values.len())]
+            .iter()
+            .sum::<f64>()
+        + values.get(band.bo).map_or(0.0, |v| band.w2 * v)
+}
+
+/// The least allowed distortion of each scalefactor band as an energy per
+/// line of `xr`: the threshold in quiet that the partitions allow noise
+/// ([`noise_in_quiet`]), collected into the band as figure C.6.c collects
+/// the threshold, per line of the FFT the band collects, times the FFT's
+/// lines per line of `xr`, `fft_lines_per_line`, and converted by
+/// [`XR_PER_FFT_ENERGY`].
+///
+/// Spec reading: this deliberately departs from clause C.1.5.4.1, which
+/// gives a band only `ratio * en / bw`, the ratio of the FFT's threshold to
+/// its energy times the energy of the band's lines in `xr`. The threshold in
+/// quiet is applied to the FFT's partitions before the ratio is taken (figure
+/// C.6.b), and the ratio carries it into `xr` only as far as the two
+/// transforms find the same energy in the band. Where they do not, the
+/// allowance can fall far below the threshold in quiet, though no noise
+/// below it is heard. With the partitions converted to the bands at their
+/// own frequencies (see [`partitions::band_weights`]), the two still
+/// spread a pure tone at the edge of a subband differently: the main lobe
+/// of the FFT's Hann window reaches into the band beside the tone, where
+/// the filterbank leaves only rounding error. A tone of 2 kHz at 16 kHz,
+/// `fs / 8`, at -40 dB below full scale, leaves the band below it about
+/// 285 dB below the tone in `xr`, and the ratio allows that band about
+/// 250 dB less than its threshold in quiet; no quantiser step meets that,
+/// and at a variable bitrate the tone took 121 to 127 kbit/s in one
+/// channel, against 8 to 38 at the other edges of the subbands. Clean
+/// harmonics near the edges of subbands can do the same in music. The floor
+/// is the same for every granule. With it, the tone takes 8 to 11 kbit/s,
+/// and keeps its level within 0.3 dB as ffmpeg decodes it. Graded with
+/// PEAQ (GstPEAQ 0.6.1, black box) on 51 tracks of nine kinds of music at
+/// 44.1 kHz, the mean grade moved by no more than 0.002 at 128 and
+/// 192 kbit/s in two channels, at 64 kbit/s in one, and at levels 50, 80
+/// and 100 of the quality scale in one channel and in two, with the
+/// streams at level 100 1.2 kbit/s smaller in two channels and 0.5 in one.
+/// At 8 kHz, where it lifts the allowance of the bands fixed at zero (see
+/// [`scalefactor_bands::fixed_at_zero`]), one minute of each of nine of
+/// those tracks in two channels came out at 50.4 kbit/s on average at
+/// level 80, from 55.7, and at 66.8 at level 100, from 75.0.
+///
+/// Such a band also forced a fine step on the whole granule, and with the
+/// floor it no longer does. Lines above the last scalefactor band have no
+/// allowance at all: at 44.1 and 48 kHz, a tone above
+/// 16 kHz, even at -20 dB below full scale, is lost at a variable bitrate,
+/// though kept at constant bitrates.
+fn quiet_allowance<const N: usize>(
+    bands: &[BandWeights; N],
+    noise_in_quiet: &[f64],
+    widths: impl Iterator<Item = usize>,
+    fft_lines_per_line: f64,
+) -> [f64; N] {
+    let widths: Vec<f64> = widths.map(|width| width as f64).collect();
     bands.map(|band| {
-        let collect = |values: &[f64]| {
-            band.w1 * values[band.bu]
-                + values[band.bu + 1..band.bo.min(values.len())]
-                    .iter()
-                    .sum::<f64>()
-                + values.get(band.bo).map_or(0.0, |v| band.w2 * v)
-        };
-        collect(thr) / collect(eb)
+        XR_PER_FFT_ENERGY * fft_lines_per_line * collect(band, noise_in_quiet)
+            / collect(band, &widths)
     })
 }
 
@@ -828,7 +975,7 @@ mod tests {
             .map(|p| p.width as f64 * p.qthr.ln())
             .sum::<f64>();
         assert!((masking.perceptual_entropy - expected).abs() < 1e-9);
-        let xmin = masking.allowed_distortion(&[0.0; GRANULE_LINES], FS);
+        let xmin = masking.allowed_distortion(&[0.0; GRANULE_LINES], FS, 1.0);
         assert_eq!(xmin, [0.0; LONG_BANDS]);
     }
 
@@ -1064,6 +1211,181 @@ mod tests {
         }
     }
 
+    /// Per line of `xr` and of the FFT, the energy of each long and short
+    /// scalefactor band of `fs`, summed over `granules` granules of `signal`
+    /// after the first four, from the filterbank and from the model's FFTs,
+    /// the latter collected as figure C.6.c collects the partitions, and
+    /// converted by [`XR_PER_FFT_ENERGY`] and the FFT's lines per line of
+    /// `xr`, as [`quiet_allowance`] converts the threshold in quiet.
+    #[allow(clippy::type_complexity)]
+    fn band_energies(
+        fs: SamplingFrequency,
+        granules: usize,
+        mut signal: impl FnMut(usize) -> [f64; GRANULE_LINES],
+    ) -> ([(f64, f64); LONG_BANDS], [(f64, f64); SHORT_BANDS]) {
+        let mut model = PsychoacousticModel::new(fs);
+        let (mut long, mut short) = (Filterbank::new(), Filterbank::new());
+        let mut long_energy = [(0.0, 0.0); LONG_BANDS];
+        let mut short_energy = [(0.0, 0.0); SHORT_BANDS];
+        let partitions = partitions::partitions(fs);
+        let widths: Vec<f64> = partitions.iter().map(|p| p.width as f64).collect();
+        let short_partitions = partitions::short_partitions(fs);
+        let short_widths: Vec<f64> = short_partitions.iter().map(|p| p.width as f64).collect();
+        for g in 0..granules + 4 {
+            let pcm = signal(g);
+            let (masking, spectra) = model.analyse(&pcm);
+            let long_xr = long.granule(&pcm, BlockType::Normal, BlockType::Normal);
+            let short_xr = short.granule(&pcm, BlockType::Short, BlockType::Short);
+            if g < 4 {
+                continue;
+            }
+            let eb: Vec<f64> = (partitions.iter())
+                .map(|p| masking.spectrum[p.start..p.start + p.width].iter().sum())
+                .collect();
+            let fft_per_line = LONG_FFT as f64 / 2.0 / GRANULE_LINES as f64;
+            let bands = scalefactor_bands::long_bands(fs).iter();
+            for ((band, weights), sum) in bands
+                .zip(partitions::band_weights(fs))
+                .zip(&mut long_energy)
+            {
+                let lines = &long_xr[band.start..band.end()];
+                sum.0 += lines.iter().map(|x| x * x).sum::<f64>() / band.width as f64;
+                sum.1 += XR_PER_FFT_ENERGY * fft_per_line * collect(weights, &eb)
+                    / collect(weights, &widths);
+            }
+            let fft_per_line = SHORT_FFT as f64 / 2.0 / (GRANULE_LINES / SHORT_WINDOWS) as f64;
+            for (window, energy) in spectra.energy.iter().enumerate() {
+                let eb: Vec<f64> = (short_partitions.iter())
+                    .map(|p| energy[p.start..p.start + p.width].iter().sum())
+                    .collect();
+                let bands = scalefactor_bands::short_bands(fs).iter();
+                for ((band, weights), sum) in bands
+                    .zip(partitions::short_band_weights(fs))
+                    .zip(&mut short_energy)
+                {
+                    // Short line `j` of a window is output `j % 6` of
+                    // subband `j / 6` (see `Filterbank::granule`).
+                    let xr: f64 = (band.start..band.end())
+                        .map(|j| short_xr[18 * (j / 6) + 6 * window + j % 6].powi(2))
+                        .sum();
+                    sum.0 += xr / band.width as f64;
+                    sum.1 += XR_PER_FFT_ENERGY * fft_per_line * collect(weights, &eb)
+                        / collect(weights, &short_widths);
+                }
+            }
+        }
+        (long_energy, short_energy)
+    }
+
+    /// [`XR_PER_FFT_ENERGY`] converts the energy the model's FFTs find into
+    /// that of the lines of `xr` over the same frequencies: for white noise,
+    /// in every long and short scalefactor band within 0.4 dB (0.32 dB at
+    /// worst, at 8 kHz), at every sampling frequency, and for a tone, in all
+    /// the lines, averaged over 40 granules, within 0.1 dB of its expected
+    /// energy, the square of its amplitude (0.06 dB at worst).
+    #[test]
+    fn xr_and_fft_energies_agree() {
+        const GRANULES: usize = 40;
+        for fs in SamplingFrequency::ALL {
+            let mut seed = 9;
+            let (long, short) = band_energies(fs, 200, |_| noise(&mut seed, 0.5));
+            for (sb, (xr, fft)) in long.iter().chain(&short).enumerate() {
+                let db = 10.0 * (xr / fft).log10();
+                assert!(
+                    db.abs() < 0.4,
+                    "{fs:?} band {sb} (long, then short): {db:.2} dB"
+                );
+            }
+            // A tone, over all the lines.
+            let amplitude = 0.25;
+            let mut model = PsychoacousticModel::new(fs);
+            let (mut long, mut short) = (Filterbank::new(), Filterbank::new());
+            let mut sums = [0.0; 4];
+            for g in 0..GRANULES + 4 {
+                let pcm = std::array::from_fn(|t| {
+                    let n = (g * GRANULE_LINES + t) as f64;
+                    amplitude * (2.0 * PI * 0.0437 * n).sin()
+                });
+                let (masking, spectra) = model.analyse(&pcm);
+                let long_xr = long.granule(&pcm, BlockType::Normal, BlockType::Normal);
+                let short_xr = short.granule(&pcm, BlockType::Short, BlockType::Short);
+                if g < 4 {
+                    continue;
+                }
+                let energies = [
+                    long_xr.iter().map(|x| x * x).sum::<f64>(),
+                    short_xr.iter().map(|x| x * x).sum::<f64>() / 3.0,
+                    XR_PER_FFT_ENERGY * masking.spectrum.iter().sum::<f64>(),
+                    XR_PER_FFT_ENERGY * spectra.energy.iter().flatten().sum::<f64>() / 3.0,
+                ];
+                for (sum, energy) in sums.iter_mut().zip(energies) {
+                    *sum += energy / GRANULES as f64;
+                }
+            }
+            for (what, energy) in ["long xr", "short xr", "long FFT", "short FFT"]
+                .iter()
+                .zip(sums)
+            {
+                let db = 10.0 * (energy / (amplitude * amplitude)).log10();
+                assert!(db.abs() < 0.1, "{fs:?}, {what}: {db:.3} dB");
+            }
+        }
+    }
+
+    /// No band is allowed less than its floor: a tone at the edge of a
+    /// subband, `fs / 8` at 16 kHz, -40 dB below full scale, leaves the band
+    /// below it almost no energy in `xr`, while the FFT lines it collects
+    /// hold the main lobe of the Hann window, so that the ratio alone allows
+    /// it less than 10^-20 of its floor. And white noise whose energy in the
+    /// FFT is the floor of a band, at 44.1 kHz, has as much energy per line
+    /// of `xr` as the floor allows it, within 0.4 dB (0.28 dB at worst), in
+    /// every long band.
+    #[test]
+    fn the_allowance_is_at_least_the_floor() {
+        use SamplingFrequency::Hz16000;
+        let mut model = PsychoacousticModel::new(Hz16000);
+        let mut filterbank = Filterbank::new();
+        let amplitude = 0.01 * 2f64.sqrt();
+        let (mut masking, mut xr) = (None, [0.0; GRANULE_LINES]);
+        for g in 0..8 {
+            let pcm = std::array::from_fn(|t| {
+                let n = (g * GRANULE_LINES + t) as f64;
+                amplitude * (2.0 * PI * n / 8.0).sin()
+            });
+            masking = Some(model.granule(&pcm));
+            xr = filterbank.granule(&pcm, BlockType::Normal, BlockType::Normal);
+        }
+        let masking = masking.unwrap();
+        let bands = scalefactor_bands::long_bands(Hz16000);
+        let unfloored: Vec<f64> = (bands.iter().zip(&masking.ratio))
+            .map(|(band, ratio)| {
+                let energy: f64 = xr[band.start..band.end()].iter().map(|x| x * x).sum();
+                ratio * energy / band.width as f64
+            })
+            .collect();
+        let least = (unfloored.iter().zip(&masking.quiet))
+            .map(|(xmin, quiet)| xmin / quiet)
+            .fold(f64::MAX, f64::min);
+        assert!(least < 1e-20, "{unfloored:?}");
+        let xmin = masking.allowed_distortion(&xr, Hz16000, 1.0);
+        for (sb, (xmin, quiet)) in xmin.iter().zip(&masking.quiet).enumerate() {
+            assert!(xmin >= quiet, "band {sb}: {xmin} < {quiet}");
+        }
+
+        // White noise, scaled so that each band's energy per line in the FFT,
+        // converted, is its floor.
+        let quiet = PsychoacousticModel::new(FS).quiet;
+        let mut seed = 13;
+        let (unit, _) = band_energies(FS, 100, |_| noise(&mut seed, 0.1));
+        for (sb, (quiet, (_, fft))) in quiet.iter().zip(unit).enumerate() {
+            let scale = quiet / (fft / 100.0);
+            let mut seed = 13;
+            let (at_quiet, _) = band_energies(FS, 100, |_| noise(&mut seed, 0.1 * scale.sqrt()));
+            let db = 10.0 * (at_quiet[sb].0 / 100.0 / quiet).log10();
+            assert!(db.abs() < 0.4, "band {sb}: {db:.2} dB");
+        }
+    }
+
     /// `xmin` is the band's mean energy per line scaled by its ratio.
     #[test]
     fn allowed_distortion_scales_the_mean_energy_per_line() {
@@ -1072,12 +1394,13 @@ mod tests {
             perceptual_entropy: 0.0,
             spectrum: Vec::new(),
             threshold: Vec::new(),
+            quiet: [0.0; LONG_BANDS],
         };
         let mut xr = [0.0; GRANULE_LINES];
         let band = scalefactor_bands::long_bands(FS)[5];
         xr[band.start] = 3.0;
         xr[band.start + 1] = -4.0;
-        let xmin = masking.allowed_distortion(&xr, FS);
+        let xmin = masking.allowed_distortion(&xr, FS, 1.0);
         assert!((xmin[5] - 0.01 * 25.0 / band.width as f64).abs() < 1e-12);
         assert_eq!(xmin[4], 0.0);
     }
