@@ -285,8 +285,49 @@ impl StreamConfig {
     /// stereo, if it is: Annex C's (see [`intensity::BORDER_HZ`]), where
     /// the stream has at most [`INTENSITY_BITS_PER_SAMPLE`] bits for each
     /// sample of each channel of the NCC.
-    fn intensity_border(&self) -> Option<f64> {
-        (self.bits_per_sample() <= INTENSITY_BITS_PER_SAMPLE).then_some(intensity::BORDER_HZ)
+    ///
+    /// At a variable or mean rate, the border falls from half the sampling
+    /// frequency to Annex C's as the noise offset rises over
+    /// [`rate::INTENSITY_DB`], or at a mean rate the offset of its nominal
+    /// rate, evenly in the logarithm of the frequency, and stays at Annex
+    /// C's above.
+    ///
+    /// Spec gap: within their allowance, as at a variable rate, a pair's
+    /// bands in intensity stereo can take more bits than coded apart, as
+    /// their signal is allowed the less of the two channels' noise (see
+    /// [`intensity::code`]): switched on at one nominal rate, intensity
+    /// stereo made one second of noise, partly correlated between the
+    /// channels, 19% longer from 6.80 to 6.85 dB, against the fall of the
+    /// length with the offset. Brought in a band at a time as the offset
+    /// rises, it lengthens a stream by a band's bits at most at each step
+    /// (see `the_length_falls_with_the_offset_without_a_break`). Of music it
+    /// shortens streams, and pays: graded with PEAQ (GstPEAQ 0.6.1, black
+    /// box), on the tuning set at 64 kbit/s, the mean was -3.018 with it
+    /// and -3.084 without, 44 of 51 tracks better with it.
+    pub fn intensity_border(&self) -> Option<f64> {
+        let Some(noise_offset_db) = self.variable_offset_db() else {
+            return (self.bits_per_sample() <= INTENSITY_BITS_PER_SAMPLE)
+                .then_some(intensity::BORDER_HZ);
+        };
+        let (low, high) = rate::INTENSITY_DB.into_inner();
+        let top = f64::from(self.sampling_frequency.hz()) / 2.0;
+        match (noise_offset_db - low) / (high - low) {
+            ..=0.0 => None,
+            1.0.. => Some(intensity::BORDER_HZ),
+            share => Some(top * (intensity::BORDER_HZ / top).powf(share)),
+        }
+    }
+
+    /// The noise offset of a variable rate, or that of a mean rate's
+    /// nominal rate (see [`rate::nominal_noise_offset_db`]), by which the
+    /// tools that pay only where bits are few are chosen; `None` at a
+    /// constant rate.
+    fn variable_offset_db(&self) -> Option<f64> {
+        match self.control {
+            Control::Constant => None,
+            Control::Variable { noise_offset_db } => Some(noise_offset_db),
+            Control::Mean => Some(rate::nominal_noise_offset_db(self.bits_per_sample())),
+        }
     }
 
     /// The lower border frequency above which channels are coded by
@@ -347,7 +388,49 @@ impl StreamConfig {
     /// 64, 128 and 192 kbit/s, the bandwidth PEAQ measured rising from 16.2
     /// to 19.1 kHz at 128 kbit/s: content above 15 kHz that the threshold
     /// in quiet takes as inaudible, coded for PEAQ's measures of bandwidth.
+    ///
+    /// At a variable or mean rate, the reading goes from the one to the
+    /// other as the noise offset rises over [`rate::BLENDED_QUIET_DB`], or
+    /// at a mean rate the offset of its nominal rate (see
+    /// [`rate::nominal_noise_offset_db`]), between the two in dB (see
+    /// [`QuietThreshold::Between`]); the loops raise `xmin` by as much of
+    /// the offset of clause C.7.4.4, and the noise offset is lowered by as
+    /// much of [`rate::PRINTED_QUIET_SHIFT_DB`].
+    ///
+    /// Spec gap: the threshold in quiet as printed, with the offset to
+    /// `xmin`, allows far more noise in the bands that the threshold
+    /// governs than the threshold as noise has it, and in every band 3 dB
+    /// more: at 6 dB, the tuning set took 38 kbit/s with it and 68 kbit/s
+    /// without. At a variable rate, the reading switched at one nominal
+    /// rate, as at a constant rate, would make a stream's length jump where
+    /// the noise offset passes the one whose nominal rate it is, and leave
+    /// the rates between unreachable; lowering the offset as it switched,
+    /// to keep the mean of the tuning set's rates level, still made the
+    /// length of one second of noise jump by 55% from 6.10 to 6.11 dB.
+    /// Taken between the two as the offset rises, and the offset lowered
+    /// alike, the allowance of every band rises with the offset without a
+    /// break, and the length falls with it; the test
+    /// `the_length_falls_with_the_offset_without_a_break` sweeps it.
+    ///
+    /// The reading as printed is kept where the nominal rate is low, as at
+    /// a constant rate. Graded with PEAQ (GstPEAQ 0.6.1, black box), on the
+    /// tuning set, with each frame quantized within its allowance (before
+    /// the loops fitted each channel to the bits that takes), at 64.3
+    /// kbit/s as printed the mean was -3.154, at 64.9 kbit/s as noise has
+    /// it -3.269, and at a constant 64 kbit/s -3.356. Taken between the
+    /// two, with intensity stereo brought in alike (see
+    /// [`Self::intensity_border`]), the means at 64.1 and 80.3 kbit/s were
+    /// -3.020 and -2.552, against -3.012 and -2.546 at 64.1 and 81.0
+    /// kbit/s switched at 0.8 bits a sample with the offset lowered.
     pub fn quiet_threshold(&self) -> QuietThreshold {
+        if let Some(noise_offset_db) = self.variable_offset_db() {
+            let (low, high) = rate::BLENDED_QUIET_DB.into_inner();
+            return match (noise_offset_db - low) / (high - low) {
+                ..=0.0 => QuietThreshold::Noise,
+                1.0.. => QuietThreshold::Printed,
+                share => QuietThreshold::Between(share),
+            };
+        }
         if self.bits_per_sample() > PRINTED_QUIET_BITS_PER_SAMPLE {
             QuietThreshold::Noise
         } else {
@@ -1840,20 +1923,104 @@ mod tests {
     }
 
     /// The tools that pay only where bits are few are chosen by the
-    /// nominal rate of the offset, for the whole stream: intensity stereo
-    /// and perceptual noise substitution, which makes every ADTS header
-    /// MPEG-4's.
+    /// offset, for the whole stream: perceptual noise substitution, which
+    /// makes every ADTS header MPEG-4's, by its nominal rate; intensity
+    /// stereo from a border that falls with the offset to Annex C's; and
+    /// the threshold in quiet, read as noise has it, then between the two
+    /// readings, then as printed.
     #[test]
-    fn the_offset_chooses_the_tools_by_its_nominal_rate() {
+    fn the_offset_chooses_the_tools() {
+        let border = |offset| variable(Framing::Adts, offset).intensity_border();
+        assert_eq!(border(3.8), None);
+        let borders = [4.0, 5.0, 6.0, 6.9].map(|o| border(o).unwrap());
+        assert!(borders.windows(2).all(|w| w[0] > w[1]), "{borders:?}");
+        assert_eq!(border(7.0), Some(intensity::BORDER_HZ));
+        assert_eq!(border(12.0), Some(intensity::BORDER_HZ));
+        let quiet = |offset| variable(Framing::Adts, offset).quiet_threshold();
+        assert_eq!(quiet(3.1), QuietThreshold::Noise);
+        let share = quiet(6.1).printed_share();
+        assert!((share - 0.5).abs() < 1e-9, "{share}");
+        assert!(matches!(quiet(6.1), QuietThreshold::Between(_)));
+        assert_eq!(quiet(9.1), QuietThreshold::Printed);
         for (offset, few) in [(-3.0, false), (12.0, true)] {
             let config = StreamConfig {
                 noise_substitution: true,
                 ..variable(Framing::Adts, offset)
             };
-            assert_eq!(config.bits_per_sample() <= INTENSITY_BITS_PER_SAMPLE, few);
-            assert_eq!(config.intensity_border().is_some(), few);
             assert_eq!(config.noise_border().is_some(), few);
             assert_eq!(config.adts_header().unwrap().mpeg4, few);
         }
+    }
+
+    /// As the noise offset rises across the offsets over which the reading
+    /// of the threshold in quiet goes from the one to the other (see
+    /// [`StreamConfig::quiet_threshold`]), the length of a stream falls
+    /// without a break: by at most 20% from one offset to the next, 0.2 dB
+    /// above it, and it rises by at most 6%, as a band's coding changes, or
+    /// as the loops fit frames to their least bits in coarse steps; of
+    /// partly correlated loud noise, of tones and of noise 50 dB below full
+    /// scale. Over the 8 dB swept, each falls by a quarter at least. Switched at a nominal rate of 0.8 bits a sample,
+    /// with the offset lowered by 6.2 dB, the reading made a second of such
+    /// loud noise 55% longer from 6.10 to 6.11 dB.
+    #[test]
+    fn the_length_falls_with_the_offset_without_a_break() {
+        let len = 6 * FRAME_SAMPLES;
+        let (a, b) = (noise(len, 8), noise(len, 9));
+        let tone = |f: f64, gain: f64| -> Vec<f64> {
+            (0..len)
+                .map(|t| gain * (std::f64::consts::TAU * f * t as f64 / 44_100.0).sin())
+                .collect()
+        };
+        let add =
+            |x: &[f64], y: &[f64]| -> Vec<f64> { x.iter().zip(y).map(|(x, y)| x + y).collect() };
+        let scale = |x: &[f64], gain: f64| -> Vec<f64> { x.iter().map(|x| gain * x).collect() };
+        let inputs: [[Vec<f64>; 2]; 3] = [
+            [scale(&a, 3.0), add(&scale(&a, 1.5), &scale(&b, 1.5))],
+            [
+                add(&tone(440.0, 0.1), &tone(3300.0, 0.05)),
+                add(&tone(440.0, 0.08), &tone(5500.0, 0.03)),
+            ],
+            [scale(&a, 0.012), scale(&a, 0.005)],
+        ];
+        let (low, high) = rate::BLENDED_QUIET_DB.into_inner();
+        for (k, [left, right]) in inputs.iter().enumerate() {
+            let (mut first, mut last): (Option<usize>, Option<usize>) = (None, None);
+            let mut offset = low - 1.0;
+            while offset <= high + 1.0 {
+                let frames = frames_of(variable(Framing::Adts, offset), &[left, right]);
+                let len: usize = frames.iter().map(Vec::len).sum();
+                if let Some(last) = last {
+                    let ratio = len as f64 / last as f64;
+                    assert!(
+                        (0.8..=1.06).contains(&ratio),
+                        "input {k}, {offset:.1} dB: {last} to {len} bytes"
+                    );
+                }
+                first = first.or(Some(len));
+                last = Some(len);
+                offset += 0.2;
+            }
+            let (first, last) = (first.unwrap(), last.unwrap());
+            assert!(4 * last <= 3 * first, "input {k}: {first} to {last} bytes");
+        }
+    }
+
+    /// At a mean rate, a second of loud noise, which takes far more than
+    /// the nominal rate's offset gives, is steered to the mean within a few
+    /// frames: the stream runs over by a tenth at most.
+    #[test]
+    fn a_short_stream_learns_what_its_content_takes() {
+        let config = StreamConfig {
+            control: Control::Mean,
+            ..config(Framing::Adts, 128_000)
+        };
+        let len = 43 * FRAME_SAMPLES;
+        let [left, right] = [noise(len, 10), noise(len, 11)]
+            .map(|x| x.iter().map(|x| 3.0 * x).collect::<Vec<f64>>());
+        let frames = frames_of(config, &[&left, &right]);
+        let bytes: usize = frames.iter().map(Vec::len).sum();
+        let mean = 128_000.0 * FRAME_SAMPLES as f64 / 44_100.0 / 8.0;
+        let ratio = bytes as f64 / (frames.len() as f64 * mean);
+        assert!((1.0..1.1).contains(&ratio), "{ratio}");
     }
 }

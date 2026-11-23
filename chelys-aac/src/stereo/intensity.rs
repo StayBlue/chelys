@@ -112,6 +112,12 @@ pub const BORDER_HZ: f64 = 6000.0;
 /// excess: a tone in the right channel alone, beside the leakage of the
 /// left channel's window into its band, decoded 28 dB too quiet.
 ///
+/// Where `within_allowance` is set, as at a variable rate, a band whose
+/// energy is within its allowance in both channels is not coded in
+/// intensity stereo either: neither channel sends lines there, and in
+/// intensity stereo the right channel would send a position and the left
+/// one its lines within the less of the two allowances.
+///
 /// Spec gap: clause C.6.2 codes the intensity signal through "the
 /// standard process for quantization and encoding", without saying what
 /// noise its bands may take. Its noise reaches the right channel scaled by
@@ -124,6 +130,7 @@ pub fn code(
     noise: &Noise,
     [left, right]: [&mut [f64; FRAME_LINES]; 2],
     [left_xmin, right_xmin]: [&mut [[f64; MAX_BANDS]]; 2],
+    within_allowance: bool,
 ) -> Intensity {
     let mut intensity = Intensity::NONE;
     let bands = super::bands(
@@ -139,6 +146,9 @@ pub fn code(
         let energy = |lines: &[f64]| lines.iter().map(|x| x * x).sum::<f64>();
         let (el, er) = (energy(l), energy(r));
         if el == 0.0 || er == 0.0 {
+            continue;
+        }
+        if within_allowance && el <= left_xmin[g][sfb] && er <= right_xmin[g][sfb] {
             continue;
         }
         let position = (2.0 * (el / er).log2()).round();

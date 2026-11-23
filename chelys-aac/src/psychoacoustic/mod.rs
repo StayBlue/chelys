@@ -123,13 +123,54 @@ fn quiet_reference(iblen: usize) -> f64 {
 
 /// How the model takes the threshold in quiet `qsthr(b)` of the tables
 /// (step 11).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum QuietThreshold {
     /// As printed: each partition's `qsthr(b)`.
     Printed,
     /// As noise is heard: each partition's `qsthr(b)` for one line, times
     /// the partition's width in Bark (see `noise_in_quiet`).
     Noise,
+    /// Between the two: in dB, this share of the way from the threshold as
+    /// noise has it to the threshold as printed, from 0 to 1 (see
+    /// [`StreamConfig::quiet_threshold`]).
+    ///
+    /// [`StreamConfig::quiet_threshold`]: crate::stream::StreamConfig::quiet_threshold
+    Between(f64),
+}
+
+impl QuietThreshold {
+    /// How far, in dB, the reading is from the threshold as noise has it
+    /// toward the threshold as printed: 0 as noise has it, 1 as printed.
+    pub fn printed_share(self) -> f64 {
+        match self {
+            Self::Noise => 0.0,
+            Self::Printed => 1.0,
+            Self::Between(share) => share,
+        }
+    }
+}
+
+/// The threshold in quiet of each partition of `sampling_frequency`'s FFT
+/// of `transform` as an energy, read as `quiet` asks: between the two
+/// readings, each partition's in dB the share of the way between its own.
+fn quiet_energies(
+    sampling_frequency: SamplingFrequency,
+    transform: Transform,
+    quiet: QuietThreshold,
+) -> Vec<f64> {
+    let tables = |quiet| Tables::get(sampling_frequency, transform, quiet);
+    match quiet {
+        QuietThreshold::Noise | QuietThreshold::Printed => tables(quiet).quiet.clone(),
+        QuietThreshold::Between(share) => {
+            let (noise, printed) = (
+                tables(QuietThreshold::Noise),
+                tables(QuietThreshold::Printed),
+            );
+            (noise.quiet.iter().zip(&printed.quiet))
+                .map(|(&noise, &printed)| noise.powf(1.0 - share) * printed.powf(share))
+                .collect()
+        }
+    }
 }
 
 /// The threshold in quiet of each of `partitions` as an energy, from their
@@ -287,7 +328,7 @@ impl Tables {
         static TABLES: [[[OnceLock<Tables>; 2]; 2]; 12] =
             [const { [const { [const { OnceLock::new() }; 2] }; 2] }; 12];
         let index = usize::from(transform == Transform::Short);
-        let reading = usize::from(quiet == QuietThreshold::Noise);
+        let reading = usize::from(quiet != QuietThreshold::Printed);
         TABLES[sampling_frequency.index() as usize][index][reading]
             .get_or_init(|| Self::new(sampling_frequency, transform, quiet))
     }
@@ -411,6 +452,7 @@ impl Tables {
         block: &BlockThreshold,
         nb_last: &mut [f64],
         rpelev: f64,
+        quiet: &[f64],
         out: &mut Threshold,
     ) {
         let n = self.partitions.len();
@@ -420,7 +462,7 @@ impl Tables {
         for b in 0..n {
             let limited = block.nb[b].min(nb_last[b] * rpelev);
             nb_last[b] = block.nb[b];
-            nb[b] = self.quiet[b].max(limited);
+            nb[b] = quiet[b].max(limited);
             // Step 12. A partition of one line weighs nothing (see
             // `Model::analyze`), and the logarithm is not taken: the
             // product would be 0, which leaves the sum as it is.
@@ -849,6 +891,10 @@ pub struct Model {
     /// Whether the thresholds of the short blocks are computed (see
     /// [`Model::long_only`]).
     short_thresholds: bool,
+    /// The threshold in quiet of each partition of the long and the short
+    /// FFT, as the model reads it.
+    long_quiet: Vec<f64>,
+    short_quiet: Vec<f64>,
 }
 
 impl Model {
@@ -880,6 +926,8 @@ impl Model {
             short_c_min: vec![0.0; SHORT_IBLEN + 1],
             last_short_entropies: None,
             short_thresholds: true,
+            long_quiet: quiet_energies(sampling_frequency, Transform::Long, quiet),
+            short_quiet: quiet_energies(sampling_frequency, Transform::Short, quiet),
         }
     }
 
@@ -1006,6 +1054,7 @@ impl Model {
             &long.threshold,
             &mut self.long_nb_last,
             RPELEV_LONG,
+            &self.long_quiet,
             &mut out.long,
         );
         if !self.short_thresholds {
@@ -1019,6 +1068,7 @@ impl Model {
                 &short.threshold,
                 &mut self.short_nb_last,
                 RPELEV_SHORT,
+                &self.short_quiet,
                 threshold,
             );
         }

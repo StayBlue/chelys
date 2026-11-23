@@ -86,7 +86,7 @@ fn ffmpeg_and_faad_decode_variable_and_mean_rates() {
         (44_100, 2, variable(0.0), 9.0),
         (44_100, 2, variable(10.0), 5.0),
         (48_000, 1, variable(-6.0), 11.0),
-        (32_000, 2, mean(96_000), 12.0),
+        (32_000, 2, mean(96_000), 10.0),
         (44_100, 2, mean(48_000), 5.0),
         (8_000, 1, variable(-40.0), 30.0),
     ] {

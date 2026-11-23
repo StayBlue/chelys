@@ -63,7 +63,9 @@ pub const SPECTRUM_CLIPPING: bool = false;
 
 /// Raises each allowed distortion `xmin` as the loops take it: by
 /// [`XMIN_OFFSET_DB`] where the model took the threshold in quiet as
-/// printed, and not at all where it took it as noise has it.
+/// printed, not at all where it took it as noise has it, and by the same
+/// share of it in dB where it took it between the two (see
+/// [`QuietThreshold::Between`]).
 ///
 /// Spec gap: clause C.7.4.4 asks for an offset wherever the bits available
 /// are more or fewer than the perceptual entropy requires, and none only
@@ -76,10 +78,11 @@ pub const SPECTRUM_CLIPPING: bool = false;
 ///
 /// [`StreamConfig::quiet_threshold`]: crate::stream::StreamConfig::quiet_threshold
 pub fn raise_xmin(xmin: &mut [[f64; MAX_BANDS]], quiet: QuietThreshold) {
-    if quiet == QuietThreshold::Noise {
+    let offset_db = XMIN_OFFSET_DB * quiet.printed_share();
+    if offset_db == 0.0 {
         return;
     }
-    let offset = 10f64.powf(XMIN_OFFSET_DB / 10.0);
+    let offset = 10f64.powf(offset_db / 10.0);
     for xmin in xmin.iter_mut().flatten() {
         *xmin *= offset;
     }

@@ -27,35 +27,50 @@ impl Control {
     }
 }
 
-/// How far the noise offset of a variable or mean rate is lowered before
-/// it raises the allowed distortion, where the stream's nominal rate is so
-/// low that the model takes the threshold in quiet as printed (see
-/// [`StreamConfig::quiet_threshold`]).
+/// The noise offsets over which, at a variable or mean rate, the model's
+/// reading of the threshold in quiet goes from the threshold as noise has
+/// it, at the lower end and below, to the threshold as printed, at the
+/// upper end and above (see [`StreamConfig::quiet_threshold`]), and the
+/// offset is lowered by as much of [`PRINTED_QUIET_SHIFT_DB`]: 3 dB either
+/// side of 6.1 dB, where the tuning set of 51 tracks at 44.1 kHz in stereo
+/// takes [`PRINTED_QUIET_BITS_PER_SAMPLE`] with the threshold as noise has
+/// it.
 ///
-/// Spec gap: the threshold in quiet as printed, with the offset of clause
-/// C.7.4.4 that the loops then add (see [`raise_xmin`]), allows far more
-/// noise in the bands it governs than the threshold as noise has it: at
-/// 6 dB, the tuning set of 51 tracks at 44.1 kHz in stereo took 38 kbit/s
-/// with the threshold as printed and 68 as noise has it. Keyed to the
-/// nominal rate alone, the reading would make the stream's rate fall by
-/// half where the offset passes the one whose nominal rate is
-/// [`PRINTED_QUIET_BITS_PER_SAMPLE`], 0.8 bits a sample, and leave the
-/// rates between unreachable. The tuning set took 0.79 bits a sample with
-/// the threshold as printed at 0 dB, and 0.81 as noise has it at 6 dB:
-/// lowered by this much, the rate falls with the offset without a break.
-///
-/// The reading as printed is kept where the nominal rate is so low, as at
-/// a constant rate. Graded with PEAQ (GstPEAQ 0.6.1, black box), on the
-/// tuning set, with each frame quantized within its allowance (before the
-/// loops fitted each channel to the bits that takes, see
-/// [`quantize_channel`]), at 64.3 kbit/s as printed the mean was -3.154,
-/// at 64.9 kbit/s as noise has it -3.269, and at a constant 64 kbit/s
-/// -3.356.
+/// The reading as printed raises the allowance of every band by 3 dB at
+/// least (see [`raise_xmin`]), and the shift lowers it by 6.2 dB: over 6
+/// dB of the offset, the allowance of a band that masking governs rises by
+/// 1 - 3.2 / 6 dB for each dB, and that of a band the threshold in quiet
+/// governs by more. Over 3.2 dB or less it would not rise.
 ///
 /// [`StreamConfig::quiet_threshold`]: crate::stream::StreamConfig::quiet_threshold
-/// [`raise_xmin`]: crate::loops::raise_xmin
-/// [`quantize_channel`]: crate::loops::quantize_channel
 /// [`PRINTED_QUIET_BITS_PER_SAMPLE`]: crate::stream::PRINTED_QUIET_BITS_PER_SAMPLE
+/// [`raise_xmin`]: crate::loops::raise_xmin
+pub const BLENDED_QUIET_DB: std::ops::RangeInclusive<f64> = 3.1..=9.1;
+
+/// The noise offsets over which, at a variable or mean rate, the lower
+/// border of a pair's bands in intensity stereo falls from half the
+/// sampling frequency to Annex C's (see
+/// [`StreamConfig::intensity_border`]): those at which the tuning set of
+/// 51 tracks at 44.1 kHz in stereo takes 1.0 and 0.75 bits a sample, the
+/// rates between which, at constant rates, the limit of
+/// [`INTENSITY_BITS_PER_SAMPLE`] lies.
+///
+/// [`StreamConfig::intensity_border`]: crate::stream::StreamConfig::intensity_border
+/// [`INTENSITY_BITS_PER_SAMPLE`]: crate::stream::INTENSITY_BITS_PER_SAMPLE
+pub const INTENSITY_DB: std::ops::RangeInclusive<f64> = 3.8..=7.0;
+
+/// How far the noise offset of a variable or mean rate is lowered before it
+/// raises the allowed distortion where the model takes the threshold in
+/// quiet as printed, and by as much of it in dB as it takes it so where it
+/// takes it between the two (see [`BLENDED_QUIET_DB`]).
+///
+/// The threshold in quiet as printed, with the offset of clause C.7.4.4
+/// that the loops then add, allows far more noise in the bands it governs
+/// than the threshold as noise has it: the tuning set took 0.79 bits a
+/// sample with the threshold as printed at 0 dB, and 0.81 as noise has it
+/// at 6 dB. Lowered by this much, the offsets at which either reading
+/// takes a rate are about the same, and the rate falls with the offset at
+/// about the same pace through the blend as on either side of it.
 pub const PRINTED_QUIET_SHIFT_DB: f64 = 6.2;
 
 /// The fewest bits a frame takes at a variable or mean rate, as a share of
@@ -91,9 +106,10 @@ pub fn noise_factor(noise_offset_db: f64) -> f64 {
 
 /// The bits for each sample of each channel of the NCC that a stream
 /// coded within its allowance raised by `noise_offset_db` takes, about, by
-/// which the tools that pay only where bits are few are chosen at a
-/// variable rate; [`nominal_noise_offset_db`] is the inverse, from which a
-/// mean rate is first steered.
+/// which perceptual noise substitution is chosen at a variable rate, and
+/// its frames' least bits are set; [`nominal_noise_offset_db`] is the
+/// inverse, from which a mean rate is first steered, and which chooses its
+/// other tools.
 ///
 /// Measured with each offset of `NOMINAL` on the tuning set of 51 tracks
 /// of 9 kinds of music at 44.1 kHz in stereo: the mean of the tracks'
@@ -107,17 +123,17 @@ pub fn noise_factor(noise_offset_db: f64) -> f64 {
 /// [`INTENSITY_BITS_PER_SAMPLE`]); at a variable rate the bits of each
 /// frame follow its content, and keying the tools to them would turn them
 /// on and off from frame to frame, and with them the stereo image and the
-/// bandwidth. They are keyed instead to a nominal rate fixed for the
-/// stream, that which streams take on average at its offset. Graded with
-/// PEAQ (GstPEAQ 0.6.1, black box), on the tuning set, with each frame
-/// quantized within its allowance (before the loops fitted each channel to
-/// the bits that takes), intensity stereo so chosen at 6.5 dB gave a mean
-/// of -3.269 at 64.9 kbit/s, and -3.300 at 67.4 kbit/s without it, 45 of
-/// the 51 tracks better with it; for the threshold in quiet, see
-/// [`PRINTED_QUIET_SHIFT_DB`]. Perceptual noise substitution, which is
-/// asked for, was not graded so.
+/// bandwidth. They are keyed instead to the stream's offset, fixed for the
+/// stream, or to its nominal rate, that which streams take on average at
+/// the offset: intensity stereo and the reading of the threshold in quiet
+/// come in over ranges of the offset, so that the length falls with the
+/// offset without a break (see [`StreamConfig::intensity_border`] and
+/// [`StreamConfig::quiet_threshold`]); perceptual noise substitution, which
+/// is asked for, switches at a nominal rate, and was not graded so.
 ///
 /// [`INTENSITY_BITS_PER_SAMPLE`]: crate::stream::INTENSITY_BITS_PER_SAMPLE
+/// [`StreamConfig::quiet_threshold`]: crate::stream::StreamConfig::quiet_threshold
+/// [`StreamConfig::intensity_border`]: crate::stream::StreamConfig::intensity_border
 pub fn nominal_bits_per_sample(noise_offset_db: f64) -> f64 {
     let log = NOMINAL.map(|(offset, bits)| (offset, bits.ln()));
     interpolate(&log, noise_offset_db).exp()
@@ -134,17 +150,22 @@ pub fn nominal_noise_offset_db(bits_per_sample: f64) -> f64 {
 /// Pairs of a noise offset in dB and the bits a sample it takes (see
 /// [`nominal_bits_per_sample`]), the offset rising: the logarithm of the
 /// bits is taken to be linear between them, and beyond the ends.
-const NOMINAL: [(f64, f64); 10] = [
-    (-9.0, 2.379),
-    (-6.0, 2.040),
-    (-3.0, 1.713),
-    (0.0, 1.398),
-    (3.0, 1.093),
-    (6.0, 0.808),
+const NOMINAL: [(f64, f64); 15] = [
+    (-9.0, 2.373),
+    (-6.0, 2.036),
+    (-3.0, 1.710),
+    (0.0, 1.396),
+    (3.0, 1.091),
+    (3.8, 1.018),
+    (4.6, 0.947),
+    (5.4, 0.880),
+    (6.1, 0.814),
+    (7.0, 0.736),
+    (7.6, 0.698),
     (9.0, 0.614),
-    (12.0, 0.426),
-    (15.0, 0.257),
-    (18.0, 0.154),
+    (12.0, 0.428),
+    (15.0, 0.255),
+    (18.0, 0.153),
 ];
 
 /// `y` at `x` on the line through the pairs `points`, `x` rising: between
@@ -173,15 +194,24 @@ fn interpolate(points: &[(f64, f64)], x: f64) -> f64 {
 /// frames so far took beyond it spread over `REPAYMENT_FRAMES` frames.
 ///
 /// Within music, the frames so far keep within some 20 frames' bits of
-/// the mean. Frames that take few bits at any offset, of silence or of a
-/// quiet end, leave the stream short of it by what they could not take.
+/// the mean. The steering sets only the frames to come, and nothing makes
+/// up at the end for what the frames so far took beyond the mean or
+/// short of it. Frames that take few bits at any offset, of silence or of
+/// a quiet end, leave the stream short by what they could not take. The
+/// first frames are steered from the nominal rate's offset, which tells
+/// little of the content, and can run over or under: a stream of a few
+/// seconds can miss the mean by much more than a long one. One second of
+/// loud white noise in stereo at 44.1 kHz and 128 kbit/s took 133 kbit/s,
+/// and its first five frames 160 kbit/s; 168 kbit/s before the start was
+/// steered faster (see `START_MEMORY_FRAMES`).
+///
 /// On the tuning set of 51 tracks at 44.1 kHz in stereo, at means of 64,
-/// 128 and 192 kbit/s, the tracks were 2.2%, 2.0% and 2.0% short on
-/// average, 7.7% at most, the one ending in some 13 s of a quiet fade,
-/// and none was 0.1% over. Steered faster, forgetting over 100 frames and
-/// giving back over 250, they were 1.6% to 1.8% short, the offset varying
-/// within a track by 3.1 dB, a standard deviation, against 2.2 dB; slower,
-/// over 400 and 1000, 2.2% to 2.4% short, varying by 1.8 dB.
+/// 128 and 192 kbit/s, the tracks were 2.1%, 2.0% and 2.0% short on
+/// average, 7.7% at most, the one ending in some 13 s of a quiet fade, and
+/// none over. Steered faster, forgetting over 100 frames and giving back
+/// over 250, they were 1.6% to 1.8% short, the offset varying within a
+/// track by 3.1 dB, a standard deviation, against 2.2 dB; slower, over 400
+/// and 1000, 2.2% to 2.4% short, varying by 1.8 dB.
 #[derive(Clone, Debug)]
 pub struct MeanSteering {
     /// The bits of a frame at the mean.
@@ -189,6 +219,8 @@ pub struct MeanSteering {
     /// The bits the recent frames would have taken at 0 dB, a mean that
     /// forgets each frame over `MEMORY_FRAMES`.
     at_0_db: f64,
+    /// The frames taken so far.
+    frames: f64,
     /// The bits the frames so far took beyond the mean; below it if
     /// negative.
     excess: f64,
@@ -211,6 +243,14 @@ const MEMORY_FRAMES: f64 = 200.0;
 /// short of it, are given back.
 const REPAYMENT_FRAMES: f64 = 500.0;
 
+/// The frames, beyond those taken so far, over which the steering forgets
+/// a frame's bits and gives back what the frames took beyond the mean,
+/// where they are fewer than [`MEMORY_FRAMES`] and [`REPAYMENT_FRAMES`]: at
+/// the start of a stream, of which the nominal rate's offset tells little.
+/// The tuning set's means were as before, within 0.1%.
+const START_MEMORY_FRAMES: f64 = 8.0;
+const START_REPAYMENT_FRAMES: f64 = 40.0;
+
 /// The noise offsets a mean rate steers within.
 const OFFSETS_DB: std::ops::RangeInclusive<f64> = -30.0..=40.0;
 
@@ -225,6 +265,7 @@ impl MeanSteering {
         Self {
             mean,
             at_0_db: mean * (BITS_PER_DB * start_db).exp(),
+            frames: 0.0,
             excess: 0.0,
             noise_offset_db: start_db,
         }
@@ -239,9 +280,12 @@ impl MeanSteering {
     pub fn spend(&mut self, len: usize) {
         let bits = 8.0 * len as f64;
         let at_0_db = bits * (BITS_PER_DB * self.noise_offset_db).exp();
-        self.at_0_db += (at_0_db - self.at_0_db) / MEMORY_FRAMES;
+        self.frames += 1.0;
+        let memory = MEMORY_FRAMES.min(self.frames + START_MEMORY_FRAMES);
+        self.at_0_db += (at_0_db - self.at_0_db) / memory;
         self.excess += bits - self.mean;
-        let wanted = (self.mean - self.excess / REPAYMENT_FRAMES).max(self.mean / 4.0);
+        let repayment = REPAYMENT_FRAMES.min(self.frames + START_REPAYMENT_FRAMES);
+        let wanted = (self.mean - self.excess / repayment).max(self.mean / 4.0);
         let offset = (self.at_0_db / wanted).ln() / BITS_PER_DB;
         self.noise_offset_db = offset.clamp(*OFFSETS_DB.start(), *OFFSETS_DB.end());
     }

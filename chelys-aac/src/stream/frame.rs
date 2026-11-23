@@ -8,7 +8,6 @@ use chelys_core::bitstream::BitWriter;
 
 use super::{FRAME_SAMPLES, FrameSink, StreamConfig};
 use crate::adts;
-use crate::psychoacoustic::QuietThreshold;
 use crate::rate::{self, Control, MeanSteering};
 use crate::raw_data_block;
 use crate::raw_data_block::element::CodedElement;
@@ -26,8 +25,10 @@ pub enum FrameRate {
         max_frame_len: usize,
         noise_offset_db: f64,
         steering: Option<MeanSteering>,
-        /// How far the offset is lowered before it raises the allowance
-        /// (see [`rate::PRINTED_QUIET_SHIFT_DB`]).
+        /// How far the offset is lowered before it raises the allowance:
+        /// [`rate::PRINTED_QUIET_SHIFT_DB`], by the share of the way the
+        /// stream's reading of the threshold in quiet is toward the
+        /// threshold as printed.
         shift_db: f64,
         /// The fewest bits a frame is given (see [`Self::least_bits`]).
         least_bits: u32,
@@ -47,10 +48,7 @@ impl FrameRate {
         let mean_bits = u64::from(config.bits_per_second) * FRAME_SAMPLES as u64
             / u64::from(config.sampling_frequency.hz());
         let least_bits = (mean_bits as f64 * rate::LEAST_BITS_OF_THE_MEAN) as u32;
-        let shift_db = match config.quiet_threshold() {
-            QuietThreshold::Printed => rate::PRINTED_QUIET_SHIFT_DB,
-            QuietThreshold::Noise => 0.0,
-        };
+        let shift_db = rate::PRINTED_QUIET_SHIFT_DB * config.quiet_threshold().printed_share();
         Some(match config.control {
             Control::Constant => Self::Constant(reservoir),
             Control::Variable { noise_offset_db } => Self::Variable {

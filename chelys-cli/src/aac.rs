@@ -58,16 +58,17 @@ MP4 file instead, which tells a player the input's exact length.
                      LFE in more: 192 in 3 channels, 320 in 5.1, 448 in
                      7.1; or the highest the sample rate and channels
                      allow where that is lower)
-  --abr              keep --bitrate as the stream's mean, each frame as
-                     long as its content needs, which silence leaves short
-                     (default: a constant bitrate)
+  --abr              steer the stream toward --bitrate as its mean, each
+                     frame as long as its content needs: silence leaves it
+                     short, and a stream of a few seconds can miss the
+                     mean either way (default: a constant bitrate)
   --vbr              give each frame the bits at which the noise of every
                      band stays within what the psychoacoustic model
                      allows: about 123 kbit/s for music in stereo at
                      44.1 kHz
   --vbr-noise DB     with --vbr, allow each band this many dB more noise
                      than the model does, or less if negative: about 180
-                     kbit/s at -6 and 71 at 6 in stereo at 44.1 kHz
+                     kbit/s at -6 and 73 at 6 in stereo at 44.1 kHz
                      (default 0)
   --noise-substitution
                      code noise-like bands as the energy of noise that the

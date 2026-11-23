@@ -41,24 +41,35 @@ pub enum Rate {
     /// `10^(noise_offset_db / 10)`: above 0 it allows more noise and gives
     /// shorter frames, below 0 less. At 0 each band is allowed what Annex
     /// C's model allows it. At 44.1 kHz in stereo, music takes about 123
-    /// kbit/s at 0 dB, 180 at -6 dB and 71 at 6 dB.
+    /// kbit/s at 0 dB, 180 at -6 dB and 73 at 6 dB.
     ///
-    /// The tools chosen by the rate, intensity stereo, perceptual noise
-    /// substitution where it is asked for, and how the threshold in quiet
-    /// is read, are chosen as at the constant rate such streams take on
-    /// average at the offset, for the whole stream.
+    /// The tools chosen by the rate are chosen for the whole stream by the
+    /// offset. Perceptual noise substitution, where it is asked for, is
+    /// used as at the constant rate such streams take on average at the
+    /// offset. From 3.1 to 9.1 dB the threshold in quiet goes over from its
+    /// reading as noise to its reading as printed, which allows more noise
+    /// in the bands it governs, while the offset raises every band's
+    /// allowance less; and from 3.8 to 7 dB intensity stereo comes in, a band
+    /// at a time from the top. So a stream's length falls with the offset
+    /// without a break, but for steps of a few percent as a band's coding
+    /// changes; with perceptual noise substitution, it drops where that
+    /// comes in.
     ///
     /// In ADTS each header's `adts_buffer_fullness` is 0x7FF, which says
     /// that the stream is of variable rate (clause 8.1.3.2.2).
     Variable { noise_offset_db: f64 },
     /// A mean rate: a variable rate whose noise offset is steered, frame
-    /// by frame, so that the stream keeps `bits_per_second` on average,
-    /// ADTS headers and their CRC included. A frame's length follows its
-    /// content, as at a variable rate, and the stream's, over some ten
-    /// seconds, the rate; frames of silence, or of a quiet end, which take
-    /// few bits at any offset, leave it short by what they do not take. The
-    /// tools chosen by the rate are those of the constant rate
-    /// `bits_per_second`, which takes the same range.
+    /// by frame, toward keeping `bits_per_second` on average, ADTS headers
+    /// and their CRC included. A frame's length follows its content, as at
+    /// a variable rate, and the stream's, over some ten seconds, the rate.
+    /// The steering only sets the frames to come: frames of silence, or of
+    /// a quiet end, which take few bits at any offset, leave the stream
+    /// short by what they do not take, and its first frames, before the
+    /// steering has learnt what the content takes, can run over or under,
+    /// so that a stream of a few seconds can miss the mean by much more
+    /// than a long one. The tools chosen by the rate are those of the
+    /// variable rate whose nominal rate is `bits_per_second`, which takes
+    /// the range of a constant rate.
     Mean { bits_per_second: u32 },
 }
 

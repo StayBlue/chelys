@@ -1027,6 +1027,7 @@ impl ElementEncoder {
             &left.noise,
             [&mut left.spectrum, &mut right.spectrum],
             [&mut left.xmin, &mut right.xmin],
+            self.within_allowance,
         );
     }
 

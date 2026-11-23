@@ -11,7 +11,7 @@ use chelys_core::fft::Complex;
 
 use super::{
     Analysis, Block, BlockThreshold, MAX_PARTITIONS, Model, QuietThreshold, RPELEV_LONG,
-    RPELEV_SHORT, Tables,
+    RPELEV_SHORT, Tables, quiet_energies,
 };
 use crate::sampling_frequency::SamplingFrequency;
 use crate::scalefactor_bands::Transform;
@@ -44,6 +44,10 @@ pub struct MidSideModel {
     current: Box<Frame>,
     ahead: Box<Frame>,
     primed: bool,
+    /// The threshold in quiet of each partition of the long and the short
+    /// FFT, as the model reads it.
+    long_quiet: Vec<f64>,
+    short_quiet: Vec<f64>,
 }
 
 /// The middle and side channels of a frame, through step 10, with the
@@ -92,6 +96,8 @@ impl MidSideModel {
             current: frame(),
             ahead: frame(),
             primed: false,
+            long_quiet: quiet_energies(sampling_frequency, Transform::Long, quiet),
+            short_quiet: quiet_energies(sampling_frequency, Transform::Short, quiet),
         }
     }
 
@@ -117,6 +123,7 @@ impl MidSideModel {
                             &block.threshold,
                             nb_last,
                             RPELEV_LONG,
+                            &self.long_quiet,
                             &mut analysis.long,
                         );
                     }
@@ -129,6 +136,7 @@ impl MidSideModel {
                                 &block.threshold,
                                 nb_last,
                                 RPELEV_SHORT,
+                                &self.short_quiet,
                                 out,
                             );
                         }
