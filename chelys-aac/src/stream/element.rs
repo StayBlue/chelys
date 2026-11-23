@@ -255,8 +255,10 @@ pub struct ElementEncoder {
     /// loops raise `xmin` (see [`loops::raise_xmin`]).
     quiet: QuietThreshold,
     /// Whether the channels' lines are shaped by temporal noise shaping,
-    /// and the memory it works in.
+    /// whether in frames of short windows and the start and stop windows
+    /// around them too, and the memory it works in.
     tns: bool,
+    tns_around_attacks: bool,
     /// Whether the loops clip the lines of long windows where that saves
     /// bits (see [`ChannelCoding::spectrum_clipping`]).
     spectrum_clipping: bool,
@@ -353,6 +355,7 @@ impl ElementEncoder {
             noise_border,
             quiet,
             tns: true,
+            tns_around_attacks: false,
             spectrum_clipping: loops::SPECTRUM_CLIPPING,
             shaping: Shaping::default(),
             lineless: LinelessBits::default(),
@@ -374,6 +377,15 @@ impl ElementEncoder {
     #[cfg(any(test, feature = "unstable"))]
     pub fn without_tns(&mut self) {
         self.tns = false;
+    }
+
+    /// The element, but with temporal noise shaping in frames of short
+    /// windows and the start and stop windows around them too, as clause
+    /// C.5 shapes each window, for tests (see
+    /// [`temporal_noise_shaping`](Self::temporal_noise_shaping)).
+    #[cfg(any(test, feature = "unstable"))]
+    pub fn with_tns_around_attacks(&mut self) {
+        self.tns_around_attacks = true;
     }
 
     /// The element, but with the noise of a pair's bands that is to be the
@@ -609,7 +621,7 @@ impl ElementEncoder {
     /// which [`quantize`](Self::quantize) may yet drop.
     ///
     /// Spec reading: this deliberately departs from clause C.5, which
-    /// shapes every window whose prediction gain exceeds the threshold,
+    /// shapes each window whose prediction gain exceeds the threshold,
     /// for windows none of whose bands in the target range exceeds its
     /// allowed distortion (see [`Analysis::audible`]): their lines quantize
     /// to zero within their allowance, which leaves no noise to shape, and
@@ -633,6 +645,52 @@ impl ElementEncoder {
     /// `stereo_pairs_decode_each_channel_in_place` and
     /// `snr_rises_with_the_bitrate`).
     ///
+    /// Spec reading: this deliberately departs from clause C.5 (pages
+    /// 174-175), which encodes "on a window basis" and shapes each window
+    /// whose prediction gain exceeds the threshold, naming no kind of
+    /// window, short ones among them, for frames of eight short windows and
+    /// the start and stop windows around them, which are not shaped: there
+    /// block switching holds back the noise of an attack, and temporal noise
+    /// shaping added to the noise before it instead, in three ways.
+    ///
+    /// - A window's filter shapes its noise after the envelope of its lines,
+    ///   which the MDCT folds, each half of the window onto itself about its
+    ///   middle, so that the filter cannot tell the samples of a half before
+    ///   an attack from those after it. In a short window that holds an
+    ///   attack, it moves noise from the quieter half into the attack's
+    ///   half, whose samples before the attack take their share.
+    /// - The stop window after an attack in the last short window, whose
+    ///   first half folds about a point beside the attack, put the noise of
+    ///   the attack's body into its short slope, just before the attack.
+    /// - The filters of short windows grouped about an attack raised their
+    ///   noise 10 to 15 times, some by more than they lowered their lines,
+    ///   and the loops, which weigh it (see [`NoiseGains`]), spent the
+    ///   frame's bits on them.
+    ///
+    /// Against the power of the attack, the error over the 256 samples
+    /// before attacks after silence rose by 1.4 to 4.3 dB with the filters,
+    /// in clicks of decaying noise at 44.1 kHz and 48 and 96 kbit/s, 32 kHz
+    /// and 48 kbit/s and 48 kHz and 128 kbit/s; in pulse trains at 32 kHz
+    /// and 48 kbit/s it rose by 3.6 dB from 1024 to 128 samples before the
+    /// attacks, 4.8 dB over the 256 before them and 8 dB over the attacks.
+    /// Unshaped, the error is that without temporal noise shaping in every
+    /// such frame (the conformance test
+    /// `temporal_noise_shaping_holds_back_the_noise_before_attacks`). Graded
+    /// with PEAQ (GstPEAQ 0.6.1, black box), on 51 tracks of 9 kinds of
+    /// music at 44.1 kHz in stereo, the means went from -3.357, -1.074 and
+    /// -0.213 at 64, 128 and 192 kbit/s to -3.356, -1.072 and -0.211, no
+    /// kind of music lower by more than 0.001.
+    ///
+    /// Given up with the filters of short windows are the 8 to 14 dB by
+    /// which they lowered the error of the clicks from 1024 to 128 samples
+    /// before their attacks, moving it nearer them, and their coding gain
+    /// on clicks at the lowest rates, whose lines their prediction takes all
+    /// but whole: at 96 kHz and 32 kbit/s, a click alone in silence comes
+    /// back at 0.35 of its level, against 0.6 shaped (the conformance test
+    /// `a_click_after_a_louder_one_is_coded_with_short_windows`). The
+    /// filters of long windows alone, where nothing else holds back the
+    /// noise of an attack, are kept.
+    ///
     /// Spec gap: the decoder applies the right channel's filters to its
     /// bands in intensity stereo, after it has taken them from the left
     /// channel's lines as they were sent (clause 4, figure 2), which the
@@ -648,8 +706,13 @@ impl ElementEncoder {
             prepared.unshaped.copy_from_slice(&*prepared.spectrum);
             prepared.tns = Tns::NONE;
             let mut gains = NoiseGains::NONE;
-            if self.tns && shape && self.kind != ElementKind::Lfe {
-                let windows = prepared.windows;
+            let windows = prepared.windows;
+            let around_attack = windows.sequence != WindowSequence::OnlyLong;
+            if self.tns
+                && shape
+                && self.kind != ElementKind::Lfe
+                && (self.tns_around_attacks || !around_attack)
+            {
                 let bands = target_bands(fs, windows.sequence.transform(), top);
                 let analysis = channel.switching.current();
                 let active = analysis.audible(windows, &prepared.spectrum, bands);
@@ -1800,7 +1863,10 @@ mod tests {
     /// short, in one channel and in a pair, and the decoder's filters
     /// restore their lines; in a pair coded in intensity stereo, the
     /// filters stop below its first band in intensity stereo, and the
-    /// right channel's bands there keep their level.
+    /// right channel's bands there keep their level. Every window is shaped
+    /// as clause C.5 shapes it (see
+    /// [`with_tns_around_attacks`](ElementEncoder::with_tns_around_attacks)),
+    /// so that the filters of short windows are restored too.
     #[test]
     fn clicks_are_shaped_in_time_and_restored() {
         let fs = SamplingFrequency::Hz44100;
@@ -1823,8 +1889,15 @@ mod tests {
             ),
         ];
         for (i, (input, bits, border)) in cases.iter().enumerate() {
-            let mut frames = round_trip_with(fs, input, *bits, *border);
-            frames.extend(round_trip_switching(fs, input, *bits, *border, false));
+            let round_trip = |block_switching| {
+                let kind = kind(input.len());
+                let mut encoder =
+                    ElementEncoder::new(fs, kind, *border, None, QuietThreshold::Noise);
+                encoder.with_tns_around_attacks();
+                round_trip_encoder(encoder, input, *bits, block_switching)
+            };
+            let mut frames = round_trip(true);
+            frames.extend(round_trip(false));
             let (mut long, mut short) = (0, 0);
             for (f, (decoded, spectra)) in frames.iter().enumerate() {
                 for (c, (ics, decoded)) in

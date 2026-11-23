@@ -465,6 +465,18 @@ impl StreamEncoder {
         self
     }
 
+    /// The encoder, but with temporal noise shaping in frames of short
+    /// windows and the start and stop windows around them too, as clause
+    /// C.5 shapes each window, for tests (see `ElementEncoder`'s temporal
+    /// noise shaping).
+    #[cfg(any(test, feature = "unstable"))]
+    pub fn with_tns_around_attacks(mut self) -> Self {
+        for element in &mut self.elements {
+            element.with_tns_around_attacks();
+        }
+        self
+    }
+
     /// The encoder, but with spectrum clipping on or off, for comparing
     /// the two in tests.
     #[cfg(any(test, feature = "unstable"))]
@@ -1408,7 +1420,11 @@ mod tests {
                     *x += 0.9;
                 }
             }
-            let mut encoder = StreamEncoder::new(config).spectrum_clipping(clipping);
+            // The other channels' every window shaped, as clause C.5 shapes
+            // it, as the clicks leave them few frames of long windows alone.
+            let mut encoder = StreamEncoder::new(config)
+                .spectrum_clipping(clipping)
+                .with_tns_around_attacks();
             let (mut short, mut shaped, mut lfe_frames) = (false, false, 0);
             encoder.encode(&vec![input.as_slice(); channels], &mut |frame: &[u8]| {
                 let block = raw_data_block(frame, fs);

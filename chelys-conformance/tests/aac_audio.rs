@@ -1325,7 +1325,10 @@ fn shaped_share(elements: &[Element]) -> (f64, f64) {
 /// sampling frequency, in mono and stereo, and in pairs coded in intensity
 /// stereo, whose filters end below its first band in intensity stereo with
 /// a filter of order 0 above; ffmpeg decodes the filters' `tns_data()`
-/// without complaint.
+/// without complaint. The encoder shapes frames of short windows, and the
+/// start and stop windows around them, as clause C.5 shapes each window,
+/// which it does not do by default (see the encoder's temporal noise
+/// shaping), so that the filters of short windows are decoded too.
 ///
 /// This is the evidence for the reading of the standard that the encoder's
 /// filters of temporal noise shaping mark as settled by decoding with
@@ -1334,6 +1337,9 @@ fn shaped_share(elements: &[Element]) -> (f64, f64) {
 /// none of them.
 #[test]
 fn temporal_noise_shaping_decodes_in_place() {
+    use chelys::aac::internals::channel_configuration::ChannelConfiguration;
+    use chelys::aac::internals::{StreamConfig, StreamEncoder};
+
     let (mut long_shaped, mut short_shaped, mut cut_short) = (false, false, false);
     for sample_rate in [
         8_000, 16_000, 22_050, 32_000, 44_100, 48_000, 64_000, 96_000,
@@ -1360,8 +1366,25 @@ fn temporal_noise_shaping_decodes_in_place() {
                 let (min, max) = bitrate_range(sample_rate, channels);
                 let bits = bits_per_sample * f64::from(sample_rate) * channels as f64;
                 let bits_per_second = (bits as u32).clamp(min, max);
-                let encoded = encode(sample_rate, &input, bits_per_second);
-                let elements = elements(&encoded.stream, sample_rate);
+                let config = StreamConfig {
+                    sampling_frequency: SamplingFrequency::from_hz(sample_rate).unwrap(),
+                    channel_configuration: if channels == 1 {
+                        ChannelConfiguration::Mono
+                    } else {
+                        ChannelConfiguration::Stereo
+                    },
+                    bits_per_second,
+                    framing: chelys::aac::Framing::Adts,
+                    flags: Default::default(),
+                    crc_protected: false,
+                    noise_substitution: false,
+                };
+                let mut encoder = StreamEncoder::new(config).with_tns_around_attacks();
+                let mut stream = Vec::new();
+                let planar: Vec<&[f64]> = input.iter().map(Vec::as_slice).collect();
+                encoder.encode(&planar, &mut stream);
+                let end = encoder.finish(&mut stream);
+                let elements = elements(&stream, sample_rate);
                 let (long, short) = shaped_share(&elements);
                 // At 96 kHz the threshold of the prediction gain is raised
                 // to 6.1, as its frames last 10.7 ms (see the encoder's
@@ -1378,7 +1401,14 @@ fn temporal_noise_shaping_decodes_in_place() {
                 cut_short |= (elements.iter().flat_map(|e| &e.channels))
                     .filter_map(|ics| ics.tns.as_ref())
                     .any(|tns| tns[0].filters.len() == 2 && tns[0].filters[0].order == 0);
-                let output = decode(&encoded, channels, &context);
+                let decoded = ffmpeg::decode_aac(&stream);
+                assert_eq!(decoded.diagnostics, "", "{context}");
+                assert_eq!(
+                    decoded.samples.len() as u64,
+                    end.frames * 1024 * channels as u64,
+                    "{context}"
+                );
+                let output = decoded.samples;
                 // Coded in intensity stereo, a pair gives up some of each
                 // channel's waveform.
                 let (least_snr, least_level) = if bits_per_sample < 1.0 {
@@ -1419,38 +1449,133 @@ fn temporal_noise_shaping_decodes_in_place() {
     assert!(long_shaped && short_shaped && cut_short);
 }
 
-/// Temporal noise shaping holds back the quantization noise before the
-/// attacks of transient signals, which a long window spreads over its
-/// span: the error of the decoded output over the 1024 samples before each
-/// attack, short of the last 64, coded with long windows alone, is less
-/// with it than without, by 1.1 to 10.5 dB. Where the frames of the
-/// attacks are coded with short windows, which hold back most of the noise
-/// themselves (see `short_windows_hold_back_the_noise_before_an_attack`),
-/// the error is less too, by up to 8.9 dB, or about as much, 1.5 dB more
-/// at most.
+/// Transients after silence, each at `sample_rate` for `len` samples, with
+/// the samples at which its attacks set in: clicks of noise that die away
+/// within a few milliseconds, in silence; the train of pulses of
+/// [`transients`], whose syllables of 0.2 s each follow 0.2 s of silence;
+/// and the notes of its struck bar every 0.5 s, dying away 52 dB before the
+/// next. Before each attack, whatever the decoder gives but for the
+/// faint tail of a note is error.
+fn transients_after_silence(
+    sample_rate: u32,
+    len: usize,
+) -> [(&'static str, Vec<f64>, Vec<usize>); 3] {
+    let fs = f64::from(sample_rate);
+    let every = len / 7;
+    let onsets: Vec<usize> = (0..)
+        .map(|k| 2000 + k * (every + 97 * k))
+        .take_while(|&onset| onset < len)
+        .collect();
+    let decay = fs / 200.0;
+    let mut state = 5u64;
+    let clicks = (0..len)
+        .map(|t| {
+            state = (state.wrapping_mul(6_364_136_223_846_793_005))
+                .wrapping_add(1_442_695_040_888_963_407);
+            let noise = (state >> 11) as f64 / (1u64 << 53) as f64 - 0.5;
+            let burst = (onsets.iter())
+                .filter(|&&onset| onset <= t)
+                .map(|&onset| (-((t - onset) as f64) / decay).exp())
+                .sum::<f64>();
+            noise * burst
+        })
+        .collect();
+    let period = (fs / 120.0) as usize;
+    let syllable = (0.2 * fs) as usize;
+    let mut pulses = vec![0.0; len];
+    let mut pulse_onsets = Vec::new();
+    for start in (syllable..len).step_by(2 * syllable) {
+        pulse_onsets.push(start);
+        for pulse in (start..(start + syllable).min(len)).step_by(period) {
+            for (t, y) in pulses[pulse..(pulse + period).min(len)]
+                .iter_mut()
+                .enumerate()
+            {
+                let t = t as f64 / fs;
+                let ring = 0.5 * (TAU * 700.0 * t).sin() + 0.25 * (TAU * 2400.0 * t).sin();
+                *y += 0.6 * ring * (-t * 400.0).exp();
+            }
+        }
+    }
+    let note = (0.5 * fs) as usize;
+    let partials = [(1.0, 0.5), (2.76, 0.25), (5.4, 0.12)];
+    let mut bars = vec![0.0; len];
+    let mut bar_onsets = Vec::new();
+    for start in (note / 2..len).step_by(note) {
+        bar_onsets.push(start);
+        for (t, y) in bars[start..].iter_mut().enumerate() {
+            let t = t as f64 / fs;
+            let decay = (-t * 12.0).exp();
+            *y += (partials.iter())
+                .map(|&(ratio, level)| level * (TAU * 880.0 * ratio * t).sin())
+                .sum::<f64>()
+                * decay;
+        }
+    }
+    [
+        ("clicks", clicks, onsets),
+        ("pulses", pulses, pulse_onsets),
+        ("bars", bars, bar_onsets),
+    ]
+}
+
+/// The pre-echo of `output` before each of `onsets` of `input`, of which it
+/// is the decoding [`DELAY`] samples late: the power of the error from
+/// `from` to `to` samples before each attack, against that of the attack's
+/// first 256 samples, in dB.
+fn pre_echo(input: &[f64], output: &[f32], onsets: &[usize], from: usize, to: usize) -> f64 {
+    let error: f64 = (onsets.iter())
+        .flat_map(|&onset| onset - from..onset - to)
+        .map(|t| (f64::from(output[t + DELAY]) - input[t]).powi(2))
+        .sum();
+    let attack: f64 = (onsets.iter())
+        .flat_map(|&onset| onset..onset + 256)
+        .map(|t| input[t].powi(2))
+        .sum();
+    10.0 * (error / attack * 256.0 / (from - to) as f64).log10()
+}
+
+/// Temporal noise shaping holds back the noise of quantization before the
+/// attacks of transients after silence, where all that the decoder gives
+/// is that noise, and adds none before them: the pre-echo "far" from the
+/// attack, from 1024 to 128 samples before it, and "near" it, over the
+/// 256 before it, against the attack's power (see [`pre_echo`]), at 44.1
+/// kHz and 48 and 96 kbit/s, 32 kHz and 48 kbit/s, and 48 kHz and 128
+/// kbit/s, in mono, decoded with ffmpeg and FAAD2 alike.
 ///
-/// Since the encoder took the threshold in quiet as noise has it, and
-/// raised `xmin` by no offset, above 0.8 bits a sample (see
-/// `StreamConfig::quiet_threshold`), the loops spend more of a frame's bits
-/// on its higher bands, and the least of these gains fell. With long
-/// windows alone, the least fell from 3.0 dB to 1.1 dB, on the clicks at
-/// 44.1 kHz and 96 kbit/s, which had gained 5.0 dB: their error with
-/// temporal noise shaping rose from 0.74 to 1.82, while it stayed at 2.3
-/// without. The offset accounted for it: with 3 dB, it was 0.44. Coding
-/// long windows alone is a setting of this test only. As the encoder
-/// codes, with short windows at attacks, the same clicks' error fell from
-/// 0.054 to 0.050. Among the other signals and rates, the error with
-/// temporal noise shaping moved by -2.9 to +3.8 dB, the reading more than
-/// the offset; that of the pulses at 44.1 kHz and 96 kbit/s rose from
-/// 2.1e-4 to 4.1e-4, 1.45 dB more than without temporal noise shaping
-/// (2.9e-4). Over 51 tracks of music, the grades of PEAQ rose at these
-/// rates (see `StreamConfig::quiet_threshold`).
+/// Coded with long windows alone, temporal noise shaping is all that holds
+/// the noise back, a long window spreading it over 2048 samples: it lowers
+/// the far pre-echo of each signal at every rate, by 0.8 to 12.5 dB, 6.0,
+/// 4.0 and 4.6 dB on average over the rates for the clicks, pulses and
+/// bars, and the pre-echo over all 1024 samples before the attacks by 3.7,
+/// 2.4 and 2.7 dB. The near pre-echo, within the half of a window that
+/// holds the attack, it lowers by -0.9 to 4.2 dB: the MDCT folds each half
+/// of a window onto itself, so that its filter cannot tell the samples
+/// before the attack from those after it. Each signal is to gain 2 dB far
+/// and 1 dB over all on average, and none to lose far at any rate.
+///
+/// With block switching, as the encoder codes, short windows hold back the
+/// noise of the attacks, and the frames of short windows and the start and
+/// stop windows around them are not shaped (see the encoder's temporal
+/// noise shaping): no pre-echo, far or near, is to be more than 1 dB above
+/// that without temporal noise shaping. Shaped as clause C.5 shapes each
+/// window, the near pre-echo of the clicks rose by 1.4 to 4.3 dB, and the
+/// pre-echo of the pulses at 32 kHz by 3.6 dB far and 4.8 dB near.
 #[test]
 fn temporal_noise_shaping_holds_back_the_noise_before_attacks() {
     use chelys::aac::internals::channel_configuration::ChannelConfiguration;
     use chelys::aac::internals::{StreamConfig, StreamEncoder};
 
-    for (sample_rate, bits_per_second) in [(44_100, 48_000), (44_100, 96_000), (32_000, 48_000)] {
+    let rates = [
+        (44_100, 48_000),
+        (44_100, 96_000),
+        (32_000, 48_000),
+        (48_000, 128_000),
+    ];
+    // For each signal, the gains of temporal noise shaping with long windows
+    // alone, far and over all 1024 samples, at each rate and decoder.
+    let mut gains: [Vec<(f64, f64)>; 3] = Default::default();
+    for (sample_rate, bits_per_second) in rates {
         let config = StreamConfig {
             sampling_frequency: SamplingFrequency::from_hz(sample_rate).unwrap(),
             channel_configuration: ChannelConfiguration::Mono,
@@ -1461,11 +1586,17 @@ fn temporal_noise_shaping_holds_back_the_noise_before_attacks() {
             noise_substitution: false,
         };
         let len = 3 * sample_rate as usize;
-        for (name, input, onsets) in transients(sample_rate, len) {
+        for (s, (name, input, onsets)) in transients_after_silence(sample_rate, len)
+            .into_iter()
+            .enumerate()
+        {
+            let onsets: Vec<usize> = (onsets.into_iter())
+                .filter(|&onset| onset >= 2048 && onset + 256 <= len)
+                .collect();
             for switching in [false, true] {
                 let context =
                     format!("{name} at {sample_rate} Hz, {bits_per_second} bit/s, {switching}");
-                let pre_echo = |tns: bool| {
+                let decoded = |tns: bool| {
                     let mut encoder = StreamEncoder::new(config);
                     if !switching {
                         encoder = encoder.without_block_switching();
@@ -1476,24 +1607,53 @@ fn temporal_noise_shaping_holds_back_the_noise_before_attacks() {
                     let mut stream = Vec::new();
                     encoder.encode(&[&input], &mut stream);
                     let end = encoder.finish(&mut stream);
-                    let decoded = ffmpeg::decode_aac(&stream);
-                    assert_eq!(decoded.diagnostics, "", "{context}");
-                    assert_eq!(decoded.samples.len() as u64, end.frames * 1024);
-                    let output = decoded.samples;
-                    (onsets.iter())
-                        .filter(|&&onset| onset >= 1024)
-                        .flat_map(|&onset| onset - 1024..onset - 64)
-                        .map(|t| (f64::from(output[t + DELAY]) - input[t]).powi(2))
-                        .sum::<f64>()
+                    [ffmpeg::decode_aac(&stream), faad::decode_aac(&stream)].map(|decoded| {
+                        assert_eq!(decoded.diagnostics, "", "{context}");
+                        assert_eq!(decoded.samples.len() as u64, end.frames * 1024);
+                        decoded.samples
+                    })
                 };
-                let gain = 10.0 * (pre_echo(false) / pre_echo(true)).log10();
-                let least = if switching { -2.0 } else { 0.5 };
-                assert!(
-                    gain > least,
-                    "{context}: {gain:.1} dB less error before the attacks"
-                );
+                let (shaped, unshaped) = (decoded(true), decoded(false));
+                for (decoder, (shaped, unshaped)) in
+                    ["ffmpeg", "FAAD2"].iter().zip(shaped.iter().zip(&unshaped))
+                {
+                    let context = format!("{context}, {decoder}");
+                    let measure =
+                        |output: &[f32], from, to| pre_echo(&input, output, &onsets, from, to);
+                    let gain = |from, to| measure(unshaped, from, to) - measure(shaped, from, to);
+                    let (far, near, all) = (gain(1024, 128), gain(256, 0), gain(1024, 0));
+                    if switching {
+                        assert!(
+                            far > -1.0,
+                            "{context}: shaping lowers the far pre-echo by {far:.1} dB"
+                        );
+                        assert!(
+                            near > -1.0,
+                            "{context}: shaping lowers the near pre-echo by {near:.1} dB"
+                        );
+                    } else {
+                        assert!(
+                            far >= 0.0,
+                            "{context}: shaping lowers the far pre-echo by {far:.1} dB"
+                        );
+                        gains[s].push((far, all));
+                    }
+                }
             }
         }
+    }
+    for (name, gains) in ["clicks", "pulses", "bars"].iter().zip(&gains) {
+        let mean =
+            |f: fn(&(f64, f64)) -> f64| gains.iter().map(f).sum::<f64>() / gains.len() as f64;
+        let (far, all) = (mean(|g| g.0), mean(|g| g.1));
+        assert!(
+            far > 2.0,
+            "{name}: shaping lowers the far pre-echo by {far:.1} dB on average"
+        );
+        assert!(
+            all > 1.0,
+            "{name}: shaping lowers the pre-echo by {all:.1} dB on average"
+        );
     }
 }
 
@@ -1502,11 +1662,21 @@ fn temporal_noise_shaping_holds_back_the_noise_before_attacks() {
 /// and at 96 kHz and 32 kbit/s, and both come back in place, the second
 /// kept as well as the first: the perceptual entropy of the second's short
 /// block rises far above the block before it, though not above the first
-/// click's. At 96 kHz and 32 kbit/s, which code few bands, each comes back
-/// at about 0.6 of its level.
+/// click's. At 44.1 kHz each comes back at 0.96 of its level.
+///
+/// At 96 kHz and 32 kbit/s, a third of a bit for each sample, the lines of
+/// a click, as many at every frequency up to 48 kHz, are too many for the
+/// bits, and each comes back at about 0.35 of its level, the second at
+/// 0.31. Shaped by temporal noise shaping, whose prediction takes a click's
+/// lines all but whole (a prediction gain of 16 to 21), they came back at
+/// 0.6; but the encoder shapes no frame of short windows (see its temporal
+/// noise shaping), as there it added to the noise before attacks, and over
+/// 51 tracks of music it graded alike unshaped.
 #[test]
 fn a_click_after_a_louder_one_is_coded_with_short_windows() {
-    for (sample_rate, bits_per_second) in [(44_100, 48_000), (96_000, 32_000)] {
+    for (sample_rate, bits_per_second, least_kept) in
+        [(44_100, 48_000, 0.5), (96_000, 32_000, 0.25)]
+    {
         let context = format!("{sample_rate} Hz, {bits_per_second} bit/s");
         let clicks = [(2304, 0.85), (3072, 0.3)];
         let mut input = vec![0.0; 8192];
@@ -1530,7 +1700,7 @@ fn a_click_after_a_louder_one_is_coded_with_short_windows() {
             f64::from(output[onset + DELAY]) / level
         });
         assert!(
-            kept[0] > 0.5 && (kept[1] - kept[0]).abs() < 0.1,
+            kept[0] > least_kept && (kept[1] - kept[0]).abs() < 0.1,
             "{context}: {kept:?} of each click's level"
         );
     }
