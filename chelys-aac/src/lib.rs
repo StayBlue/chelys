@@ -29,6 +29,8 @@
 //!   is coded in its lowest lines;
 //! - a constant rate, with the bit reservoir (clause 8.2.3.2) lending
 //!   frames bits and keeping those they leave, and fill where it is full;
+//!   or a variable rate, each frame as short as keeps its noise within
+//!   what the model allows, raised by an offset, which a mean rate steers;
 //! - each frame in ADTS, with an optional CRC and the header's
 //!   `private_bit`, `original_copy` and `home` as asked, or as its
 //!   `raw_data_block()` alone, for a container that carries the
@@ -68,6 +70,7 @@ mod loops;
 mod noise_substitution;
 mod noiseless;
 mod psychoacoustic;
+mod rate;
 mod raw_data_block;
 mod reservoir;
 mod sampling_frequency;
@@ -109,6 +112,7 @@ pub mod internals {
         noise_substitution,
         noiseless,
         psychoacoustic,
+        rate,
         raw_data_block,
         reservoir,
         sampling_frequency,

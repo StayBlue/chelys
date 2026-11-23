@@ -9,6 +9,7 @@ use std::fmt;
 
 use super::adts::Flags;
 use super::channel_configuration::ChannelConfiguration;
+use super::rate::Control;
 use super::sampling_frequency::SamplingFrequency;
 use super::stream::StreamConfig;
 
@@ -19,7 +20,7 @@ pub const SAMPLE_RATES: [u32; 12] = [
 ];
 
 /// How the frames' lengths are chosen.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum Rate {
     /// A constant rate: frames as long as a channel of `bits_per_second`
@@ -27,6 +28,38 @@ pub enum Rate {
     /// (clause 8.2.3.2), and padded with fill where it is full. The rate
     /// counts every byte written, ADTS headers and their CRC included.
     Constant { bits_per_second: u32 },
+    /// A variable rate: each frame as long as it takes to keep the
+    /// quantization noise of every band within what the psychoacoustic
+    /// model allows it, raised by `noise_offset_db`, its channels then coded
+    /// by the iteration loops in those bits; but no shorter than a quarter
+    /// of a frame at the rate such streams take on average at the offset,
+    /// so that quiet passages that the model takes as inaudible are still
+    /// coded, and no longer than the decoder's input buffer, or than 4608
+    /// bytes in ADTS (see [`ConfigError::UnsupportedBitrate`]).
+    ///
+    /// The offset scales the noise each band is allowed by
+    /// `10^(noise_offset_db / 10)`: above 0 it allows more noise and gives
+    /// shorter frames, below 0 less. At 0 each band is allowed what Annex
+    /// C's model allows it. At 44.1 kHz in stereo, music takes about 123
+    /// kbit/s at 0 dB, 180 at -6 dB and 71 at 6 dB.
+    ///
+    /// The tools chosen by the rate, intensity stereo, perceptual noise
+    /// substitution where it is asked for, and how the threshold in quiet
+    /// is read, are chosen as at the constant rate such streams take on
+    /// average at the offset, for the whole stream.
+    ///
+    /// In ADTS each header's `adts_buffer_fullness` is 0x7FF, which says
+    /// that the stream is of variable rate (clause 8.1.3.2.2).
+    Variable { noise_offset_db: f64 },
+    /// A mean rate: a variable rate whose noise offset is steered, frame
+    /// by frame, so that the stream keeps `bits_per_second` on average,
+    /// ADTS headers and their CRC included. A frame's length follows its
+    /// content, as at a variable rate, and the stream's, over some ten
+    /// seconds, the rate; frames of silence, or of a quiet end, which take
+    /// few bits at any offset, leave it short by what they do not take. The
+    /// tools chosen by the rate are those of the constant rate
+    /// `bits_per_second`, which takes the same range.
+    Mean { bits_per_second: u32 },
 }
 
 impl Rate {
@@ -37,6 +70,7 @@ impl Rate {
     pub fn is_constant(self) -> bool {
         match self {
             Self::Constant { .. } => true,
+            Self::Variable { .. } | Self::Mean { .. } => false,
         }
     }
 }
@@ -58,7 +92,7 @@ pub enum Framing {
 
 /// What to encode, and how: the sample rate, channels and rate, and options
 /// set by the methods that take and return it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Config {
     sample_rate: u32,
     channels: usize,
@@ -178,7 +212,8 @@ impl Config {
     ///
     /// It is used at rates of up to 1.3 bits for each sample of each
     /// channel but the LFE, about 115 kbit/s in stereo at 44.1 kHz, above
-    /// which it costs more than it saves.
+    /// which it costs more than it saves; at a variable rate, where the
+    /// rate it is taken as is (see [`Rate::Variable`]).
     ///
     /// Perceptual noise substitution is a tool of MPEG-4 AAC, which MPEG-2
     /// AAC does not have: where it is used, each ADTS header says that the
@@ -227,7 +262,9 @@ impl Config {
     /// more for the elements' fields: 16 bits an element, 24 from 255
     /// bytes, and an element for each 510. A frame with less data queued
     /// keeps the rest for audio. At most as many as the rate brings each
-    /// frame beyond the shortest.
+    /// frame beyond the shortest: at a mean rate, its mean, and at a
+    /// variable rate, the rate it is taken as for the tools it chooses (see
+    /// [`Rate::Variable`]).
     ///
     /// The elements carry one data stream, with the `element_instance_tag`
     /// 0, its bytes unaligned (`data_byte_align_flag` 0). A decoder ignores
@@ -270,16 +307,31 @@ impl Config {
         if self.framing == Framing::Raw && (self.crc || self.flags != Flags::default()) {
             return Err(ConfigError::AdtsOnly);
         }
-        let Rate::Constant { bits_per_second } = self.rate;
-        let config = StreamConfig {
+        let mut config = StreamConfig {
             sampling_frequency,
             channel_configuration,
-            bits_per_second,
+            bits_per_second: 0,
+            control: Control::Constant,
             framing: self.framing,
             flags: self.flags,
             crc_protected: self.crc,
             noise_substitution: self.noise_substitution,
         };
+        let bits_per_second = match self.rate {
+            Rate::Constant { bits_per_second } => bits_per_second,
+            Rate::Variable { noise_offset_db } => {
+                if !noise_offset_db.is_finite() {
+                    return Err(ConfigError::NoiseOffset { noise_offset_db });
+                }
+                config.control = Control::Variable { noise_offset_db };
+                config.nominal_bits_per_second(noise_offset_db)
+            }
+            Rate::Mean { bits_per_second } => {
+                config.control = Control::Mean;
+                bits_per_second
+            }
+        };
+        config.bits_per_second = bits_per_second;
         if !config.is_valid() {
             return Err(ConfigError::UnsupportedBitrate {
                 bits_per_second,
@@ -299,7 +351,7 @@ impl Config {
 }
 
 /// Why a [`Config`] cannot be encoded.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum ConfigError {
     /// The sample rate is not one of [`SAMPLE_RATES`].
@@ -324,6 +376,8 @@ pub enum ConfigError {
     /// More bytes of data streams a frame were asked for than the rate
     /// brings each frame beyond the shortest, `max`.
     DataStreamTooLong { bytes_per_frame: usize, max: usize },
+    /// The noise offset of [`Rate::Variable`] is not a finite number.
+    NoiseOffset { noise_offset_db: f64 },
 }
 
 impl fmt::Display for ConfigError {
@@ -355,6 +409,12 @@ impl fmt::Display for ConfigError {
                 "{bytes_per_frame} bytes of data streams a frame exceed the {max} the bitrate \
                  brings each frame beyond the shortest"
             ),
+            Self::NoiseOffset { noise_offset_db } => {
+                write!(
+                    f,
+                    "the noise offset is not a finite number: {noise_offset_db}"
+                )
+            }
         }
     }
 }

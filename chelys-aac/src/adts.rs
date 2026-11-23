@@ -68,7 +68,9 @@ impl Header {
     }
 
     /// Writes the header of an `adts_frame()` of `frame_len` bytes, headers
-    /// included, with `buffer_fullness` as `adts_buffer_fullness`.
+    /// included, with `buffer_fullness` as `adts_buffer_fullness`: the
+    /// state of the bit reservoir, or 0x7FF in a stream of variable rate
+    /// (clause 8.1.3.2.2).
     ///
     /// The frame holds one `raw_data_block()`
     /// (`number_of_raw_data_blocks_in_frame` 0), which follows the
@@ -79,7 +81,10 @@ impl Header {
             (HEADER_LEN..=MAX_FRAME_LEN).contains(&frame_len),
             "an ADTS frame of {frame_len} bytes"
         );
-        debug_assert!(buffer_fullness < 0x7FF, "buffer fullness {buffer_fullness}");
+        debug_assert!(
+            buffer_fullness <= 0x7FF,
+            "buffer fullness {buffer_fullness}"
+        );
         // The copyright identification is not offered (see below).
         // adts_fixed_header()
         w.write(0xFFF, 12); // syncword
@@ -249,6 +254,7 @@ mod tests {
     #[test]
     fn each_frame_protects_the_bits_its_elements_start_with() {
         use crate::config::Framing;
+        use crate::rate::Control;
         use crate::raw_data_block::decoder::{adts_frame, raw_data_block};
         use crate::stream::{StreamConfig, StreamEncoder};
 
@@ -273,6 +279,7 @@ mod tests {
                 sampling_frequency: fs,
                 channel_configuration,
                 bits_per_second,
+                control: Control::Constant,
                 framing: Framing::Adts,
                 flags: Flags::default(),
                 crc_protected: true,
@@ -432,6 +439,7 @@ mod tests {
     #[test]
     fn a_second_stream_from_before_bit_64_is_protected_again_for_128_bits() {
         use crate::config::Framing;
+        use crate::rate::Control;
         use crate::raw_data_block::decoder::{adts_frame, raw_data_block};
         use crate::stream::{StreamConfig, StreamEncoder};
 
@@ -444,6 +452,7 @@ mod tests {
             sampling_frequency: fs,
             channel_configuration: ChannelConfiguration::Stereo,
             bits_per_second: 320_000,
+            control: Control::Constant,
             framing: Framing::Adts,
             flags: Flags::default(),
             crc_protected: true,

@@ -5,6 +5,7 @@
 //! channel's lines to the bits available, and the outer loop around it,
 //! which shapes the quantization noise with scalefactors.
 
+pub mod allowance;
 pub mod inner;
 pub mod outer;
 
@@ -116,6 +117,10 @@ pub struct ChannelCoding<'a> {
     /// Whether the lines of a long window are clipped where that saves
     /// bits (see [`clipping`](crate::noiseless::clipping)).
     pub spectrum_clipping: bool,
+    /// Whether the channel is fitted to the bits it takes within its
+    /// allowance, as at a variable rate, rather than to `available_bits`,
+    /// where those are fewer (see [`allowance::within_allowance`]).
+    pub within_allowance: bool,
 }
 
 impl<'a> ChannelCoding<'a> {
@@ -139,6 +144,7 @@ impl<'a> ChannelCoding<'a> {
             noise: None,
             tns,
             spectrum_clipping: SPECTRUM_CLIPPING,
+            within_allowance: false,
         }
     }
 
@@ -158,8 +164,10 @@ impl<'a> ChannelCoding<'a> {
 /// each scalefactor band of each window group, each line's error weighed
 /// by `weights` (see [`Lines::weighted`]), shaped to its allowed
 /// distortion `xmin`, raised by [`XMIN_OFFSET_DB`] (see [`raise_xmin`] and
-/// [`outer::outer_loop`]). Gives the channel and how far its noise exceeds
-/// that allowance (see [`outer::excess`]).
+/// [`outer::outer_loop`]). Where `coding` asks for the channel within its
+/// allowance, as at a variable rate, the bits it fits are those that its
+/// bands take within their allowed distortion, if they fit those
+/// available (see [`allowance::within_allowance`]).
 ///
 /// The bits the channel leaves unused (figure C.6) are not counted here:
 /// the frame's length, spent from the bit reservoir, leaves them there.
@@ -168,23 +176,16 @@ impl<'a> ChannelCoding<'a> {
 ///
 /// If not even a channel without lines fits in the available bits: a
 /// caller's error.
-pub fn quantize(
-    spectrum: &[f64; FRAME_LINES],
-    weights: &[f64; FRAME_LINES],
-    xmin: &[[f64; MAX_BANDS]],
-    coding: ChannelCoding<'_>,
-) -> (CodedChannel, f64) {
-    let counting = Counting::new(Lines::weighted(spectrum, weights), coding);
-    outer::outer_loop(counting, xmin)
-}
-
-/// [`quantize`] for a `single_channel_element()`'s channel, without its
-/// excess.
 pub fn quantize_channel(
     spectrum: &[f64; FRAME_LINES],
     weights: &[f64; FRAME_LINES],
     xmin: &[[f64; MAX_BANDS]],
     coding: ChannelCoding<'_>,
 ) -> CodedChannel {
-    quantize(spectrum, weights, xmin, coding).0
+    let mut counting = Counting::new(Lines::weighted(spectrum, weights), coding);
+    if coding.within_allowance && allowance::within_allowance(&mut counting, xmin).is_some() {
+        let bits = counting.counted_bits();
+        counting.refit(bits);
+    }
+    outer::outer_loop(counting, xmin).0
 }

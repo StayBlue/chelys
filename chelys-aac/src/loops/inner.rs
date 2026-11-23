@@ -165,6 +165,26 @@ impl<'a> Lines<'a> {
         self.start
     }
 
+    /// The coarsest step at which the distortion of the lines `range`, one
+    /// scalefactor band's, is within `allowed`, or `None` where they can
+    /// quantize to zero within it, as [`band_bits`] searches it.
+    pub fn coarsest_step(&self, range: Range<usize>, allowed: f64) -> Option<u8> {
+        coarsest_step(
+            &self.scaled[range.clone()],
+            &self.spectrum[range.clone()],
+            &self.weights[range],
+            allowed,
+        )
+    }
+
+    /// The finest step at which every line of `range` quantizes to zero:
+    /// at which `int(x * 2^(-3/16 * (sf_decoder - SF_OFFSET)) +
+    /// MAGIC_NUMBER)` is 0 for the largest power of 3/4 `x` of its lines, or
+    /// the largest `global_gain` if none is.
+    pub fn zero_step(&self, range: Range<usize>) -> u8 {
+        zero_step(self.scaled[range].iter().fold(0.0f64, |a, &x| a.max(x)))
+    }
+
     /// Quantizes the lines `range` with the step of the scalefactor
     /// `sf_decoder` (clause C.7.4.5, `quantize_spectrum`) into `x_quant`,
     /// carrying the sign of each line.
@@ -220,22 +240,31 @@ impl<'a> Lines<'a> {
 /// distortion to grow with the step; where even the smallest exceeds
 /// `allowed`, it is taken.
 pub fn band_bits(lines: &[f64], weights: &[f64], allowed: f64, scratch: &mut BandScratch) -> u32 {
-    let energy: f64 = lines.iter().zip(weights).map(|(x, w)| x * x * w).sum();
-    if energy <= allowed {
-        return 0;
-    }
     let scaled = &mut scratch.scaled[..lines.len()];
     for (scaled, &x) in scaled.iter_mut().zip(lines) {
         *scaled = power_three_quarters(x);
     }
-    let scaled = &*scaled;
-    let x_quant = &mut scratch.x_quant[..lines.len()];
-    let quantize = |sf_decoder: u8, x_quant: &mut [i32]| {
-        let scale = step_scale(sf_decoder);
-        for ((q, &scaled), &x) in x_quant.iter_mut().zip(scaled).zip(lines) {
-            *q = signed((scaled * scale + MAGIC_NUMBER).min(BEYOND_MAGNITUDE), x);
-        }
+    let Some(step) = coarsest_step(scaled, lines, weights, allowed) else {
+        return 0;
     };
+    let scale = step_scale(step);
+    let x_quant = &mut scratch.x_quant[..lines.len()];
+    for ((q, &scaled), &x) in x_quant.iter_mut().zip(&*scaled).zip(lines) {
+        *q = signed((scaled * scale + MAGIC_NUMBER).min(BEYOND_MAGNITUDE), x);
+    }
+    spectrum::least_bits(x_quant).unwrap_or(u32::MAX / 8)
+}
+
+/// The coarsest step, as the `sf_decoder` of a band, at which the
+/// distortion of `lines`, one scalefactor band's, whose powers of 3/4 are
+/// `scaled`, is within `allowed`, each line's error weighed by `weights`;
+/// `None` where their energy so weighed is within it, as they can quantize
+/// to zero. See [`band_bits`] for the search.
+fn coarsest_step(scaled: &[f64], lines: &[f64], weights: &[f64], allowed: f64) -> Option<u8> {
+    let energy: f64 = lines.iter().zip(weights).map(|(x, w)| x * x * w).sum();
+    if energy <= allowed {
+        return None;
+    }
     let largest = scaled.iter().fold(0.0f64, |a, &x| a.max(x));
     // Whether the distortion of the lines quantized with the step of
     // `sf_decoder` is within `allowed`, from their magnitudes alone. Where
@@ -271,8 +300,29 @@ pub fn band_bits(lines: &[f64], weights: &[f64], allowed: f64, scratch: &mut Ban
             }
         }
     }
-    quantize(fits, x_quant);
-    spectrum::least_bits(x_quant).unwrap_or(u32::MAX / 8)
+    Some(fits)
+}
+
+/// The finest step, as the `sf_decoder` of a band, at which every line of
+/// a band whose largest power of 3/4 is `largest` quantizes to zero: where
+/// `int(largest * 2^(-3/16 * (sf_decoder - SF_OFFSET)) + MAGIC_NUMBER)` is
+/// 0, or the largest `global_gain` if none is.
+fn zero_step(largest: f64) -> u8 {
+    if largest == 0.0 {
+        return 0;
+    }
+    let zero = |sf_decoder: u8| {
+        truncate((largest * step_scale(sf_decoder) + MAGIC_NUMBER).min(BEYOND_MAGNITUDE)) == 0
+    };
+    let estimate = 16.0 / 3.0 * (largest / (1.0 - MAGIC_NUMBER)).log2() + f64::from(SF_OFFSET);
+    let mut step = estimate.floor().clamp(0.0, 255.0) as u8;
+    while step > 0 && zero(step - 1) {
+        step -= 1;
+    }
+    while step < u8::MAX && !zero(step) {
+        step += 1;
+    }
+    step
 }
 
 /// The memory [`band_bits`] works in, for the lines of any band.
@@ -352,6 +402,9 @@ pub struct Counting<'a> {
     /// `sf_decoder` above hold.
     fitted_at: Option<(u8, usize)>,
     fitted_scalefactors: Vec<[u8; MAX_BANDS]>,
+    /// The bits of the coding counted last, where it was counted to the
+    /// end (see [`Self::counted_bits`]).
+    counted_bits: u32,
 }
 
 impl<'a> Counting<'a> {
@@ -375,6 +428,7 @@ impl<'a> Counting<'a> {
             pulses: Pulses::NONE,
             sf_decoder: vec![Vec::with_capacity(MAX_BANDS); groups],
             fitted_at: None,
+            counted_bits: 0,
             fitted_scalefactors: vec![[0; MAX_BANDS]; groups],
         }
     }
@@ -564,14 +618,31 @@ impl<'a> Counting<'a> {
         let noiseless: u32 = (self.sections.iter())
             .map(|s| s.section_data_bits() + s.spectral_data_bits())
             .sum();
-        channel::bits(
+        self.counted_bits = channel::bits(
             windows,
             common_window,
             &self.pulses,
             tns,
             noiseless + scalefactor_bits,
-        ) + element_bits
-            <= available_bits
+        ) + element_bits;
+        self.counted_bits <= available_bits
+    }
+
+    /// The bits the coding counted last takes, with those its coding adds
+    /// to its element (see [`ChannelCoding::element_bits`]), where it was
+    /// counted to the end.
+    pub fn counted_bits(&self) -> u32 {
+        self.counted_bits
+    }
+
+    /// Makes `available_bits` the bits the channel is to fit, every
+    /// scalefactor 0, as before the loops.
+    pub fn refit(&mut self, available_bits: u32) {
+        self.coding.available_bits = available_bits;
+        for scalefactors in &mut self.scalefactors {
+            scalefactors.fill(0);
+        }
+        self.fitted_at = None;
     }
 
     /// `global_gain` for the sections and scalefactors counted last: the

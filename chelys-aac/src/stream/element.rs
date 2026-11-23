@@ -127,13 +127,13 @@ impl PreparedChannel {
     /// The channel's allowed distortions, perceptual entropy and
     /// `bit_allocation`, from its lines before temporal noise shaping and
     /// `analysis`, its model's thresholds.
-    fn thresholds(&mut self, analysis: &Analysis, quiet: QuietThreshold) {
+    fn thresholds(&mut self, analysis: &Analysis, allowance: Allowance) {
         (self.bit_allocation, self.perceptual_entropy) = thresholds(
             analysis,
             self.windows,
             &self.unshaped,
             &mut self.xmin,
-            quiet,
+            allowance,
         );
     }
 }
@@ -175,25 +175,43 @@ impl MidSideChannel {
     /// The channel's allowed distortions, perceptual entropy and
     /// `bit_allocation` in `windows`, from its lines before temporal noise
     /// shaping and `analysis`, its model's thresholds.
-    fn thresholds(&mut self, windows: Windows, analysis: &Analysis, quiet: QuietThreshold) {
+    fn thresholds(&mut self, windows: Windows, analysis: &Analysis, allowance: Allowance) {
         (self.bit_allocation, self.perceptual_entropy) =
-            thresholds(analysis, windows, &self.unshaped, &mut self.xmin, quiet);
+            thresholds(analysis, windows, &self.unshaped, &mut self.xmin, allowance);
     }
+}
+
+/// How far the allowed distortion of each band is raised before the
+/// loops take it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Allowance {
+    /// How the model reads the threshold in quiet, which sets how far the
+    /// loops raise `xmin` (see [`loops::raise_xmin`]).
+    quiet: QuietThreshold,
+    /// The factor of a variable or mean rate's noise offset, 1 at a
+    /// constant rate (see [`Rate::Variable`](crate::Rate::Variable)).
+    noise_factor: f64,
 }
 
 /// From a channel's lines `unshaped` of `windows`, before temporal noise
 /// shaping, and `analysis`, its model's thresholds: the allowed distortion
-/// of each band of each window group, raised as the loops take it, in
-/// `xmin`, and the channel's `bit_allocation` and perceptual entropy.
+/// of each band of each window group, raised as the loops take it and by
+/// the rate's noise factor, in `xmin`, and the channel's `bit_allocation`
+/// and perceptual entropy.
 fn thresholds(
     analysis: &Analysis,
     windows: Windows,
     unshaped: &[f64; FRAME_LINES],
     xmin: &mut Vec<[f64; MAX_BANDS]>,
-    quiet: QuietThreshold,
+    allowance: Allowance,
 ) -> (f64, f64) {
     analysis.xmin(windows, unshaped, xmin);
-    loops::raise_xmin(xmin, quiet);
+    loops::raise_xmin(xmin, allowance.quiet);
+    if allowance.noise_factor != 1.0 {
+        for xmin in xmin.iter_mut().flatten() {
+            *xmin *= allowance.noise_factor;
+        }
+    }
     (
         analysis.bit_allocation(windows.sequence),
         analysis.perceptual_entropy(windows.sequence),
@@ -254,6 +272,12 @@ pub struct ElementEncoder {
     /// How the models read the threshold in quiet, and with it how far the
     /// loops raise `xmin` (see [`loops::raise_xmin`]).
     quiet: QuietThreshold,
+    /// Whether each channel is quantized within its allowance, as at a
+    /// variable or mean rate (see [`ChannelCoding::within_allowance`]).
+    within_allowance: bool,
+    /// The factor by which each allowed distortion is raised, that of a
+    /// variable or mean rate's noise offset; 1 at a constant rate.
+    noise_factor: f64,
     /// Whether the channels' lines are shaped by temporal noise shaping,
     /// whether in frames of short windows and the start and stop windows
     /// around them too, and the memory it works in.
@@ -322,13 +346,16 @@ impl ElementEncoder {
     /// The element `kind` at `sampling_frequency`, a pair coded in
     /// intensity stereo above `intensity_border` Hz, if given, and its
     /// channels by perceptual noise substitution above `noise_border` Hz,
-    /// if given, whose models read the threshold in quiet as `quiet` asks.
+    /// if given, whose models read the threshold in quiet as `quiet` asks,
+    /// and whose channels are quantized within their allowance if
+    /// `within_allowance` is set.
     pub fn new(
         sampling_frequency: SamplingFrequency,
         kind: ElementKind,
         intensity_border: Option<f64>,
         noise_border: Option<f64>,
         quiet: QuietThreshold,
+        within_allowance: bool,
     ) -> Self {
         let channels = kind.channels();
         Self {
@@ -354,6 +381,8 @@ impl ElementEncoder {
             noise_ms_used: [0; SHORT_WINDOWS],
             noise_border,
             quiet,
+            within_allowance,
+            noise_factor: 1.0,
             tns: true,
             tns_around_attacks: false,
             spectrum_clipping: loops::SPECTRUM_CLIPPING,
@@ -402,6 +431,20 @@ impl ElementEncoder {
     #[cfg(any(test, feature = "unstable"))]
     pub fn spectrum_clipping(&mut self, on: bool) {
         self.spectrum_clipping = on;
+    }
+
+    /// Raises each band's allowed distortion by `factor`, that of a
+    /// variable or mean rate's noise offset, in the frames prepared from now
+    /// on.
+    pub fn set_noise_factor(&mut self, factor: f64) {
+        self.noise_factor = factor;
+    }
+
+    /// Has the channels of the frames quantized from now on quantized
+    /// within their allowance, or fitted to their bits (see
+    /// [`ChannelCoding::within_allowance`]).
+    pub fn set_within_allowance(&mut self, on: bool) {
+        self.within_allowance = on;
     }
 
     /// Appends the next samples of each channel.
@@ -745,8 +788,18 @@ impl ElementEncoder {
     /// decoder restores them, through its filters, rather than weighing
     /// them, graded -1.200 and took half as long again to encode.
     fn thresholds(&mut self) {
+        let allowance = self.allowance();
         for (channel, prepared) in self.channels.iter().zip(&mut self.prepared) {
-            prepared.thresholds(channel.switching.current(), self.quiet);
+            prepared.thresholds(channel.switching.current(), allowance);
+        }
+    }
+
+    /// How far the allowed distortion of each band of the frame being coded
+    /// is raised.
+    fn allowance(&self) -> Allowance {
+        Allowance {
+            quiet: self.quiet,
+            noise_factor: self.noise_factor,
         }
     }
 
@@ -996,6 +1049,7 @@ impl ElementEncoder {
     /// those of the left and right channels.
     fn middle_side_bands(&mut self) {
         let fs = self.sampling_frequency;
+        let allowance = self.allowance();
         let Some(mid_side) = &mut self.mid_side else {
             unreachable!("a pair")
         };
@@ -1023,7 +1077,7 @@ impl ElementEncoder {
         }
         let analyses = mid_side.model.current(windows.sequence.transform());
         for (channel, analysis) in [&mut *mid, &mut *side].into_iter().zip(analyses) {
-            channel.thresholds(windows, analysis, self.quiet);
+            channel.thresholds(windows, analysis, allowance);
         }
         self.ms = middle_side::choose(
             windows,
@@ -1469,6 +1523,7 @@ impl ElementEncoder {
         } else {
             let coding = ChannelCoding {
                 spectrum_clipping: self.spectrum_clipping,
+                within_allowance: self.within_allowance,
                 noise: prepared.noise.is_present().then_some(&prepared.noise),
                 ..coding
             };
@@ -1621,6 +1676,7 @@ mod tests {
             intensity_border,
             None,
             QuietThreshold::Noise,
+            false,
         );
         round_trip_encoder(encoder, input, bits, block_switching)
     }
@@ -1769,8 +1825,14 @@ mod tests {
         let pair = [clicks(5), clicks(6)];
         let (mut pulses, mut short) = (0, 0);
         for (input, bits) in [(&pair[..1], 500), (&pair[..1], 1500), (&pair[..], 3000)] {
-            let mut encoder =
-                ElementEncoder::new(fs, kind(input.len()), None, None, QuietThreshold::Noise);
+            let mut encoder = ElementEncoder::new(
+                fs,
+                kind(input.len()),
+                None,
+                None,
+                QuietThreshold::Noise,
+                false,
+            );
             encoder.spectrum_clipping(true);
             // round_trip_encoder checks the bits and decodes each frame.
             for (element, _) in round_trip_encoder(encoder, input, bits, true) {
@@ -1892,7 +1954,7 @@ mod tests {
             let round_trip = |block_switching| {
                 let kind = kind(input.len());
                 let mut encoder =
-                    ElementEncoder::new(fs, kind, *border, None, QuietThreshold::Noise);
+                    ElementEncoder::new(fs, kind, *border, None, QuietThreshold::Noise, false);
                 encoder.with_tns_around_attacks();
                 round_trip_encoder(encoder, input, *bits, block_switching)
             };
@@ -1990,8 +2052,14 @@ mod tests {
         // The bits of each frame's element at 23 kbit/s, less the header,
         // id_syn_ele and ID_END.
         let bits = 23_000 * 1024 / 64_000 - 56 - 6;
-        let mut encoder =
-            ElementEncoder::new(fs, ElementKind::Pair, None, None, QuietThreshold::Noise);
+        let mut encoder = ElementEncoder::new(
+            fs,
+            ElementKind::Pair,
+            None,
+            None,
+            QuietThreshold::Noise,
+            false,
+        );
         let channels: Vec<&[f64]> = input.iter().map(Vec::as_slice).collect();
         encoder.push(&channels);
         encoder.prime();
@@ -2048,6 +2116,7 @@ mod tests {
             None,
             Some(noise_substitution::BORDER_HZ),
             QuietThreshold::Noise,
+            false,
         );
         let frames = round_trip_encoder(encoder, &input, 1500, true);
         let first = first_band_above(fs, Transform::Long, noise_substitution::BORDER_HZ);
@@ -2096,6 +2165,7 @@ mod tests {
                 None,
                 Some(noise_substitution::BORDER_HZ),
                 QuietThreshold::Noise,
+                false,
             );
             let frames = round_trip_encoder(encoder, &[left.clone(), right], 3000, false);
             let (mut substituted, mut shared) = (0, 0);

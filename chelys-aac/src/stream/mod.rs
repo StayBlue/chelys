@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: MIT
 
 //! The frames of a stream: one per block of 1024 samples of each channel,
-//! each as long as the bit reservoir lets it be, framed as asked.
+//! each as long as the bit reservoir lets it be, or at a variable rate as
+//! its noise within its allowance takes, framed as asked.
 
 mod element;
 mod frame;
@@ -15,6 +16,7 @@ use super::channel_configuration::{ChannelConfiguration, ElementKind};
 use super::config::Framing;
 use super::noise_substitution;
 use super::psychoacoustic::QuietThreshold;
+use super::rate::{self, Control};
 use super::raw_data_block;
 use super::raw_data_block::data_stream::{self, DataStreamQueue};
 use super::raw_data_block::element::CodedElement;
@@ -24,6 +26,7 @@ use super::stereo::intensity;
 use super::stereo::middle_side::MsMask;
 use super::window::{WindowSequence, Windows};
 use element::ElementEncoder;
+use frame::FrameRate;
 
 /// The samples of each channel a frame codes (clause 8.2.1.1).
 pub const FRAME_SAMPLES: usize = 1024;
@@ -101,11 +104,17 @@ pub const NOISE_BITS_PER_SAMPLE: f64 = 1.3;
 pub const PRINTED_QUIET_BITS_PER_SAMPLE: f64 = 0.8;
 
 /// What the stream is: what its headers say, its rate and its framing.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct StreamConfig {
     pub sampling_frequency: SamplingFrequency,
     pub channel_configuration: ChannelConfiguration,
+    /// The stream's bitrate, ADTS headers included: at a constant rate the
+    /// rate, at a mean rate the mean, and at a variable rate the nominal
+    /// rate of its offset (see [`rate::nominal_bits_per_sample`]). It
+    /// keys the tools that pay only where bits are few.
     pub bits_per_second: u32,
+    /// How the frames' lengths are chosen.
+    pub control: Control,
     pub framing: Framing,
     /// The flags of each ADTS header; raw frames have none.
     pub flags: Flags,
@@ -224,7 +233,36 @@ impl StreamConfig {
         )
     }
 
-    fn reservoir(&self) -> Option<BitReservoir> {
+    /// The bitrate of [`Control::Variable`]'s offset: the nominal bits a
+    /// sample of [`rate::nominal_bits_per_sample`] for each channel of the
+    /// NCC, within the range of bitrates.
+    pub fn nominal_bits_per_second(&self, noise_offset_db: f64) -> u32 {
+        let ncc = self.channel_configuration.ncc() as f64;
+        let fs = f64::from(self.sampling_frequency.hz());
+        let nominal = rate::nominal_bits_per_sample(noise_offset_db) * ncc * fs;
+        let (min, max) = (self.min_bits_per_second(), self.max_bits_per_second());
+        (nominal.round().clamp(0.0, f64::from(u32::MAX)) as u32).clamp(min, max.max(min))
+    }
+
+    /// The longest frame in bytes at a variable or mean rate: as long as
+    /// the decoder's input buffer, or [`reservoir::MAX_ADTS_FRAME_LEN`] in
+    /// ADTS where that is shorter.
+    ///
+    /// Spec reading: "For variable bitrate channels the encoder must
+    /// operate in a way that the input buffer requirements do not exceed
+    /// the minimum decoder input buffer" (clause 8.2.3.2), and in a variable
+    /// rate, demand read channel "there is no minimum input data
+    /// requirement prior to the start of decoding" (clause 8.2.4): a decoder
+    /// that reads each frame as it decodes it holds one frame, its headers
+    /// among its bits (clause 8.2.3.1). So each frame is no longer than the
+    /// buffer, and each element no longer than its share of it (see
+    /// [`reservoir::element_max_bits`]), as at a constant rate.
+    pub fn max_variable_frame_len(&self) -> usize {
+        let buffer = reservoir::buffer_bits(self.channel_configuration) as usize / 8;
+        self.max_frame_len().map_or(buffer, |len| buffer.min(len))
+    }
+
+    pub(super) fn reservoir(&self) -> Option<BitReservoir> {
         if self.bits_per_second < self.min_bits_per_second() {
             return None;
         }
@@ -311,7 +349,7 @@ impl StreamConfig {
     }
 
     /// The bits for each sample of each channel of the NCC.
-    fn bits_per_sample(&self) -> f64 {
+    pub fn bits_per_sample(&self) -> f64 {
         let ncc = self.channel_configuration.ncc() as f64;
         f64::from(self.bits_per_second) / (ncc * f64::from(self.sampling_frequency.hz()))
     }
@@ -362,7 +400,7 @@ impl<F: FnMut(&[u8])> FrameSink for F {
 #[derive(Debug)]
 pub struct StreamEncoder {
     config: StreamConfig,
-    reservoir: BitReservoir,
+    rate: FrameRate,
     /// The elements of each frame, which `channel_configuration` gives, in
     /// order.
     elements: Vec<ElementEncoder>,
@@ -393,8 +431,7 @@ impl StreamEncoder {
     ///
     /// If the configuration is not [valid](StreamConfig::is_valid).
     pub fn new(config: StreamConfig) -> Self {
-        let reservoir = config
-            .reservoir()
+        let rate = FrameRate::new(&config)
             .unwrap_or_else(|| panic!("a stream that cannot be written: {config:?}"));
         let elements = (config.channel_configuration.elements().iter())
             .map(|&kind| {
@@ -404,12 +441,13 @@ impl StreamEncoder {
                     config.intensity_border(),
                     config.noise_border(),
                     config.quiet_threshold(),
+                    config.control.is_variable(),
                 )
             })
             .collect();
         Self {
             config,
-            reservoir,
+            rate,
             elements,
             block_switching: true,
             shortest_short_frame_bits: config.shortest_short_frame_bits(),
@@ -509,8 +547,7 @@ impl StreamEncoder {
     /// Near the lowest bitrate they may not, as it is set by the frames of
     /// long windows (see [`StreamConfig::min_bits_per_second`]).
     fn affords_short(&self, data_bits: u32) -> bool {
-        let bits = (self.reservoir.available_bits(0)).max(self.reservoir.offered_bits());
-        self.shortest_short_frame_bits + data_bits <= bits
+        self.shortest_short_frame_bits + data_bits <= self.rate.most_bits()
     }
 
     /// The `AudioSpecificConfig()` of ISO/IEC 14496-3 that describes the
@@ -616,7 +653,11 @@ impl StreamEncoder {
     /// [`ElementEncoder::prepare`]); has the bit reservoir make bits
     /// available to the frame for the bits the models ask for; and
     /// quantizes the elements in them, less those of the data the frame
-    /// carries (see [`Self::quantize`]).
+    /// carries (see [`Self::quantize`]). At a variable or mean rate, the
+    /// elements take the bits that their noise within its allowance, raised
+    /// by the offset, takes, up to the longest frame, and the frame is
+    /// quantized again in its least bits where it takes fewer (see
+    /// [`FrameRate::least_bits`]).
     fn encode_frame<O: FrameSink + ?Sized>(&mut self, start: usize, out: &mut O) {
         for element in &mut self.elements {
             element.look_ahead(start + FRAME_SAMPLES, self.block_switching);
@@ -624,14 +665,28 @@ impl StreamEncoder {
         let data = self.data.take_next_frame();
         let data_bits = data_stream::bits(data.len());
         let afford_short = self.affords_short(data_bits);
+        let noise_factor = self.rate.noise_factor();
         for element in &mut self.elements {
+            element.set_noise_factor(noise_factor);
             element.prepare(start, afford_short);
         }
         let demand = self.elements.iter().map(ElementEncoder::demand).sum();
-        let available_bits =
-            frame::elements_bits(&self.config, &self.reservoir, &demand, data_bits);
-        let elements = self.quantize(available_bits);
-        frame::write(&self.config, &mut self.reservoir, &elements, &data, out);
+        let available_bits = frame::elements_bits(&self.config, &self.rate, &demand, data_bits);
+        let mut elements = self.quantize(available_bits);
+        if let Some(least) = self.rate.least_bits() {
+            let overhead = frame::frame_overhead_bits(&self.config, data_bits);
+            let used: u32 = elements.iter().map(CodedElement::bits).sum::<u32>() + overhead;
+            if used < least {
+                for element in &mut self.elements {
+                    element.set_within_allowance(false);
+                }
+                elements = self.quantize(least - overhead);
+                for element in &mut self.elements {
+                    element.set_within_allowance(true);
+                }
+            }
+        }
+        frame::write(&self.config, &mut self.rate, &elements, &data, out);
         self.frames += 1;
     }
 
@@ -714,7 +769,9 @@ impl StreamEncoder {
             let budget = element.bits() + remaining;
             let budget =
                 reservoir::element_max_bits(element.kind()).map_or(budget, |max| budget.min(max));
-            if silenced && budget > budgets[e] {
+            // Within its allowance, as at a variable rate, it takes no more
+            // than it did.
+            if silenced && budget > budgets[e] && !self.config.control.is_variable() {
                 remaining += element.bits();
                 let element = self.elements[e].quantize(budget);
                 remaining = remaining.saturating_sub(element.bits());
@@ -747,6 +804,7 @@ mod tests {
             sampling_frequency: SamplingFrequency::Hz44100,
             channel_configuration: ChannelConfiguration::Stereo,
             bits_per_second,
+            control: Control::Constant,
             framing,
             flags: Flags::default(),
             crc_protected: false,
@@ -822,6 +880,7 @@ mod tests {
                         sampling_frequency: fs,
                         channel_configuration,
                         bits_per_second: 0,
+                        control: Control::Constant,
                         framing,
                         flags: Flags::default(),
                         crc_protected,
@@ -961,6 +1020,7 @@ mod tests {
             sampling_frequency: SamplingFrequency::Hz44100,
             channel_configuration: ChannelConfiguration::Mono,
             bits_per_second: 0,
+            control: Control::Constant,
             framing: Framing::Adts,
             flags: Flags::default(),
             crc_protected: false,
@@ -995,6 +1055,7 @@ mod tests {
             sampling_frequency: SamplingFrequency::Hz44100,
             channel_configuration: ChannelConfiguration::Mono,
             bits_per_second: 8_000,
+            control: Control::Constant,
             framing: Framing::Adts,
             flags: Flags::default(),
             crc_protected: false,
@@ -1092,6 +1153,7 @@ mod tests {
             sampling_frequency: fs,
             channel_configuration: ChannelConfiguration::Mono,
             bits_per_second: 132_300,
+            control: Control::Constant,
             framing: Framing::Adts,
             flags: Flags::default(),
             crc_protected: true,
@@ -1140,6 +1202,7 @@ mod tests {
             sampling_frequency: fs,
             channel_configuration: ChannelConfiguration::Mono,
             bits_per_second: 48_000,
+            control: Control::Constant,
             framing: Framing::Adts,
             flags: Flags::default(),
             crc_protected: true,
@@ -1251,6 +1314,7 @@ mod tests {
                     sampling_frequency: fs,
                     channel_configuration,
                     bits_per_second: 0,
+                    control: Control::Constant,
                     framing: Framing::Adts,
                     flags: Flags::default(),
                     crc_protected: true,
@@ -1331,6 +1395,7 @@ mod tests {
                 sampling_frequency: fs,
                 channel_configuration,
                 bits_per_second: 96_000 * channel_configuration.ncc() as u32,
+                control: Control::Constant,
                 framing: Framing::Raw,
                 flags: Flags::default(),
                 crc_protected: false,
@@ -1408,6 +1473,7 @@ mod tests {
                 sampling_frequency: fs,
                 channel_configuration,
                 bits_per_second: 64_000 * channel_configuration.ncc() as u32,
+                control: Control::Constant,
                 framing: Framing::Raw,
                 flags: Flags::default(),
                 crc_protected: false,
@@ -1481,6 +1547,7 @@ mod tests {
                 sampling_frequency: fs,
                 channel_configuration,
                 bits_per_second,
+                control: Control::Constant,
                 framing: Framing::Raw,
                 flags: Flags::default(),
                 crc_protected: false,
@@ -1536,6 +1603,7 @@ mod tests {
             sampling_frequency: fs,
             channel_configuration: ChannelConfiguration::Four,
             bits_per_second: 11_000,
+            control: Control::Constant,
             framing: Framing::Adts,
             flags: Flags::default(),
             crc_protected: true,
@@ -1585,6 +1653,7 @@ mod tests {
                     sampling_frequency: fs,
                     channel_configuration,
                     bits_per_second: 0,
+                    control: Control::Constant,
                     framing: Framing::Adts,
                     flags: Flags::default(),
                     crc_protected,
@@ -1635,6 +1704,7 @@ mod tests {
                     sampling_frequency: fs,
                     channel_configuration: configuration,
                     bits_per_second,
+                    control: Control::Constant,
                     framing,
                     flags: Flags::default(),
                     crc_protected: false,
@@ -1671,5 +1741,112 @@ mod tests {
     fn a_share_beyond_the_most_is_refused() {
         let config = config(Framing::Raw, 64_000);
         StreamEncoder::new(config).with_data_stream(config.max_data_stream_bytes() + 1);
+    }
+
+    fn variable(framing: Framing, noise_offset_db: f64) -> StreamConfig {
+        let mut config = StreamConfig {
+            control: Control::Variable { noise_offset_db },
+            ..config(framing, 0)
+        };
+        config.bits_per_second = config.nominal_bits_per_second(noise_offset_db);
+        config
+    }
+
+    /// The frames of `config` coding `channels`, each apart.
+    fn frames_of(config: StreamConfig, channels: &[&[f64]]) -> Vec<Vec<u8>> {
+        let mut frames = Vec::new();
+        let mut sink = |frame: &[u8]| frames.push(frame.to_vec());
+        let mut encoder = StreamEncoder::new(config);
+        encoder.encode(channels, &mut sink);
+        encoder.finish(&mut sink);
+        frames
+    }
+
+    /// At a variable rate, silence takes the shortest frames, with no fill
+    /// to keep a rate, and noise longer ones; every header's
+    /// `adts_buffer_fullness` is 0x7FF.
+    #[test]
+    fn variable_frames_take_what_they_need_and_say_so() {
+        use crate::raw_data_block::decoder::{adts_frame, raw_data_block};
+
+        let config = variable(Framing::Adts, 0.0);
+        let mut input = vec![0.0; 8 * FRAME_SAMPLES];
+        input.extend(noise(8 * FRAME_SAMPLES, 3));
+        let frames = frames_of(config, &[&input, &input]);
+        let shortest = config.shortest_frame_len(Windows::LONG_SINE, 0);
+        assert!(frames[1..6].iter().all(|f| f.len() == shortest));
+        assert!(frames[10..15].iter().all(|f| f.len() > 4 * shortest));
+        for frame in &frames {
+            let frame = adts_frame(frame);
+            assert_eq!(frame.adts_buffer_fullness, 0x7FF);
+            let block = raw_data_block(frame.raw_data_block, config.sampling_frequency);
+            assert!(!block.ids.contains(&6), "ID_FIL: {:?}", block.ids);
+        }
+    }
+
+    /// A larger noise offset allows more noise, and gives shorter frames.
+    #[test]
+    fn the_noise_offset_trades_length_for_noise() {
+        let input = noise(12 * FRAME_SAMPLES, 4);
+        let right: Vec<f64> = input.iter().map(|x| 0.5 * x).collect();
+        let lens: Vec<usize> = [-6.0, 0.0, 6.0]
+            .into_iter()
+            .map(|offset| {
+                let frames = frames_of(variable(Framing::Raw, offset), &[&input, &right]);
+                frames.iter().map(Vec::len).sum()
+            })
+            .collect();
+        assert!(lens[0] > lens[1] && lens[1] > lens[2], "{lens:?}");
+    }
+
+    /// Where the noise allowed asks for more than the decoder's input
+    /// buffer holds, each frame is as long as it may be, at most, and
+    /// coded as at a constant rate within it; in mono at 8 kHz, whose
+    /// lines are few, and in raw frames and ADTS, with the CRC.
+    #[test]
+    fn variable_frames_are_no_longer_than_the_buffer() {
+        use crate::noiseless::decoder::{BitReader, element};
+
+        let input = noise(6 * FRAME_SAMPLES, 5);
+        for (framing, crc_protected) in [(Framing::Raw, false), (Framing::Adts, true)] {
+            let mut config = StreamConfig {
+                sampling_frequency: SamplingFrequency::Hz8000,
+                channel_configuration: ChannelConfiguration::Mono,
+                crc_protected,
+                ..variable(framing, -60.0)
+            };
+            config.bits_per_second = config.nominal_bits_per_second(-60.0);
+            assert_eq!(config.bits_per_second, config.max_bits_per_second());
+            let max = config.max_variable_frame_len();
+            assert_eq!(max, 6144 / 8);
+            let frames = frames_of(config, &[&input]);
+            assert!(frames.iter().all(|f| f.len() <= max));
+            assert!(
+                frames[2..6].iter().any(|f| f.len() > max - 16),
+                "{framing:?}"
+            );
+            for frame in &frames {
+                let mut r = BitReader::new(&frame[config.header_len()..]);
+                element(&mut r, config.sampling_frequency);
+            }
+        }
+    }
+
+    /// The tools that pay only where bits are few are chosen by the
+    /// nominal rate of the offset, for the whole stream: intensity stereo
+    /// and perceptual noise substitution, which makes every ADTS header
+    /// MPEG-4's.
+    #[test]
+    fn the_offset_chooses_the_tools_by_its_nominal_rate() {
+        for (offset, few) in [(-3.0, false), (12.0, true)] {
+            let config = StreamConfig {
+                noise_substitution: true,
+                ..variable(Framing::Adts, offset)
+            };
+            assert_eq!(config.bits_per_sample() <= INTENSITY_BITS_PER_SAMPLE, few);
+            assert_eq!(config.intensity_border().is_some(), few);
+            assert_eq!(config.noise_border().is_some(), few);
+            assert_eq!(config.adts_header().unwrap().mpeg4, few);
+        }
     }
 }

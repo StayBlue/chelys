@@ -10,6 +10,7 @@ use chelys::aac::internals::noiseless::clipping;
 use chelys::aac::internals::noiseless::decoder::{BitReader, element};
 use chelys::aac::internals::noiseless::pulses::Pulses;
 use chelys::aac::internals::noiseless::sections::{self, Sections};
+use chelys::aac::internals::rate::Control;
 use chelys::aac::internals::raw_data_block::{self, element::CodedElement};
 use chelys::aac::internals::sampling_frequency::SamplingFrequency;
 use chelys::aac::internals::scalefactor_bands::GroupBands;
@@ -259,6 +260,7 @@ fn ffmpeg_decodes_streams_coded_with_spectrum_clipping() {
             sampling_frequency: SamplingFrequency::Hz44100,
             channel_configuration: ChannelConfiguration::Stereo,
             bits_per_second,
+            control: Control::Constant,
             framing: Framing::Adts,
             flags: Default::default(),
             crc_protected: false,

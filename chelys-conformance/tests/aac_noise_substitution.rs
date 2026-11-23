@@ -9,6 +9,7 @@ use std::f64::consts::TAU;
 
 use chelys::aac::internals::channel_configuration::ChannelConfiguration;
 use chelys::aac::internals::noiseless::decoder::{BitReader, Element, element_of};
+use chelys::aac::internals::rate::Control;
 use chelys::aac::internals::sampling_frequency::SamplingFrequency;
 use chelys::aac::internals::{StreamConfig, StreamEncoder};
 use chelys::aac::{Config, Encoder, Framing, Rate};
@@ -198,6 +199,7 @@ fn pair_streams(ms_used: bool) -> [(bool, [Vec<f64>; 2], Vec<u8>); 2] {
             sampling_frequency: SamplingFrequency::Hz44100,
             channel_configuration: ChannelConfiguration::Stereo,
             bits_per_second: 96_000,
+            control: Control::Constant,
             framing: Framing::Adts,
             flags: Default::default(),
             crc_protected: false,

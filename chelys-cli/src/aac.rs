@@ -13,11 +13,13 @@ use crate::output::Output;
 use crate::{pcm, value};
 
 pub const USAGE: &str = "\
-usage: chelys aac --sample-rate HZ --channels N [--bitrate KBPS]
+usage: chelys aac --sample-rate HZ --channels N
+                  [--bitrate KBPS [--abr] | --vbr [--vbr-noise DB]]
                   [--noise-substitution]
                   [--crc] [--private-bit] [--original-copy] [--home]
                   < input.f32 > output.aac
-       chelys aac --mp4 --sample-rate HZ --channels N [--bitrate KBPS]
+       chelys aac --mp4 --sample-rate HZ --channels N
+                  [--bitrate KBPS [--abr] | --vbr [--vbr-noise DB]]
                   [--noise-substitution]
                   < input.f32 > output.mp4
 
@@ -56,6 +58,17 @@ MP4 file instead, which tells a player the input's exact length.
                      LFE in more: 192 in 3 channels, 320 in 5.1, 448 in
                      7.1; or the highest the sample rate and channels
                      allow where that is lower)
+  --abr              keep --bitrate as the stream's mean, each frame as
+                     long as its content needs, which silence leaves short
+                     (default: a constant bitrate)
+  --vbr              give each frame the bits at which the noise of every
+                     band stays within what the psychoacoustic model
+                     allows: about 123 kbit/s for music in stereo at
+                     44.1 kHz
+  --vbr-noise DB     with --vbr, allow each band this many dB more noise
+                     than the model does, or less if negative: about 180
+                     kbit/s at -6 and 71 at 6 in stereo at 44.1 kHz
+                     (default 0)
   --noise-substitution
                      code noise-like bands as the energy of noise that the
                      decoder generates in their place, saving bits for the
@@ -93,6 +106,10 @@ pub struct Options {
     sample_rate: u32,
     channels: usize,
     kbps: u32,
+    /// With `--abr`, `kbps` is the mean.
+    abr: bool,
+    /// With `--vbr`, its noise offset, in place of `kbps`.
+    vbr_noise: Option<f64>,
     noise_substitution: bool,
     crc: bool,
     private_bit: bool,
@@ -103,7 +120,13 @@ pub struct Options {
 
 impl Options {
     fn config(&self) -> Config {
-        config(self.sample_rate, self.channels, self.kbps)
+        let bits_per_second = self.kbps.saturating_mul(1000);
+        let rate = match self.vbr_noise {
+            Some(noise_offset_db) => Rate::Variable { noise_offset_db },
+            None if self.abr => Rate::Mean { bits_per_second },
+            None => Rate::Constant { bits_per_second },
+        };
+        Config::new(self.sample_rate, self.channels, rate)
             .framing(framing(self.mp4))
             .noise_substitution(self.noise_substitution)
             .crc(self.crc)
@@ -130,6 +153,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> 
     let (mut sample_rate, mut channels, mut bitrate) = (None, None, None);
     let (mut crc, mut private_bit, mut original_copy, mut home) = (false, false, false, false);
     let (mut noise_substitution, mut mp4) = (false, false);
+    let (mut abr, mut vbr, mut vbr_noise) = (false, false, None);
     let mut args = args.into_iter();
     while let Some(flag) = args.next() {
         let args = &mut args;
@@ -137,6 +161,9 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> 
             "--sample-rate" => sample_rate = Some(value::<u32>(args, &flag)?),
             "--channels" => channels = Some(value::<u32>(args, &flag)?),
             "--bitrate" => bitrate = Some(value::<u32>(args, &flag)?),
+            "--abr" => abr = true,
+            "--vbr" => vbr = true,
+            "--vbr-noise" => vbr_noise = Some(value::<f64>(args, &flag)?),
             "--noise-substitution" => noise_substitution = true,
             "--crc" => crc = true,
             "--private-bit" => private_bit = true,
@@ -153,11 +180,19 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> 
         n @ (1..=6 | 8) => n as usize,
         n => return Err(format!("unsupported channel count: {n}")),
     };
+    if vbr && (bitrate.is_some() || abr) {
+        return Err("--bitrate and --abr exclude --vbr".to_owned());
+    }
+    if !vbr && vbr_noise.is_some() {
+        return Err("--vbr-noise needs --vbr".to_owned());
+    }
     let kbps = bitrate.unwrap_or_else(|| default_kbps(sample_rate, channels, crc, mp4));
     let options = Options {
         sample_rate,
         channels,
         kbps,
+        abr,
+        vbr_noise: vbr.then_some(vbr_noise.unwrap_or(DEFAULT_VBR_NOISE_DB)),
         noise_substitution,
         crc,
         private_bit,
@@ -171,6 +206,10 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> 
         .map_err(|e| describe(e, &options))?;
     Ok(options)
 }
+
+/// The noise `--vbr` allows each band beyond what the psychoacoustic model
+/// does, in dB, unless `--vbr-noise` says otherwise.
+const DEFAULT_VBR_NOISE_DB: f64 = 0.0;
 
 /// The bitrate without `--bitrate`, in kbit/s, for each channel but the
 /// LFE, where there are more than two.
@@ -213,6 +252,9 @@ fn describe(error: ConfigError, options: &Options) -> String {
                 min.div_ceil(1000),
                 max / 1000,
             )
+        }
+        ConfigError::NoiseOffset { noise_offset_db } => {
+            format!("--vbr-noise: not a finite number: {noise_offset_db}")
         }
         ConfigError::AdtsOnly => {
             "--crc, --private-bit, --original-copy and --home set fields of ADTS headers, \
@@ -296,7 +338,7 @@ mod tests {
 
     #[test]
     fn refuses_what_it_cannot_parse() {
-        assert_eq!(error(&["--vbr"]), "unknown argument: --vbr");
+        assert_eq!(error(&["--cbr"]), "unknown argument: --cbr");
         assert_eq!(error(&["--bitrate"]), "--bitrate needs a value");
         assert_eq!(
             error(&["--bitrate", "128k"]),
@@ -517,5 +559,68 @@ mod tests {
         assert_eq!(kbps("48000", "8"), 448);
         assert_eq!(kbps("8000", "6"), 239);
         assert_eq!(kbps("8000", "8"), 287);
+    }
+
+    #[test]
+    fn the_rate_modes() {
+        let rate = |args: &[&str]| {
+            let base = ["--sample-rate", "44100", "--channels", "2"];
+            parse(&[&base[..], args].concat()).unwrap().config().rate()
+        };
+        assert_eq!(
+            rate(&["--bitrate", "96"]),
+            Rate::Constant {
+                bits_per_second: 96_000
+            }
+        );
+        assert_eq!(
+            rate(&["--bitrate", "96", "--abr"]),
+            Rate::Mean {
+                bits_per_second: 96_000
+            }
+        );
+        assert_eq!(
+            rate(&["--abr"]),
+            Rate::Mean {
+                bits_per_second: 128_000
+            }
+        );
+        assert_eq!(
+            rate(&["--vbr"]),
+            Rate::Variable {
+                noise_offset_db: DEFAULT_VBR_NOISE_DB
+            }
+        );
+        assert_eq!(
+            rate(&["--vbr", "--vbr-noise", "-2.5"]),
+            Rate::Variable {
+                noise_offset_db: -2.5
+            }
+        );
+    }
+
+    #[test]
+    fn refuses_rate_modes_that_exclude_each_other() {
+        let error = |args: &[&str]| {
+            let base = ["--sample-rate", "44100", "--channels", "2"];
+            error(&[&base[..], args].concat())
+        };
+        assert_eq!(
+            error(&["--vbr", "--bitrate", "96"]),
+            "--bitrate and --abr exclude --vbr"
+        );
+        assert_eq!(
+            error(&["--vbr", "--abr"]),
+            "--bitrate and --abr exclude --vbr"
+        );
+        assert_eq!(error(&["--vbr-noise", "3"]), "--vbr-noise needs --vbr");
+        assert_eq!(
+            error(&["--vbr", "--vbr-noise", "inf"]),
+            "--vbr-noise: not a finite number: inf"
+        );
+        assert_eq!(
+            error(&["--abr", "--bitrate", "4"]),
+            "unsupported bitrate at 44100 Hz in stereo: 4; it takes 5 to 528"
+        );
     }
 }

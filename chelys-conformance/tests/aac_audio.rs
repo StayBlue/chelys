@@ -314,6 +314,7 @@ fn snr_rises_with_the_bitrate() {
 #[test]
 fn temporal_noise_shaping_costs_a_sweep_little() {
     use chelys::aac::internals::channel_configuration::ChannelConfiguration;
+    use chelys::aac::internals::rate::Control;
     use chelys::aac::internals::{StreamConfig, StreamEncoder};
 
     let sample_rate = 44_100;
@@ -327,6 +328,7 @@ fn temporal_noise_shaping_costs_a_sweep_little() {
             sampling_frequency: SamplingFrequency::Hz44100,
             channel_configuration: ChannelConfiguration::Stereo,
             bits_per_second,
+            control: Control::Constant,
             framing: chelys::aac::Framing::Adts,
             flags: Default::default(),
             crc_protected: false,
@@ -724,6 +726,7 @@ fn impulses_over_a_quiet_tone_are_coded_with_short_windows() {
 #[test]
 fn short_windows_hold_back_the_noise_before_an_attack() {
     use chelys::aac::internals::channel_configuration::ChannelConfiguration;
+    use chelys::aac::internals::rate::Control;
     use chelys::aac::internals::{StreamConfig, StreamEncoder};
 
     let sample_rate = 44_100;
@@ -731,6 +734,7 @@ fn short_windows_hold_back_the_noise_before_an_attack() {
         sampling_frequency: SamplingFrequency::Hz44100,
         channel_configuration: ChannelConfiguration::Mono,
         bits_per_second: 48_000,
+        control: Control::Constant,
         framing: chelys::aac::Framing::Adts,
         flags: Default::default(),
         crc_protected: false,
@@ -1338,6 +1342,7 @@ fn shaped_share(elements: &[Element]) -> (f64, f64) {
 #[test]
 fn temporal_noise_shaping_decodes_in_place() {
     use chelys::aac::internals::channel_configuration::ChannelConfiguration;
+    use chelys::aac::internals::rate::Control;
     use chelys::aac::internals::{StreamConfig, StreamEncoder};
 
     let (mut long_shaped, mut short_shaped, mut cut_short) = (false, false, false);
@@ -1374,6 +1379,7 @@ fn temporal_noise_shaping_decodes_in_place() {
                         ChannelConfiguration::Stereo
                     },
                     bits_per_second,
+                    control: Control::Constant,
                     framing: chelys::aac::Framing::Adts,
                     flags: Default::default(),
                     crc_protected: false,
@@ -1564,6 +1570,7 @@ fn pre_echo(input: &[f64], output: &[f32], onsets: &[usize], from: usize, to: us
 #[test]
 fn temporal_noise_shaping_holds_back_the_noise_before_attacks() {
     use chelys::aac::internals::channel_configuration::ChannelConfiguration;
+    use chelys::aac::internals::rate::Control;
     use chelys::aac::internals::{StreamConfig, StreamEncoder};
 
     let rates = [
@@ -1580,6 +1587,7 @@ fn temporal_noise_shaping_holds_back_the_noise_before_attacks() {
             sampling_frequency: SamplingFrequency::from_hz(sample_rate).unwrap(),
             channel_configuration: ChannelConfiguration::Mono,
             bits_per_second,
+            control: Control::Constant,
             framing: chelys::aac::Framing::Adts,
             flags: Default::default(),
             crc_protected: false,

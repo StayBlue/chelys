@@ -265,4 +265,31 @@ mod tests {
             assert!(avg > 0 && avg <= max, "{len} samples: {avg} > {max}");
         }
     }
+
+    /// A stream at a variable or mean rate has an avgBitrate of 0, as
+    /// ISO/IEC 14496-1 asks "For streams with variable bitrate", and its
+    /// maxBitrate as measured.
+    #[test]
+    fn a_variable_rate_has_no_average() {
+        for rate in [
+            Rate::Variable {
+                noise_offset_db: 0.0,
+            },
+            Rate::Mean {
+                bits_per_second: 96_000,
+            },
+        ] {
+            let mut encoder = Encoder::new(Config::new(44_100, 2, rate)).unwrap();
+            let pcm: Vec<f32> = (0..2 * 44_100)
+                .map(|i| ((i / 2) as f32 * 0.05).sin() * 0.3)
+                .collect();
+            encoder.encode_interleaved(&pcm);
+            let mut file = Vec::new();
+            encoder.finish(&mut file).unwrap();
+            let at = position(&file, &[0x04, 17, 0x40, 0x15]) + 4;
+            let field = |at: usize| u32::from_be_bytes(file[at..at + 4].try_into().unwrap());
+            assert!(field(at + 3) > 0, "{rate:?}");
+            assert_eq!(field(at + 7), 0, "{rate:?}");
+        }
+    }
 }
