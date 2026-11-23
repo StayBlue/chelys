@@ -73,6 +73,15 @@ pub const PRINTED_QUIET_SHIFT_DB: f64 = 6.2;
 /// end early, their stereo image narrowing as they do. Of the tuning set of
 /// 51 tracks at 44.1 kHz in stereo, the frames so raised took 0.2% more
 /// bits at 0 dB.
+///
+/// Settled by decoding with ffmpeg (black box): pink noise panned 8 dB to
+/// the left and fading out from -30 dB below full scale, coded at 0 dB
+/// without a least length, fell to silence from -70 dB, and its two
+/// channels to one level from -52 dB, where at a constant 128 and 64
+/// kbit/s it was coded to -115 dB, its panning within 1 dB. With frames of
+/// at least a quarter of the nominal rate's bits, it was coded to -115 dB
+/// too, its panning within 1.2 dB at 0 dB and 2 dB at 10 dB. The
+/// conformance test is `a_panned_fade_keeps_its_image`.
 pub const LEAST_BITS_OF_THE_MEAN: f64 = 0.25;
 
 /// The factor `noise_offset_db` raises the allowed distortion by.

@@ -257,6 +257,13 @@ impl StreamConfig {
     /// among its bits (clause 8.2.3.1). So each frame is no longer than the
     /// buffer, and each element no longer than its share of it (see
     /// [`reservoir::element_max_bits`]), as at a constant rate.
+    ///
+    /// Settled by decoding with ffmpeg and FAAD2 (black box): both decode
+    /// streams at variable and mean rates, each header's
+    /// `adts_buffer_fullness` 0x7FF, without complaint, among them frames as
+    /// long as the buffer, 768 bytes, in mono at 8 kHz; above 24 kHz,
+    /// FAAD2 decodes them to within 134 dB of what ffmpeg does. The
+    /// conformance test is `ffmpeg_and_faad_decode_variable_and_mean_rates`.
     pub fn max_variable_frame_len(&self) -> usize {
         let buffer = reservoir::buffer_bits(self.channel_configuration) as usize / 8;
         self.max_frame_len().map_or(buffer, |len| buffer.min(len))
