@@ -8,7 +8,10 @@
 //!
 //! The tables are transcribed as printed, except that the `cbw` column of
 //! Tables C.8 and D.4 is left out: the conversion in figure C.6.c does not
-//! use it. Their numbering and layout are checked at compile time.
+//! use it. Their numbering and layout are checked at compile time. The
+//! conversion tables are kept for the tests only: the conversion is computed
+//! from the frequencies of the partitions and bands at every sampling
+//! frequency (see [`band_weights`]).
 //!
 //! Spec gap: neither standard nor US patent 6,185,539 B1 has tables for
 //! MPEG-2.5. Each of its sampling frequencies is half one of ISO/IEC
@@ -130,16 +133,68 @@ pub fn partitions(sampling_frequency: SamplingFrequency) -> &'static [Partition]
     }
 }
 
-pub fn band_weights(sampling_frequency: SamplingFrequency) -> &'static [BandWeights; LONG_BANDS] {
-    match sampling_frequency {
-        SamplingFrequency::Hz48000 => &BANDS_48000,
-        SamplingFrequency::Hz44100 => &BANDS_44100,
-        SamplingFrequency::Hz32000 => &BANDS_32000,
-        SamplingFrequency::Hz24000 => &BANDS_24000,
-        SamplingFrequency::Hz22050 => &BANDS_22050,
-        SamplingFrequency::Hz16000 => &BANDS_16000,
-        _ => &mpeg25(sampling_frequency).band_weights,
-    }
+/// How each long scalefactor band collects the partitions (figure C.6.c):
+/// by the frequencies of the partitions' FFT lines (see
+/// `weights_by_frequency`).
+///
+/// Spec reading: Table C.8 (ISO/IEC 11172-3, pp. 88 to 90) and Table D.4 of
+/// ISO/IEC 13818-3 (second edition, pp. 105 to 107) are not used, as they
+/// gather each band's threshold and energy from partitions above the band's
+/// own frequencies. Clause C.1.5.3.2.1 says only that the partitions are
+/// converted to the bands with the weights of the tables, and gives no rule
+/// for them, but the lowest long bands at 44.1 and 48 kHz agree with the
+/// bands' frequencies exactly, an FFT line standing for half a line either
+/// side of it. Above them the printed bands lie higher by a number of whole
+/// lines (fractions of a line in ISO/IEC 13818-3) that grows with frequency
+/// (see the test `printed_tables_collect_above_the_bands`). Long blocks:
+/// below the top band, up to 34 FFT lines (1.6 kHz) at 48 kHz, 26 (1.1 kHz)
+/// at 44.1 kHz, 36 (1.1 kHz) at 32 kHz, 29.6 (690 Hz) at 24 kHz, 29.1
+/// (630 Hz) at 22.05 kHz and 28.8 (450 Hz) at 16 kHz, where every band from
+/// the second on starts at least 3 lines high, more than half the width of the
+/// lowest bands; the top band takes 66 lines (3.1 kHz) above its upper edge
+/// at 48 kHz, 72 (3.1 kHz) at 44.1 kHz and 32 (500 Hz) at 16 kHz. Short
+/// blocks: up to 6 to 7 lines (of the 256-point FFT) below the top band, and
+/// 16 and 18 lines (3 kHz) above the top band at 48 and 44.1 kHz.
+///
+/// Where a band collects a tone that lies above its lines, the ratio of
+/// threshold to energy it takes from the FFT does not hold for its lines of
+/// `xr`, and the band that holds the tone, having lost the tone's energy
+/// from its ratio, is allowed noise far above its own energy: Table D.4.c
+/// gives a tone of 2 kHz at 16 kHz to the band below its own, and at
+/// 44.1 kHz the top band took its ratio from partitions up to 3 kHz above
+/// it. Bands at their own frequencies take the FFT's ratio for the lines
+/// they code. Quiet pure tones, at -40 dB below full scale, coded in one
+/// channel at level 80 of the quality scale, had the band beside them
+/// allowed almost no noise, so that at the edges of the subbands, `fs / 8`
+/// and `fs / 16`, every frame took the highest bitrate at 16 and 24 kHz,
+/// and at `fs / 8` at 44.1 kHz, and so did tones elsewhere, such as one of
+/// 10 kHz at 44.1 kHz (85 kbit/s), 11.2 kHz at 32 kHz (132) and 18.8 kHz
+/// at 48 kHz (137). At their own frequencies, all of them take 8 to
+/// 38 kbit/s but a tone of 2 kHz at 16 kHz, `fs / 8` (see
+/// `quiet_allowance` in the model). As ffmpeg decodes them, the tones at
+/// the edges keep their level within 0.3 dB, and those above them decode
+/// up to 2.2 dB loud, as tones of those frequencies whose bands were not
+/// starved did before. Graded with PEAQ (GstPEAQ 0.6.1, black box) on 51 tracks of
+/// nine kinds of music at 44.1 kHz, the mean grade rose by 0.025 at
+/// 128 kbit/s in two channels and by 0.014 at 64 in one, and held at 192;
+/// at levels 50, 80 and 100 of the quality scale it moved by -0.021,
+/// +0.005 and +0.003 in two channels, at 2.0 kbit/s less, 0.8 more and
+/// 0.1 less, and by -0.013, +0.024 and +0.020 in one, at 1.1 less, 1.0
+/// more and 1.3 more.
+///
+/// The highest band (`sfb 21`), above 16 kHz at 44.1 and 48 kHz, has no
+/// allowance, and Annex C leaves its lines to the step the other bands are
+/// coded at. Tones there of 16.4 to 18.8 kHz had been kept at a variable
+/// bitrate only by the starved band below them, at 68 to 137 kbit/s; they
+/// are now lost at level 80, as one of 19.8 kHz already was.
+pub fn band_weights(sampling_frequency: SamplingFrequency) -> [BandWeights; LONG_BANDS] {
+    weights_by_frequency(
+        scalefactor_bands::long_bands(sampling_frequency),
+        partitions(sampling_frequency)
+            .iter()
+            .map(|p| (p.start, p.width)),
+        LONG_FFT_LINES_PER_LINE,
+    )
 }
 
 /// The partitions for short blocks.
@@ -164,50 +219,38 @@ pub fn short_partitions(sampling_frequency: SamplingFrequency) -> &'static [Shor
     }
 }
 
-pub fn short_band_weights(
-    sampling_frequency: SamplingFrequency,
-) -> &'static [BandWeights; SHORT_BANDS] {
-    match sampling_frequency {
-        SamplingFrequency::Hz48000 => &SHORT_BANDS_48000,
-        SamplingFrequency::Hz44100 => &SHORT_BANDS_44100,
-        SamplingFrequency::Hz32000 => &SHORT_BANDS_32000,
-        SamplingFrequency::Hz24000 => &SHORT_BANDS_24000,
-        SamplingFrequency::Hz22050 => &SHORT_BANDS_22050,
-        SamplingFrequency::Hz16000 => &SHORT_BANDS_16000,
-        _ => &mpeg25(sampling_frequency).short_band_weights,
-    }
+/// As [`band_weights`], for the short scalefactor bands.
+pub fn short_band_weights(sampling_frequency: SamplingFrequency) -> [BandWeights; SHORT_BANDS] {
+    weights_by_frequency(
+        scalefactor_bands::short_bands(sampling_frequency),
+        short_partitions(sampling_frequency)
+            .iter()
+            .map(|p| (p.start, p.width)),
+        SHORT_FFT_LINES_PER_LINE,
+    )
 }
+
+/// The lines of the long FFT to a line of `xr` in a long block: 512 to 576,
+/// both spanning the frequencies up to half the sampling frequency.
+const LONG_FFT_LINES_PER_LINE: f64 = 512.0 / 576.0;
+
+/// The lines of the short FFT to a line of `xr` in a short window: 128 to
+/// 192.
+const SHORT_FFT_LINES_PER_LINE: f64 = 128.0 / 192.0;
 
 /// The tables of an MPEG-2.5 sampling frequency, derived from those of the
 /// frequency of ISO/IEC 13818-3 twice as high (see [`halve`]).
 struct Mpeg25Tables {
     partitions: Vec<Partition>,
-    band_weights: [BandWeights; LONG_BANDS],
     short_partitions: Vec<ShortPartition>,
-    short_band_weights: [BandWeights; SHORT_BANDS],
 }
 
-static MPEG25_8000: LazyLock<Mpeg25Tables> = LazyLock::new(|| {
-    Mpeg25Tables::halving(
-        SamplingFrequency::Hz8000,
-        &PARTITIONS_16000,
-        &SHORT_PARTITIONS_16000,
-    )
-});
-static MPEG25_11025: LazyLock<Mpeg25Tables> = LazyLock::new(|| {
-    Mpeg25Tables::halving(
-        SamplingFrequency::Hz11025,
-        &PARTITIONS_22050,
-        &SHORT_PARTITIONS_22050,
-    )
-});
-static MPEG25_12000: LazyLock<Mpeg25Tables> = LazyLock::new(|| {
-    Mpeg25Tables::halving(
-        SamplingFrequency::Hz12000,
-        &PARTITIONS_24000,
-        &SHORT_PARTITIONS_24000,
-    )
-});
+static MPEG25_8000: LazyLock<Mpeg25Tables> =
+    LazyLock::new(|| Mpeg25Tables::halving(&PARTITIONS_16000, &SHORT_PARTITIONS_16000));
+static MPEG25_11025: LazyLock<Mpeg25Tables> =
+    LazyLock::new(|| Mpeg25Tables::halving(&PARTITIONS_22050, &SHORT_PARTITIONS_22050));
+static MPEG25_12000: LazyLock<Mpeg25Tables> =
+    LazyLock::new(|| Mpeg25Tables::halving(&PARTITIONS_24000, &SHORT_PARTITIONS_24000));
 
 fn mpeg25(sampling_frequency: SamplingFrequency) -> &'static Mpeg25Tables {
     match sampling_frequency {
@@ -219,13 +262,9 @@ fn mpeg25(sampling_frequency: SamplingFrequency) -> &'static Mpeg25Tables {
 }
 
 impl Mpeg25Tables {
-    /// The tables of MPEG-2.5's `sampling_frequency` from the partitions of
-    /// the frequency twice as high, `long` and `short`.
-    fn halving(
-        sampling_frequency: SamplingFrequency,
-        long: &[Partition],
-        short: &[ShortPartition],
-    ) -> Self {
+    /// The partitions of an MPEG-2.5 sampling frequency from those of the
+    /// frequency twice as high, `long` and `short`.
+    fn halving(long: &[Partition], short: &[ShortPartition]) -> Self {
         let halved = halve(long.iter().map(|p| (p.start, p.width)), 512);
         let partitions: Vec<Partition> = (long.iter().zip(halved))
             .map(|(p, (start, width))| Partition {
@@ -244,21 +283,9 @@ impl Mpeg25Tables {
                 ..*p
             })
             .collect();
-        let band_weights = weights_by_frequency(
-            scalefactor_bands::long_bands(sampling_frequency),
-            partitions.iter().map(|p| (p.start, p.width)),
-            8.0 / 9.0,
-        );
-        let short_band_weights = weights_by_frequency(
-            scalefactor_bands::short_bands(sampling_frequency),
-            short_partitions.iter().map(|p| (p.start, p.width)),
-            2.0 / 3.0,
-        );
         Self {
             partitions,
-            band_weights,
             short_partitions,
-            short_band_weights,
         }
     }
 }
@@ -277,17 +304,16 @@ fn halve(
         .map(move |(start, width)| (2 * start, 2 * ((start + width).min(nyquist / 2) - start)))
 }
 
-/// Converts partitions `(start, width)` of FFT lines to `bands` of
-/// frequency lines, `fft_per_line` FFT lines to a frequency line: 512 to 576
-/// for long blocks and 128 to 192 for short ones, both spanning the
-/// frequencies up to half the sampling frequency. Each band takes from each
-/// partition the share of its FFT lines that lies within the band's
-/// frequencies.
-///
-/// Spec gap: the standards print their conversion tables (Tables C.8 and
-/// D.4) without saying how they were made, and these weights follow no rule
-/// read from them. A band within a single partition gets `bo` one past `bu`
-/// and a `w2` of zero, so that it takes the ratio of that partition alone.
+/// Converts partitions `(start, width)` of FFT lines to `bands` of lines of
+/// `xr`, `fft_per_line` FFT lines to a line of `xr`. Each band takes from
+/// each partition the share of the partition's frequencies that lies within
+/// the band's: FFT line `j` stands for the frequencies from `j - 1/2` to
+/// `j + 1/2` times the FFT's spacing, and the lines of `xr` from `start` to
+/// `end` for those from `start` to `end` times their own. DC belongs wholly
+/// to the first band. A band within a single partition gets `bo` one past
+/// `bu` and a `w2` of zero, so that it takes the ratio of that partition
+/// alone, and a band that runs past the last partition collects the
+/// partitions after `bu` in full.
 fn weights_by_frequency<const N: usize>(
     bands: &[Band; N],
     partitions: impl Iterator<Item = (usize, usize)>,
@@ -295,9 +321,15 @@ fn weights_by_frequency<const N: usize>(
 ) -> [BandWeights; N] {
     let partitions: Vec<(f64, f64)> = partitions.map(|(s, w)| (s as f64, w as f64)).collect();
     let containing = |x: f64| partitions.iter().position(|&(s, w)| s <= x && x < s + w);
+    // The frequency `line` lines of `xr` up, in the partitions' own
+    // measure, where partition `(s, w)` runs from `s` to `s + w`: half a
+    // line above the FFT line of that frequency.
+    let edge = |line: usize| match line {
+        0 => 0.0,
+        _ => line as f64 * fft_per_line + 0.5,
+    };
     bands.map(|band| {
-        let low = band.start as f64 * fft_per_line;
-        let high = band.end() as f64 * fft_per_line;
+        let (low, high) = (edge(band.start), edge(band.end()));
         let bu = containing(low).expect("every band starts within the partitions");
         let (start, width) = partitions[bu];
         if high <= start + width {
@@ -420,6 +452,7 @@ const fn short_partitions_with<const N: usize>(
 /// Builds a conversion table from printed rows `(no. sb, bu, bo, w1, w2)`,
 /// checking that the bands are numbered in order, start at partition 0, and
 /// that each band begins at the partition where the last one ended.
+#[cfg(test)]
 const fn band_weights_from<const N: usize>(
     rows: [(usize, usize, usize, f64, f64); N],
 ) -> [BandWeights; N] {
@@ -779,6 +812,7 @@ const SHORT_PARTITIONS_32000: [ShortPartition; 42] = short_partitions_from([
 
 // Table C.8.a, 48 kHz long blocks.
 
+#[cfg(test)]
 const BANDS_48000: [BandWeights; LONG_BANDS] = band_weights_from([
     (0, 0, 4, 1.000, 0.056),
     (1, 4, 7, 0.944, 0.611),
@@ -805,6 +839,7 @@ const BANDS_48000: [BandWeights; LONG_BANDS] = band_weights_from([
 
 // Table C.8.b, 44.1 kHz long blocks.
 
+#[cfg(test)]
 const BANDS_44100: [BandWeights; LONG_BANDS] = band_weights_from([
     (0, 0, 4, 1.000, 0.056),
     (1, 4, 7, 0.944, 0.611),
@@ -831,6 +866,7 @@ const BANDS_44100: [BandWeights; LONG_BANDS] = band_weights_from([
 
 // Table C.8.c, 32 kHz long blocks.
 
+#[cfg(test)]
 const BANDS_32000: [BandWeights; LONG_BANDS] = band_weights_from([
     (0, 0, 2, 1.000, 0.528),
     (1, 2, 4, 0.472, 0.305),
@@ -857,6 +893,7 @@ const BANDS_32000: [BandWeights; LONG_BANDS] = band_weights_from([
 
 // Table C.8.d, 48 kHz short blocks.
 
+#[cfg(test)]
 const SHORT_BANDS_48000: [BandWeights; SHORT_BANDS] = band_weights_from([
     (0, 0, 3, 1.000, 0.167),
     (1, 3, 5, 0.833, 0.833),
@@ -874,6 +911,7 @@ const SHORT_BANDS_48000: [BandWeights; SHORT_BANDS] = band_weights_from([
 
 // Table C.8.e, 44.1 kHz short blocks.
 
+#[cfg(test)]
 const SHORT_BANDS_44100: [BandWeights; SHORT_BANDS] = band_weights_from([
     (0, 0, 3, 1.000, 0.167),
     (1, 3, 5, 0.833, 0.833),
@@ -891,6 +929,7 @@ const SHORT_BANDS_44100: [BandWeights; SHORT_BANDS] = band_weights_from([
 
 // Table C.8.f, 32 kHz short blocks.
 
+#[cfg(test)]
 const SHORT_BANDS_32000: [BandWeights; SHORT_BANDS] = band_weights_from([
     (0, 0, 3, 1.000, 0.167),
     (1, 3, 5, 0.833, 0.833),
@@ -1250,6 +1289,7 @@ const SHORT_PARTITIONS_16000: [ShortPartition; 46] = short_partitions_from_ratio
 
 // Table D.4.a of ISO/IEC 13818-3, 24 kHz long blocks.
 
+#[cfg(test)]
 const BANDS_24000: [BandWeights; LONG_BANDS] = band_weights_from([
     (0, 0, 3, 1.0, 0.916666746),
     (1, 3, 6, 0.083333254, 0.583333492),
@@ -1281,6 +1321,7 @@ const BANDS_24000: [BandWeights; LONG_BANDS] = band_weights_from([
 // which adds up to 1 with `w1` of band 14, as the weights of every other
 // partition shared by two bands do.
 
+#[cfg(test)]
 const BANDS_22050: [BandWeights; LONG_BANDS] = band_weights_from([
     (0, 0, 3, 1.0, 0.916666746),
     (1, 3, 6, 0.083333254, 0.583333492),
@@ -1307,6 +1348,7 @@ const BANDS_22050: [BandWeights; LONG_BANDS] = band_weights_from([
 
 // Table D.4.c of ISO/IEC 13818-3, 16 kHz long blocks.
 
+#[cfg(test)]
 const BANDS_16000: [BandWeights; LONG_BANDS] = band_weights_from([
     (0, 0, 2, 1.0, 0.944444478),
     (1, 2, 4, 0.055555504, 0.722222328),
@@ -1333,6 +1375,7 @@ const BANDS_16000: [BandWeights; LONG_BANDS] = band_weights_from([
 
 // Table D.4.d of ISO/IEC 13818-3, 24 kHz short blocks.
 
+#[cfg(test)]
 const SHORT_BANDS_24000: [BandWeights; SHORT_BANDS] = band_weights_from([
     (0, 0, 4, 1.0, 0.166666746),
     (1, 4, 6, 0.833333254, 0.833333492),
@@ -1350,6 +1393,7 @@ const SHORT_BANDS_24000: [BandWeights; SHORT_BANDS] = band_weights_from([
 
 // Table D.4.e of ISO/IEC 13818-3, 22.05 kHz short blocks.
 
+#[cfg(test)]
 const SHORT_BANDS_22050: [BandWeights; SHORT_BANDS] = band_weights_from([
     (0, 0, 4, 1.0, 0.166666746),
     (1, 4, 6, 0.833333254, 0.833333492),
@@ -1367,6 +1411,7 @@ const SHORT_BANDS_22050: [BandWeights; SHORT_BANDS] = band_weights_from([
 
 // Table D.4.f of ISO/IEC 13818-3, 16 kHz short blocks.
 
+#[cfg(test)]
 const SHORT_BANDS_16000: [BandWeights; SHORT_BANDS] = band_weights_from([
     (0, 0, 4, 1.0, 0.166666746),
     (1, 4, 6, 0.833333254, 0.833333492),
@@ -1393,6 +1438,20 @@ mod tests {
             .filter(|fs| fs.version() == Version::Mpeg1)
     }
     use crate::psychoacoustic::spreading_function;
+
+    /// Table C.8 or Table D.4 of ISO/IEC 13818-3 for `fs`'s long and short
+    /// blocks, as printed.
+    fn printed(fs: SamplingFrequency) -> (&'static [BandWeights], &'static [BandWeights]) {
+        match fs {
+            SamplingFrequency::Hz48000 => (&BANDS_48000, &SHORT_BANDS_48000),
+            SamplingFrequency::Hz44100 => (&BANDS_44100, &SHORT_BANDS_44100),
+            SamplingFrequency::Hz32000 => (&BANDS_32000, &SHORT_BANDS_32000),
+            SamplingFrequency::Hz24000 => (&BANDS_24000, &SHORT_BANDS_24000),
+            SamplingFrequency::Hz22050 => (&BANDS_22050, &SHORT_BANDS_22050),
+            SamplingFrequency::Hz16000 => (&BANDS_16000, &SHORT_BANDS_16000),
+            _ => panic!("{fs:?} has no printed table"),
+        }
+    }
 
     /// `norm` is printed without its derivation, but in Tables C.7.a to
     /// C.7.c it matches the normalisation `rnorm` of clause D.2.4 f), the
@@ -1505,9 +1564,10 @@ mod tests {
     #[test]
     fn shared_partitions_are_split_between_bands() {
         for fs in SamplingFrequency::STANDARD {
+            let (long, short) = printed(fs);
             let tables: [(&[BandWeights], usize); 2] = [
-                (band_weights(fs), partitions(fs).len()),
-                (short_band_weights(fs), short_partitions(fs).len()),
+                (long, partitions(fs).len()),
+                (short, short_partitions(fs).len()),
             ];
             for (bands, partitions) in tables {
                 assert_eq!(bands[0].w1, 1.0);
@@ -1535,7 +1595,7 @@ mod tests {
         assert_eq!(lines(SamplingFrequency::Hz48000), 481);
         assert_eq!(lines(SamplingFrequency::Hz44100), 465);
         assert_eq!(lines(SamplingFrequency::Hz32000), 488);
-        assert_eq!(band_weights(SamplingFrequency::Hz44100)[5].bo, 18);
+        assert_eq!(printed(SamplingFrequency::Hz44100).0[5].bo, 18);
 
         let short_lines = |fs| {
             let last = short_partitions(fs).last().unwrap();
@@ -1544,36 +1604,123 @@ mod tests {
         assert_eq!(short_lines(SamplingFrequency::Hz48000), 107);
         assert_eq!(short_lines(SamplingFrequency::Hz44100), 109);
         assert_eq!(short_lines(SamplingFrequency::Hz32000), 110);
-        assert_eq!(short_band_weights(SamplingFrequency::Hz32000)[11].bo, 41);
+        assert_eq!(printed(SamplingFrequency::Hz32000).1[11].bo, 41);
     }
 
-    /// The computed conversion for 8 kHz gives each partition out in shares
-    /// that add up to no more than the whole, and to the whole for those
-    /// lying wholly below the top band.
+    /// The computed conversion gives each partition out in shares that add
+    /// up to no more than the whole, and to the whole for those lying wholly
+    /// below the top band, at every sampling frequency.
     #[test]
     fn computed_weights_share_out_the_partitions() {
-        let fs = SamplingFrequency::Hz8000;
-        let tables: [(&[BandWeights], usize); 2] = [
-            (band_weights(fs), partitions(fs).len()),
-            (short_band_weights(fs), short_partitions(fs).len()),
-        ];
-        for (bands, count) in tables {
-            let mut shares = vec![0.0; count + 1];
-            for band in bands {
-                assert!(band.bu < band.bo);
-                assert!((0.0..=1.0).contains(&band.w1) && (0.0..=1.0).contains(&band.w2));
-                shares[band.bu] += band.w1;
-                for share in &mut shares[band.bu + 1..band.bo] {
-                    *share += 1.0;
+        for fs in SamplingFrequency::ALL {
+            let tables: [(&[BandWeights], usize); 2] = [
+                (&band_weights(fs), partitions(fs).len()),
+                (&short_band_weights(fs), short_partitions(fs).len()),
+            ];
+            for (bands, count) in tables {
+                let mut shares = vec![0.0; count + 1];
+                for band in bands {
+                    assert!(band.bu < band.bo);
+                    assert!((0.0..=1.0).contains(&band.w1) && (0.0..=1.0).contains(&band.w2));
+                    shares[band.bu] += band.w1;
+                    for share in &mut shares[band.bu + 1..band.bo] {
+                        *share += 1.0;
+                    }
+                    shares[band.bo] += band.w2;
                 }
-                shares[band.bo] += band.w2;
+                let last = bands.last().unwrap().bu;
+                for (b, share) in shares.iter().enumerate() {
+                    assert!(*share <= 1.0 + 1e-9, "{fs:?} partition {b}: {share}");
+                    if b < last {
+                        assert!((share - 1.0).abs() < 1e-9, "{fs:?} partition {b}: {share}");
+                    }
+                }
             }
-            let last = bands.last().unwrap().bu;
-            for (b, share) in shares.iter().enumerate() {
-                assert!(*share <= 1.0 + 1e-9, "partition {b}: {share}");
-                if b < last {
-                    assert!((share - 1.0).abs() < 1e-9, "partition {b}: {share}");
-                }
+        }
+    }
+
+    /// The FFT line, counted from `-1/2` as [`weights_by_frequency`] counts
+    /// them, at which `band` starts and ends collecting `partitions`.
+    fn collected(band: &BandWeights, partitions: &[(usize, usize)]) -> (f64, f64) {
+        let (start, width) = partitions[band.bu];
+        let low = start as f64 + (1.0 - band.w1) * width as f64;
+        let high = match partitions.get(band.bo) {
+            Some(&(start, width)) => start as f64 + band.w2 * width as f64,
+            None => {
+                let (start, width) = partitions[partitions.len() - 1];
+                (start + width) as f64
+            }
+        };
+        (low - 0.5, high - 0.5)
+    }
+
+    /// How far above the frequencies of their bands the printed tables
+    /// collect the partitions, in FFT lines, for the note in
+    /// [`band_weights`]: the most by which a band's lower and upper edges
+    /// lie above the computed ones, which are its frequencies, short of the
+    /// top band, and those of the top band.
+    #[test]
+    fn printed_tables_collect_above_the_bands() {
+        // fs, long: (below the top, top), short: (below the top, top).
+        let expected = [
+            (SamplingFrequency::Hz48000, (34.0, 66.0), (6.0, 16.0)),
+            (SamplingFrequency::Hz44100, (26.0, 72.0), (6.0, 17.8)),
+            (SamplingFrequency::Hz32000, (36.0, 36.0), (7.0, 7.0)),
+            (SamplingFrequency::Hz24000, (29.6, 29.6), (7.0, 7.0)),
+            (SamplingFrequency::Hz22050, (29.1, 29.1), (6.6, 6.6)),
+            (SamplingFrequency::Hz16000, (28.8, 32.3), (6.8, 6.8)),
+        ];
+        for (fs, long, short) in expected {
+            let (printed_long, printed_short) = printed(fs);
+            let tables = [
+                (
+                    printed_long,
+                    band_weights(fs).to_vec(),
+                    partitions(fs)
+                        .iter()
+                        .map(|p| (p.start, p.width))
+                        .collect::<Vec<_>>(),
+                    long,
+                ),
+                (
+                    printed_short,
+                    short_band_weights(fs).to_vec(),
+                    short_partitions(fs)
+                        .iter()
+                        .map(|p| (p.start, p.width))
+                        .collect(),
+                    short,
+                ),
+            ];
+            for (printed, computed, partitions, (below_top, top)) in tables {
+                let offsets: Vec<(f64, f64)> = (printed.iter().zip(&computed))
+                    .map(|(printed, computed)| {
+                        let (pl, ph) = collected(printed, &partitions);
+                        let (cl, ch) = collected(computed, &partitions);
+                        (pl - cl, ph - ch)
+                    })
+                    .collect();
+                // The lowest bands of the long tables of ISO/IEC 11172-3
+                // agree with their frequencies to the printed precision.
+                assert!(
+                    offsets[0].1.abs() < 0.05
+                        || fs.version() == Version::Mpeg2
+                        || fs == SamplingFrequency::Hz32000,
+                    "{fs:?}: {offsets:?}"
+                );
+                let (last, rest) = offsets.split_last().unwrap();
+                let most = rest.iter().map(|&(l, h)| l.max(h)).fold(f64::MIN, f64::max);
+                println!(
+                    "{fs:?}: {:?} top {last:?}",
+                    rest.iter()
+                        .map(|&(l, h)| format!("{l:+.1}/{h:+.1}"))
+                        .collect::<Vec<_>>()
+                );
+                assert!(
+                    (most - below_top).abs() < 0.1,
+                    "{fs:?}: {most:.2}, {offsets:?}"
+                );
+                assert!((last.0.max(last.1) - top).abs() < 0.1, "{fs:?}: {last:?}");
             }
         }
     }

@@ -336,13 +336,13 @@ impl Analysis {
 /// channel's filterbank.
 pub struct PsychoacousticModel {
     partitions: &'static [Partition],
-    band_weights: &'static [BandWeights; LONG_BANDS],
+    band_weights: [BandWeights; LONG_BANDS],
     /// For each partition `b`, the partitions `bb` that spread into it, with
     /// `sprdngf(bval(bb), bval(b))`, in order: those with a spread of zero
     /// are left out, as adding nothing to the sums they are in changes none.
     spread_into: Vec<Vec<(usize, f64)>>,
     short_partitions: &'static [ShortPartition],
-    short_band_weights: &'static [BandWeights; SHORT_BANDS],
+    short_band_weights: [BandWeights; SHORT_BANDS],
     /// As `spread_into`, between the short partitions.
     short_spread_into: Vec<Vec<(usize, f64)>>,
     /// The normalising constant of each short partition.
@@ -539,7 +539,7 @@ impl PsychoacousticModel {
         // Figure C.6.c: the partitions converted to scalefactor bands.
         let spectrum: Vec<f64> = energy[..middle_side::CRITERION_LINES].to_vec();
         let long = Masking {
-            ratio: band_ratio(self.band_weights, &allowed, &eb),
+            ratio: band_ratio(&self.band_weights, &allowed, &eb),
             perceptual_entropy,
             spectrum: spectrum.clone(),
             threshold: thr,
@@ -593,7 +593,7 @@ impl PsychoacousticModel {
                 self.short_noise_in_quiet[b].max(nbb)
             })
             .collect();
-        band_ratio(self.short_band_weights, &thr, &eb)
+        band_ratio(&self.short_band_weights, &thr, &eb)
     }
 
     /// The energies of the lines of the granule's three short blocks, and the

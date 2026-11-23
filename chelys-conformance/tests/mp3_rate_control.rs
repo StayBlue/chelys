@@ -8,6 +8,7 @@ use std::f64::consts::TAU;
 
 use chelys::mp3::internals::header::{Bitrate, Flags, Mode, SamplingFrequency};
 use chelys::mp3::internals::rate::StreamRate;
+use chelys::mp3::internals::scalefactor_bands;
 use chelys::mp3::internals::{
     GRANULE_LINES, StreamConfig, StreamEncoder, encode_pcm, encode_silence,
 };
@@ -702,6 +703,35 @@ fn dual_channel_keeps_each_programme_in_its_channel() {
     }
 }
 
+/// `seconds` of noise at `fs` from `low` to `high` Hz, away from each of
+/// `tones` by more than 100 Hz: up to 400 sinusoids at random frequencies
+/// and phases, each of an amplitude of `amplitude`.
+fn noise_between(
+    fs: f64,
+    (low, high): (f64, f64),
+    tones: &[f64],
+    amplitude: f64,
+    seconds: f64,
+) -> Vec<f64> {
+    let mut seed = 3u64;
+    let mut next = || {
+        seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+        (seed >> 11) as f64 / (1u64 << 53) as f64
+    };
+    let components: Vec<(f64, f64)> = (0..400)
+        .map(|_| (low + (high - low) * next(), TAU * next()))
+        .filter(|(f, _)| tones.iter().all(|tone| (f - tone).abs() > 100.0))
+        .collect();
+    (0..(seconds * fs) as usize)
+        .map(|t| {
+            let time = t as f64 / fs;
+            (components.iter())
+                .map(|(f, phase)| amplitude * (TAU * f * time + phase).sin())
+                .sum()
+        })
+        .collect()
+}
+
 /// With intensity stereo allowed, frames short of bits code their upper
 /// bands in intensity stereo (Annex G.2 c)), alone or with MS stereo below
 /// them. A low tone the same in both channels, and tones at 12 and 18 kHz
@@ -712,11 +742,17 @@ fn dual_channel_keeps_each_programme_in_its_channel() {
 /// sum of the channels, 1.5 times the left, as `tan(60) / (1 + tan(60))`
 /// and `1 / (1 + tan(60))`. The tone at 12 kHz lies in the highest
 /// scalefactor band but one, above every bound, and the tone at 18 kHz
-/// above the highest band.
+/// above the highest band. Noise from 6 to 20 kHz, the right channel at
+/// half the left as for the upper tones, keeps the frames short of bits:
+/// the three tones alone are within their allowance at 64 kbit/s, and
+/// almost no frame is coded in intensity stereo, as each band takes its
+/// allowance from the partitions at its own frequencies (see
+/// `partitions::band_weights` in the psychoacoustic model).
 ///
-/// With MS stereo on as well, the side channel is zero below the bound, so
-/// that every band there is marked as not coded in intensity stereo, and
-/// the low tone is coded in the middle channel alone.
+/// With MS stereo on as well, the side channel is zero below 6 kHz, so
+/// that every band there below the bound is marked as not coded in
+/// intensity stereo, and the low tone is coded in the middle channel
+/// alone.
 ///
 /// Without intensity stereo allowed, no frame is coded in it.
 ///
@@ -736,8 +772,23 @@ fn intensity_stereo_keeps_the_level_of_each_channel() {
             })
             .collect()
     };
-    let left = tones([(440.0, 0.2), (12_000.0, 0.2), (18_000.0, 0.1)]);
-    let right = tones([(440.0, 0.2), (12_000.0, 0.1), (18_000.0, 0.05)]);
+    // Noise from 6 to 20 kHz, away from the upper tones, so that the frames
+    // are short of bits.
+    let noise = noise_between(
+        44_100.0,
+        (6_000.0, 20_000.0),
+        &[12_000.0, 18_000.0],
+        0.005,
+        2.0,
+    );
+    let left: Vec<f64> = (tones([(440.0, 0.2), (12_000.0, 0.2), (18_000.0, 0.1)]).iter())
+        .zip(&noise)
+        .map(|(x, n)| x + n)
+        .collect();
+    let right: Vec<f64> = (tones([(440.0, 0.2), (12_000.0, 0.1), (18_000.0, 0.05)]).iter())
+        .zip(&noise)
+        .map(|(x, n)| x + 0.5 * n)
+        .collect();
     let ratio = (60f64).to_radians().tan();
     let (left_share, right_share) = (ratio / (1.0 + ratio), 1.0 / (1.0 + ratio));
 
@@ -809,6 +860,16 @@ fn intensity_stereo_keeps_the_level_of_each_channel() {
 /// its level to the bitrate; in left/right stereo the tones above lose up
 /// to a third.)
 ///
+/// As at 44.1 kHz, noise keeps the frames short of bits, from the lowest
+/// frequency of band 18 up, away from the tones there, and in the right
+/// channel at the ratio of the tones above the bounds: sinusoids of 0.01
+/// at 22.05 and 16 kHz, and of 0.007 at 24 kHz, where at 0.01 the tone at
+/// 11.45 kHz the same in both channels decodes 17% low (11% low with the
+/// printed tables C.8 and D.4: the frames are starved at that noise either
+/// way). The tones alone
+/// are within their allowance in most frames at these bitrates, which are
+/// then not coded in intensity stereo.
+///
 /// Each stream is decoded with ffmpeg, mpg123 and LAME. This is the evidence
 /// for the position of the lines above the highest band and the scaling of
 /// the sum at the lower sampling frequencies, and, with
@@ -825,21 +886,24 @@ fn intensity_stereo_keeps_the_level_of_each_channel_at_the_lower_sampling_freque
             48,
             [1_400.0, 2_900.0, 4_200.0, 6_000.0],
             [7_000.0, 8_000.0, 10_500.0],
+            0.01,
         ),
         (
             SamplingFrequency::Hz16000,
             40,
             [1_050.0, 2_150.0, 3_050.0, 4_300.0],
             [5_100.0, 6_100.0, 7_600.0],
+            0.01,
         ),
         (
             SamplingFrequency::Hz24000,
             48,
             [1_550.0, 3_100.0, 4_400.0, 6_300.0],
             [7_600.0, 9_100.0, 11_450.0],
+            0.007,
         ),
     ];
-    for (fs, kbps, below_bounds, [band_18, band_19, above]) in cases {
+    for (fs, kbps, below_bounds, [band_18_tone, band_19, above], loudness) in cases {
         let hz = f64::from(fs.hz());
         let tones = |levels: &[(f64, f64, f64)], channel: usize| -> Vec<f64> {
             (0..2 * fs.hz() as usize)
@@ -864,7 +928,7 @@ fn intensity_stereo_keeps_the_level_of_each_channel_at_the_lower_sampling_freque
         let alike_top = [
             below(0.05).as_slice(),
             &[
-                (band_18, 0.05, 0.05),
+                (band_18_tone, 0.05, 0.05),
                 (band_19, 0.05, 0.05),
                 (above, 0.05, 0.05),
             ],
@@ -875,15 +939,34 @@ fn intensity_stereo_keeps_the_level_of_each_channel_at_the_lower_sampling_freque
             &[(band_19, 0.2, 0.1), (above, 0.1, 0.05)],
         ]
         .concat();
-        let mut cases = vec![
-            (&panned_top, false),
-            (&panned_top, true),
-            (&alike_top, false),
-            (&alike_top, true),
+        // Noise from the lowest frequency of band 18 to `fs / 2`, away from
+        // the tones above it, so that the frames are short of bits, in the
+        // right channel at the ratio of the tones above it.
+        let band_18 = scalefactor_bands::long_bands(fs)[18].start as f64 * hz / 1152.0;
+        let noise = noise_between(
+            hz,
+            (band_18, hz / 2.0),
+            &[band_18_tone, band_19, above],
+            loudness,
+            2.0,
+        );
+        let cases = [
+            (&panned_top, false, 0.5),
+            (&panned_top, true, 0.5),
+            (&alike_top, false, 1.0),
+            (&alike_top, true, 1.0),
+            (&alike_below, true, 0.5),
         ];
-        cases.push((&alike_below, true));
-        for (levels, ms_stereo) in cases {
-            let (left, right) = (tones(levels, 0), tones(levels, 1));
+        for (levels, ms_stereo, noise_right) in cases {
+            let with_noise = |channel: Vec<f64>, share: f64| -> Vec<f64> {
+                (channel.iter().zip(&noise))
+                    .map(|(x, n)| x + share * n)
+                    .collect()
+            };
+            let (left, right) = (
+                with_noise(tones(levels, 0), 1.0),
+                with_noise(tones(levels, 1), noise_right),
+            );
             let mode = Mode::JointStereo {
                 intensity_stereo: true,
                 ms_stereo,

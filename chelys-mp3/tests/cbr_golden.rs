@@ -71,15 +71,15 @@ const MS_IS: ChannelMode = ChannelMode::JointStereo {
 /// Sample rate, kbit/s, mode, error check, and the stream's length and
 /// hash.
 const STREAMS: [(u32, u32, ChannelMode, bool, usize, u64); 8] = [
-    (44_100, 128, MS, false, 24659, 0x9EF8_8C52_950B_578E),
-    (44_100, 64, MS_IS, false, 12329, 0x34BD_6310_7DC9_C84E),
+    (44_100, 128, MS, false, 24659, 0xA4AE_A0DA_0766_4C29),
+    (44_100, 64, MS_IS, false, 12329, 0xB67A_DAC5_EF02_DB50),
     (
         32_000,
         320,
         ChannelMode::Stereo,
         true,
         61920,
-        0x84DF_5785_62E0_68F2,
+        0x2738_C155_31E4_592E,
     ),
     (
         48_000,
@@ -87,25 +87,25 @@ const STREAMS: [(u32, u32, ChannelMode, bool, usize, u64); 8] = [
         ChannelMode::Mono,
         false,
         12288,
-        0x1C2E_673E_E32F_50EB,
+        0xFD19_48DC_8E80_5289,
     ),
-    (22_050, 32, MS_IS, false, 6269, 0xE92C_A9E8_7BCB_875B),
+    (22_050, 32, MS_IS, false, 6269, 0x6F30_E11D_91C9_C45E),
     (
         16_000,
         8,
         ChannelMode::Mono,
         true,
         1584,
-        0x73C0_4956_1886_F27C,
+        0xF5D9_EEFA_5286_66B4,
     ),
-    (8_000, 16, MS, false, 3312, 0xD76E_B943_9639_A539),
+    (8_000, 16, MS, false, 3312, 0x787B_377D_C3F9_A9E4),
     (
         11_025,
         24,
         ChannelMode::Stereo,
         false,
         4858,
-        0x9F49_0885_E260_599D,
+        0x9BBE_FAC7_0AD2_1D52,
     ),
 ];
 

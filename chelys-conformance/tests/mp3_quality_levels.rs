@@ -148,7 +148,9 @@ fn lines_up(input: &[f64], output: &[f32], channels: usize, c: usize, lag: usize
 ///   sample, which it could not were the tag's delays or frame count
 ///   wrong; ffmpeg every frame's samples, the input [`DELAY`] late (see
 ///   `decoders_read_the_tag_at_every_sampling_frequency`).
-/// - The stream is shorter at each level than at the level above.
+/// - The stream is no longer at each level than at the level above, and
+///   shorter than two levels above. At 8 kHz in one channel, levels 50 and
+///   60, whose offsets lie 0.6 dB apart, give streams of the same length.
 /// - At 8 kHz no frame is above 64 kbit/s in one channel, nor 128 in two,
 ///   the lowest bitrates whose slots hold every granule's 4095 bits.
 #[test]
@@ -192,7 +194,8 @@ fn every_level_decodes_at_the_mpeg25_sampling_frequencies() {
                         lens.push(stream.len());
                     }
                     let context = format!("{sample_rate} Hz, {channels} channels: {lens:?}");
-                    assert!(lens.windows(2).all(|pair| pair[0] < pair[1]), "{context}");
+                    assert!(lens.windows(2).all(|pair| pair[0] <= pair[1]), "{context}");
+                    assert!(lens.windows(3).all(|run| run[0] < run[2]), "{context}");
                 });
             }
         }
@@ -236,54 +239,64 @@ fn frames_keep_to_the_bitrates_asked_for_at_the_mpeg25_sampling_frequencies() {
     });
 }
 
-/// A tone of `hz` at -40 dB below full scale, `seconds` of it at
-/// `sample_rate`, in `channels`, planar.
-fn quiet_tone(sample_rate: u32, hz: f64, channels: usize, seconds: f64) -> Vec<Vec<f64>> {
-    let fs = f64::from(sample_rate);
-    let tone: Vec<f64> = (0..(seconds * fs) as usize)
-        .map(|t| 0.01 * (TAU * hz * t as f64 / fs).sin())
-        .collect();
-    vec![tone; channels]
+/// `seconds` of white noise at `sample_rate`, uniform from -0.5 to 0.5, in
+/// `channels` that differ, planar.
+fn white_noise(sample_rate: u32, channels: usize, seconds: f64) -> Vec<Vec<f64>> {
+    let mut seed = 11u64;
+    let mut next = || {
+        seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+        (seed >> 11) as f64 / (1u64 << 53) as f64 - 0.5
+    };
+    let len = (seconds * f64::from(sample_rate)) as usize;
+    (0..channels)
+        .map(|_| (0..len).map(|_| next()).collect())
+        .collect()
 }
 
 /// No frame goes above the lowest bitrate whose slot holds every granule's
 /// 4095 bits, at the sampling frequencies of ISO/IEC 11172-3 as at the
-/// lower ones. A quiet tone, at -40 dB below full scale, of 3 kHz at
-/// 32 kHz and of 2 kHz at 16 kHz, has more than 90% of its frames at that
-/// bitrate, 256 kbit/s and 128 in one channel, at levels 0, 80 and 100. In
-/// two channels, where no slot of the table holds that much, those frames
-/// go to the highest, 320 kbit/s and 160. ffmpeg and mpg123 decode every stream without complaint, and
-/// mpg123 gives the input's length, from the Xing/Info tag. With the lowest
-/// bitrate asked for at that bitrate or above, every frame is at the lowest.
+/// lower ones. White noise, coded with 30 dB less noise than the model
+/// allows, which no bitrate meets, has more than 90% of its frames at that
+/// bitrate, 256 kbit/s at 32 kHz and 128 at 16 kHz in one channel. In two
+/// channels, where no slot of the table holds that much, those frames go to
+/// the highest, 320 kbit/s and 160. (No level of the quality scale reaches
+/// it with music or noise: at level 100 white noise takes up to 224 kbit/s
+/// at 32 kHz in one channel.) ffmpeg and mpg123 decode every stream without
+/// complaint, and mpg123 gives the input's length, from the Xing/Info tag.
+/// With the lowest bitrate asked for at that bitrate or above, every frame
+/// is at the lowest.
 #[test]
 fn frames_go_no_higher_than_the_bitrate_that_holds_every_granule() {
     let cases = [
-        (32_000, 3_000.0, ChannelMode::Mono, 256),
-        (32_000, 3_000.0, JOINT, 320),
-        (16_000, 2_000.0, ChannelMode::Mono, 128),
-        (16_000, 2_000.0, JOINT, 160),
+        (32_000, ChannelMode::Mono, 256),
+        (32_000, JOINT, 320),
+        (16_000, ChannelMode::Mono, 128),
+        (16_000, JOINT, 160),
     ];
     std::thread::scope(|scope| {
-        for (sample_rate, hz, mode, highest) in cases {
-            for level in [0, 80, 100] {
-                scope.spawn(move || {
-                    let channels = mode.channels();
-                    let input = quiet_tone(sample_rate, hz, channels, 3.0);
-                    let config = Config::new(sample_rate, mode, quality(level)).info_tag(true);
-                    let (stream, _) = encode(config, &input);
-                    let kbps = frame_kbps(&stream);
-                    let case = format!("{sample_rate} Hz, {mode:?}, level {level}");
-                    let at_highest = kbps.iter().filter(|&&kbps| kbps == highest).count();
-                    assert!(kbps.iter().all(|&kbps| kbps <= highest), "{case}: {kbps:?}");
-                    assert!(10 * at_highest > 9 * kbps.len(), "{case}: {kbps:?}");
-                    let decoded = mpg123::decode_mp3(&stream);
-                    assert_eq!(decoded.diagnostics, "", "mpg123, {case}");
-                    let samples = input[0].len() * channels;
-                    assert_eq!(decoded.samples.len(), samples, "mpg123, {case}");
-                    let decoded = ffmpeg::decode_mp3(&stream);
-                    assert_eq!(decoded.diagnostics, "", "ffmpeg, {case}");
-                });
-            }
+        for (sample_rate, mode, highest) in cases {
+            scope.spawn(move || {
+                let channels = mode.channels();
+                let input = white_noise(sample_rate, channels, 3.0);
+                let rate = Rate::Variable {
+                    min_kbps: None,
+                    max_kbps: None,
+                    noise_offset_db: -30.0,
+                };
+                let config = Config::new(sample_rate, mode, rate).info_tag(true);
+                let (stream, _) = encode(config, &input);
+                let kbps = frame_kbps(&stream);
+                let case = format!("{sample_rate} Hz, {mode:?}");
+                let at_highest = kbps.iter().filter(|&&kbps| kbps == highest).count();
+                assert!(kbps.iter().all(|&kbps| kbps <= highest), "{case}: {kbps:?}");
+                assert!(10 * at_highest > 9 * kbps.len(), "{case}: {kbps:?}");
+                let decoded = mpg123::decode_mp3(&stream);
+                assert_eq!(decoded.diagnostics, "", "mpg123, {case}");
+                let samples = input[0].len() * channels;
+                assert_eq!(decoded.samples.len(), samples, "mpg123, {case}");
+                let decoded = ffmpeg::decode_mp3(&stream);
+                assert_eq!(decoded.diagnostics, "", "ffmpeg, {case}");
+            });
         }
     });
     let bounds = [
@@ -356,17 +369,26 @@ fn level(samples: impl Fn(usize) -> f64, start: usize, len: usize) -> f64 {
 /// 4 s by 80 dB, from -22 dB below full scale in the left channel, is
 /// coded at the sampling frequencies of MPEG-2.5 as at those of ISO/IEC
 /// 13818-3, as ffmpeg decodes it. In each window of 0.1 s whose left
-/// channel is above -70 dB, each channel keeps its level within 2.5 dB and
-/// the left channel is louder by 8 dB within 3.5 dB at level 0, and within
-/// 1.5 and 2.5 dB at levels 30, 50, 80 and 100; at 80 and 100 within 1.5
-/// and 2 dB down to -75 dB; and no window above -80 dB decodes to silence.
-/// The worst windows above -70 dB were 1.6 and 2.0 dB off at MPEG-2.5's
-/// rates, at level 0, and 2.2 and 3.0 dB at 24 kHz; above level 0, 1.2 and
-/// 1.9 dB, at 12 kHz. The first window decoded to silence was below -85 dB
-/// at MPEG-2.5's rates, and at -81 dB at 16 kHz at level 0. Below the
-/// fade's last 10 dB, where the threshold in quiet lies, the image narrows,
-/// and the right channel, then the left, are lost at every sampling
-/// frequency.
+/// channel is above -70 dB, each channel keeps its level within 1.5 dB and
+/// the left channel is louder by 8 dB within 2.5 dB at levels 30, 50, 80
+/// and 100, and within 2.5 and 3.5 dB at level 0 above -69 dB; at 80 and
+/// 100 within 1.5 and 2 dB down to -75 dB; and no window above -80 dB
+/// decodes to silence. The worst windows at level 0 were 1.4 and 1.9 dB
+/// off at MPEG-2.5's rates and 1.5 and 2.1 dB at 16 kHz; above level 0,
+/// 1.5 dB in level at 16 kHz, just within its bound, and 1.8 dB in panning
+/// at 12 kHz, both at level 30. Below the fade's last 10 dB, where the threshold in
+/// quiet lies, the image narrows, and the right channel, then the left,
+/// are lost at every sampling frequency. At level 0, which allows 12 dB
+/// more noise than the model, the side channel is lost first: at 24 kHz
+/// from the window at -69.4 dB, which decodes 2.9 dB low in the left
+/// channel and 4.6 dB high in the right, as the lowest bands take the
+/// threshold in quiet of their own frequencies (see
+/// `partitions::band_weights` in the psychoacoustic model); with the
+/// partitions of Table D.4.a of ISO/IEC 13818-3, which lie above them, it
+/// was lost from a window at -73.4 dB. That is accepted, and the bound at
+/// level 0 starts at -69 dB for it: about 23 dB SPL with full scale at
+/// 92 dB, near the threshold in quiet of those bands, at the level that
+/// allows the most noise, rather than a rule for quiet fades at level 0.
 #[test]
 fn a_panned_fade_keeps_its_image_as_at_the_lower_sampling_frequencies() {
     std::thread::scope(|scope| {
@@ -402,8 +424,8 @@ fn a_panned_fade_keeps_its_image_as_at_the_lower_sampling_frequencies() {
                              right {right:.1} dB ({right_in:.1})"
                         );
                         let (level_db, image_db) = match (q, left_in) {
-                            (_, -70.0..) if q == 0 => (2.5, 3.5),
-                            (_, -70.0..) => (1.5, 2.5),
+                            (0, -69.0..) => (2.5, 3.5),
+                            (1.., -70.0..) => (1.5, 2.5),
                             (80.., -75.0..) => (1.5, 2.0),
                             (_, -80.0..) => {
                                 assert!(left > -200.0, "{context}");

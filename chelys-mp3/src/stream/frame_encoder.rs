@@ -341,10 +341,10 @@ impl<C: Coding> FrameEncoder<C> {
     /// the frame after each but two took 64 to 80 kbit/s more, from the
     /// reservoir's smaller store, and the streams came out the same length
     /// to 288 bytes shorter. At 16 kHz none kept a frame above 128 kbit/s,
-    /// but quiet tones at the edges of the subbands, whose allowance in some
-    /// band no step meets, kept 98% of their frames at 160 kbit/s, as at
-    /// 320 at 32 kHz, at every level; the frames at 128 and 256 bring their
-    /// mean down by 20%. Where no bitrate is dropped, at 44.1 and 48 kHz and
+    /// but a quiet tone of 2 kHz there, at the edge of a subband, whose
+    /// allowance in the band below it no step meets, keeps almost every
+    /// frame at the highest bitrate it is given at every level, 128 kbit/s
+    /// in one channel in place of 160. Where no bitrate is dropped, at 44.1 and 48 kHz and
     /// in two channels at 32 and 16 kHz, those tracks and tones came out
     /// byte for byte as with every bitrate kept.
     fn useful_bitrates(&self, bitrates: &[Bitrate], ancillary_bits: usize) -> usize {
