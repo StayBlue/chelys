@@ -18,25 +18,25 @@ use chelys_core::quality::{self, CALIBRATION_LEVELS};
 type Offsets = [f64; CALIBRATION_LEVELS.len()];
 
 /// Two channels, calibrated at 44.1 kHz: from 65 kbit/s on average at
-/// level 0 to 139 at 50, 190 at 80 and 228 at 100, where the mean grades
-/// were -0.727, -0.118 and 0.002.
+/// level 0 to 138 at 50, 190 at 80 and 229 at 100, where the mean grades
+/// were -0.743, -0.117 and 0.003.
 ///
-/// Swept, the mean grade was 0.060 at -15 dB, 0.047 at -12, 0.015 at -9,
-/// -0.013 at -7.5, -0.057 at -6, -0.124 at -4.5, -0.231 at -3, -0.403 at
-/// -1.5, -0.655 at 0, -1.066 at 1.5, -1.607 at 3, -2.178 at 4.5, -2.786 at
-/// 6, -3.075 at 7.5, -3.256 at 9 and -3.549 at 12.
-const STEREO: Offsets = [7.1, 5.1, 3.8, 2.6, 1.5, 0.3, -1.0, -2.7, -4.6, -6.9, -8.2];
+/// Swept, the mean grade was 0.061 at -15 dB, 0.047 at -12, 0.016 at -9,
+/// -0.012 at -7.5, -0.056 at -6, -0.124 at -4.5, -0.230 at -3, -0.399 at
+/// -1.5, -0.647 at 0, -1.056 at 1.5, -1.597 at 3, -2.168 at 4.5, -2.778 at
+/// 6, -3.068 at 7.5, -3.250 at 9 and -3.546 at 12.
+const STEREO: Offsets = [7.1, 5.1, 3.8, 2.6, 1.6, 0.4, -1.0, -2.6, -4.6, -6.9, -8.2];
 
 /// One channel, calibrated at 44.1 kHz on the tracks mixed down to the
 /// mean of their channels: from 41 kbit/s on average at level 0 to 80 at
-/// 50, 106 at 80 and 123 at 100, where the mean grades were -0.741,
-/// -0.111 and 0.002.
+/// 50, 106 at 80 and 123 at 100, where the mean grades were -0.736,
+/// -0.111 and 0.000.
 ///
-/// Swept, the mean grade was 0.068 at -15 dB, 0.059 at -12, 0.034 at -9,
-/// 0.011 at -7.5, -0.025 at -6, -0.081 at -4.5, -0.171 at -3, -0.321 at
-/// -1.5, -0.563 at 0, -0.982 at 1.5, -1.561 at 3, -2.131 at 4.5, -2.770 at
-/// 6, -3.047 at 7.5, -3.213 at 9 and -3.495 at 12.
-const MONO: Offsets = [7.2, 5.2, 3.9, 2.8, 1.8, 0.7, -0.5, -2.0, -3.9, -5.9, -7.1];
+/// Swept, the mean grade was 0.069 at -15 dB, 0.059 at -12, 0.034 at -9,
+/// 0.011 at -7.5, -0.025 at -6, -0.081 at -4.5, -0.171 at -3, -0.319 at
+/// -1.5, -0.558 at 0, -0.976 at 1.5, -1.554 at 3, -2.125 at 4.5, -2.765 at
+/// 6, -3.043 at 7.5, -3.209 at 9 and -3.492 at 12.
+const MONO: Offsets = [7.3, 5.2, 4.0, 2.8, 1.8, 0.7, -0.5, -2.0, -3.9, -5.9, -7.0];
 
 /// The noise offset, in dB, of `level` (see
 /// [`Rate::Variable`](crate::Rate::Variable)) in `channels` channels: one

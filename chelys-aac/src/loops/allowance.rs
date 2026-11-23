@@ -97,6 +97,106 @@ pub fn within_allowance(counting: &mut Counting<'_>, xmin: &[[f64; MAX_BANDS]]) 
     }
 }
 
+/// Spends the bits of `counting` that its coding at `common_gain` leaves:
+/// makes its bands' steps finer by one, a band at a time from the lowest,
+/// every band with a line that is not zero in turn and again, for as many
+/// steps as fit the bits it makes available, each band no finer than its
+/// lines can be coded at, nor than 60 below the coarsest (see
+/// [`MAX_AMPLIFICATION`]); and gives the common step to quantize them from.
+/// `counting` holds the coding at that step, which fits.
+///
+/// Spec gap: at a variable rate the loops are given the bits that the
+/// channel takes within its allowance, or the frame's least bits, and the
+/// outer loop keeps the iteration of the least excess (see
+/// [`outer_loop`](super::outer::outer_loop)), which can take far fewer:
+/// the first, where every band is within its allowance, the last, or one
+/// between, as the bands within their allowance change. At a constant rate
+/// the bit reservoir keeps what a frame leaves; at a variable rate it would
+/// be lost, and the frame's length would jump as the offset changes.
+/// Given the same bits as its least, a channel of quiet noise was so coded
+/// in 240 bits at one noise offset and in 387 at an offset 0.001 dB
+/// higher. Spent a band at a time, the bits rise in steps of about a
+/// line's, and a frame takes about the bits its allowance or its least
+/// length gives it.
+pub fn spend(counting: &mut Counting<'_>, common_gain: u8) -> u8 {
+    let groups: Vec<_> = counting.groups().collect();
+    // Each band with a line that is not zero: where, its step, and the
+    // finest its lines can be coded at.
+    let mut bands = Vec::new();
+    for (g, &(start, group)) in groups.iter().enumerate() {
+        for sb in 0..group.num_swb() {
+            let band = group.band(sb);
+            let range = start + band.start..start + band.end;
+            let lines = counting.lines();
+            if lines.spectrum()[range.clone()].iter().all(|&x| x == 0.0) {
+                continue;
+            }
+            let step = common_gain - counting.scalefactors[g][sb];
+            let finest = lines.finest_step(range).min(step);
+            bands.push((g, sb, step, finest));
+        }
+    }
+    if bands.is_empty() {
+        return common_gain;
+    }
+    let original = counting.scalefactors.clone();
+    let count = bands.len();
+    // The coding with the steps made finer `n` times, a band at a time.
+    let code = |counting: &mut Counting<'_>, n: usize| {
+        let (rounds, first) = (n / count, n % count);
+        let steps: Vec<u8> = (bands.iter().enumerate())
+            .map(|(k, &(_, _, step, finest))| {
+                let finer = rounds + usize::from(k < first);
+                u8::try_from(usize::from(step).saturating_sub(finer))
+                    .unwrap_or(0)
+                    .max(finest)
+            })
+            .collect();
+        let coarsest = *steps.iter().max().expect("a band");
+        let finest = *steps.iter().min().expect("a band");
+        let gain = coarsest.min(finest.saturating_add(MAX_AMPLIFICATION));
+        for (&(g, sb, _, _), &step) in bands.iter().zip(&steps) {
+            counting.scalefactors[g][sb] = gain - step.min(gain);
+        }
+        counting.count_at(gain, MAX_BANDS).then_some(gain)
+    };
+    // The most steps that fit, the bits taken to grow with them: doubling
+    // the steps, then halving the distance.
+    let limit = count * usize::from(u8::MAX);
+    let (mut fitting, mut over, mut gain) = (0, None, None);
+    let mut next = 1;
+    while next <= limit {
+        match code(counting, next) {
+            Some(g) => (fitting, gain) = (next, Some(g)),
+            None => {
+                over = Some(next);
+                break;
+            }
+        }
+        next *= 2;
+    }
+    if let Some(mut over) = over {
+        while over - fitting > 1 {
+            let middle = fitting + (over - fitting) / 2;
+            match code(counting, middle) {
+                Some(g) => (fitting, gain) = (middle, Some(g)),
+                None => over = middle,
+            }
+        }
+    }
+    match gain {
+        Some(gain) if code(counting, fitting) == Some(gain) => gain,
+        _ => {
+            counting.scalefactors.copy_from_slice(&original);
+            assert!(
+                counting.count_at(common_gain, MAX_BANDS),
+                "a coding that fitted"
+            );
+            common_gain
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::ChannelCoding;
@@ -225,6 +325,36 @@ mod tests {
             .collect();
         let range = sent.iter().max().unwrap() - sent.iter().min().unwrap();
         assert_eq!(range, MAX_AMPLIFICATION, "{sent:?}");
+    }
+
+    /// The bits the outer loop leaves are spent: given ever more bits, a
+    /// channel takes nearly all of them, and never fewer than the loops
+    /// alone spend, nor more than it is given.
+    #[test]
+    fn the_bits_the_loops_leave_are_spent() {
+        let fs = SamplingFrequency::Hz44100;
+        let spectrum = noise(6).map(|x| x * 1e-3);
+        let energy = band_energy(&spectrum);
+        let xmin = [std::array::from_fn(|sb| energy[sb] * 0.05)];
+        let weights = [1.0; FRAME_LINES];
+        let mut last = 0;
+        for available_bits in (300..3000).step_by(100) {
+            let coded = |spend_all| {
+                let coding = ChannelCoding {
+                    spend_all,
+                    ..ChannelCoding::single(Windows::LONG_SINE, fs, available_bits)
+                };
+                crate::loops::quantize_channel(&spectrum, &weights, &xmin, coding).bits(false)
+            };
+            let (spent, left) = (coded(true), coded(false));
+            assert!(
+                left <= spent && spent <= available_bits,
+                "{available_bits}: {left}, {spent}"
+            );
+            assert!(spent + 40 >= available_bits, "{available_bits}: {spent}");
+            assert!(spent >= last, "{available_bits}: {last} to {spent}");
+            last = spent;
+        }
     }
 
     /// Where the channel does not fit the bits within its allowance, the

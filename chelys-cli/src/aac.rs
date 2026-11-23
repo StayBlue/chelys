@@ -71,8 +71,8 @@ MP4 file instead, which tells a player the input's exact length.
   --quality LEVEL    with --vbr, the level of quality, from 0 to 100,
                      higher for better quality and mostly larger files, on
                      a scale shared with chelys mp3 --vbr: for music in
-                     stereo at 44.1 kHz about 139 kbit/s at 50, 190 at 80
-                     and 228 at 100 (default 80)
+                     stereo at 44.1 kHz about 138 kbit/s at 50, 190 at 80
+                     and 229 at 100 (default 80)
   --vbr-noise DB     with --vbr, in place of --quality, allow each band
                      this many dB more noise than the model does, or less
                      if negative: about 205 kbit/s at -6, 142 at 0 and 73

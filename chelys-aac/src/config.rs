@@ -32,7 +32,8 @@ pub enum Rate {
     /// A variable rate: each frame as long as it takes to keep the
     /// quantization noise of every band within what the psychoacoustic
     /// model allows it, raised by `noise_offset_db`, its channels then coded
-    /// by the iteration loops in those bits; but no shorter than a quarter
+    /// by the iteration loops in those bits, and any the loops leave spent
+    /// on finer steps; but no shorter than a quarter
     /// of a frame at the rate such streams take on average at the offset,
     /// so that quiet passages that the model takes as inaudible are still
     /// coded, and no longer than the decoder's input buffer, or than 4608
@@ -81,8 +82,8 @@ pub enum Rate {
     ///
     /// It is [`Rate::Variable`] with the noise offset the level maps to,
     /// calibrated to the scale's grades at 44.1 kHz in one channel and in
-    /// two: music in stereo averages about 139 kbit/s at level 50, 190 at
-    /// 80 and 228 at 100. Configurations of more channels take the offsets
+    /// two: music in stereo averages about 138 kbit/s at level 50, 190 at
+    /// 80 and 229 at 100. Configurations of more channels take the offsets
     /// of two, and every other sampling frequency those of 44.1 kHz. At 32
     /// and 48 kHz the grades are expected to be near the scale's, but have
     /// not been measured. At the lower sampling frequencies PEAQ grades

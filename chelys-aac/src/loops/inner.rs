@@ -165,6 +165,14 @@ impl<'a> Lines<'a> {
         self.start
     }
 
+    /// [`Self::start_gain`] of the lines `range` alone, one scalefactor
+    /// band's: the finest step at which each of them can be coded.
+    pub fn finest_step(&self, range: Range<usize>) -> u8 {
+        let largest = self.scaled[range].iter().fold(0.0f64, |a, &x| a.max(x));
+        let start = (16.0 / 3.0 * (largest / MAX_QUANT).log2()).ceil();
+        (start + f64::from(SF_OFFSET)).clamp(0.0, 255.0) as u8
+    }
+
     /// The coarsest step at which the distortion of the lines `range`, one
     /// scalefactor band's, is within `allowed`, or `None` where they can
     /// quantize to zero within it, as [`band_bits`] searches it.

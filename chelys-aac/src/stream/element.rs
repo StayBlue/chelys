@@ -271,6 +271,9 @@ pub struct ElementEncoder {
     /// Whether each channel is quantized within its allowance, as at a
     /// variable or mean rate (see [`ChannelCoding::within_allowance`]).
     within_allowance: bool,
+    /// Whether the bits the loops leave are spent, as at a variable or mean
+    /// rate (see [`ChannelCoding::spend_all`]).
+    spend_all: bool,
     /// The factor by which each allowed distortion is raised, that of a
     /// variable or mean rate's noise offset; 1 at a constant rate.
     noise_factor: f64,
@@ -379,6 +382,7 @@ impl ElementEncoder {
             noise_border,
             quiet: quiet.reading,
             within_allowance,
+            spend_all: within_allowance,
             noise_factor: 1.0,
             tns: true,
             tns_around_attacks: false,
@@ -1522,6 +1526,7 @@ impl ElementEncoder {
             let coding = ChannelCoding {
                 spectrum_clipping: self.spectrum_clipping,
                 within_allowance: self.within_allowance,
+                spend_all: self.spend_all,
                 noise: prepared.noise.is_present().then_some(&prepared.noise),
                 ..coding
             };

@@ -6,7 +6,6 @@
 //! noise exceeds what the psychoacoustic model allows them.
 
 use super::inner::{Counting, decoder_gain, first_inner_loop, inner_loop, powers_four_thirds};
-use crate::channel::CodedChannel;
 use crate::scalefactor_bands::MAX_BANDS;
 
 /// The most that the outer loop amplifies a band by, in steps of the
@@ -104,8 +103,12 @@ pub const MAX_AMPLIFICATION: u8 = 60;
 /// The offset to every `xmin` of clause C.7.4.4 is applied before the loop
 /// (see [`raise_xmin`](super::raise_xmin)).
 ///
-/// Gives the channel and the excess of its iteration (see [`excess`]).
-pub fn outer_loop(mut counting: Counting, xmin: &[[f64; MAX_BANDS]]) -> (CodedChannel, f64) {
+/// Gives the counting with the scalefactors of the iteration kept, its
+/// step, the bands it sends, and its excess (see [`excess`]).
+pub fn outer_loop<'a>(
+    mut counting: Counting<'a>,
+    xmin: &[[f64; MAX_BANDS]],
+) -> (Counting<'a>, u8, usize, f64) {
     let groups: Vec<_> = counting.groups().collect();
     assert_eq!(xmin.len(), groups.len(), "an xmin for each window group");
     let mut distortion = vec![[0.0; MAX_BANDS]; groups.len()];
@@ -114,7 +117,7 @@ pub fn outer_loop(mut counting: Counting, xmin: &[[f64; MAX_BANDS]]) -> (CodedCh
     if band_limit < MAX_BANDS {
         quantization_distortion(&counting, gain, &mut distortion, &mut measured_at);
         let excess = excess(&groups, &distortion, xmin);
-        return (counting.into_channel(gain, band_limit), excess);
+        return (counting, gain, band_limit, excess);
     }
     // Whether each band's energy exceeds its xmin: those the loop is to
     // amplify, if it can.
@@ -170,7 +173,7 @@ pub fn outer_loop(mut counting: Counting, xmin: &[[f64; MAX_BANDS]]) -> (CodedCh
     }
     let (excess, gain) = best.expect("an iteration was measured");
     counting.scalefactors.copy_from_slice(&best_scalefactors);
-    (counting.into_channel(gain, MAX_BANDS), excess)
+    (counting, gain, MAX_BANDS, excess)
 }
 
 /// How far the distortion of the bands exceeds their allowance: the sum,
@@ -239,7 +242,7 @@ fn quantization_distortion(
 mod tests {
     use super::super::inner::Lines;
     use super::*;
-    use crate::channel::FRAME_LINES;
+    use crate::channel::{CodedChannel, FRAME_LINES};
     use crate::loops::ChannelCoding;
     use crate::sampling_frequency::SamplingFrequency;
     use crate::scalefactor_bands::GroupBands;
@@ -277,7 +280,8 @@ mod tests {
             Lines::new(spectrum),
             ChannelCoding::single(Windows::LONG_SINE, fs, available),
         );
-        let (channel, _) = outer_loop(counting, &[xmin]);
+        let (counting, gain, band_limit, _) = outer_loop(counting, &[xmin]);
+        let channel = counting.into_channel(gain, band_limit);
         // Measure the coded channel's distortion as a decoder would.
         let bands = GroupBands::long(fs);
         let (group, lines) = channel.groups().next().unwrap();

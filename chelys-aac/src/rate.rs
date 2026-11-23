@@ -98,7 +98,8 @@ pub const PRINTED_QUIET_SHIFT_DB: f64 = 6.2;
 /// The fewest bits a frame takes at a variable or mean rate, as a share of
 /// those of a frame at the stream's nominal rate or mean: a frame that
 /// takes fewer within its allowance is fitted to these by the loops, as at
-/// a constant rate.
+/// a constant rate, and the bits they leave spent (see
+/// [`spend`](crate::loops::allowance::spend)).
 ///
 /// Spec gap: within its allowance, a frame codes nothing that the model
 /// takes as inaudible, and of a quiet passage, nothing below the threshold
@@ -136,8 +137,10 @@ pub fn noise_factor(noise_offset_db: f64) -> f64 {
 ///
 /// Measured with each offset of `NOMINAL` on the tuning set of 51 tracks
 /// of 9 kinds of music at 44.1 kHz in stereo: the mean of the tracks'
-/// bitrates, with the tools so chosen. It is taken as the same at every
-/// sampling frequency and in every channel configuration.
+/// bitrates, with the tools so chosen, before the bits the loops leave
+/// were spent (see [`spend`](crate::loops::allowance::spend)), which
+/// raised them by 0.2% to 0.5% from -15 to 7.6 dB. It is taken as the
+/// same at every sampling frequency and in every channel configuration.
 ///
 /// Spec gap: Annex C chooses no tool by the rate, as it has only one
 /// rate. The limits on the bits for each sample by which chelys turns

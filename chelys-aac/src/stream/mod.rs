@@ -460,15 +460,14 @@ impl StreamConfig {
     /// measured it 6.9 kHz.
     ///
     /// Lowered by 20 dB at offsets up to 0 dB, and by none from 6 dB, the
-    /// variable rate graded -0.108 at 192.2 kbit/s and -0.959 at 128.3
+    /// variable rate graded -0.110 at 192.1 kbit/s and -0.958 at 128.2
     /// kbit/s, against -0.272 and -1.053 at 192.2 and 127.7 kbit/s
     /// unlowered, and better than at constant 192 and 128 kbit/s on 44 and
-    /// 38 tracks of the 51, and on every analog and acoustic one; and the
-    /// piano track -0.198. At 96 and 80 kbit/s it graded -1.962 and -2.534,
+    /// 38 tracks of the 51; and the piano track -0.197. At 96 and 80 kbit/s it graded -1.962 and -2.534,
     /// against -1.969 and -2.552 unlowered, and -2.328 and -3.069 at
     /// constant rates; at 64 kbit/s, about 7.2 dB, it is not lowered, and
-    /// graded -3.029 at 63.7 kbit/s, against -3.356 at a constant rate. A
-    /// mean rate of 128 and 192 kbit/s graded -1.021 and -0.141, against
+    /// graded -3.030 at 63.7 kbit/s, against -3.356 at a constant rate. A
+    /// mean rate of 128 and 192 kbit/s graded -1.020 and -0.142, against
     /// -1.094 and -0.228 unlowered. Lowered by 10 dB, the variable rate
     /// graded -0.149 and -0.972 at 193.0 and 128.5 kbit/s; by 30 dB, -0.107
     /// and -0.926 at 192.3 and 129.6 kbit/s; by 20 dB from -4 dB to none
@@ -480,7 +479,9 @@ impl StreamConfig {
     /// 96 kbit/s, and of other lowerings, were taken before the nominal
     /// rates were measured again with the threshold lowered (see
     /// [`rate::nominal_bits_per_sample`]), which sets each frame's least
-    /// bits.
+    /// bits, and before the bits the loops leave were spent (see
+    /// [`spend`](crate::loops::allowance::spend)), which raised the mean
+    /// grades swept from -15 to 12 dB by 0.010 at most, and lowered none.
     ///
     /// The partitions from the cap of `bval(b)` up, from about 15 kHz, keep
     /// their threshold: lowered too, the variable rate graded -0.062 at
@@ -835,8 +836,7 @@ impl StreamEncoder {
         let mut elements = self.quantize(available_bits);
         if let Some(least) = self.rate.least_bits() {
             let overhead = frame::frame_overhead_bits(&self.config, data_bits);
-            let used: u32 = elements.iter().map(CodedElement::bits).sum::<u32>() + overhead;
-            if used < least {
+            if bits(&elements) + overhead < least {
                 for element in &mut self.elements {
                     element.set_within_allowance(false);
                 }
@@ -940,6 +940,11 @@ impl StreamEncoder {
         }
         coded.into_iter().map(|e| e.expect("quantized")).collect()
     }
+}
+
+/// The bits of a frame's elements.
+fn bits(elements: &[CodedElement]) -> u32 {
+    elements.iter().map(CodedElement::bits).sum()
 }
 
 /// A stream of `frames` silent frames, each apart, for tests: the
@@ -2037,13 +2042,18 @@ mod tests {
     /// next, 0.1 dB above it, and it rises by at most 6%, as a band's coding
     /// changes, or as the loops fit frames to their least bits in coarse
     /// steps; of partly correlated loud noise, of tones and of noise 50 dB
-    /// below full scale. Over the 11 dB swept, each falls by a quarter at
-    /// least. Where the threshold in quiet is lowered less and read more as
-    /// printed at once, from 3.1 to 6 dB, the quiet noise falls by up to 12%
-    /// a step, and fell by 21% in a step of 0.2 dB. Switched at a nominal
-    /// rate of 0.8 bits a sample, with the offset lowered by 6.2 dB, the
-    /// reading made a second of such loud noise 55% longer from 6.10 to 6.11
-    /// dB.
+    /// below full scale; and of noise some 75 dB below full scale in one
+    /// channel at 48 kHz, repeated, which also rises by at most 2% in steps
+    /// of 0.001 dB from 0.5 to 0.6 dB, where it grew by 7% before the bits
+    /// the loops leave were spent (see
+    /// [`spend`](crate::loops::allowance::spend)). Over the 11 dB swept,
+    /// each of the first three falls by a quarter at least. Where the
+    /// threshold in quiet is lowered less and read more as printed at once,
+    /// from 3.1 to 6 dB, the quiet noise falls by up to 11% a step, and fell
+    /// by 21% in a step of 0.2 dB before the loops' bits were spent and it
+    /// was swept finer. Switched at a nominal rate of 0.8 bits a sample,
+    /// with the offset lowered by 6.2 dB, the reading made a second of such
+    /// loud noise 55% longer from 6.10 to 6.11 dB.
     #[test]
     fn the_length_falls_with_the_offset_without_a_break() {
         let len = 6 * FRAME_SAMPLES;
@@ -2070,12 +2080,38 @@ mod tests {
         let high = rate::BLENDED_QUIET_DB
             .end()
             .max(*rate::LOWERED_QUIET_DB.end());
-        for (k, [left, right]) in inputs.iter().enumerate() {
+        // Quiet noise in one channel at 48 kHz, 8192 samples repeated: the
+        // loops, given the frames' least bits, made it 7% longer from 0.559
+        // to 0.560 dB before the bits they leave were spent.
+        let mut period = noise(8192, 14);
+        period.iter_mut().for_each(|x| *x *= 0.0012);
+        let quiet = period.repeat(3);
+        let mono = |offset| {
+            let mut config = StreamConfig {
+                sampling_frequency: SamplingFrequency::Hz48000,
+                channel_configuration: ChannelConfiguration::Mono,
+                ..variable(Framing::Adts, offset)
+            };
+            config.bits_per_second = config.nominal_bits_per_second(offset);
+            config
+        };
+        let cases = inputs
+            .iter()
+            .map(|[left, right]| {
+                (
+                    variable as fn(Framing, f64) -> StreamConfig,
+                    vec![&left[..], &right[..]],
+                )
+            })
+            .collect::<Vec<_>>();
+        let lengths = |config: StreamConfig, channels: &[&[f64]]| -> usize {
+            frames_of(config, channels).iter().map(Vec::len).sum()
+        };
+        for (k, (config, channels)) in cases.iter().enumerate() {
             let (mut first, mut last): (Option<usize>, Option<usize>) = (None, None);
             let mut offset = low - 1.0;
             while offset <= high + 1.0 {
-                let frames = frames_of(variable(Framing::Adts, offset), &[left, right]);
-                let len: usize = frames.iter().map(Vec::len).sum();
+                let len = lengths(config(Framing::Adts, offset), channels);
                 if let Some(last) = last {
                     let ratio = len as f64 / last as f64;
                     assert!(
@@ -2089,6 +2125,31 @@ mod tests {
             }
             let (first, last) = (first.unwrap(), last.unwrap());
             assert!(4 * last <= 3 * first, "input {k}: {first} to {last} bytes");
+        }
+        let mut last = None;
+        for step in 0..=(10.0 * (high - low + 2.0)) as usize {
+            let offset = low - 1.0 + 0.1 * step as f64;
+            let len = lengths(mono(offset), &[&quiet]);
+            if let Some(last) = last {
+                let ratio = len as f64 / last as f64;
+                assert!(
+                    (0.8..=1.06).contains(&ratio),
+                    "quiet mono, {offset:.1} dB: {last} to {len} bytes"
+                );
+            }
+            last = Some(len);
+        }
+        let mut last = None;
+        for step in 0..=100 {
+            let offset = 0.5 + 0.001 * f64::from(step);
+            let len = lengths(mono(offset), &[&quiet]);
+            if let Some(last) = last {
+                assert!(
+                    len as f64 <= 1.02 * last as f64,
+                    "quiet mono, {offset:.3} dB: {last} to {len} bytes"
+                );
+            }
+            last = Some(len);
         }
     }
 

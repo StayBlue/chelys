@@ -124,6 +124,10 @@ pub struct ChannelCoding<'a> {
     /// allowance, as at a variable rate, rather than to `available_bits`,
     /// where those are fewer (see [`allowance::within_allowance`]).
     pub within_allowance: bool,
+    /// Whether the bits the outer loop leaves unspent are spent by making
+    /// the bands' steps finer, a band at a time (see [`allowance::spend`]),
+    /// as at a variable rate, where they would otherwise be lost.
+    pub spend_all: bool,
 }
 
 impl<'a> ChannelCoding<'a> {
@@ -148,6 +152,7 @@ impl<'a> ChannelCoding<'a> {
             tns,
             spectrum_clipping: SPECTRUM_CLIPPING,
             within_allowance: false,
+            spend_all: false,
         }
     }
 
@@ -170,10 +175,13 @@ impl<'a> ChannelCoding<'a> {
 /// [`outer::outer_loop`]). Where `coding` asks for the channel within its
 /// allowance, as at a variable rate, the bits it fits are those that its
 /// bands take within their allowed distortion, if they fit those
-/// available (see [`allowance::within_allowance`]).
+/// available (see [`allowance::within_allowance`]). Where `coding` asks for
+/// it, as at a variable rate, the bits the outer loop leaves are then spent
+/// (see [`allowance::spend`]).
 ///
-/// The bits the channel leaves unused (figure C.6) are not counted here:
-/// the frame's length, spent from the bit reservoir, leaves them there.
+/// Otherwise the bits the channel leaves unused (figure C.6) are not
+/// counted here: the frame's length, spent from the bit reservoir, leaves
+/// them there.
 ///
 /// # Panics
 ///
@@ -190,5 +198,11 @@ pub fn quantize_channel(
         let bits = counting.counted_bits();
         counting.refit(bits);
     }
-    outer::outer_loop(counting, xmin).0
+    let (mut counting, gain, band_limit, _) = outer::outer_loop(counting, xmin);
+    let gain = if coding.spend_all && band_limit == MAX_BANDS {
+        allowance::spend(&mut counting, gain)
+    } else {
+        gain
+    };
+    counting.into_channel(gain, band_limit)
 }
