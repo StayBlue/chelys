@@ -4,10 +4,13 @@
 //! `chelys aac` run as a program: its help, its errors, and the ADTS
 //! stream it writes from raw PCM on stdin.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::process::{Command, Output, Stdio};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use chelys::aac::{Config, DELAY, Encoder, Rate};
+use chelys::mp4::aac::{FragmentOptions, FragmentedEncoder};
 
 /// Runs `chelys` with `args`, `stdin` as its input.
 fn chelys(args: &[&str], stdin: &[u8]) -> Output {
@@ -314,7 +317,7 @@ fn refuses_input_that_is_not_a_number() {
     // input in pieces: the sample is named in the whole of it.
     let mut pcm = stereo_tone(44_100, 0.5);
     pcm[2 * 20_000 + 1] = f32::NAN;
-    for container in [&[][..], &["--mp4"]] {
+    for container in [&[][..], &["--mp4"], &["--mp4", "--fragmented"]] {
         let mut args = vec!["aac", "--sample-rate", "44100", "--channels", "2"];
         args.extend(container);
         let output = chelys(&args, &le_bytes(&pcm));
@@ -325,4 +328,131 @@ fn refuses_input_that_is_not_a_number() {
             "{args:?}"
         );
     }
+}
+
+/// With `--mp4 --fragmented`, the init segment and the fragments the
+/// library writes, one after another, at the default bitrate; for no
+/// input, the init segment and one fragment, of the one frame that codes
+/// the encoder's delay.
+#[test]
+fn writes_the_fragmented_mp4_file_the_library_writes() {
+    let args = [
+        "aac",
+        "--mp4",
+        "--fragmented",
+        "--sample-rate",
+        "44100",
+        "--channels",
+        "2",
+    ];
+    let config = Config::new(
+        44_100,
+        2,
+        Rate::Constant {
+            bits_per_second: 128_000,
+        },
+    );
+    for seconds in [0.0, 2.5] {
+        let pcm = stereo_tone(44_100, seconds);
+        let output = chelys(&args, &le_bytes(&pcm));
+        assert!(output.status.success(), "{}", text(&output.stderr));
+        assert_eq!(text(&output.stderr), "");
+        let mut encoder = FragmentedEncoder::new(config, FragmentOptions::default()).unwrap();
+        let mut expected = encoder.init_segment().to_vec();
+        encoder.encode_interleaved(&pcm, &mut expected).unwrap();
+        encoder.finish(&mut expected).unwrap();
+        assert!(output.stdout == expected, "{seconds} s: the library's file");
+        assert_eq!(&output.stdout[4..8], b"ftyp");
+    }
+}
+
+/// The types of the boxes that `bytes` starts with, as far as they are
+/// whole.
+fn whole_boxes(bytes: &[u8]) -> Vec<[u8; 4]> {
+    let mut kinds = Vec::new();
+    let mut at = 0;
+    while at + 8 <= bytes.len() {
+        let size = u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+        if size < 8 || at + size > bytes.len() {
+            break;
+        }
+        kinds.push(bytes[at + 4..at + 8].try_into().unwrap());
+        at += size;
+    }
+    kinds
+}
+
+/// With `--mp4 --fragmented`, chelys writes the init segment before any
+/// input, and a fragment once its frames are coded, while stdin is still
+/// open: it does not hold the file until the input ends. Each wait fails
+/// after a minute rather than hang.
+#[test]
+fn writes_each_fragment_while_the_input_goes_on() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_chelys"))
+        .args([
+            "aac",
+            "--mp4",
+            "--fragmented",
+            "--sample-rate",
+            "44100",
+            "--channels",
+            "2",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("chelys runs");
+    let mut input = child.stdin.take().unwrap();
+    let mut output = child.stdout.take().unwrap();
+    let (sender, receiver) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut buffer = [0; 64 * 1024];
+        while let Ok(read @ 1..) = output.read(&mut buffer) {
+            if sender.send(buffer[..read].to_vec()).is_err() {
+                break;
+            }
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut stdout = Vec::new();
+    let mut wait_for = |what: &str, done: &dyn Fn(&[[u8; 4]]) -> bool| {
+        while !done(&whole_boxes(&stdout)) {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match receiver.recv_timeout(left) {
+                Ok(bytes) => stdout.extend(bytes),
+                Err(_) => {
+                    let _ = child.kill();
+                    panic!("no {what} on stdout while stdin is open");
+                }
+            }
+        }
+    };
+    wait_for("init segment", &|kinds| kinds == [*b"ftyp", *b"moov"]);
+    // Two seconds: the first fragment's second, and the frames the encoder
+    // looks ahead to.
+    let pcm = stereo_tone(44_100, 2.0);
+    input.write_all(&le_bytes(&pcm)).unwrap();
+    input.flush().unwrap();
+    wait_for("fragment", &|kinds| {
+        kinds.len() >= 4 && kinds[2..4] == [*b"moof", *b"mdat"]
+    });
+    drop(input);
+    for bytes in receiver {
+        stdout.extend(bytes);
+    }
+    reader.join().unwrap();
+    assert!(child.wait().unwrap().success());
+    let config = Config::new(
+        44_100,
+        2,
+        Rate::Constant {
+            bits_per_second: 128_000,
+        },
+    );
+    let mut encoder = FragmentedEncoder::new(config, FragmentOptions::default()).unwrap();
+    let mut expected = encoder.init_segment().to_vec();
+    encoder.encode_interleaved(&pcm, &mut expected).unwrap();
+    encoder.finish(&mut expected).unwrap();
+    assert!(stdout == expected, "the library's file");
 }

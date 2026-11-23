@@ -9,6 +9,7 @@ use std::io::Write;
 use chelys::aac::quality::MAX_LEVEL;
 use chelys::aac::{Config, ConfigError, Encoder, Framing, Rate};
 use chelys::mp4;
+use chelys::mp4::aac::{EncodeError, FragmentOptions};
 
 use crate::output::Output;
 use crate::{pcm, value};
@@ -20,7 +21,7 @@ usage: chelys aac --sample-rate HZ --channels N
                   [--noise-substitution]
                   [--crc] [--private-bit] [--original-copy] [--home]
                   < input.f32 > output.aac
-       chelys aac --mp4 --sample-rate HZ --channels N
+       chelys aac --mp4 [--fragmented] --sample-rate HZ --channels N
                   [--bitrate KBPS [--abr] | --vbr [--quality LEVEL |
                   --vbr-noise DB]]
                   [--noise-substitution]
@@ -101,6 +102,14 @@ MP4 file instead, which tells a player the input's exact length.
                      refused with it; the file is written once the input
                      has ended, so it is held in memory until then, about
                      the bitrate times the duration
+  --fragmented       with --mp4, write a fragmented MP4 file as the input
+                     arrives: the file's header at once, then a fragment of
+                     about a second of the stream as each is coded, so that
+                     little is held in memory and the file can be played
+                     as it is written; but as the input's length is not
+                     known until it ends, the file does not give it, and
+                     a player plays the near silence after the input too,
+                     fewer than 1024 samples, which --mp4 alone leaves out
 
 The decoded output starts with 1024 samples before the input and ends with
 fewer than 1024 after it, near silence to be discarded: ADTS has no field
@@ -125,6 +134,8 @@ pub struct Options {
     original_copy: bool,
     home: bool,
     mp4: bool,
+    /// With `--mp4`, whether the file is fragmented.
+    fragmented: bool,
 }
 
 impl Options {
@@ -161,7 +172,7 @@ fn config(sample_rate: u32, channels: usize, kbps: u32) -> Config {
 pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
     let (mut sample_rate, mut channels, mut bitrate) = (None, None, None);
     let (mut crc, mut private_bit, mut original_copy, mut home) = (false, false, false, false);
-    let (mut noise_substitution, mut mp4) = (false, false);
+    let (mut noise_substitution, mut mp4, mut fragmented) = (false, false, false);
     let (mut abr, mut vbr, mut quality, mut vbr_noise) = (false, false, None, None);
     let mut args = args.into_iter();
     while let Some(flag) = args.next() {
@@ -180,6 +191,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> 
             "--original-copy" => original_copy = true,
             "--home" => home = true,
             "--mp4" => mp4 = true,
+            "--fragmented" => fragmented = true,
             // An empty message asks for the usage text alone.
             "-h" | "--help" => return Err(String::new()),
             other => return Err(format!("unknown argument: {other}")),
@@ -190,6 +202,9 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> 
         n @ (1..=6 | 8) => n as usize,
         n => return Err(format!("unsupported channel count: {n}")),
     };
+    if fragmented && !mp4 {
+        return Err("--fragmented needs --mp4".to_owned());
+    }
     if vbr && (bitrate.is_some() || abr) {
         return Err("--bitrate and --abr exclude --vbr".to_owned());
     }
@@ -226,6 +241,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> 
         original_copy,
         home,
         mp4,
+        fragmented,
     };
     options
         .config()
@@ -297,10 +313,12 @@ fn describe(error: ConfigError, options: &Options) -> String {
 }
 
 /// Encodes stdin to stdout as it arrives, or with `--mp4` writes the file
-/// once stdin has ended.
+/// once stdin has ended, unless it is `--fragmented`.
 pub fn encode(options: &Options) -> Result<(), String> {
-    if options.mp4 {
-        return encode_mp4(options);
+    match (options.mp4, options.fragmented) {
+        (true, false) => return encode_mp4(options),
+        (true, true) => return encode_fragmented(options),
+        (false, _) => {}
     }
     let mut output = Output::stdout();
     let mut encoder = Encoder::new(options.config()).map_err(|e| e.to_string())?;
@@ -326,6 +344,35 @@ fn encode_mp4(options: &Options) -> Result<(), String> {
     let error = |e: std::io::Error| format!("writing stdout: {e}");
     encoder.finish(&mut stdout).map_err(error)?;
     stdout.flush().map_err(error)
+}
+
+/// Encodes stdin into a fragmented MP4 file, written to stdout as it is
+/// coded: its init segment first, then each fragment as it is ended, each
+/// flushed at once, so that a reader of stdout has it.
+fn encode_fragmented(options: &Options) -> Result<(), String> {
+    let mut encoder =
+        mp4::aac::FragmentedEncoder::new(options.config(), FragmentOptions::default())
+            .map_err(|e| e.to_string())?;
+    let mut output = Output::stdout();
+    let mut stream = encoder.init_segment().to_vec();
+    let mut write = |stream: &mut Vec<u8>| {
+        if stream.is_empty() {
+            return Ok(());
+        }
+        output.write(stream)?;
+        output.flush()
+    };
+    write(&mut stream)?;
+    pcm::read(encoder.channels(), |samples| {
+        match encoder.encode_interleaved(samples, &mut stream) {
+            Ok(()) => {}
+            Err(EncodeError::NonFiniteSample(e)) => return Err(e.into()),
+            Err(e) => return Err(e.to_string().into()),
+        }
+        Ok(write(&mut stream)?)
+    })?;
+    encoder.finish(&mut stream).map_err(|e| e.to_string())?;
+    write(&mut stream)
 }
 
 #[cfg(test)]
@@ -508,6 +555,14 @@ mod tests {
                 "{flag}"
             );
         }
+    }
+
+    #[test]
+    fn fragmented_needs_mp4() {
+        let args = ["--fragmented", "--sample-rate", "44100", "--channels", "2"];
+        assert_eq!(error(&args), "--fragmented needs --mp4");
+        let options = parse(&[&args[..], &["--mp4"]].concat()).unwrap();
+        assert!(options.mp4 && options.fragmented);
     }
 
     /// The ranges the usage gives with --mp4, and that the lowest is at
