@@ -11,8 +11,11 @@
 //! says "Settled by decoding with" the decoders that settled it and names
 //! the test. That evidence was recorded with ffmpeg n9.0.2, mpg123 1.33.7
 //! and LAME 4.0 (64-bit), for AAC with ffmpeg n9.0.2 and FAAD2 2.11.4,
-//! and for MP4 files with ffmpeg n9.0.2; other versions could decode
-//! differently.
+//! and for MP4 files with ffmpeg n9.0.2 and GStreamer 1.28.9, through
+//! `qtdemux`, gst-libav 1.28.9's `avdec_aac` and `audiosegmentclip` (see
+//! [`gstreamer`]); other versions could decode differently. `avdec_aac`
+//! wraps ffmpeg's AAC decoder, so that GStreamer's evidence is of its
+//! reading of the file, not of an independent decoder.
 //!
 //! Quality is graded with PEAQ (ITU-R BS.1387) as GstPEAQ computes it, also
 //! as a black box (see [`peaq`]). Its grades were recorded with GstPEAQ

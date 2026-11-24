@@ -183,6 +183,18 @@ impl Fragmenter {
     /// where there is no padding. The file without fragments keeps every
     /// frame's duration, as its edit list alone ends its presentation.
     ///
+    /// Settled by decoding with ffmpeg and GStreamer (`qtdemux`,
+    /// `avdec_aac`, `audiosegmentclip`; black box): GStreamer 1.28.9
+    /// presents a fragmented file of a declared length as it presents the
+    /// file written whole of the same input, the padding left out, its
+    /// `qtdemux` ending the last segment it marks at the input's end, where
+    /// the padding is none, a frame's less one, and in between; and ffprobe
+    /// n9.0.2 gives the stream the media's duration, the delay and the
+    /// input, though ffmpeg presents the padding all the same (see
+    /// [`init_segment`]). The conformance tests are
+    /// `gstreamer_decodes_fragmented_files_of_a_declared_length_as_the_files_written_whole`
+    /// and `ffprobe_reads_fragmented_files_as_long_as_their_media`.
+    ///
     /// # Panics
     ///
     /// If `last_duration` is 0 or more than `frame_samples`.
@@ -346,6 +358,14 @@ const SAMPLE_FLAGS: u32 = (2 << 26) | (2 << 24) | (2 << 20);
 /// `ffmpeg_decodes_fragmented_files_to_the_frames_of_the_file_written_whole`,
 /// `ffprobe_reads_fragmented_files_as_long_as_their_media` and
 /// `ffmpeg_reads_empty_and_short_fragmented_files`.
+///
+/// Settled by decoding with GStreamer (`qtdemux`, `avdec_aac`,
+/// `audiosegmentclip`; black box): where the length is not known,
+/// GStreamer 1.28.9's `qtdemux` marks a segment from the delay with no
+/// end, and it presents the padding after the input; where it is known,
+/// it presents the input alone (see [`Fragmenter::finish`]). The
+/// conformance test is
+/// `gstreamer_presents_the_padding_of_fragmented_files_of_no_length`.
 pub fn init_segment(track: &AudioTrack, length: Option<u64>) -> Vec<u8> {
     let durations = Durations {
         edit: length.unwrap_or(0),
@@ -369,6 +389,13 @@ pub fn init_segment(track: &AudioTrack, length: Option<u64>) -> Vec<u8> {
     };
     let extends = |out: &mut Vec<u8>| {
         write_box(out, b"mvex", |out| {
+            // The MovieExtendsHeaderBox comes with every edit of a known
+            // length, and only with one, as clause 8.6.6.1 adjusts the one
+            // to the other. GStreamer 1.28.9's qtdemux (black box), given
+            // the edit without the box, ends each segment it marks at the
+            // end of the fragments it has read, until the last: see the
+            // conformance test
+            // `gstreamer_ends_a_finite_edit_without_mehd_with_the_fragments_read`.
             if let Some(length) = length {
                 let version = version(&[length]);
                 write_full_box(out, b"mehd", version, 0, |out| {

@@ -117,6 +117,11 @@ impl std::error::Error for LengthError {}
 /// ffmpeg n9.0.2 (black box) presents the padding of a fragmented file
 /// whether its length is declared or not: see the conformance test
 /// `ffmpeg_decodes_fragmented_files_to_the_frames_of_the_file_written_whole`.
+/// GStreamer 1.28.9 (`qtdemux`, `avdec_aac`, `audiosegmentclip`; black
+/// box) presents the input alone where the length is declared, and the
+/// padding too where it is not: see the conformance tests
+/// `gstreamer_decodes_fragmented_files_of_a_declared_length_as_the_files_written_whole`
+/// and `gstreamer_presents_the_padding_of_fragmented_files_of_no_length`.
 ///
 /// The frames are the same as an [`Encoder`]'s of the same input: the
 /// fragments' `MediaDataBox`es hold, one after another, what the file
