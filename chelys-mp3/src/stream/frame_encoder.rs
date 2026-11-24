@@ -16,6 +16,7 @@ use crate::rate::{MeanRateSchedule, StreamRate};
 use crate::reservoir::Reservoir;
 use crate::{filterbank, rate, scalefactor_bands};
 use chelys_core::FrameSink;
+use std::num::NonZeroU32;
 
 /// The PCM a [`FrameEncoder`] needs past a frame before coding it: two
 /// granules, as a granule's block type depends on whether the granule after
@@ -63,8 +64,9 @@ struct FrameAtBitrate {
     padding: bool,
     coded: CodedFrame,
     main_data_begin: usize,
-    /// The bits of the frame's main data slot beyond the granules' shares
-    /// and its ancillary data.
+    /// The bits the granules share beyond their shares: of the frame's main
+    /// data slot less its ancillary data, and of the reservoir where the
+    /// frame drains it (see [`FrameEncoder::drains`]).
     unshared_bits: usize,
     reservoir: Reservoir,
 }
@@ -92,6 +94,9 @@ pub(super) struct FrameEncoder<C: Coding> {
     /// For each channel, the block type and analysis of the granule after
     /// the next to be filtered.
     ahead: Vec<Option<(BlockType, C::Analysis)>>,
+    /// About how many samples apart frames begin their main data in
+    /// themselves (see [`Self::starts_independent`]).
+    independent_period: Option<NonZeroU32>,
 }
 
 /// What a [`FrameEncoder`] wrote, once it has finished.
@@ -122,7 +127,53 @@ impl<C: Coding> FrameEncoder<C> {
             frame_lens: Vec::new(),
             ancillary: AncillaryQueue::default(),
             ahead: (0..channels).map(|_| None).collect(),
+            independent_period: None,
         }
+    }
+
+    pub(super) fn set_independent_period(&mut self, samples: NonZeroU32) {
+        self.independent_period = Some(samples);
+    }
+
+    /// Whether the frame `index` begins its main data in itself: the first,
+    /// and, with [`Self::independent_period`], the frame whose start is
+    /// nearest each multiple of the period, the later where two are as
+    /// near: frame `j` if some `n` has `(j - 1/2) f <= n p < (j + 1/2) f`,
+    /// for frames of `f` samples and a period of `p`.
+    pub(super) fn starts_independent(&self, index: u64) -> bool {
+        let Some(period) = self.independent_period else {
+            return index == 0;
+        };
+        if index == 0 {
+            return true;
+        }
+        let (f, p, j) = (
+            self.samples_per_frame() as u128,
+            u128::from(period.get()),
+            u128::from(index),
+        );
+        let n = ((2 * j - 1) * f).div_ceil(2 * p);
+        2 * n * p < (2 * j + 1) * f
+    }
+
+    /// Whether the frame being coded is the last before one that begins its
+    /// main data in itself, and so leaves the reservoir empty.
+    ///
+    /// Spec reading: the bit reservoir of clause C.1.5.4.2.2 keeps what a
+    /// granule leaves for the granules after it, as far as its limit allows,
+    /// and leaves the rest as stuffing. Before a frame that is to be decoded
+    /// without the bytes before it, it is to keep nothing, as
+    /// `main_data_begin` may always be 0 (clause 2.4.3.4.3); rather than
+    /// leave all it holds as stuffing, the frame before shares it between
+    /// its granules with their own shares, `mean_bits` (clause C.1.5.3.4),
+    /// where its coding takes from the reservoir. A granule may not use all
+    /// of its share, as one that is silent, or at the most that
+    /// `part2_3_length` allows, and at a variable bitrate a frame of normal
+    /// blocks is coded against a reservoir of its own (see
+    /// [`Self::quantize_within`]); what the frame's granules leave is
+    /// stuffing.
+    fn drains(&self) -> bool {
+        self.starts_independent(self.frame_lens.len() as u64 + 1)
     }
 
     /// Codes the frames whose PCM, and the granule after it, have arrived,
@@ -307,6 +358,10 @@ impl<C: Coding> FrameEncoder<C> {
         self.writer.write(&header, &side_info, &main_data);
         self.reservoir = reservoir;
         self.reservoir_bytes = self.reservoir.end_frame(unshared_bits);
+        if self.drains() {
+            self.reservoir.empty();
+            self.reservoir_bytes = 0;
+        }
         self.writer.keep_unused(self.reservoir_bytes);
         self.frame_lens.push(header.frame_len());
     }
@@ -457,14 +512,20 @@ impl<C: Coding> FrameEncoder<C> {
         only_within: bool,
     ) -> Option<FrameAtBitrate> {
         let fs = self.config.sampling_frequency;
-        let mut reservoir = self.reservoir.for_frame(bitrate.frame_len(fs, true));
+        let reservoir = self.reservoir.for_frame(bitrate.frame_len(fs, true));
         let main_data_begin = reservoir.bytes();
         // mode_extension does not change the frame's length.
         let slot_bits = main_data_bits(&self.config.frame_header(bitrate, padding, false, false))
             .checked_sub(ancillary_bits)
             .expect("the ancillary data fits in the frame");
+        // The bits the granules share: those of the slot, and before a frame
+        // that begins its main data in itself, the reservoir's (see `drains`).
+        let (mut reservoir, shared_bits) = match self.drains() {
+            true => (reservoir.draining(), slot_bits + reservoir.drain()),
+            false => (reservoir, slot_bits),
+        };
         let shares = frame.len() * self.pcm.len();
-        let mean_bits = slot_bits / shares;
+        let mean_bits = shared_bits / shares;
         let coded =
             self.coding
                 .quantize(frame, mean_bits, &mut reservoir, intensity, only_within)?;
@@ -473,7 +534,7 @@ impl<C: Coding> FrameEncoder<C> {
             padding,
             coded,
             main_data_begin,
-            unshared_bits: slot_bits - shares * mean_bits,
+            unshared_bits: shared_bits - shares * mean_bits,
             reservoir,
         })
     }

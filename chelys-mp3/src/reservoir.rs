@@ -195,6 +195,32 @@ impl Reservoir {
         self.bits += mean_bits as isize - used as isize;
     }
 
+    /// The reservoir of a frame after which the next begins its main data in
+    /// itself: with the bits it holds handed to the frame's granules, as
+    /// [`drain`](Self::drain) gives them, and no room to keep any. A granule
+    /// is then given what the granules before it in the frame left over,
+    /// and is to use it ([`least_use`](Self::least_use)); what the last
+    /// cannot use is stuffing.
+    pub fn draining(&self) -> Self {
+        Self {
+            bits: 0,
+            stream_max_bytes: self.stream_max_bytes,
+            max_bytes: 0,
+        }
+    }
+
+    /// The bits a [`draining`](Self::draining) reservoir hands over: those of
+    /// its whole bytes, the frame's `main_data_begin`.
+    pub fn drain(&self) -> usize {
+        8 * self.bytes()
+    }
+
+    /// Empties the reservoir after a frame, so that the next frame's
+    /// `main_data_begin` is 0, and what it held is stuffing.
+    pub fn empty(&mut self) {
+        self.bits = 0;
+    }
+
     /// Ends a frame whose main data slot held `unshared_bits` more than the
     /// granules' shares, and returns the bytes the reservoir keeps for the
     /// frames after it: the next frame's `main_data_begin`, unless its

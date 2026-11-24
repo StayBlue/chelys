@@ -6,6 +6,7 @@
 //! the encoder could write is one the standard allows.
 
 use std::fmt;
+use std::num::NonZeroU32;
 
 use super::calibration;
 use super::header::{Bitrate, Flags, Mode, SamplingFrequency};
@@ -143,6 +144,7 @@ pub struct Config {
     mixed_blocks: bool,
     flags: Flags,
     ancillary_bits_per_frame: usize,
+    independent_frames_every: Option<NonZeroU32>,
 }
 
 impl Config {
@@ -159,6 +161,7 @@ impl Config {
             mixed_blocks: false,
             flags: Flags::default(),
             ancillary_bits_per_frame: 0,
+            independent_frames_every: None,
         }
     }
 
@@ -232,6 +235,40 @@ impl Config {
         self
     }
 
+    /// Has a frame begin its main data in itself, with a `main_data_begin`
+    /// of 0, about every `samples` samples of each channel, so that it and
+    /// the frames after it can be decoded without the bytes before it, as
+    /// where a stream is cut into segments that a decoder may start at.
+    /// `None`, the default, has none do so but the first; others may still,
+    /// where the bit reservoir happens to be empty.
+    ///
+    /// The frames counted are those of audio, from the stream's start, and
+    /// their samples are those they decode to, [`DELAY`] included. The
+    /// frame that begins this way is the one whose start is nearest each
+    /// multiple of `samples`, the later where two are as near, as
+    /// `chelys-mp4` ends fragments of a duration in samples: at 44.1 kHz, a
+    /// period of six seconds, 264600 samples, is mostly 230 frames, and 229
+    /// every third period or so, and stays in step with the multiples. A
+    /// period of `k` frames is `k` times
+    /// [`samples_per_frame`](super::Encoder::samples_per_frame).
+    ///
+    /// The bit reservoir cannot carry bits over such a frame: what it holds
+    /// is stuffing, up to 511 bytes a period (255 at the lower sampling
+    /// frequencies), but for what the frame before it can spend, which is
+    /// none at a variable rate where that frame is of normal blocks in
+    /// MPEG-1. As no later frame can begin its main data before it, the
+    /// frames before it are all given as soon as the frame before it is
+    /// coded. A decoder that starts at such a frame still starts with its
+    /// filterbank empty, and its first two granules or so decode unlike
+    /// the whole stream's: the frame is independent of the bytes before
+    /// it, not of the audio.
+    ///
+    /// [`DELAY`]: super::DELAY
+    pub fn independent_frames_every(mut self, samples: Option<NonZeroU32>) -> Self {
+        self.independent_frames_every = samples;
+        self
+    }
+
     /// Whether [`Encoder::new`] takes this configuration.
     ///
     /// # Errors
@@ -253,6 +290,10 @@ impl Config {
 
     pub(super) fn ancillary_bits(&self) -> usize {
         self.ancillary_bits_per_frame
+    }
+
+    pub(super) fn independent_period(&self) -> Option<NonZeroU32> {
+        self.independent_frames_every
     }
 
     /// The stream's configuration, if every option is one the stream can

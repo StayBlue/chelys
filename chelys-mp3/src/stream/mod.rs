@@ -20,6 +20,8 @@ pub use layout::max_ancillary_bits;
 #[cfg(feature = "unstable")]
 pub use layout::{encode_granules, encode_silence, write_frame};
 
+use std::num::NonZeroU32;
+
 use crate::header::{Bitrate, Emphasis, Flags, Header, Mode, SamplingFrequency};
 use crate::info_tag;
 use crate::rate::StreamRate;
@@ -268,6 +270,15 @@ impl StreamEncoder {
             "{bits_per_frame} bits of ancillary data exceed the {slot} of the shortest frame"
         );
         self.frames.ancillary.set_bits_per_frame(bits_per_frame);
+        self
+    }
+
+    /// Has the frame whose start is nearest each multiple of `samples`
+    /// begin its main data in itself, as
+    /// [`Config::independent_frames_every`](crate::Config::independent_frames_every)
+    /// describes.
+    pub fn with_independent_frames(mut self, samples: NonZeroU32) -> Self {
+        self.frames.set_independent_period(samples);
         self
     }
 
@@ -1097,5 +1108,153 @@ mod tests {
             encoder.finish(&mut out);
             assert!(out == whole, "chunks of {chunk}");
         }
+    }
+
+    /// The frames that begin their main data in themselves are the first
+    /// and the one whose start is nearest each multiple of the period, the
+    /// later where two are as near.
+    #[test]
+    fn independent_frames_keep_to_the_period() {
+        let config = StreamConfig {
+            rate: StreamRate::Constant(Bitrate::from_kbps(Version::Mpeg1, 128).unwrap()),
+            sampling_frequency: SamplingFrequency::Hz44100,
+            mode: MS,
+            crc_protected: false,
+            flags: Flags::default(),
+        };
+        let independent = |samples: u32| {
+            let samples = NonZeroU32::new(samples).unwrap();
+            let encoder = StreamEncoder::new(config).with_independent_frames(samples);
+            (0..2_000)
+                .filter(|&j| encoder.frames.starts_independent(j))
+                .collect::<Vec<u64>>()
+        };
+        // Six seconds: 229.6875 frames.
+        let six = independent(264_600);
+        let lens: Vec<u64> = six.windows(2).map(|w| w[1] - w[0]).collect();
+        assert_eq!(six[..3], [0, 230, 459]);
+        assert!(lens.iter().all(|&len| len == 229 || len == 230));
+        assert_eq!(lens.iter().filter(|&&len| len == 229).count(), 2);
+        for (n, &j) in six.iter().enumerate() {
+            let boundary = n as f64 * 264_600.0 / 1152.0;
+            assert!((j as f64 - boundary).abs() <= 0.5, "frame {j}");
+        }
+        // Half a frame either way: the later of two as near.
+        assert_eq!(independent(3 * 1152)[..3], [0, 3, 6]);
+        assert_eq!(independent(1152 + 576)[..4], [0, 2, 3, 5]);
+        assert_eq!(independent(500), (0..2_000).collect::<Vec<_>>());
+        let without = StreamEncoder::new(config);
+        assert!(
+            (0..2_000)
+                .filter(|&j| without.frames.starts_independent(j))
+                .eq([0])
+        );
+    }
+
+    /// With a period, each frame that begins its main data in itself starts
+    /// a stream of its own, which the frames after it keep to the rules of
+    /// the reservoir within, at every rate, while the frames between still
+    /// begin theirs in earlier frames; and the stream still does not depend
+    /// on how the input is divided.
+    #[test]
+    fn independent_frames_need_no_earlier_bytes() {
+        use SamplingFrequency::*;
+        let at = |fs: SamplingFrequency, kbps| {
+            StreamRate::Constant(Bitrate::from_kbps(fs.version(), kbps).unwrap())
+        };
+        let mean = |fs: SamplingFrequency, kbps: u32| {
+            StreamRate::Mean(rate::MeanRate::new(fs.version(), kbps * 1000).unwrap())
+        };
+        let free = |fs: SamplingFrequency, bits_per_second| {
+            StreamRate::Constant(Bitrate::free(fs.version(), bits_per_second).unwrap())
+        };
+        let intensity = Mode::JointStereo {
+            intensity_stereo: true,
+            ms_stereo: true,
+        };
+        let cases = [
+            (Hz44100, at(Hz44100, 128), MS, 0, 5 * 1152),
+            (Hz44100, at(Hz44100, 64), Mode::Stereo, 16, 10_000),
+            (Hz48000, mean(Hz48000, 100), MS, 0, 7_000),
+            (Hz44100, variable(Hz44100, [32, 320], 0.0), MS, 0, 6_000),
+            (
+                Hz22050,
+                variable(Hz22050, [8, 160], 0.0),
+                intensity,
+                0,
+                4_000,
+            ),
+            (Hz32000, free(Hz32000, 100_000), Mode::Stereo, 0, 8_000),
+            (Hz8000, at(Hz8000, 16), Mode::SingleChannel, 8, 2_000),
+        ];
+        std::thread::scope(|scope| {
+            for (fs, rate, mode, ancillary, period) in cases {
+                scope.spawn(move || {
+                    let config = StreamConfig {
+                        rate,
+                        sampling_frequency: fs,
+                        mode,
+                        crc_protected: false,
+                        flags: Flags::default(),
+                    };
+                    let case = format!("{fs:?} at {rate:?}");
+                    let input = varied(fs, 1.0);
+                    let channels: Vec<&[f64]> = match mode {
+                        Mode::SingleChannel => vec![&input[0]],
+                        _ => vec![&input[0], &input[1]],
+                    };
+                    let encode = |chunk: usize| {
+                        let period = NonZeroU32::new(period).unwrap();
+                        let mut encoder =
+                            StreamEncoder::new(config).with_independent_frames(period);
+                        if ancillary > 0 {
+                            encoder = encoder.with_ancillary(ancillary);
+                            encoder.push_ancillary(&[0xA5; 10_000]);
+                        }
+                        let mut frames = Vec::new();
+                        let mut out = |frame: &[u8]| frames.push(frame.to_vec());
+                        let len = channels[0].len();
+                        for start in (0..len).step_by(chunk) {
+                            let end = len.min(start + chunk);
+                            let part: Vec<&[f64]> =
+                                channels.iter().map(|c| &c[start..end]).collect();
+                            encoder.encode(&part, &mut out);
+                        }
+                        encoder.finish(&mut out);
+                        frames
+                    };
+                    let frames = encode(usize::MAX);
+                    assert!(encode(1_000) == frames, "{case}: in chunks");
+                    let check = |stream: &[u8]| match rate {
+                        StreamRate::Constant(bitrate) if bitrate.is_free() => {
+                            check::free_frames(stream, bitrate)
+                        }
+                        _ => check::frames(stream),
+                    };
+                    let whole = check(&frames.concat());
+                    assert!(whole.iter().any(|f| f.main_data_begin > 0), "{case}");
+                    let f = fs.version().samples_per_frame() as u64;
+                    let p = u64::from(period);
+                    let cuts: Vec<usize> = (1..)
+                        .map(|n: u64| ((2 * n * p + f) / (2 * f)) as usize)
+                        .take_while(|&j| j < frames.len())
+                        .collect();
+                    assert!(cuts.len() >= 3, "{case}");
+                    for (j, frame) in whole.iter().enumerate() {
+                        let cut = j == 0 || cuts.contains(&j);
+                        assert!(!cut || frame.main_data_begin == 0, "{case}: frame {j}");
+                    }
+                    let coded = |frames: &[check::Frame]| -> Vec<(usize, usize, usize)> {
+                        (frames.iter())
+                            .map(|f| (f.len, f.main_data_begin, f.audio_bits))
+                            .collect()
+                    };
+                    for &j in &cuts {
+                        let tail = check(&frames[j..].concat());
+                        assert!(coded(&tail) == coded(&whole[j..]), "{case}: from frame {j}");
+                    }
+                });
+            }
+        });
     }
 }

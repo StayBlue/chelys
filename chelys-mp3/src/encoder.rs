@@ -91,6 +91,9 @@ impl Encoder {
         if config.ancillary_bits() > 0 {
             stream = stream.with_ancillary(config.ancillary_bits());
         }
+        if let Some(samples) = config.independent_period() {
+            stream = stream.with_independent_frames(samples);
+        }
         Ok(Self {
             stream,
             pcm: vec![Vec::new(); stream_config.mode.channels()],

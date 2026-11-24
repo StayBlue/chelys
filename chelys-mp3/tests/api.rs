@@ -5,6 +5,7 @@
 //! input give the same stream.
 
 use std::f64::consts::TAU;
+use std::num::NonZeroU32;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use chelys_mp3::{
@@ -375,6 +376,38 @@ fn a_sink_that_panics_loses_no_frame() {
     encoder.encode_interleaved(&pcm, &mut expected).unwrap();
     assert_eq!(encoder.finish(&mut expected), finished);
     assert!(stream == expected);
+}
+
+/// A period of independent frames has the frames at its multiples begin
+/// their main data in themselves, and leaves the others free to begin
+/// theirs earlier; with none, the stream is the default's.
+#[test]
+fn independent_frames_begin_their_main_data_in_themselves() {
+    let config = Config::new(44_100, ChannelMode::Stereo, Rate::Constant { kbps: 128 });
+    let pcm = tone(44_100, 60_000, 2);
+    let slices: Vec<&[f64]> = pcm.iter().map(Vec::as_slice).collect();
+    let frames = |config: Config| {
+        let mut encoder = Encoder::new(config).unwrap();
+        let mut frames = Vec::new();
+        let mut out = |frame: &[u8]| frames.push(frame.to_vec());
+        encoder.encode_planar(&slices, &mut out).unwrap();
+        encoder.finish(&mut out);
+        frames
+    };
+    // MPEG-1 without a CRC: the 9 bits after the header.
+    let main_data_begin = |frame: &[u8]| (usize::from(frame[4]) << 1) | usize::from(frame[5] >> 7);
+    let period = NonZeroU32::new(5 * 1152);
+    let independent = frames(config.independent_frames_every(period));
+    assert!(independent.len() > 20);
+    for (j, frame) in independent.iter().enumerate() {
+        if j % 5 == 0 {
+            assert_eq!(main_data_begin(frame), 0, "frame {j}");
+        }
+    }
+    assert!(independent.iter().any(|frame| main_data_begin(frame) > 0));
+    let default = frames(config);
+    assert!((default.iter().step_by(5)).any(|frame| main_data_begin(frame) > 0));
+    assert_eq!(frames(config.independent_frames_every(None)), default);
 }
 
 /// Samples far beyond full scale are clamped.
