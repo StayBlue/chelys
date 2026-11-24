@@ -288,3 +288,96 @@ pub fn probe_mp4(file: &[u8]) -> Mp4Stream {
         time_base: field("time_base").to_owned(),
     }
 }
+
+/// A stream's packets as ffprobe splits them, each with its duration in
+/// the stream's time base, and the stream's extradata, the codec's
+/// configuration: the data of the STREAMINFO block for FLAC, and the
+/// identification header for Opus.
+pub struct Packets {
+    pub config: Vec<u8>,
+    pub packets: Vec<Vec<u8>>,
+    pub durations: Vec<u64>,
+}
+
+/// The packets of the first audio stream of `file`, a file of the format
+/// `extension` names, from ffprobe's hex dumps of them. Only that text is
+/// parsed, never the file's format.
+pub fn packets(file: &[u8], extension: &str) -> Packets {
+    let file = TempFile::new(extension, file);
+    let output = run(Command::new("ffprobe")
+        .args(["-v", "error", "-select_streams", "a:0", "-show_data"])
+        .args(["-show_entries", "packet=duration,data:stream=extradata"])
+        .arg(file.path()));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let mut config = Vec::new();
+    let mut packets: Vec<Vec<u8>> = Vec::new();
+    let mut durations = Vec::new();
+    let mut in_stream = false;
+    for line in stdout.lines() {
+        if line == "[PACKET]" {
+            packets.push(Vec::new());
+        } else if line == "[STREAM]" {
+            in_stream = true;
+        } else if let Some(duration) = line.strip_prefix("duration=") {
+            durations.push(duration.parse().unwrap());
+        } else if let Some((_offset, dump)) = line.split_once(": ") {
+            // The hex in groups of four digits, then two spaces and the
+            // bytes as text.
+            let hex: String = dump.split("  ").next().unwrap().split(' ').collect();
+            let bytes = (0..hex.len())
+                .step_by(2)
+                .map(|at| u8::from_str_radix(&hex[at..at + 2], 16).unwrap());
+            if in_stream {
+                config.extend(bytes);
+            } else {
+                packets.last_mut().unwrap().extend(bytes);
+            }
+        }
+    }
+    assert_eq!(packets.len(), durations.len(), "{stdout}");
+    Packets {
+        config,
+        packets,
+        durations,
+    }
+}
+
+/// An Ogg Opus file of `pcm`, interleaved samples of `channels` at 48 kHz,
+/// as ffmpeg's libopus encoder makes it at `kbps`, run as a black box to
+/// make the packets that `chelys-mp4`'s tests write in MP4 files.
+pub fn encode_opus(pcm: &[f32], channels: usize, kbps: u32) -> Vec<u8> {
+    let raw: Vec<u8> = pcm.iter().flat_map(|s| s.to_le_bytes()).collect();
+    let input = TempFile::new("f32", &raw);
+    let output = run(Command::new("ffmpeg")
+        .args(["-nostdin", "-v", "error", "-f", "f32le", "-ar", "48000"])
+        .args(["-ac", &channels.to_string(), "-i"])
+        .arg(input.path())
+        .args([
+            "-c:a",
+            "libopus",
+            "-b:a",
+            &format!("{kbps}k"),
+            "-f",
+            "ogg",
+            "-",
+        ]));
+    output.stdout
+}
+
+/// Decodes the first audio stream of a file of the format `extension`
+/// names, as ffmpeg presents it.
+pub fn decode_file(file: &[u8], extension: &str) -> Decoded {
+    let file = TempFile::new(extension, file);
+    let output = run(Command::new("ffmpeg")
+        .args(["-nostdin", "-v", "error", "-i"])
+        .arg(file.path())
+        .args(["-map", "0:a:0", "-f", "f32le", "-acodec", "pcm_f32le", "-"]));
+    Decoded {
+        samples: output
+            .stdout
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect(),
+        diagnostics: String::from_utf8_lossy(&output.stderr).into_owned(),
+    }
+}

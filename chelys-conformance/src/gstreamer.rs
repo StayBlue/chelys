@@ -2,9 +2,11 @@
 // SPDX-License-Identifier: MIT
 
 //! GStreamer, as a black-box reader of MP4 files, run as `gst-launch-1.0`:
-//! its own MP4 demuxer, `qtdemux`, then gst-libav's `avdec_aac`, which
-//! wraps ffmpeg's AAC decoder, so that what it shows is GStreamer's reading
-//! of the file, not an independent decoder's.
+//! its own MP4 demuxer, `qtdemux`, then for AAC gst-libav's `avdec_aac`,
+//! which wraps ffmpeg's AAC decoder, so that what it shows is GStreamer's
+//! reading of the file, not an independent decoder's; for FLAC
+//! gst-plugins-good's `flacdec`, which wraps libFLAC; and for Opus
+//! gst-plugins-base's `opusdec`, which wraps libopus.
 //!
 //! Observed of GStreamer 1.28.9 as a black box:
 //!
@@ -26,15 +28,33 @@ use std::process::Command;
 
 use crate::{Decoded, TempFile, run};
 
-/// Decodes the first audio stream of an MP4 file to 32-bit float PCM as a
-/// player's sink would take it: through `qtdemux`, `avdec_aac`,
+/// Decodes the first audio stream of an MP4 file of AAC to 32-bit float
+/// PCM as a player's sink would take it: through `qtdemux`, `avdec_aac`,
 /// `audiosegmentclip`, which clips the samples to the segment `qtdemux`
 /// marks, and `audioconvert`.
 pub fn decode_mp4(file: &[u8]) -> Decoded {
+    decode_mp4_with(file, "avdec_aac")
+}
+
+/// Decodes the first audio stream of an MP4 file of Opus as
+/// [`decode_mp4`] does AAC, through gst-plugins-base's `opusdec`, which
+/// wraps libopus, the reference decoder.
+pub fn decode_opus_mp4(file: &[u8]) -> Decoded {
+    decode_mp4_with(file, "opusdec")
+}
+
+/// Decodes the first audio stream of an MP4 file of FLAC as
+/// [`decode_mp4`] does AAC, through gst-plugins-good's `flacdec`, which
+/// wraps libFLAC, the reference decoder.
+pub fn decode_flac_mp4(file: &[u8]) -> Decoded {
+    decode_mp4_with(file, "flacdec")
+}
+
+fn decode_mp4_with(file: &[u8], decoder: &str) -> Decoded {
     let file = TempFile::new("mp4", file);
     let output = TempFile::new("f32", &[]);
     let pipeline = format!(
-        "filesrc location={} ! qtdemux ! avdec_aac ! audiosegmentclip ! audioconvert ! \
+        "filesrc location={} ! qtdemux ! {decoder} ! audiosegmentclip ! audioconvert ! \
          audio/x-raw,format=F32LE,layout=interleaved ! filesink location={}",
         file.path().display(),
         output.path().display()
