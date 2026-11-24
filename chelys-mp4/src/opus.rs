@@ -321,6 +321,14 @@ impl Config {
         // least 3840 samples (80 ms)" is for streams that are cropped (RFC
         // 7845, clause 4.2), which a writer of the encoder's packets does
         // not do.
+        //
+        // Settled by decoding with ffmpeg and GStreamer (`qtdemux`,
+        // `opusdec`, `audiosegmentclip`; black box): neither leaves the
+        // pre-skip out twice, for the edit and for the PreSkip, and both
+        // present the input of the Ogg Opus file of the same packets, to
+        // the sample, as ffmpeg presents it. The conformance tests are
+        // `ffmpeg_decodes_opus_in_mp4_files_as_the_ogg_opus_files` and
+        // `gstreamer_decodes_opus_in_mp4_files_as_the_ogg_opus_files`.
         write_box(&mut boxes, b"dOps", |out| {
             out.push(0); // Version
             out.push(self.channels); // OutputChannelCount

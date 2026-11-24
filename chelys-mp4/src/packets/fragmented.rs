@@ -24,6 +24,13 @@ use crate::movie::fragmented::{FragmentSink, Fragmenter, init_segment};
 /// present the padding that the last packet decodes to. A FLAC stream has
 /// no padding, and needs no length to end where it does.
 ///
+/// ffmpeg n9.0.2 (black box) presents the padding of a fragmented Opus file
+/// whether its length is declared or not, as it does of AAC's. GStreamer
+/// 1.28.9 (`qtdemux`, `opusdec`, `audiosegmentclip`; black box)
+/// presents the input alone where the length is declared, and the padding
+/// too where it is not. See the conformance test
+/// `fragmented_opus_in_mp4_files_decode_as_the_files_written_whole`.
+///
 /// Of an Opus stream, which ends with padding, the latest packet is held
 /// until the next comes, or the stream ends, so that the last can last
 /// only to the end of the input: each fragment is written a packet later

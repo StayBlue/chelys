@@ -172,6 +172,19 @@ impl Writer {
             // cannot give the end, "in the case producing movie fragments on
             // the fly", which the fragmented file does (see
             // `FragmentedWriter::finish`).
+            //
+            // Settled by decoding with ffmpeg and GStreamer (`qtdemux`,
+            // `opusdec`, `audiosegmentclip`; black box): both present
+            // the files of the example's form from the pre-skip to the
+            // input's end, to the sample, as ffmpeg presents the Ogg Opus
+            // files the packets came in, though ffmpeg n9.0.2 presents
+            // nothing of an input no longer than the pre-skip; ffmpeg
+            // decodes them to exactly the samples of the Ogg Opus files,
+            // and GStreamer, whose libopus decodes otherwise, to within
+            // 2^-11 of them. The
+            // conformance tests are
+            // `ffmpeg_decodes_opus_in_mp4_files_as_the_ogg_opus_files` and
+            // `gstreamer_decodes_opus_in_mp4_files_as_the_ogg_opus_files`.
             Some(_) => end - track.delay(),
             // Spec reading: a stream of no packets is a track of no samples,
             // which needs no edit to present nothing; the Opus mapping's

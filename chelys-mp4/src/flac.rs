@@ -220,6 +220,12 @@ const BRANDS: Brands = Brands {
 /// division is taken as a division by a power of two, which gives the
 /// example's 48000 for both: the rate halved until it holds 16 bits, if
 /// each halving is exact, as at 88.2, 96, 176.4 and 192 kHz.
+///
+/// ffmpeg n9.0.2 and GStreamer 1.28.9 (`qtdemux`, `flacdec`; black box)
+/// take the rate from the STREAMINFO, not from this field, and decode such
+/// files exactly at the rate: see the conformance tests
+/// `ffmpeg_decodes_flac_in_mp4_files_to_the_input_exactly` and
+/// `gstreamer_decodes_flac_in_mp4_files_to_the_input_exactly`.
 fn samplerate(sample_rate: u32) -> u32 {
     let regular = (0..u32::BITS)
         .map(|n| sample_rate >> n)
