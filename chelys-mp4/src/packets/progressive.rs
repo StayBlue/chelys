@@ -9,11 +9,11 @@ use std::io::{self, Write};
 use super::{EndError, PacketError, Track};
 use crate::movie::progressive::write_file;
 
-/// Writes packets of FLAC or Opus, which any encoder made, as an MP4 file,
-/// which [`finish`](Self::finish) writes whole.
+/// Writes packets of FLAC, Opus or AAC-LC, which any encoder made, as an
+/// MP4 file, which [`finish`](Self::finish) writes whole.
 ///
-/// Each packet is a sample of the track: a FLAC frame, or an Opus packet,
-/// one per stream for a stream of several. The packets are kept in memory
+/// Each packet is a sample of the track: a FLAC frame, an Opus packet, one
+/// per stream for a stream of several, or an AAC `raw_data_block()`. The packets are kept in memory
 /// until the file is written, its sample tables before them, as they
 /// describe each packet. A [`FragmentedWriter`](super::FragmentedWriter)
 /// writes a file as the packets come instead.
@@ -78,11 +78,12 @@ impl From<io::Error> for FinishError {
 }
 
 impl Writer {
-    /// A writer of the stream `track` describes: a [`flac::Config`] or an
-    /// [`opus::Config`].
+    /// A writer of the stream `track` describes: a [`flac::Config`], an
+    /// [`opus::Config`] or an [`aac::Config`].
     ///
     /// [`flac::Config`]: crate::flac::Config
     /// [`opus::Config`]: crate::opus::Config
+    /// [`aac::Config`]: crate::aac::Config
     pub fn new(track: impl Into<Track>) -> Self {
         Self {
             track: track.into(),
@@ -94,12 +95,14 @@ impl Writer {
     }
 
     /// Takes the next packet, whose duration it reads from the packet: a
-    /// FLAC frame's block size, or an Opus packet's frames.
+    /// FLAC frame's block size, or an Opus packet's frames. An AAC packet,
+    /// a `raw_data_block()` whose ADTS header, if it had one, has been
+    /// taken off, lasts a frame, as its configuration says.
     ///
     /// # Errors
     ///
-    /// [`PacketError`] if the packet is not one of the codec, as far as its
-    /// duration shows. It is not taken.
+    /// [`PacketError`] if the packet is not one of the codec, as far as the
+    /// writer reads it (see [`PacketError`]). It is not taken.
     ///
     /// # Panics
     ///
@@ -116,7 +119,7 @@ impl Writer {
 
     /// The samples of each channel that the packets taken decode to, any
     /// delay included, in the track's timescale: at the sample rate for
-    /// FLAC, and at 48 kHz for Opus.
+    /// FLAC and AAC, and at 48 kHz for Opus.
     pub fn samples(&self) -> u64 {
         self.samples
     }
@@ -126,19 +129,21 @@ impl Writer {
     /// each channel, in the track's timescale, if given, and otherwise every
     /// sample that the packets decode to.
     ///
-    /// For Opus, the samples presented follow the pre-skip, which the file's
-    /// edit list leaves out, and `length` is that of the input, the samples
-    /// before the padding that the stream ends with, where the edit ends.
-    /// For FLAC, which has neither,
-    /// `length`, if given, is to be every sample the frames decode to, as
-    /// a check of the stream: the file has no edit list.
+    /// For Opus, and AAC whose delay is given, the samples presented follow
+    /// the pre-skip or the delay, which the file's edit list leaves out, and
+    /// `length` is that of the input, the samples before the padding that
+    /// the stream ends with, where the edit ends. For FLAC, which has
+    /// neither, and AAC whose delay is not given, `length`, if given, is to
+    /// be every sample the packets decode to, as a check of the stream: the
+    /// file has no edit list.
     ///
     /// # Errors
     ///
     /// [`FinishError::End`] if the packets end before their delay, or
     /// `length` is given and is more than the
     /// packets present, or would end the presentation before the last
-    /// packet, or for FLAC before the last frame's end; nothing is written.
+    /// packet, or without an edit list before the last packet's end;
+    /// nothing is written.
     /// [`FinishError::Io`] if `out` fails; `out` may then hold the start of
     /// the file, which is to be discarded.
     pub fn finish<W: Write + ?Sized>(
@@ -155,7 +160,7 @@ impl Writer {
         } = self;
         let last = durations.last().copied();
         let end = track.end(length, samples, last).map_err(FinishError::End)?;
-        let mut audio = track.audio_track();
+        let mut audio = track.audio_track(Some(&sizes));
         let presented = match last {
             // Spec reading: the Opus mapping has the last sample last only
             // to the input's end, "the duration of the last Opus sample of an
@@ -200,12 +205,12 @@ impl Writer {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::LengthError;
     use crate::boxes::read::{FourCcs, boxes, children, find, u32_at};
     use crate::flac::tests::streaminfo;
-    use crate::{flac, opus};
+    use crate::{aac, flac, opus};
 
     /// An Opus packet of one frame of 20 ms of CELT, of `size` bytes.
     fn opus_packet(size: usize) -> Vec<u8> {
@@ -354,6 +359,95 @@ mod tests {
         let mut writer = Writer::new(config);
         assert_eq!(writer.push(&opus_packet(10)), Err(PacketError::FlacFrame));
         assert_eq!(writer.samples(), 0);
+    }
+
+    /// The file of chelys's own AAC encoder of `pcm`, stereo at 44.1 kHz at
+    /// a variable rate, and its raw frames and configuration.
+    #[cfg(feature = "aac")]
+    pub(crate) fn chelys_aac(pcm: &[f32]) -> (Vec<u8>, Vec<Vec<u8>>, Vec<u8>) {
+        use chelys_aac::{Config, Framing, Rate};
+        let config = Config::new(
+            44_100,
+            2,
+            Rate::Variable {
+                noise_offset_db: 0.0,
+            },
+        );
+        let mut encoder = crate::aac::encode::Encoder::new(config).unwrap();
+        encoder.encode_interleaved(pcm).unwrap();
+        let mut file = Vec::new();
+        encoder.finish(&mut file).unwrap();
+        let mut raw = chelys_aac::Encoder::new(config.framing(Framing::Raw)).unwrap();
+        let asc = raw.audio_specific_config();
+        let mut frames: Vec<Vec<u8>> = Vec::new();
+        let mut sink = |frame: &[u8]| frames.push(frame.to_vec());
+        raw.encode_interleaved(pcm, &mut sink).unwrap();
+        raw.finish(&mut sink);
+        (file, frames, asc)
+    }
+
+    #[cfg(feature = "aac")]
+    pub(crate) fn tone(len: usize) -> Vec<f32> {
+        (0..2 * len)
+            .map(|i| ((i / 2) as f32 * 0.04 + (i % 2) as f32).sin() * 0.3)
+            .collect()
+    }
+
+    /// chelys's own frames, given as packets with their delay, make the
+    /// file that its encoder makes, at a variable rate, whose avgBitrate is
+    /// 0 either way.
+    #[test]
+    #[cfg(feature = "aac")]
+    fn aac_packets_make_the_file_of_chelys_s_own_encoder() {
+        for len in [0, 1, 5000, 44_100] {
+            let (expected, frames, asc) = chelys_aac(&tone(len));
+            let config =
+                aac::Config::from_audio_specific_config(&asc, Some(chelys_aac::DELAY as u32))
+                    .unwrap();
+            let mut writer = Writer::new(config);
+            for frame in &frames {
+                writer.push(frame).unwrap();
+            }
+            let mut file = Vec::new();
+            writer.finish(Some(len as u64), &mut file).unwrap();
+            assert!(file == expected, "{len}");
+        }
+    }
+
+    #[test]
+    fn aac_packets_of_no_delay_present_every_sample() {
+        let config = aac::Config::from_audio_specific_config(&[0x11, 0x90], None).unwrap();
+        assert_eq!((config.sample_rate(), config.channels()), (48_000, 2));
+        let mut writer = Writer::new(config);
+        let packets = [vec![0x21; 30], vec![0x21; 40], vec![0x21; 50]];
+        for packet in &packets {
+            writer.push(packet).unwrap();
+        }
+        assert_eq!(writer.push(&[]), Err(PacketError::AacEmpty));
+        assert_eq!(writer.samples(), 3 * 1024);
+        let mut file = Vec::new();
+        writer.finish(None, &mut file).unwrap();
+        assert_eq!(find(&file, &[b"ftyp"]).payload, b"mp42\0\0\0\0mp42isom");
+        assert_eq!(find(&file, &[b"mdat"]).payload, packets.concat());
+        assert_eq!(
+            children(&find(&file, &[b"moov", b"trak"])).kinds(),
+            ["tkhd", "mdia"]
+        );
+        assert_eq!(stbl(&file, b"stts"), [1, 3, 1024]);
+        let tkhd = find(&file, &[b"moov", b"trak", b"tkhd"]);
+        assert_eq!(u32_at(tkhd.payload, 20), 3 * 1024);
+        // Every packet in the pre-roll group, of one packet.
+        let stbl_box = find(&file, &[b"moov", b"trak", b"mdia", b"minf", b"stbl"]);
+        assert_eq!(
+            children(&stbl_box).kinds(),
+            ["stsd", "stts", "stsc", "stsz", "stco", "sbgp", "sgpd"]
+        );
+        // A length short of every sample is refused, as for FLAC.
+        let config = aac::Config::from_audio_specific_config(&[0x11, 0x90], None).unwrap();
+        let mut writer = Writer::new(config);
+        writer.push(&packets[0]).unwrap();
+        let error = writer.finish(Some(1000), &mut file).unwrap_err();
+        assert!(matches!(error, FinishError::End(_)), "{error}");
     }
 
     #[test]

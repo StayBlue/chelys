@@ -4,7 +4,7 @@
 //! Research audio encoders implemented from their specifications, one
 //! crate each, offered here as a module each behind a feature of the same
 //! name, and the MP4 file format as `mp4`, which holds chelys's AAC, and
-//! FLAC and Opus packets from any encoder.
+//! FLAC, Opus and AAC-LC packets from any encoder.
 //!
 //! ```
 //! # #[cfg(feature = "mp3")] {

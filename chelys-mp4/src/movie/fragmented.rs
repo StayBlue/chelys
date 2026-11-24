@@ -59,16 +59,18 @@ pub struct FragmentInfo {
     /// not the time at which the fragment is presented: it is on the
     /// media's timeline, which counts any delay that a decoder's output
     /// starts with, the samples before the input that the edit list leaves
-    /// out (`chelys_aac::DELAY` for AAC, the pre-skip for Opus), so that
-    /// the fragment is presented from that many samples earlier.
+    /// out (`chelys_aac::DELAY` for chelys's AAC, the delay given for AAC
+    /// packets, the pre-skip for Opus), so that the fragment is presented
+    /// from that many samples earlier.
     pub decode_time: u64,
     /// The frames the fragment holds, each a sample of the track: an AAC
     /// frame, a FLAC frame or an Opus packet.
     pub frames: u32,
     /// The duration of those frames in samples; in the last fragment of a
-    /// stream that ends with padding, as AAC's and Opus's do, its last
-    /// frame lasts only to the end of the input, and not to the end of the
-    /// padding it decodes to.
+    /// stream that ends with padding, as chelys's AAC, AAC packets of a
+    /// known delay and Opus do, its last frame lasts only to the end of the
+    /// input, where its length is known, and not to the end of the padding
+    /// it decodes to.
     pub duration: u64,
 }
 

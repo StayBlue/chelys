@@ -10,19 +10,21 @@ use super::{EndError, PacketError, Track};
 use crate::fragments::{FragmentOptions, LengthError};
 use crate::movie::fragmented::{FragmentSink, Fragmenter, init_segment};
 
-/// Writes packets of FLAC or Opus, which any encoder made, as a fragmented
-/// MP4 file (ISO/IEC 14496-12, clause 8.8), written as the packets come:
-/// its [`init_segment`](Self::init_segment), then fragments of about a
-/// second each, which a [`FragmentSink`] takes, so that the file can be
-/// sent or played as the stream is encoded, as over HLS.
+/// Writes packets of FLAC, Opus or AAC-LC, which any encoder made, as a
+/// fragmented MP4 file (ISO/IEC 14496-12, clause 8.8), written as the
+/// packets come: its [`init_segment`](Self::init_segment), then fragments
+/// of about a second each, which a [`FragmentSink`] takes, so that the
+/// file can be sent or played as the stream is encoded, as over HLS.
 ///
 /// Where the input's length is declared in advance
 /// ([`FragmentOptions::length`]), the file gives a player its exact length,
 /// as a [`Writer`](super::Writer)'s does. Otherwise an Opus file's edit
-/// list leaves out the pre-skip, and its media ends with the packets, but
-/// it does not give where the presentation ends, so that a player may
-/// present the padding that the last packet decodes to. A FLAC stream has
-/// no padding, and needs no length to end where it does.
+/// list leaves out the pre-skip, or an AAC file's the delay given, and its
+/// media ends with the packets, but it does not give where the
+/// presentation ends, so that a player may present the padding that the
+/// last packet decodes to. A FLAC stream has no padding, nor has an AAC
+/// stream whose delay is not given, and needs no length to end where it
+/// does.
 ///
 /// ffmpeg n9.0.2 (black box) presents the padding of a fragmented Opus file
 /// whether its length is declared or not, as it does of AAC's. GStreamer
@@ -31,10 +33,10 @@ use crate::movie::fragmented::{FragmentSink, Fragmenter, init_segment};
 /// too where it is not. See the conformance test
 /// `fragmented_opus_in_mp4_files_decode_as_the_files_written_whole`.
 ///
-/// Of an Opus stream, which ends with padding, the latest packet is held
-/// until the next comes, or the stream ends, so that the last can last
-/// only to the end of the input: each fragment is written a packet later
-/// than its last packet is pushed.
+/// Of a stream that ends with padding, Opus, or AAC whose delay is given,
+/// the latest packet is held until the next comes, or the stream ends, so
+/// that the last can last only to the end of the input: each fragment is
+/// written a packet later than its last packet is pushed.
 ///
 /// ```
 /// use chelys_mp4::{FragmentOptions, FragmentedWriter, flac};
@@ -75,7 +77,8 @@ pub enum PushError {
     /// The packet is not one of the codec.
     Packet(PacketError),
     /// The packet would take the stream past the length declared: for
-    /// FLAC, its samples; for Opus, it would start after the input's end.
+    /// FLAC, and AAC whose delay is not given, its samples; for Opus, and
+    /// AAC whose delay is given, it would start after the input's end.
     Length(LengthError),
 }
 
@@ -97,17 +100,18 @@ impl From<PacketError> for PushError {
 }
 
 impl FragmentedWriter {
-    /// A writer of the stream `track` describes, a [`flac::Config`] or an
-    /// [`opus::Config`], into the file `options` asks for. The length and
-    /// the fragments' duration are in the track's timescale: at the sample
-    /// rate for FLAC, and at 48 kHz for Opus, the length after the
-    /// pre-skip.
+    /// A writer of the stream `track` describes, a [`flac::Config`], an
+    /// [`opus::Config`] or an [`aac::Config`], into the file `options` asks
+    /// for. The length and the fragments' duration are in the track's
+    /// timescale: at the sample rate for FLAC and AAC, and at 48 kHz for
+    /// Opus, the length after the pre-skip or the delay.
     ///
     /// [`flac::Config`]: crate::flac::Config
     /// [`opus::Config`]: crate::opus::Config
+    /// [`aac::Config`]: crate::aac::Config
     pub fn new(track: impl Into<Track>, options: FragmentOptions) -> Self {
         let track = track.into();
-        let audio = track.audio_track();
+        let audio = track.audio_track(None);
         let one_second = NonZeroU32::new(audio.timescale).expect("a timescale");
         let fragment_samples = options.fragment_samples.unwrap_or(one_second);
         Self {
@@ -135,8 +139,9 @@ impl FragmentedWriter {
         self.samples
     }
 
-    /// Takes the next packet, whose duration it reads from the packet, and
-    /// gives `out` the fragment it completes, if it completes one.
+    /// Takes the next packet, as [`Writer::push`](super::Writer::push)
+    /// does, and gives `out` the fragment it completes, if it completes
+    /// one.
     ///
     /// # Errors
     ///
@@ -181,8 +186,8 @@ impl FragmentedWriter {
     /// has a packet: a fragment always has one, so that this does nothing
     /// where no packet has been written since the last. The next fragment
     /// ends where it would have, at the next multiple of the fragments'
-    /// duration past this one's end. Of an Opus stream, the latest packet,
-    /// which is held, is not in the fragment.
+    /// duration past this one's end. Of a stream that ends with padding,
+    /// the latest packet, which is held, is not in the fragment.
     pub fn end_fragment<O: FragmentSink + ?Sized>(&mut self, out: &mut O) {
         if let Some(fragment) = self.fragmenter.flush() {
             out.fragment(&fragment.bytes, fragment.info);
@@ -215,8 +220,10 @@ impl FragmentedWriter {
             // The last packet lasts to the input's end, as the Opus mapping
             // has it (clause 4.3.4), and offers "in the case producing movie
             // fragments on the fly", where the edit list cannot give the end
-            // (clause 4.4); see `Writer::finish`. Without a length, the end
-            // is that of the last packet, and its duration is its own.
+            // (clause 4.4); see `Writer::finish`. An AAC stream's last
+            // packet lasts as long as the last frame of chelys's own
+            // fragmented AAC files. Without a length, the end is that of the
+            // last packet, and its duration is its own.
             let trimmed = end - (samples - u64::from(duration));
             let trimmed = u32::try_from(trimmed).expect("within the last packet");
             let fragment = fragmenter.finish(&packet, trimmed);
@@ -359,6 +366,66 @@ mod tests {
         ));
         assert_eq!(writer.samples(), 1920);
         assert!(writer.finish(&mut file).is_ok());
+    }
+
+    /// chelys's own frames, given as packets with their delay, make the
+    /// file that its fragmented encoder makes at a variable rate, whether
+    /// the length is declared or not.
+    #[test]
+    #[cfg(feature = "aac")]
+    fn aac_packets_make_the_file_of_chelys_s_own_encoder() {
+        use crate::packets::progressive::tests::{chelys_aac, tone};
+        use chelys_aac::{Config, Rate};
+        for len in [0, 1, 5000, 3 * 44_100 + 17] {
+            for declared in [false, true] {
+                let pcm = tone(len);
+                let options = if declared {
+                    FragmentOptions::default().length(len as u64)
+                } else {
+                    FragmentOptions::default()
+                };
+                let config = Config::new(
+                    44_100,
+                    2,
+                    Rate::Variable {
+                        noise_offset_db: 0.0,
+                    },
+                );
+                let mut encoder =
+                    crate::aac::encode::FragmentedEncoder::new(config, options).unwrap();
+                let mut expected = encoder.init_segment().to_vec();
+                let mut expected_infos = Vec::new();
+                let mut out = |bytes: &[u8], info: FragmentInfo| {
+                    expected.extend_from_slice(bytes);
+                    expected_infos.push(info);
+                };
+                encoder.encode_interleaved(&pcm, &mut out).unwrap();
+                encoder.finish(&mut out).unwrap();
+
+                let (_, frames, asc) = chelys_aac(&pcm);
+                let config = crate::aac::Config::from_audio_specific_config(
+                    &asc,
+                    Some(chelys_aac::DELAY as u32),
+                )
+                .unwrap();
+                let (file, infos) = write(FragmentedWriter::new(config, options), &frames);
+                if declared {
+                    assert!(file == expected, "{len}");
+                    assert_eq!(infos, expected_infos, "{len}");
+                } else {
+                    // chelys's encoder knows the input's end, and the last
+                    // frame lasts to it; the writer, not told, keeps the
+                    // last packet's duration.
+                    assert!(media_data(&file) == media_data(&expected), "{len}");
+                    let frames = |infos: &[FragmentInfo]| -> Vec<u32> {
+                        infos.iter().map(|info| info.frames).collect()
+                    };
+                    assert_eq!(frames(&infos), frames(&expected_infos), "{len}");
+                    let total: u64 = infos.iter().map(|info| info.duration).sum();
+                    assert_eq!(total, 1024 * frames(&infos).iter().sum::<u32>() as u64);
+                }
+            }
+        }
     }
 
     #[test]

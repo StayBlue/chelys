@@ -29,6 +29,13 @@ const SL_PREDEFINED_MP4: u8 = 0x02;
 /// `expandable(2^28-1)` (clause 6.2.2.2).
 const MAX_SIZE_OF_INSTANCE: usize = (1 << 28) - 1;
 
+/// The longest `DecoderSpecificInfo` whose [`es_descriptor`] keeps within
+/// [`MAX_SIZE_OF_INSTANCE`]: the `ES_Descriptor`'s fields are 29 bytes
+/// longer at most, its own 3, the `DecoderConfigDescriptor`'s tag, size,
+/// 13 bytes of fields, and the `DecoderSpecificInfo`'s tag and size, 23,
+/// and the `SLConfigDescriptor`'s 3, each size of 4 bytes at most.
+pub const MAX_SPECIFIC_INFO: usize = MAX_SIZE_OF_INSTANCE - 29;
+
 /// The encoding of `sizeOfInstance`, which precedes every descriptor's
 /// fields after its tag, as `BaseDescriptor` is an expandable class: 7 bits
 /// a byte, most significant first, each byte but the last with its top

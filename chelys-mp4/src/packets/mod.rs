@@ -2,9 +2,10 @@
 // SPDX-License-Identifier: MIT
 
 //! MP4 files of packets that any encoder made, of a codec whose mapping to
-//! the file format chelys implements: FLAC ([`flac`](crate::flac)) and
-//! Opus ([`opus`](crate::opus)). The packets are taken as they are: only
-//! what the mapping needs of them is read, each packet's duration.
+//! the file format chelys implements: FLAC ([`flac`](crate::flac)), Opus
+//! ([`opus`](crate::opus)) and AAC-LC ([`aac`](crate::aac)). The packets
+//! are taken as they are: only what the mapping needs of them is read,
+//! each packet's duration, which AAC's configuration gives instead.
 
 mod fragmented;
 mod progressive;
@@ -16,7 +17,7 @@ use std::fmt;
 
 use crate::fragments::LengthError;
 use crate::movie::AudioTrack;
-use crate::{flac, opus};
+use crate::{aac, flac, opus};
 
 /// The stream that a file of packets holds, as its codec's configuration
 /// describes it.
@@ -25,6 +26,7 @@ use crate::{flac, opus};
 pub enum Track {
     Flac(flac::Config),
     Opus(opus::Config),
+    Aac(aac::Config),
 }
 
 impl From<flac::Config> for Track {
@@ -39,8 +41,17 @@ impl From<opus::Config> for Track {
     }
 }
 
-/// Why a packet was refused: it is not one of the codec, as far as its
-/// duration shows.
+impl From<aac::Config> for Track {
+    fn from(config: aac::Config) -> Self {
+        Self::Aac(config)
+    }
+}
+
+/// Why a packet was refused: it is not one of the codec, as far as what
+/// the writer reads of it shows, its duration, or for AAC, whose duration
+/// the configuration gives, that it is not empty. The packets are not
+/// checked further: an AAC packet that still has its ADTS header is taken,
+/// and makes a file that does not decode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum PacketError {
@@ -54,6 +65,9 @@ pub enum PacketError {
     /// An Opus packet shorter than the shortest packet declared, which the
     /// pre-roll is reckoned in (see [`opus::Config::shortest_packet`]).
     OpusShorterThanDeclared { duration: u32, shortest: u32 },
+    /// An empty AAC packet, which no `raw_data_block()` is: its
+    /// `id_syn_ele` alone takes 3 bits.
+    AacEmpty,
 }
 
 impl fmt::Display for PacketError {
@@ -65,6 +79,7 @@ impl fmt::Display for PacketError {
                 f,
                 "an Opus packet of {duration} samples, shorter than the {shortest} declared"
             ),
+            Self::AacEmpty => write!(f, "an empty AAC packet"),
         }
     }
 }
@@ -105,10 +120,13 @@ impl std::error::Error for EndError {
 }
 
 impl Track {
-    pub(crate) fn audio_track(&self) -> AudioTrack {
+    /// The track of the stream, of packets of `sizes` where they are known,
+    /// and otherwise before any, as in a fragmented file's init segment.
+    pub(crate) fn audio_track(&self, sizes: Option<&[u32]>) -> AudioTrack {
         match self {
             Self::Flac(config) => config.track(),
             Self::Opus(config) => config.track(),
+            Self::Aac(config) => config.track(sizes),
         }
     }
 
@@ -117,6 +135,8 @@ impl Track {
         match self {
             Self::Flac(_) => flac::frame_duration(packet),
             Self::Opus(config) => config.duration(packet),
+            Self::Aac(_) if packet.is_empty() => Err(PacketError::AacEmpty),
+            Self::Aac(config) => Ok(config.frame_samples()),
         }
     }
 
@@ -125,16 +145,24 @@ impl Track {
         match self {
             Self::Flac(_) => 0,
             Self::Opus(config) => u64::from(config.pre_skip()),
+            Self::Aac(config) => config.delay().map_or(0, u64::from),
         }
     }
 
     /// Whether the stream ends with padding past the input, which the edit
     /// list of a file written whole leaves out, and the last packet's
     /// duration in a fragmented file: an Opus stream's (the Opus mapping,
-    /// clauses 4.3.4 and 4.4). A FLAC stream has no padding, and its last
-    /// frame lasts its block size, as every frame does.
+    /// clauses 4.3.4 and 4.4), and an AAC stream's whose delay is given, as
+    /// chelys's own AAC files have it. A FLAC stream has no padding, and its
+    /// last frame lasts its block size, as every frame does; nor has an AAC
+    /// stream whose delay is not known, whose track has no edit list and
+    /// presents every sample.
     fn ends_with_padding(&self) -> bool {
-        matches!(self, Self::Opus(_))
+        match self {
+            Self::Flac(_) => false,
+            Self::Opus(_) => true,
+            Self::Aac(config) => config.delay().is_some(),
+        }
     }
 
     /// The end of the presentation on the media's timeline, of a stream

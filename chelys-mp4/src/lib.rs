@@ -2,10 +2,10 @@
 // SPDX-License-Identifier: MIT
 
 //! MP4 files (ISO/IEC 14496-14:2020) of one audio track, implemented from
-//! their specifications: AAC-LC from `chelys-aac` (`aac::encode`, with
-//! the feature `aac`), and packets of FLAC ([`flac`]) and Opus
-//! ([`opus`]) that any encoder made, which a [`Writer`] or a
-//! [`FragmentedWriter`] takes. The `chelys` crate offers it as
+//! their specifications: packets of FLAC ([`flac`]), Opus ([`opus`]) and
+//! AAC-LC ([`aac`]) that any encoder made, which a [`Writer`] or a
+//! [`FragmentedWriter`] takes, and AAC-LC coded from PCM by `chelys-aac`
+//! (`aac::encode`, with the feature `aac`). The `chelys` crate offers it as
 //! `chelys::mp4`.
 //!
 //! Clause references refer to ISO/IEC 14496-12:2026, the ISO base media
@@ -16,7 +16,8 @@
 //! format, as each module says.
 //!
 //! An AAC file is written whole, from its start to its end, so that it can be
-//! written where nothing can be sought, as a pipe:
+//! written where nothing can be sought, as a pipe; one of packets from
+//! another encoder has no `edts` where their delay is not given:
 //!
 //! ```text
 //! ftyp                  the brands: mp42, isom
@@ -100,12 +101,9 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
-#[cfg(feature = "aac")]
 pub mod aac;
-#[cfg(feature = "aac")]
 mod bitrate;
 mod boxes;
-#[cfg(feature = "aac")]
 mod descriptor;
 pub mod flac;
 mod fragments;

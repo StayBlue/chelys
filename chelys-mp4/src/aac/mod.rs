@@ -3,9 +3,17 @@
 
 //! AAC-LC in MP4 files (ISO/IEC 14496-14): the raw frames of a stream as
 //! the samples of an `'mp4a'` track, which its `AudioSpecificConfig()`
-//! describes, coded from PCM by chelys's own encoder ([`encode`]).
+//! describes. The frames are either made by any encoder and given as they
+//! are, with their configuration ([`Config`]), to a
+//! [`Writer`](crate::Writer) or a [`FragmentedWriter`](crate::FragmentedWriter),
+//! or coded from PCM by chelys's own encoder, with the feature `aac`
+//! (`encode`).
 
+mod config;
+#[cfg(feature = "aac")]
 pub mod encode;
+
+pub use config::{Config, ConfigError};
 
 use super::boxes::{FourCc, write_full_box};
 use super::descriptor::{AUDIO_ISO_IEC_14496_3, AUDIO_STREAM, DecoderConfig, es_descriptor};
@@ -13,6 +21,7 @@ use super::movie::{AudioTrack, Brands, SampleEntry};
 
 /// What the track's boxes give of a stream, all known before its first
 /// frame but the bitrates.
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Stream {
     sample_rate: u32,
     channels: u16,

@@ -13,9 +13,12 @@ use std::num::NonZeroU32;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct FragmentOptions {
-    /// The samples of each channel that the input will have, if known; for
-    /// AAC as `chelys_aac::Finished::samples` counts them, and for Opus
-    /// after its pre-skip. `None` by default.
+    /// The samples of each channel that the input will have, if known: of
+    /// chelys's AAC encoder, as `chelys_aac::Finished::samples` counts
+    /// them; of Opus packets, after the pre-skip, and of AAC packets of a
+    /// known delay, after it, the samples before the padding; and of FLAC
+    /// packets, and AAC packets whose delay is not known, every sample they
+    /// decode to. `None` by default.
     pub length: Option<u64>,
     /// The duration that each fragment is to have; by default one second.
     pub fragment_samples: Option<NonZeroU32>,
