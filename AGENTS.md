@@ -250,3 +250,33 @@ by the agent and approved by the user.*
 *User, 2026-11-21: narrowed to encoder delay, as chelys is not to write tags
 (lofty exists for that); the wording was proposed by the agent and approved by
 the user.*
+
+## GStreamer as a source of evidence for MP4
+
+GStreamer may be used as a black-box reader of chelys's MP4 files, for MP4
+evidence only, as ffmpeg is: run as a separate program (`gst-launch-1.0` or
+`gst-discoverer-1.0`), with only its observable output used, such as decoded
+samples, buffer timestamps and durations, and its errors and warnings, never
+its debug or trace logs (`GST_DEBUG`). GStreamer and its plugins, including
+their demuxers, muxers and codecs, fall under "Clean room" as the codecs named
+there do, and its muxers and encoders are not run. It is optional: evidence
+need not be checked against it, but may be, for example where ffmpeg does not
+honour something the standards define, such as an edit list that trims the end
+of a fragmented file.
+
+The file is read with GStreamer's own MP4 demuxer (`qtdemux`), not one that
+wraps another program's. It may be run without an AAC decoder element, to demux
+only, or with one, which may wrap another codec such as ffmpeg's; ask before
+installing a plugin. Either way, its output is evidence of GStreamer's reading
+of the file, not of an independent AAC decoder. Evidence from it is documented
+as under "mpg123 and LAME as sources of evidence": say "Settled by decoding
+with", also where GStreamer only demuxes; name every decoder or reader the
+evidence was taken from, with the GStreamer elements or tool used; and name the
+test. Record the GStreamer version the evidence was recorded with (currently
+1.28.9), and that of any plugin used whose version differs, in the
+`chelys-conformance` crate's documentation, next to ffmpeg's, and update them
+when the evidence is recorded again with other versions.
+
+*User, 2026-11-23, when ffmpeg was found not to trim the end padding of
+fragmented MP4 files: the wording was proposed by the agent and approved by the
+user.*
