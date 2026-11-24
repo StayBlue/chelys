@@ -98,6 +98,8 @@ pub mod aac;
 mod bitrate;
 mod boxes;
 mod descriptor;
+mod fragments;
 mod movie;
 
+pub use fragments::{FragmentOptions, LengthError};
 pub use movie::fragmented::{FragmentInfo, FragmentSink};

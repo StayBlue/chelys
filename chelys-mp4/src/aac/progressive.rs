@@ -141,7 +141,15 @@ impl Encoder {
             max_bitrate(&frames.sizes, frame_samples, sample_rate),
             if constant_rate { avg_bitrate } else { 0 },
         );
-        write_file(&track, &frames.sizes, finished.samples, &frames.data, out)?;
+        let durations = vec![frame_samples; frames.sizes.len()];
+        write_file(
+            &track,
+            &frames.sizes,
+            &durations,
+            finished.samples,
+            &frames.data,
+            out,
+        )?;
         Ok(finished)
     }
 }

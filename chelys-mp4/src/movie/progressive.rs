@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: MIT
 
 //! The file written whole once the stream has ended: its `FileTypeBox`,
-//! its `MovieBox`, whose sample tables describe every frame, and one
-//! `MediaDataBox`, which holds the frames one after another.
+//! its `MovieBox`, whose sample tables describe every sample, and one
+//! `MediaDataBox`, which holds the samples one after another.
 
 use std::io::{self, Write};
 
@@ -13,10 +13,10 @@ use super::{
 };
 use crate::boxes;
 
-/// Writes the file of `track`, whose frames, of `sizes`, `media_data`
-/// holds, one after another, and which decode to `length` samples after
-/// the track's delay, to `out`: its `FileTypeBox`, then its `MovieBox`,
-/// then its `MediaDataBox`.
+/// Writes the file of `track`, whose samples, of `sizes` and `durations`,
+/// `media_data` holds, one after another, and which decode to `length`
+/// samples after the track's delay, to `out`: its `FileTypeBox`, then its
+/// `MovieBox`, then its `MediaDataBox`.
 ///
 /// The `MovieBox` comes before the media data, so that a reader that reads
 /// the file from its start, as from a network, can play it as it arrives;
@@ -31,10 +31,12 @@ use crate::boxes;
 /// The `MovieBox`'s durations are the input's `length`, which its edit
 /// presents, and with it the track's and the movie's, and the media's,
 /// "the largest composition timestamp plus the duration of that sample"
-/// (clause 8.4.2.3), that of all the frames.
+/// (clause 8.4.2.3), that of all the samples. A track without an edit list
+/// presents the media's samples, all of them: its duration is theirs, and
+/// `length` is not used.
 ///
-/// Spec reading: an input of no samples is coded in one frame, as the
-/// stream of an encoder that ends at once, and its edit has an
+/// Spec reading, of AAC: an input of no samples is coded in one frame, as
+/// the stream of an encoder that ends at once, and its edit has an
 /// `edit_duration` of 0. The standard is inconsistent on what that means.
 /// Clause 8.6.6.1 reads a last edit's duration of 0 as that of all the
 /// samples only "When a movie is fragmented, and does not contain any
@@ -43,13 +45,13 @@ use crate::boxes;
 /// onwards" with an `edit_duration` of 0 in a movie that it does not say is
 /// fragmented. Either way the edit presents nothing here: the one frame's
 /// media ends at the edit's `media_time`, as AAC's delay is a frame's
-/// length, so that nothing follows it. The alternatives were weighed: no edit would present the
-/// frame's every sample; an empty edit alone is not allowed, as "The last
-/// edit in a track shall never be an empty edit"; and a track of no
-/// samples, which needs no edit, would make empty input the one case in
-/// which the file does not hold the frames the encoder reports
-/// ([`Finished::frames`](chelys_aac::Finished::frames)). Only decoding
-/// shows which reading a reader takes.
+/// length, so that nothing follows it. The alternatives were weighed: no
+/// edit would present the frame's every sample; an empty edit alone is not
+/// allowed, as "The last edit in a track shall never be an empty edit";
+/// and a track of no samples, which needs no edit, would make empty input
+/// the one case in which the file does not hold the frames the encoder
+/// reports (`chelys_aac::Finished::frames`). Only decoding shows which
+/// reading a reader takes.
 ///
 /// Settled by decoding with ffmpeg (black box): it decodes a file of no
 /// samples to none, and files of a sample or so either side of a frame's
@@ -69,29 +71,34 @@ use crate::boxes;
 pub fn write_file<W: Write + ?Sized>(
     track: &AudioTrack,
     sizes: &[u32],
+    durations: &[u32],
     length: u64,
     media_data: &[u8],
     out: &mut W,
 ) -> io::Result<()> {
-    let file_type = file_type_box();
+    let file_type = file_type_box(&track.brands);
     let media_data_header = boxes::media_data_header(media_data.len() as u64);
-    let durations = Durations {
-        edit: length,
+    let media = durations.iter().map(|&d| u64::from(d)).sum();
+    let edit = track.delay.map(|_| length);
+    let durations_of_movie = Durations {
+        edit,
         // "the sum of the durations of all of the track's edits" (clause
-        // 8.3.2.3), of the one edit.
-        track: length,
-        media: sizes.len() as u64 * u64::from(track.frame_samples),
+        // 8.3.2.3), of the one edit, or without one the media's.
+        track: edit.unwrap_or(media),
+        media,
     };
     let movie = |chunk_offset: u32| {
         let sample_tables = |out: &mut Vec<u8>| {
-            write_sample_tables(out, track, sizes, chunk_offset);
-            write_roll_mapping(out, count(sizes));
-            // Its flags are 0, as the two flags it may have in a
-            // SampleTableBox concern movie fragments, which the file has
-            // none of.
-            write_roll_description(out, track, 0);
+            write_sample_tables(out, sizes, durations, chunk_offset);
+            if let Some(roll_distance) = track.roll_distance {
+                write_roll_mapping(out, count(sizes));
+                // Its flags are 0, as the two flags it may have in a
+                // SampleTableBox concern movie fragments, which the file
+                // has none of.
+                write_roll_description(out, roll_distance, 0);
+            }
         };
-        movie_box(track, durations, sample_tables, |_| {})
+        movie_box(track, durations_of_movie, sample_tables, |_| {})
     };
     let movie_len = movie(0).len();
     let offset = file_type.len() + movie_len + media_data_header.len();
@@ -111,7 +118,8 @@ mod tests {
 
     fn write(track: &AudioTrack, sizes: &[u32], length: u64, media_data: &[u8]) -> Vec<u8> {
         let mut file = Vec::new();
-        write_file(track, sizes, length, media_data, &mut file).unwrap();
+        let durations = vec![1024; sizes.len()];
+        write_file(track, sizes, &durations, length, media_data, &mut file).unwrap();
         file
     }
 
@@ -196,6 +204,47 @@ mod tests {
         assert_eq!(
             boxes(stbl.payload, 0).kinds(),
             ["stsd", "stts", "stsc", "stsz", "stco", "sbgp", "sgpd"]
+        );
+    }
+}
+
+#[cfg(test)]
+mod generic_tests {
+    use super::*;
+    use crate::boxes::read::{FourCcs, children, find, u32_at};
+    use crate::movie::tests::track;
+
+    /// The words of the payload of `kind` in the sample table of `file`,
+    /// after its version and flags.
+    fn table(file: &[u8], kind: &[u8; 4]) -> Vec<u32> {
+        let path = [b"moov", b"trak", b"mdia", b"minf", b"stbl", kind];
+        let payload = find(file, &path).payload;
+        (4..payload.len())
+            .step_by(4)
+            .map(|at| u32_at(payload, at))
+            .collect()
+    }
+
+    #[test]
+    fn durations_are_given_in_runs() {
+        let mut file = Vec::new();
+        let durations = [4096, 4096, 4096, 1000, 1000, 17];
+        write_file(&track(96_000), &[1; 6], &durations, 0, &[0; 6], &mut file).unwrap();
+        assert_eq!(table(&file, b"stts"), [3, 3, 4096, 2, 1000, 1, 17]);
+        let mdhd = find(&file, &[b"moov", b"trak", b"mdia", b"mdhd"]);
+        assert_eq!(u32_at(mdhd.payload, 16), 3 * 4096 + 2000 + 17);
+    }
+
+    #[test]
+    fn a_track_without_a_roll_has_no_sample_group() {
+        let mut no_roll = track(44_100);
+        no_roll.roll_distance = None;
+        let mut file = Vec::new();
+        write_file(&no_roll, &[1, 2], &[10, 10], 20, &[0; 3], &mut file).unwrap();
+        let stbl = find(&file, &[b"moov", b"trak", b"mdia", b"minf", b"stbl"]);
+        assert_eq!(
+            children(&stbl).kinds(),
+            ["stsd", "stts", "stsc", "stsz", "stco"]
         );
     }
 }

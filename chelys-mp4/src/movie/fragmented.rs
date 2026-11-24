@@ -6,9 +6,9 @@
 //! movie fragments, each a `MovieFragmentBox` and the `MediaDataBox` of its
 //! frames, written as the frames come.
 //!
-//! It is the file of one track whose frames all last as long, and which
-//! lie one after another, each fragment's in one run: what an audio
-//! encoder writes, and not what a fragmented file can be in general.
+//! It is the file of one track whose samples, each a frame or packet of
+//! the stream, lie one after another, each fragment's in one run: what an
+//! audio encoder writes, and not what a fragmented file can be in general.
 //!
 //! It has no `MovieFragmentRandomAccessBox` (clause 8.8.9), which comes
 //! last and gives each fragment's offset in the file, nor a
@@ -46,7 +46,8 @@ impl<F: FnMut(&[u8], FragmentInfo)> FragmentSink for F {
     }
 }
 
-/// What a fragment holds, in samples of each channel at the sample rate.
+/// What a fragment holds, its durations in the track's timescale: samples
+/// of each channel at the rate a decoder outputs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct FragmentInfo {
@@ -56,16 +57,18 @@ pub struct FragmentInfo {
     /// The decoding time of the fragment's first frame, its
     /// `baseMediaDecodeTime`: the samples of the frames before it. It is
     /// not the time at which the fragment is presented: it is on the
-    /// media's timeline, which counts the delay that a decoder's output
+    /// media's timeline, which counts any delay that a decoder's output
     /// starts with, the samples before the input that the edit list leaves
-    /// out ([`chelys_aac::DELAY`] for AAC), so that the fragment is
-    /// presented from that many samples earlier.
+    /// out (`chelys_aac::DELAY` for AAC, the pre-skip for Opus), so that
+    /// the fragment is presented from that many samples earlier.
     pub decode_time: u64,
-    /// The frames the fragment holds.
+    /// The frames the fragment holds, each a sample of the track: an AAC
+    /// frame, a FLAC frame or an Opus packet.
     pub frames: u32,
-    /// The duration of those frames in samples: `frames` times a frame's,
-    /// but in the last fragment, whose last frame lasts only to the end of
-    /// the input, and not to the end of the padding it decodes to.
+    /// The duration of those frames in samples; in the last fragment of a
+    /// stream that ends with padding, as AAC's and Opus's do, its last
+    /// frame lasts only to the end of the input, and not to the end of the
+    /// padding it decodes to.
     pub duration: u64,
 }
 
@@ -75,27 +78,34 @@ pub struct Fragment {
     pub info: FragmentInfo,
 }
 
-/// The most frames a fragment has, whatever its duration: their sizes in
-/// its run, 4 bytes each, keep the `MovieFragmentBox` far under the 2 GiB
-/// that the run's signed `data_offset` reaches, and they are counted in 32
-/// bits. AAC's fragments, of at most 2^32 - 1 samples in frames of 1024,
+/// The most frames a fragment has, whatever its duration: their sizes and
+/// durations in its run, 8 bytes each at most, keep the `MovieFragmentBox`
+/// far under the 2 GiB that the run's signed `data_offset` reaches, and
+/// they are counted in 32 bits. AAC's fragments, of at most 2^32 - 1 samples in frames of 1024,
 /// never reach it.
 const MAX_FRAMES: usize = 1 << 24;
 
-/// Divides frames, given one at a time, into fragments of about
-/// `fragment_samples` samples each, as long as a whole number of frames
-/// can be, and of [`MAX_FRAMES`] frames at most, and writes each fragment
-/// once its last frame has come. It is written for one track, whose frames
-/// all last `frame_samples` samples.
+/// Divides frames, given one at a time with their durations, into
+/// fragments of about `fragment_samples` samples each, as long as a whole
+/// number of frames can be, and of [`MAX_FRAMES`] frames at most, and
+/// writes each fragment once its last frame has come. It is written for
+/// one track.
 #[derive(Debug)]
 pub struct Fragmenter {
-    frame_samples: u32,
+    /// The `TrackExtendsBox`'s `default_sample_duration`, which a fragment
+    /// whose frames all last as long need not repeat.
+    default_duration: u32,
+    /// Whether the frames are mapped to the pre-roll group.
+    roll: bool,
     fragment_samples: NonZeroU32,
     /// The frames of the fragment being gathered, one after another.
     data: Vec<u8>,
     sizes: Vec<u32>,
-    /// The frames written in fragments before it.
-    frames_written: u64,
+    durations: Vec<u32>,
+    /// The duration of the frames written in fragments before it.
+    time_written: u64,
+    /// The duration of the frames of the fragment being gathered.
+    time_gathered: u64,
     /// The `sequence_number` of the fragment being gathered.
     sequence_number: u32,
     /// The number of the next boundary the fragments keep to.
@@ -103,41 +113,56 @@ pub struct Fragmenter {
 }
 
 impl Fragmenter {
-    pub fn new(frame_samples: u32, fragment_samples: NonZeroU32) -> Self {
+    pub fn new(track: &AudioTrack, fragment_samples: NonZeroU32) -> Self {
         Self {
-            frame_samples,
+            default_duration: track.default_duration,
+            roll: track.roll_distance.is_some(),
             fragment_samples,
             data: Vec::new(),
             sizes: Vec::new(),
-            frames_written: 0,
+            durations: Vec::new(),
+            time_written: 0,
+            time_gathered: 0,
             sequence_number: 1,
             boundary: 1,
         }
     }
 
-    /// The frame at the `n`'th boundary: the frame whose start is nearest
-    /// `n` times `fragment_samples`, the later where two are as near.
+    /// Whether a fragment that ends at `end`, its last frame lasting
+    /// `last`, reaches the `n`'th boundary, at `n` times
+    /// `fragment_samples`: whether the boundary is before the middle of a
+    /// next frame as long as the last.
     ///
     /// Spec gap: how long a fragment is, is the writer's to choose. The
     /// boundaries are counted from the stream's start, so that fragments
     /// of a duration that is not a whole number of frames vary by a frame,
     /// and their ends keep to the duration's multiples: at 44.1 kHz,
-    /// fragments of a second are 43 frames, and 44 every fifteenth or so.
-    fn boundary_frame(&self, n: u64) -> u64 {
-        let samples = u128::from(n) * u128::from(self.fragment_samples.get());
-        let frame = u128::from(self.frame_samples);
-        u64::try_from((2 * samples + frame) / (2 * frame)).unwrap_or(u64::MAX)
+    /// fragments of a second of AAC are 43 frames, and 44 every fifteenth
+    /// or so. Where the frames all last as long, a fragment ends with the
+    /// frame whose end is nearest the boundary, the later where two are as
+    /// near. Where they vary, the next frame's duration is not known when
+    /// the fragment is to end, and is taken to be the last's.
+    fn reaches(&self, n: u64, end: u64, last: u32) -> bool {
+        let boundary = 2 * u128::from(n) * u128::from(self.fragment_samples.get());
+        boundary < 2 * u128::from(end) + u128::from(last)
     }
 
-    /// Takes the next frame, and gives the fragment that it ends, if it
-    /// ends one: if it reaches the next boundary, or [`MAX_FRAMES`].
-    pub fn push_frame(&mut self, frame: &[u8]) -> Option<Fragment> {
+    /// Takes the next frame, which lasts `duration` samples, and gives the
+    /// fragment that it ends, if it ends one: if it reaches the next
+    /// boundary, or [`MAX_FRAMES`].
+    pub fn push_frame(&mut self, frame: &[u8], duration: u32) -> Option<Fragment> {
+        self.gather(frame, duration);
+        let end = self.time_written + self.time_gathered;
+        let full = self.sizes.len() >= MAX_FRAMES;
+        (full || self.reaches(self.boundary, end, duration)).then(|| self.write())
+    }
+
+    fn gather(&mut self, frame: &[u8], duration: u32) {
         self.data.extend_from_slice(frame);
         self.sizes
             .push(u32::try_from(frame.len()).expect("a frame under 4 GiB"));
-        let frames = self.frames_written + self.sizes.len() as u64;
-        let full = self.sizes.len() >= MAX_FRAMES;
-        (full || frames >= self.boundary_frame(self.boundary)).then(|| self.flush().unwrap())
+        self.durations.push(duration);
+        self.time_gathered += u64::from(duration);
     }
 
     /// Writes the fragment of the frames taken since the last, if there
@@ -147,41 +172,42 @@ impl Fragmenter {
         if self.sizes.is_empty() {
             return None;
         }
-        Some(self.write(self.frame_samples))
+        Some(self.write())
     }
 
     /// Takes the stream's `last` frame, and writes the last fragment, of
     /// the frames taken since the last fragment and that frame, which lasts
     /// `last_duration` samples.
     ///
-    /// Spec reading: the last frame's `sample_duration` is shorter than the
-    /// `frame_samples` samples it decodes to, by the padding that the
-    /// stream ends with past the input, so that it ends where the input
-    /// does. A sample's duration is the difference between its decoding
-    /// time and the next's, "`DT[n+1] = DT[n] + sample_delta[n]`", and "In
-    /// the absence of composition offsets, the sum of all sample durations
-    /// gives the duration of the media in the track" (clause 8.6.1.2.1),
-    /// which TrackRunBox's `sample_duration` gives in a fragment (Table 5).
-    /// For the last sample, with no successive sample, `sample_delta`
-    /// "should be set equal to duration subtracted by the composition
-    /// timestamp of the last sample" (clause 8.6.1.2.3), the duration being
-    /// the `MediaHeaderBox`'s, which in the init segment is that of the
-    /// samples the `MovieBox` describes, none (see [`init_segment`]); that
-    /// of the whole media, which ends with the input, gives the value
-    /// taken, and "The decoding of the last ISOBMFF sample of a track can
-    /// produce additional audio samples that are not meant to be rendered"
-    /// (clause 8.4.2.3). The media then ends at the input's end, the
-    /// track's delay and its length into it: where an edit of the input's
-    /// length from the delay ends, and with it the duration of the
-    /// `MovieExtendsHeaderBox`; so that the implied edit "that inserts the
-    /// new media material" of fragments (clause 8.6.6.1, NOTE 1), read as
-    /// starting at the media's end, adds no padding past it; and "the
-    /// accumulated duration of all samples", which an edit of duration 0
-    /// lasts (clause 8.6.6.1), ends at the input's end too. The duration is
-    /// at least 1, as the last frame holds the last sample of the input, or
-    /// of the delay where there is no input, and at most `frame_samples`,
-    /// where there is no padding. The file without fragments keeps every
-    /// frame's duration, as its edit list alone ends its presentation.
+    /// Spec reading: in a stream that ends with padding, as AAC's and
+    /// Opus's do, the last frame's `sample_duration` is shorter than the
+    /// samples it decodes to, by the padding that the stream ends with past
+    /// the input, so that it ends where the input does. A sample's duration
+    /// is the difference between its decoding time and the next's,
+    /// "`DT[n+1] = DT[n] + sample_delta[n]`", and "In the absence of
+    /// composition offsets, the sum of all sample durations gives the
+    /// duration of the media in the track" (clause 8.6.1.2.1), which
+    /// TrackRunBox's `sample_duration` gives in a fragment (Table 5). For
+    /// the last sample, with no successive sample, `sample_delta` "should be
+    /// set equal to duration subtracted by the composition timestamp of the
+    /// last sample" (clause 8.6.1.2.3), the duration being the
+    /// `MediaHeaderBox`'s, which in the init segment is that of the samples
+    /// the `MovieBox` describes, none (see [`init_segment`]); that of the
+    /// whole media, which ends with the input, gives the value taken, and
+    /// "The decoding of the last ISOBMFF sample of a track can produce
+    /// additional audio samples that are not meant to be rendered" (clause
+    /// 8.4.2.3). The media then ends at the input's end, the track's delay
+    /// and its length into it: where an edit of the input's length from the
+    /// delay ends, and with it the duration of the `MovieExtendsHeaderBox`;
+    /// so that the implied edit "that inserts the new media material" of
+    /// fragments (clause 8.6.6.1, NOTE 1), read as starting at the media's
+    /// end, adds no padding past it; and "the accumulated duration of all
+    /// samples", which an edit of duration 0 lasts (clause 8.6.6.1), ends at
+    /// the input's end too. The duration is at least 1, as the last frame
+    /// holds the last sample of the input, or of the delay where there is no
+    /// input, and at most the frame's, where there is no padding. The AAC
+    /// file without fragments keeps every frame's duration, as its edit list
+    /// alone ends its presentation.
     ///
     /// Settled by decoding with ffmpeg and GStreamer (`qtdemux`,
     /// `avdec_aac`, `audiosegmentclip`; black box): GStreamer 1.28.9
@@ -197,37 +223,36 @@ impl Fragmenter {
     ///
     /// # Panics
     ///
-    /// If `last_duration` is 0 or more than `frame_samples`.
+    /// If `last_duration` is 0.
     pub fn finish(&mut self, last: &[u8], last_duration: u32) -> Fragment {
-        assert!(
-            (1..=self.frame_samples).contains(&last_duration),
-            "a last frame of {last_duration} samples"
-        );
-        self.data.extend_from_slice(last);
-        self.sizes
-            .push(u32::try_from(last.len()).expect("a frame under 4 GiB"));
-        self.write(last_duration)
+        assert!(last_duration > 0, "a last frame of 0 samples");
+        self.gather(last, last_duration);
+        self.write()
     }
 
     /// Writes the fragment of the frames taken since the last, of which
-    /// there is one at least, the last lasting `last_duration` samples.
-    fn write(&mut self, last_duration: u32) -> Fragment {
+    /// there is one at least.
+    fn write(&mut self) -> Fragment {
         let frames = u32::try_from(self.sizes.len()).expect("MAX_FRAMES frames at most");
         let info = FragmentInfo {
             sequence_number: self.sequence_number,
-            decode_time: self.frames_written * u64::from(self.frame_samples),
+            decode_time: self.time_written,
             frames,
-            duration: u64::from(frames - 1) * u64::from(self.frame_samples)
-                + u64::from(last_duration),
+            duration: self.time_gathered,
         };
-        let durations = FrameDurations {
-            frame: self.frame_samples,
-            last: last_duration,
+        let run = Run {
+            sizes: &self.sizes,
+            durations: &self.durations,
+            default_duration: self.default_duration,
+            roll: self.roll,
         };
-        let bytes = fragment(&info, durations, &self.sizes, &self.data);
+        let bytes = fragment(&info, &run, &self.data);
+        let last = *self.durations.last().expect("a frame at least");
         self.data.clear();
         self.sizes.clear();
-        self.frames_written += u64::from(frames);
+        self.durations.clear();
+        self.time_written += self.time_gathered;
+        self.time_gathered = 0;
         // Spec gap: the sequence_number "usually starts at 1 and increases
         // for each movie fragment in the file" (clause 8.8.5.1), but its 32
         // bits hold no more than 2^32 - 1 fragments: 136 years of fragments
@@ -236,22 +261,23 @@ impl Fragmenter {
         // number wraps to 0 and counts up again, and a reader that checks
         // the order may take the fragment where it wraps as out of order.
         self.sequence_number = self.sequence_number.wrapping_add(1);
-        // The first boundary past the frames written: the least n for
-        // which round(n * fragment_samples / frame_samples) > frames_written.
-        let frame = u128::from(self.frame_samples);
-        let past = frame * (2 * u128::from(self.frames_written) + 1);
+        // The first boundary that the frames written do not reach: the
+        // least n for which 2 n fragment_samples >= 2 end + last.
+        let past = 2 * u128::from(self.time_written) + u128::from(last);
         let fragment_samples = u128::from(self.fragment_samples.get());
         self.boundary = u64::try_from(past.div_ceil(2 * fragment_samples)).unwrap_or(u64::MAX);
         Fragment { bytes, info }
     }
 }
 
-/// The durations of a fragment's frames: `frame` each, but the last,
-/// which lasts `last`.
-#[derive(Clone, Copy)]
-struct FrameDurations {
-    frame: u32,
-    last: u32,
+/// The frames of a fragment's one run: their sizes and durations, the
+/// duration the `TrackExtendsBox` gives each by default, and whether they
+/// are mapped to the pre-roll group.
+struct Run<'a> {
+    sizes: &'a [u32],
+    durations: &'a [u32],
+    default_duration: u32,
+    roll: bool,
 }
 
 /// The `default_sample_flags` of every frame (clause 8.8.3.1), as the
@@ -262,7 +288,8 @@ struct FrameDurations {
 /// - `sample_depends_on` 2, "this sample does not depend on others": each
 ///   frame is decoded from its own bits, as the pre-roll's
 ///   `AudioRollRecoveryEntry` takes them to be (see
-///   [`write_roll_description`]).
+///   [`write_roll_description`]), and as each codec's are (see
+///   `write_sample_table` in `movie`).
 /// - `sample_is_depended_on` 0, "the dependency of other samples on this
 ///   sample is unknown".
 /// - `sample_has_redundancy` 2, "there is no redundant coding in this
@@ -272,9 +299,10 @@ struct FrameDurations {
 ///
 /// Spec reading: no frame depends on another to be decoded, so none is
 /// depended on in that sense, which would make `sample_is_depended_on` 2,
-/// "disposable"; but a frame is needed to present the next correctly, as
-/// its samples overlap the next frame's, and a reader that disposed of it
-/// would break the pre-roll. The file without fragments has no
+/// "disposable"; but an AAC frame or Opus packet is needed to present the
+/// next correctly, as its samples overlap the next one's, and a reader
+/// that disposed of it would break the pre-roll. A FLAC frame is not, but
+/// "unknown" is true of it too. The file without fragments has no
 /// `SampleDependencyTypeBox`, in whose absence "the dependency of other
 /// samples on this one is unknown" (clause 8.6.4.1), and the fragments say
 /// so too.
@@ -322,6 +350,11 @@ const SAMPLE_FLAGS: u32 = (2 << 26) | (2 << 24) | (2 << 20);
 /// all tracks are 0, and movie fragments are present, the duration in
 /// MovieHeaderBox should be set to indefinite or 0" (clause 8.8.2.1).
 ///
+/// A track without an edit list, whose decoder's output starts with no
+/// delay, as FLAC's, needs none to present its media from the start and to
+/// its end, where its last frame ends; where its length is known, it is the
+/// `MovieExtendsHeaderBox`'s duration alone.
+///
 /// Where the input's length is known, it is the edit's duration and the
 /// `MovieExtendsHeaderBox`'s, "the duration of the longest track,
 /// including movie fragments" (clause 8.8.2.3), as clause 8.6.6.1 has the
@@ -368,12 +401,15 @@ const SAMPLE_FLAGS: u32 = (2 << 26) | (2 << 24) | (2 << 20);
 /// `gstreamer_presents_the_padding_of_fragmented_files_of_no_length`.
 pub fn init_segment(track: &AudioTrack, length: Option<u64>) -> Vec<u8> {
     let durations = Durations {
-        edit: length.unwrap_or(0),
+        edit: track.delay.map(|_| length.unwrap_or(0)),
         track: 0,
         media: 0,
     };
     let sample_tables = |out: &mut Vec<u8>| {
-        write_sample_tables(out, track, &[], 0);
+        write_sample_tables(out, &[], &[], 0);
+        let Some(roll_distance) = track.roll_distance else {
+            return;
+        };
         // Spec reading: the frames are mapped to the pre-roll in each
         // fragment (see `fragment`), and none are in the MovieBox,
         // so it has no SampleToGroupBox, as "there may also be no
@@ -385,13 +421,13 @@ pub fn init_segment(track: &AudioTrack, length: Option<u64>) -> Vec<u8> {
         // SampleGroupDescriptionBoxes of this grouping_type in any
         // TrackFragmentBox of this track" (clause 8.9.3.1). It does not
         // have static_mapping, 0x2, as the fragments map their frames.
-        write_roll_description(out, track, 0x00_0001);
+        write_roll_description(out, roll_distance, 0x00_0001);
     };
     let extends = |out: &mut Vec<u8>| {
         write_box(out, b"mvex", |out| {
-            // The MovieExtendsHeaderBox comes with every edit of a known
-            // length, and only with one, as clause 8.6.6.1 adjusts the one
-            // to the other. GStreamer 1.28.9's qtdemux (black box), given
+            // The MovieExtendsHeaderBox comes with every known length, and
+            // with an edit list only with an edit of that length, as clause
+            // 8.6.6.1 adjusts the one to the other. GStreamer 1.28.9's qtdemux (black box), given
             // the edit without the box, ends each segment it marks at the
             // end of the fragments it has read, until the last: see the
             // conformance test
@@ -406,22 +442,22 @@ pub fn init_segment(track: &AudioTrack, length: Option<u64>) -> Vec<u8> {
             write_full_box(out, b"trex", 0, 0, |out| {
                 out.extend_from_slice(&TRACK_ID.to_be_bytes());
                 out.extend_from_slice(&1u32.to_be_bytes()); // default_sample_description_index
-                out.extend_from_slice(&track.frame_samples.to_be_bytes()); // default_sample_duration
+                out.extend_from_slice(&track.default_duration.to_be_bytes()); // default_sample_duration
                 out.extend_from_slice(&0u32.to_be_bytes()); // default_sample_size
                 out.extend_from_slice(&SAMPLE_FLAGS.to_be_bytes()); // default_sample_flags
             });
         });
     };
-    let mut out = file_type_box();
+    let mut out = file_type_box(&track.brands);
     out.extend(movie_box(track, durations, sample_tables, extends));
     out
 }
 
-/// The fragment `info` describes, of the frames of `sizes`, which
+/// The fragment `info` describes, of the frames of `run`, which
 /// `media_data` holds one after another: its `MovieFragmentBox` (clause
 /// 8.8.4), whose header gives its `sequence_number` (clause 8.8.5), and
 /// whose one `TrackFragmentBox` (clause 8.8.6) holds the track's header, its
-/// decoding time, one run of every frame and their pre-roll; then the
+/// decoding time, one run of every frame and any pre-roll; then the
 /// `MediaDataBox` of the frames.
 ///
 /// Spec reading: the run's `data_offset` is from the first byte of the
@@ -432,26 +468,21 @@ pub fn init_segment(track: &AudioTrack, length: Option<u64>) -> Vec<u8> {
 /// `base_data_offset` "is inferred to be equal to 0" and "is relative to
 /// the first byte of the MovieFragmentBox containing this box" (Table 6),
 /// as with default-base-is-moof; but that flag "shall not be used in brands
-/// or compatible brands earlier than 'iso5'" (clause 8.8.7.1), and the file
-/// is `'isom'` (see `COMPATIBLE_BRANDS` in `movie`). A `base_data_offset`
+/// or compatible brands earlier than 'iso5'" (clause 8.8.7.1), and the
+/// files are `'isom'` or `'iso2'` (see each codec's brands). A `base_data_offset`
 /// given, from the start of the file, would tie each fragment to where it
 /// lies in it.
 ///
 /// Spec reading: the `TrackFragmentBaseMediaDecodeTimeBox` is among the
 /// boxes `'iso6'` requires readers to support (Table E.6), not `'isom'`,
 /// as the pre-roll's are of `'avc1'`, and is written for the same reasons
-/// (see `COMPATIBLE_BRANDS` in `movie`): a reader skips it if it does not
+/// (see AAC's brands): a reader skips it if it does not
 /// recognize it, and finds the time by the frames before, as it would
 /// without it. It comes "after the TrackFragmentHeaderBox and before the
 /// first TrackRunBox" (clause 8.8.12.1).
-fn fragment(
-    info: &FragmentInfo,
-    durations: FrameDurations,
-    sizes: &[u32],
-    media_data: &[u8],
-) -> Vec<u8> {
+fn fragment(info: &FragmentInfo, run: &Run, media_data: &[u8]) -> Vec<u8> {
     let media_data_header = boxes::media_data_header(media_data.len() as u64);
-    let common_size = common_size(sizes);
+    let common_size = common_size(run.sizes);
     let mut out = Vec::new();
     let mut data_offset_at = 0;
     write_box(&mut out, b"moof", |out| {
@@ -477,11 +508,11 @@ fn fragment(
             // The TrackRunBox (clause 8.8.8) of every frame: of version 0,
             // which 'isom' requires readers to support (clause E.2), with
             // data-offset-present, 0x1; sample-duration-present, 0x100,
-            // where the last frame is shorter than the TrackExtendsBox's
-            // default_sample_duration, as the stream's last can be (see
-            // Fragmenter::finish); and sample-size-present, 0x200, where the
-            // frames' sizes differ.
-            let each_duration = durations.last != durations.frame;
+            // where a frame's duration is not the TrackExtendsBox's
+            // default_sample_duration, as the stream's last can be shorter
+            // (see Fragmenter::finish); and sample-size-present, 0x200,
+            // where the frames' sizes differ.
+            let each_duration = (run.durations.iter()).any(|&d| d != run.default_duration);
             let mut flags = 0x00_0001;
             if each_duration {
                 flags |= 0x00_0100;
@@ -493,14 +524,8 @@ fn fragment(
                 out.extend_from_slice(&info.frames.to_be_bytes()); // sample_count
                 data_offset_at = out.len();
                 out.extend_from_slice(&0i32.to_be_bytes()); // data_offset
-                for (i, &size) in sizes.iter().enumerate() {
+                for (&size, &duration) in run.sizes.iter().zip(run.durations) {
                     if each_duration {
-                        let last = i + 1 == sizes.len();
-                        let duration = if last {
-                            durations.last
-                        } else {
-                            durations.frame
-                        };
                         out.extend_from_slice(&duration.to_be_bytes()); // sample_duration
                     }
                     if common_size.is_none() {
@@ -513,7 +538,9 @@ fn fragment(
             // 8.9.2.1) is one in each container, as clause 8.9.4 has a
             // SampleToGroupBox in each TrackFragmentBox document "the total
             // number of samples in all the track fragment runs".
-            write_roll_mapping(out, info.frames);
+            if run.roll {
+                write_roll_mapping(out, info.frames);
+            }
         });
     });
     let data_offset = i32::try_from(out.len() + media_data_header.len())
@@ -531,7 +558,7 @@ mod tests {
     use crate::movie::tests::track;
 
     fn fragmenter(fragment_samples: u32) -> Fragmenter {
-        Fragmenter::new(1024, NonZeroU32::new(fragment_samples).unwrap())
+        Fragmenter::new(&track(44_100), NonZeroU32::new(fragment_samples).unwrap())
     }
 
     #[test]
@@ -539,7 +566,7 @@ mod tests {
         let mut fragmenter = fragmenter(44_100);
         let mut ends = Vec::new();
         for i in 0..44 * 60 {
-            if let Some(fragment) = fragmenter.push_frame(&[0]) {
+            if let Some(fragment) = fragmenter.push_frame(&[0], 1024) {
                 ends.push(i + 1);
                 assert_eq!(
                     fragment.info.decode_time + fragment.info.duration,
@@ -561,7 +588,9 @@ mod tests {
     fn a_fragment_has_a_frame_at_least() {
         let mut fragmenter = fragmenter(1);
         for i in 0..5 {
-            let fragment = fragmenter.push_frame(&[i]).expect("a fragment a frame");
+            let fragment = fragmenter
+                .push_frame(&[i], 1024)
+                .expect("a fragment a frame");
             assert_eq!(fragment.info.frames, 1);
             assert_eq!(fragment.info.sequence_number, u32::from(i) + 1);
             assert_eq!(fragment.info.decode_time, 1024 * u64::from(i));
@@ -573,11 +602,13 @@ mod tests {
     /// AAC stream has them, end their fragment at MAX_FRAMES.
     #[test]
     fn a_fragment_has_max_frames_at_most() {
-        let mut fragmenter = Fragmenter::new(1, NonZeroU32::MAX);
+        let mut one = track(44_100);
+        one.default_duration = 1;
+        let mut fragmenter = Fragmenter::new(&one, NonZeroU32::MAX);
         for _ in 1..MAX_FRAMES {
-            assert!(fragmenter.push_frame(&[]).is_none());
+            assert!(fragmenter.push_frame(&[], 1).is_none());
         }
-        let fragment = fragmenter.push_frame(&[]).expect("a full fragment");
+        let fragment = fragmenter.push_frame(&[], 1).expect("a full fragment");
         assert_eq!(fragment.info.frames as usize, MAX_FRAMES);
         let trun = find(&fragment.bytes, &[b"moof", b"traf", b"trun"]);
         assert_eq!(u32_at(trun.payload, 4) as usize, MAX_FRAMES);
@@ -587,13 +618,13 @@ mod tests {
     fn a_flush_ends_the_fragment_and_the_next_keeps_to_the_boundaries() {
         let mut fragmenter = fragmenter(10 * 1024);
         for _ in 0..3 {
-            assert!(fragmenter.push_frame(&[0]).is_none());
+            assert!(fragmenter.push_frame(&[0], 1024).is_none());
         }
         let first = fragmenter.flush().unwrap();
         assert_eq!((first.info.frames, first.info.duration), (3, 3 * 1024));
         assert!(fragmenter.flush().is_none());
         let ends: Vec<u64> = (0..30)
-            .filter_map(|_| fragmenter.push_frame(&[0]))
+            .filter_map(|_| fragmenter.push_frame(&[0], 1024))
             .map(|f| (f.info.decode_time + f.info.duration) / 1024)
             .collect();
         assert_eq!(ends, [10, 20, 30]);
@@ -610,7 +641,7 @@ mod tests {
     fn one_fragment(sizes: &[u32]) -> Fragment {
         let mut fragmenter = fragmenter(u32::MAX);
         for frame in frames(sizes) {
-            assert!(fragmenter.push_frame(&frame).is_none());
+            assert!(fragmenter.push_frame(&frame, 1024).is_none());
         }
         fragmenter.flush().unwrap()
     }
@@ -684,7 +715,7 @@ mod tests {
         let sizes = [3, 1, 2];
         let frames = frames(&sizes);
         for frame in &frames[..2] {
-            assert!(three.push_frame(frame).is_none());
+            assert!(three.push_frame(frame, 1024).is_none());
         }
         let fragment = three.finish(&frames[2], 636);
         assert_eq!(fragment.info.duration, 2 * 1024 + 636);
@@ -698,7 +729,7 @@ mod tests {
         assert_eq!(rows, [1024, 3, 1024, 1, 636, 2]);
         // Of one size, the durations alone; a frame alone, its own.
         let mut alike = fragmenter(u32::MAX);
-        assert!(alike.push_frame(&[0; 5]).is_none());
+        assert!(alike.push_frame(&[0; 5], 1024).is_none());
         let fragment = alike.finish(&[0; 5], 1);
         let trun = find(&fragment.bytes, &[b"moof", b"traf", b"trun"]);
         assert_eq!(u32_at(trun.payload, 0), 0x00_0101);
@@ -716,22 +747,16 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "a last frame of 1025 samples")]
-    fn a_last_frame_lasts_a_frame_at_most() {
-        fragmenter(1024).finish(&[0], 1025);
-    }
-
-    #[test]
     fn decode_times_past_32_bits_take_version_1() {
         let mut fragmenter = fragmenter(1024);
-        fragmenter.frames_written = (1 << 22) - 1;
-        let before = fragmenter.push_frame(&[0]).unwrap();
+        fragmenter.time_written = ((1 << 22) - 1) * 1024;
+        let before = fragmenter.push_frame(&[0], 1024).unwrap();
         let tfdt = find(&before.bytes, &[b"moof", b"traf", b"tfdt"]);
         assert_eq!(
             tfdt.payload,
             [&[0; 4][..], &(u32::MAX - 1023).to_be_bytes()].concat()
         );
-        let after = fragmenter.push_frame(&[0]).unwrap();
+        let after = fragmenter.push_frame(&[0], 1024).unwrap();
         let tfdt = find(&after.bytes, &[b"moof", b"traf", b"tfdt"]);
         assert_eq!(
             tfdt.payload,

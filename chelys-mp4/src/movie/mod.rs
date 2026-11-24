@@ -13,35 +13,64 @@ pub mod progressive;
 
 use super::boxes::{FourCc, write_box, write_full_box};
 
-/// What the boxes describe of an audio track whose samples are frames of
-/// `frame_samples` samples each, which decode to the presentation's
-/// samples after `delay` samples to be discarded, and some to be
-/// discarded after them: all that is known of the track before its first
-/// frame.
+/// What the boxes describe of an audio track, all that is known of it
+/// before its first sample: each sample a frame or packet of the stream,
+/// which decodes to the presentation's samples after the `delay` samples
+/// that its edit leaves out, if it has an edit list.
 #[derive(Clone, Debug)]
 pub struct AudioTrack {
-    /// The sample entry's `format`, as `'mp4a'` (ISO/IEC 14496-14, clause
-    /// 6.7).
-    pub coding_name: FourCc,
-    /// The `ES_Descriptor` its `ESDBox` holds (ISO/IEC 14496-14, clause
-    /// 6.7.2).
-    pub es_descriptor: Vec<u8>,
-    pub sample_rate: u32,
+    /// The brands of the `FileTypeBox`, which are the codec's to choose.
+    pub brands: Brands,
+    pub sample_entry: SampleEntry,
+    /// The timescale of the media, and of the movie: the rate of the
+    /// samples that a decoder outputs, in which every duration is counted.
+    pub timescale: u32,
     pub channels: u16,
-    pub frame_samples: u32,
-    pub delay: u32,
-    /// The number of frames before a frame that are to be decoded before
-    /// it for it to decode correctly, as a negative `roll_distance`
-    /// (clause 10.1), for every frame.
-    pub roll_distance: i16,
+    /// The samples that a decoder's output starts with before the
+    /// presentation, which the track's one edit leaves out, or `None` where
+    /// the track has no edit list and presents every sample it decodes to.
+    pub delay: Option<u32>,
+    /// The duration that every sample but the last has, where they all
+    /// have one, or 0: the `TrackExtendsBox`'s `default_sample_duration`
+    /// in a fragmented file.
+    pub default_duration: u32,
+    /// The number of samples before each sample that are to be decoded
+    /// before it for it to decode correctly, as a negative `roll_distance`
+    /// (clause 10.1), or `None` where each decodes correctly alone, and the
+    /// track has no pre-roll group.
+    pub roll_distance: Option<i16>,
+}
+
+/// The brands of the `FileTypeBox` (clause 5.2): its major brand, and its
+/// compatible brands.
+#[derive(Clone, Copy, Debug)]
+pub struct Brands {
+    pub major: FourCc,
+    pub compatible: &'static [FourCc],
+}
+
+/// The fields and boxes of the track's one sample entry, an
+/// `AudioSampleEntry` (clause 12.2.3), which are the codec's to give but
+/// for `channelcount`, the track's channels.
+#[derive(Clone, Debug)]
+pub struct SampleEntry {
+    /// The sample entry's `format`, its box type, as `'mp4a'`.
+    pub coding_name: FourCc,
+    /// `samplesize`.
+    pub sample_size: u16,
+    /// `samplerate`, in 16.16 fixed point.
+    pub sample_rate: u32,
+    /// The boxes that follow the fields, as an `ESDBox`, one after another.
+    pub boxes: Vec<u8>,
 }
 
 /// The durations of the `MovieBox`, each in samples, as both timescales
-/// are the sample rate.
+/// are the track's.
 #[derive(Clone, Copy, Debug)]
 struct Durations {
-    /// The `edit_duration` of the one edit: the samples it presents.
-    edit: u64,
+    /// The `edit_duration` of the one edit, where the track has an edit
+    /// list: the samples it presents.
+    edit: Option<u64>,
     /// The track's `duration` (clause 8.3.2.3), and the movie's, that of
     /// "the longest track" (clause 8.2.2.3), the one track.
     track: u64,
@@ -50,36 +79,19 @@ struct Durations {
     media: u64,
 }
 
-/// The brands of the `FileTypeBox` (clause 5.2): `'mp42'`, which
-/// "identifies this version" of ISO/IEC 14496-14, of which `'mp41'` or
-/// `'mp42'` "shall appear in the compatible-brands list" (clause 5), as
-/// major brand and compatible, and `'isom'`, the first version of ISO/IEC
-/// 14496-12 (clause E.2), which the file keeps to.
-///
-/// Spec reading: the `SampleToGroupBox` and `SampleGroupDescriptionBox`
-/// of the pre-roll (see [`write_roll_mapping`]) are among the boxes that
-/// `'avc1'`, and so `'iso2'`, require readers to support (clauses E.3 and
-/// E.4), and not among those of `'isom'` (Table E.1); but a reader skips
-/// a box it does not recognize (clause 4.2.2), and the file plays without
-/// them. So `'isom'` is claimed, which more readers support, and `'iso2'`
-/// is not needed. Annex E's brands "should not be used as the major brand"
-/// (clause E.1), so `'mp42'` is.
-const MAJOR_BRAND: FourCc = *b"mp42";
-const COMPATIBLE_BRANDS: [FourCc; 2] = [*b"mp42", *b"isom"];
-
 /// The `track_ID` of the track (clause 8.3.2.3), from which an
 /// `ES_Descriptor` built into a stream takes its `ES_ID` (ISO/IEC 14496-14,
 /// clause 4.1.2): the first, as "Zero is not a valid track_ID value".
 const TRACK_ID: u32 = 1;
 
 /// The `FileTypeBox` (clause 5.2), which comes first in the file.
-fn file_type_box() -> Vec<u8> {
+fn file_type_box(brands: &Brands) -> Vec<u8> {
     let mut out = Vec::new();
     write_box(&mut out, b"ftyp", |out| {
-        out.extend_from_slice(&MAJOR_BRAND);
+        out.extend_from_slice(&brands.major);
         out.extend_from_slice(&0u32.to_be_bytes()); // minor_version
-        for brand in COMPATIBLE_BRANDS {
-            out.extend_from_slice(&brand);
+        for brand in brands.compatible {
+            out.extend_from_slice(brand);
         }
     });
     out
@@ -156,7 +168,7 @@ fn movie_box(
 
 /// The `MovieHeaderBox` (clause 8.2.2).
 ///
-/// Its `timescale` is the sample rate, as the media's is (see
+/// Its `timescale` is the track's, as the media's is (see
 /// [`write_media`]), so that the track's edit, whose duration is in this
 /// timescale (clause 8.6.6.3), is exact to the sample. Its `duration` is
 /// the layout's, that of the one track. `rate`, `volume` and
@@ -168,7 +180,7 @@ fn write_movie_header(out: &mut Vec<u8>, track: &AudioTrack, durations: Duration
     write_full_box(out, b"mvhd", version, 0, |out| {
         put_sized(out, version, CREATION_TIME); // creation_time
         put_sized(out, version, CREATION_TIME); // modification_time
-        out.extend_from_slice(&track.sample_rate.to_be_bytes()); // timescale
+        out.extend_from_slice(&track.timescale.to_be_bytes());
         put_sized(out, version, duration);
         out.extend_from_slice(&0x0001_0000u32.to_be_bytes()); // rate, 1.0
         out.extend_from_slice(&0x0100u16.to_be_bytes()); // volume, 1.0
@@ -179,8 +191,9 @@ fn write_movie_header(out: &mut Vec<u8>, track: &AudioTrack, durations: Duration
     });
 }
 
-/// The `TrackBox` (clause 8.3.1): its header, its edit list, then its
-/// media (clause 7.3.4: the `EditBox` "should precede the MediaBox").
+/// The `TrackBox` (clause 8.3.1): its header, its edit list if it has
+/// one, then its media (clause 7.3.4: the `EditBox` "should precede the
+/// MediaBox").
 fn write_track(
     out: &mut Vec<u8>,
     track: &AudioTrack,
@@ -189,7 +202,9 @@ fn write_track(
 ) {
     write_box(out, b"trak", |out| {
         write_track_header(out, durations);
-        write_edit(out, track, durations);
+        if let (Some(delay), Some(duration)) = (track.delay, durations.edit) {
+            write_edit(out, delay, duration);
+        }
         write_media(out, track, durations, sample_tables);
     });
 }
@@ -224,19 +239,18 @@ fn write_track_header(out: &mut Vec<u8>, durations: Durations) {
 }
 
 /// The `EditBox` and its `EditListBox` (clauses 8.6.5 and 8.6.6): one
-/// edit, which presents `durations.edit` samples from the track's
-/// `delay`'th, at the normal rate, 1.0. A decoder's output starts with
+/// edit, which presents `duration` samples from the `delay`'th, at the
+/// normal rate, 1.0. A decoder's output starts with
 /// `delay` samples that precede the input and ends with samples past it;
 /// the edit leaves both out, as Annex A of ISO/IEC 14496-14 describes, so
 /// that "the output of the decoder has the same length as the input to
 /// the encoder, with the audio in the same temporal position".
 ///
-/// Its `media_time` is in the media's timescale, the sample rate, and its
-/// `edit_duration` in the movie's, also the sample rate (see
-/// [`write_movie_header`]), so that both count samples.
-fn write_edit(out: &mut Vec<u8>, track: &AudioTrack, durations: Durations) {
-    let duration = durations.edit;
-    let media_time = u64::from(track.delay);
+/// Its `media_time` is in the media's timescale, and its `edit_duration`
+/// in the movie's, the same (see [`write_movie_header`]), so that both
+/// count samples.
+fn write_edit(out: &mut Vec<u8>, delay: u32, duration: u64) {
+    let media_time = u64::from(delay);
     // media_time is signed, an int(32) in version 0.
     let version = version(&[duration]).max(u8::from(media_time > i32::MAX as u64));
     write_box(out, b"edts", |out| {
@@ -254,8 +268,9 @@ fn write_edit(out: &mut Vec<u8>, track: &AudioTrack, durations: Durations) {
 /// (clause 7.3.4: "the HandlerBox should precede the
 /// MediaInformationBox").
 ///
-/// Its `timescale` is the sample rate, as "The timescale for an audio
-/// track should be chosen to match the sampling rate" (clause 12.2.3.1).
+/// Its `timescale` is the track's, which the codec chooses: "The timescale
+/// for an audio track should be chosen to match the sampling rate" (clause
+/// 12.2.3.1).
 fn write_media(
     out: &mut Vec<u8>,
     track: &AudioTrack,
@@ -268,7 +283,7 @@ fn write_media(
         write_full_box(out, b"mdhd", version, 0, |out| {
             put_sized(out, version, CREATION_TIME); // creation_time
             put_sized(out, version, CREATION_TIME); // modification_time
-            out.extend_from_slice(&track.sample_rate.to_be_bytes()); // timescale
+            out.extend_from_slice(&track.timescale.to_be_bytes());
             put_sized(out, version, duration);
             out.extend_from_slice(&UNDETERMINED_LANGUAGE.to_be_bytes());
             out.extend_from_slice(&0u16.to_be_bytes()); // pre_defined
@@ -324,10 +339,13 @@ fn write_data_information(out: &mut Vec<u8>) {
 ///
 /// It has no `SyncSampleBox`, so that every sample is a sync sample
 /// (clause 8.5.1.1), in a track that is not fragmented, and in one that is,
-/// whose samples' flags say so (see [`fragmented`]): each frame is decoded
-/// from its own bits, which
-/// clause 10.1 describes of the audio streams an `AudioRollRecoveryEntry`
-/// serves, "in which every sample can be independently decoded".
+/// whose samples' flags say so (see [`fragmented`]): each sample of every
+/// codec written is decoded from its own bits, which clause 10.1 describes
+/// of the audio streams an `AudioRollRecoveryEntry` serves, "in which
+/// every sample can be independently decoded", and which the mappings of
+/// FLAC and Opus have of theirs ("every FLAC sample is a sync sample",
+/// "every Opus sample is a sync sample"), each with its "Sync Sample Box
+/// shall not be present".
 fn write_sample_table(
     out: &mut Vec<u8>,
     track: &AudioTrack,
@@ -342,84 +360,49 @@ fn write_sample_table(
     });
 }
 
-/// The sample entry: an `MP4AudioSampleEntry` (ISO/IEC 14496-14, clause
-/// 6.7.2), an `AudioSampleEntry` (clause 12.2.3) with an `ESDBox`.
-///
-/// `channelcount` is the number of channels, "the total number of channels
-/// in the audio stream". `samplesize` and `samplerate` are template fields,
-/// which "When a file is created as a pure MPEG-4 file ... shall be set to
-/// their default values" (ISO/IEC 14496-14, clause 7): `samplesize` 16, and
-/// `samplerate` "{ default samplerate of media}<<16", the sample rate in
-/// 16.16 fixed point (clause 12.2.3.2).
-///
-/// Spec reading: the two standards conflict above 65535 Hz, as at 88.2 and
-/// 96 kHz, where the default `samplerate` cannot be written: its 16-bit
-/// integer part cannot hold the rate. ISO/IEC 14496-14 gives no way out;
-/// clause 12.2.3.1 does, for a codec that gives its own rate, as the
-/// `AudioSpecificConfig()` does: "a SamplingRateBox is present in the
-/// AudioSampleEntryV1 or AudioSampleEntry, and it documents the actual
-/// sampling rate", and `samplerate` "should contain a value that matches
-/// the media timescale left-shifted 16 bits ... or be an integer division
-/// or multiple of it". So where the rate holds 16 bits, `samplerate` is the
-/// default, as clause 7 requires; above, where no value meets it, it is the
-/// rate divided by the least integer that brings it within 16 bits, 2 at
-/// 88.2 and 96 kHz, and a `SamplingRateBox` follows the `ESDBox`, as "the
-/// SamplingRateBox ... should follow, not precede, any boxes defined in or
-/// required by derived specifications".
+/// The sample entry, an `AudioSampleEntry` (clause 12.2.3), of the
+/// codec's type, fields and boxes. `channelcount` is the number of
+/// channels, "the total number of channels in the audio stream".
 fn write_sample_entry(out: &mut Vec<u8>, track: &AudioTrack) {
-    let divisor = (1..)
-        .find(|&d| track.sample_rate % d == 0 && track.sample_rate / d <= 0xffff)
-        .expect("the rate over itself, 1, holds 16 bits");
-    write_box(out, &track.coding_name, |out| {
+    let entry = &track.sample_entry;
+    write_box(out, &entry.coding_name, |out| {
         // SampleEntry (clause 8.5.2.2).
         out.extend_from_slice(&[0; 6]); // reserved
         out.extend_from_slice(&1u16.to_be_bytes()); // data_reference_index
         // AudioSampleEntry.
         out.extend_from_slice(&[0; 2 * 4]); // reserved
         out.extend_from_slice(&track.channels.to_be_bytes()); // channelcount
-        out.extend_from_slice(&16u16.to_be_bytes()); // samplesize
+        out.extend_from_slice(&entry.sample_size.to_be_bytes()); // samplesize
         out.extend_from_slice(&0u16.to_be_bytes()); // pre_defined
         out.extend_from_slice(&[0; 2]); // reserved
-        out.extend_from_slice(&((track.sample_rate / divisor) << 16).to_be_bytes());
-        write_full_box(out, b"esds", 0, 0, |out| {
-            out.extend_from_slice(&track.es_descriptor);
-        });
-        if divisor > 1 {
-            // Spec gap: the SamplingRateBox extends FullBox('srat') without
-            // a version or flags; they are 0, as for the other boxes that
-            // define none.
-            write_full_box(out, b"srat", 0, 0, |out| {
-                out.extend_from_slice(&track.sample_rate.to_be_bytes()); // sampling_rate
-            });
-        }
+        out.extend_from_slice(&entry.sample_rate.to_be_bytes()); // samplerate
+        out.extend_from_slice(&entry.boxes);
     });
 }
 
-/// The number of frames of `sizes`.
+/// The number of samples of `sizes`.
 fn count(sizes: &[u32]) -> u32 {
-    u32::try_from(sizes.len()).expect("fewer than 2^32 frames")
+    u32::try_from(sizes.len()).expect("fewer than 2^32 samples")
 }
 
-/// The sample tables of the frames of `sizes`, one chunk of them at
-/// `chunk_offset`, after the `SampleDescriptionBox`, in the order clause
-/// 7.3.4 recommends: `TimeToSampleBox`, `SampleToChunkBox`,
-/// `SampleSizeBox` and `ChunkOffsetBox`. Without frames, each has no
+/// The sample tables of the samples of `sizes` and `durations`, one chunk
+/// of them at `chunk_offset`, after the `SampleDescriptionBox`, in the
+/// order clause 7.3.4 recommends: `TimeToSampleBox`, `SampleToChunkBox`,
+/// `SampleSizeBox` and `ChunkOffsetBox`. Without samples, each has no
 /// entries.
-fn write_sample_tables(out: &mut Vec<u8>, track: &AudioTrack, sizes: &[u32], chunk_offset: u32) {
+fn write_sample_tables(out: &mut Vec<u8>, sizes: &[u32], durations: &[u32], chunk_offset: u32) {
+    debug_assert_eq!(sizes.len(), durations.len());
     let count = count(sizes);
-    // The TimeToSampleBox (clause 8.6.1.2): every frame lasts as long.
+    // The TimeToSampleBox (clause 8.6.1.2): an entry for each run of
+    // samples that last as long.
     write_full_box(out, b"stts", 0, 0, |out| {
-        let entries: &[(u32, u32)] = match count {
-            0 => &[],
-            _ => &[(count, track.frame_samples)],
-        };
-        put_entries(out, entries);
+        put_entries(out, &runs(durations));
     });
-    // The SampleToChunkBox (clause 8.7.4): one chunk of every frame,
+    // The SampleToChunkBox (clause 8.7.4): one chunk of every sample,
     // described by the one sample entry.
     //
     // Spec gap: the standard leaves how samples are grouped into chunks
-    // to the writer. The track's frames lie one after another in the
+    // to the writer. The track's samples lie one after another in the
     // MediaDataBox, and there is no other track to interleave them
     // with, so they are one chunk, whose offset is all the
     // ChunkOffsetBox gives.
@@ -435,7 +418,7 @@ fn write_sample_tables(out: &mut Vec<u8>, track: &AudioTrack, sizes: &[u32], chu
     // The SampleSizeBox (clause 8.7.3.2), as "the first version is
     // preferred for maximum compatibility" over the CompactSampleSizeBox
     // (clauses 8.7.3.1 and 8.7.3.3); with one sample_size where every
-    // frame is as long.
+    // sample is as long.
     write_full_box(out, b"stsz", 0, 0, |out| {
         let sample_size = common_size(sizes).unwrap_or(0);
         out.extend_from_slice(&sample_size.to_be_bytes());
@@ -457,8 +440,22 @@ fn write_sample_tables(out: &mut Vec<u8>, track: &AudioTrack, sizes: &[u32], chu
     });
 }
 
-/// The size every frame of `sizes` has, if they all have one, and there
-/// is a frame.
+/// The runs of equal values in `durations`, each its length and the
+/// value: the `sample_count` and `sample_delta` of the entries of a
+/// `TimeToSampleBox`.
+fn runs(durations: &[u32]) -> Vec<(u32, u32)> {
+    let mut runs: Vec<(u32, u32)> = Vec::new();
+    for &duration in durations {
+        match runs.last_mut() {
+            Some((count, delta)) if *delta == duration => *count += 1,
+            _ => runs.push((1, duration)),
+        }
+    }
+    runs
+}
+
+/// The size every sample of `sizes` has, if they all have one, and there
+/// is a sample.
 fn common_size(sizes: &[u32]) -> Option<u32> {
     let first = *sizes.first()?;
     sizes.iter().all(|&size| size == first).then_some(first)
@@ -467,12 +464,12 @@ fn common_size(sizes: &[u32]) -> Option<u32> {
 /// The `grouping_type` of the pre-roll (clause 10.1).
 const ROLL: &FourCc = b"roll";
 
-/// The pre-roll of every frame, as a sample group of `grouping_type`
+/// The pre-roll of every sample, as a sample group of `grouping_type`
 /// `'roll'` (clause 10.1): this `SampleToGroupBox` (clause 8.9.2) maps the
-/// next `count` frames to the one entry of the `SampleGroupDescriptionBox`
+/// next `count` samples to the one entry of the `SampleGroupDescriptionBox`
 /// (clause 8.9.3) that [`write_roll_description`] writes.
 ///
-/// A frame's samples overlap the previous frame's, and decode correctly
+/// Of AAC: a frame's samples overlap the previous frame's, and decode correctly
 /// only once that frame has been decoded too; Annex A of ISO/IEC 14496-14
 /// has "a pre-roll sample group, for example a pre-roll value of ‒1 (minus
 /// one)" tell a reader to decode the frame before the first it presents,
@@ -502,9 +499,10 @@ fn write_roll_mapping(out: &mut Vec<u8>, count: u32) {
 }
 
 /// The `SampleGroupDescriptionBox` of the pre-roll (see
-/// [`write_roll_mapping`]), of `flags`, with its one entry.
+/// [`write_roll_mapping`]), of `flags`, with its one entry, of
+/// `roll_distance`.
 ///
-/// Spec reading: clause 10.1 offers an `AudioRollRecoveryEntry`
+/// Spec reading, of AAC: clause 10.1 offers an `AudioRollRecoveryEntry`
 /// (`'roll'`), for "audio streams in which every sample can be
 /// independently decoded, but the decoder output is only assured to be
 /// correct after pre-rolling", and an `AudioPreRollEntry` (`'prol'`), for
@@ -517,12 +515,12 @@ fn write_roll_mapping(out: &mut Vec<u8>, count: u32) {
 /// The box is of version 1, with the entries' `default_length`, as version
 /// 0 entries are "deprecated" (clause 8.9.3.1), and not 2, as each frame's
 /// group is mapped, none by default.
-fn write_roll_description(out: &mut Vec<u8>, track: &AudioTrack, flags: u32) {
+fn write_roll_description(out: &mut Vec<u8>, roll_distance: i16, flags: u32) {
     write_full_box(out, b"sgpd", 1, flags, |out| {
         out.extend_from_slice(ROLL); // grouping_type
         out.extend_from_slice(&2u32.to_be_bytes()); // default_length
         out.extend_from_slice(&1u32.to_be_bytes()); // entry_count
-        out.extend_from_slice(&track.roll_distance.to_be_bytes());
+        out.extend_from_slice(&roll_distance.to_be_bytes());
     });
 }
 
@@ -532,23 +530,47 @@ mod tests {
     use super::*;
     use crate::boxes::read::{FourCcs, boxes, children, find, u32_at};
 
-    /// A track of stereo at `sample_rate`, its `ES_Descriptor` a stub.
+    const MP42_ISOM: [FourCc; 2] = [*b"mp42", *b"isom"];
+
+    /// A track of stereo at `sample_rate`, as AAC's are, its sample entry
+    /// an `'mp4a'` whose `ESDBox` holds a stub.
     pub fn track(sample_rate: u32) -> AudioTrack {
+        let mut boxes = Vec::new();
+        write_full_box(&mut boxes, b"esds", 0, 0, |out| {
+            out.extend_from_slice(&[0x03, 0x00]);
+        });
         AudioTrack {
-            coding_name: *b"mp4a",
-            es_descriptor: vec![0x03, 0x00],
-            sample_rate,
+            brands: Brands {
+                major: *b"mp42",
+                compatible: &MP42_ISOM,
+            },
+            sample_entry: SampleEntry {
+                coding_name: *b"mp4a",
+                sample_size: 16,
+                sample_rate: sample_rate << 16,
+                boxes,
+            },
+            timescale: sample_rate,
             channels: 2,
-            frame_samples: 1024,
-            delay: 1024,
-            roll_distance: -1,
+            delay: Some(1024),
+            default_duration: 1024,
+            roll_distance: Some(-1),
         }
     }
 
     /// The file of `frames` frames of a byte each, of `length` samples.
     fn write(track: &AudioTrack, frames: usize, length: u64) -> Vec<u8> {
         let mut file = Vec::new();
-        write_file(track, &vec![1; frames], length, &vec![0; frames], &mut file).unwrap();
+        let (sizes, durations) = (vec![1; frames], vec![1024; frames]);
+        write_file(
+            track,
+            &sizes,
+            &durations,
+            length,
+            &vec![0; frames],
+            &mut file,
+        )
+        .unwrap();
         file
     }
 
@@ -603,20 +625,23 @@ mod tests {
         assert_eq!(find(&short, &[b"moov", b"mvhd"]).payload[0], 0);
         // media_time is an int(32) in version 0.
         let mut late = track(44_100);
-        late.delay = 1 << 31;
+        late.delay = Some(1 << 31);
         let file = write(&late, 2, 0);
         let elst = find(&file, &[b"moov", b"trak", b"edts", b"elst"]);
         assert_eq!(elst.payload[0], 1);
         assert_eq!(&elst.payload[16..24], (1u64 << 31).to_be_bytes());
-        late.delay = (1 << 31) - 1;
+        late.delay = Some((1 << 31) - 1);
         let file = write(&late, 2, 0);
         let elst = find(&file, &[b"moov", b"trak", b"edts", b"elst"]);
         assert_eq!(elst.payload[0], 0);
     }
 
     #[test]
-    fn the_sample_entry_carries_the_es_descriptor() {
-        let file = write(&track(44_100), 1, 0);
+    fn the_sample_entry_holds_the_codec_s_fields_and_boxes() {
+        let mut track = track(44_100);
+        track.channels = 6;
+        track.sample_entry.sample_size = 24;
+        let file = write(&track, 1, 0);
         let stsd = find(
             &file,
             &[b"moov", b"trak", b"mdia", b"minf", b"stbl", b"stsd"],
@@ -629,8 +654,8 @@ mod tests {
             &[0; 6],  // reserved
             &[0, 1],  // data_reference_index
             &[0; 8],  // reserved
-            &[0, 2],  // channelcount
-            &[0, 16], // samplesize
+            &[0, 6],  // channelcount
+            &[0, 24], // samplesize
             &[0; 4],  // pre_defined, reserved
             &(44_100u32 << 16).to_be_bytes(),
             &14u32.to_be_bytes(),
@@ -643,21 +668,14 @@ mod tests {
     }
 
     #[test]
-    fn rates_past_16_bits_are_halved_and_given_in_full_in_srat() {
-        let path = [
-            b"moov", b"trak", b"mdia", b"minf", b"stbl", b"stsd", b"mp4a",
-        ];
-        for (rate, half) in [(96_000, 48_000), (88_200, 44_100)] {
-            let file = write(&track(rate), 1, 0);
-            let entry = find(&file, &path);
-            assert_eq!(u32_at(entry.payload, 24), half << 16);
-            let srat = find(&file, &[&path[..], &[b"srat"]].concat());
-            assert_eq!(srat.payload, [&[0; 4][..], &rate.to_be_bytes()].concat());
-        }
-        let file = write(&track(64_000), 1, 0);
-        let entry = find(&file, &path);
-        assert_eq!(u32_at(entry.payload, 24), 64_000 << 16);
-        assert_eq!(children(&entry).kinds(), ["esds"], "no srat");
+    fn a_track_without_a_delay_has_no_edit_list() {
+        let mut track = track(48_000);
+        track.delay = None;
+        let file = write(&track, 3, 3 * 1024);
+        let kinds = children(&find(&file, &[b"moov", b"trak"])).kinds();
+        assert_eq!(kinds, ["tkhd", "mdia"]);
+        let tkhd = find(&file, &[b"moov", b"trak", b"tkhd"]);
+        assert_eq!(u32_at(tkhd.payload, 20), 3 * 1024); // duration
     }
 
     #[test]

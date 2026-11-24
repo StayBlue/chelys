@@ -6,48 +6,13 @@
 use std::fmt;
 use std::num::NonZeroU32;
 
+pub use crate::fragments::{FragmentOptions, LengthError};
+
 use chelys_aac::{Config, ConfigError, Finished, FrameSink, NonFiniteSample, Rate, Sample};
 
 use super::{Stream, raw_encoder};
 use crate::bitrate::window_frames;
 use crate::movie::fragmented::{FragmentSink, Fragmenter, init_segment};
-
-/// What a [`FragmentedEncoder`] is to write, beyond the stream.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct FragmentOptions {
-    /// The samples of each channel that the input will have, if known, as
-    /// [`Finished::samples`] counts them; `None` by default.
-    pub length: Option<u64>,
-    /// The duration that each fragment is to have, in samples of each
-    /// channel; by default the sample rate's, one second.
-    pub fragment_samples: Option<NonZeroU32>,
-}
-
-impl FragmentOptions {
-    /// Declares the samples of each channel that the input will have, so
-    /// that the file presents them exactly, as an [`Encoder`]'s does: the
-    /// encoder takes no more, and its [`finish`](FragmentedEncoder::finish)
-    /// fails with fewer.
-    ///
-    /// [`Encoder`]: super::Encoder
-    pub fn length(mut self, samples: u64) -> Self {
-        self.length = Some(samples);
-        self
-    }
-
-    /// Has each fragment last about `samples` samples of each channel: as
-    /// many whole frames as end nearest each multiple of `samples`, and a
-    /// frame at least. A duration in samples is exact at every sample rate,
-    /// as the file's times are in samples. It is at most 2^32 - 1 samples,
-    /// 12 hours at 96 kHz, which keeps every fragment's tables within their
-    /// fields. A fragment's frames are held in memory until it ends: about
-    /// the bitrate times its duration.
-    pub fn fragment_samples(mut self, samples: NonZeroU32) -> Self {
-        self.fragment_samples = Some(samples);
-        self
-    }
-}
 
 /// Why a [`FragmentedEncoder`] refused a call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,29 +40,6 @@ impl fmt::Display for EncodeError {
 }
 
 impl std::error::Error for EncodeError {}
-
-/// An input whose length is not the one declared in
-/// [`FragmentOptions::length`], which the init segment gives.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct LengthError {
-    /// The samples of each channel declared.
-    pub length: u64,
-    /// The samples of each channel the input would have had.
-    pub samples: u64,
-}
-
-impl fmt::Display for LengthError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "an input of {} samples of each channel, where {} were declared",
-            self.samples, self.length
-        )
-    }
-}
-
-impl std::error::Error for LengthError {}
 
 /// Encodes PCM as AAC-LC, as [`chelys_aac::Encoder`] does, into a
 /// fragmented MP4 file (ISO/IEC 14496-12, clause 8.8), written as the
@@ -163,12 +105,13 @@ pub struct FragmentedEncoder {
 /// sink, as the encoder codes them.
 struct Fragments<'a, O: ?Sized> {
     fragmenter: &'a mut Fragmenter,
+    frame_samples: u32,
     out: &'a mut O,
 }
 
 impl<O: FragmentSink + ?Sized> FrameSink for Fragments<'_, O> {
     fn frame(&mut self, frame: &[u8]) {
-        if let Some(fragment) = self.fragmenter.push_frame(frame) {
+        if let Some(fragment) = self.fragmenter.push_frame(frame, self.frame_samples) {
             self.out.fragment(&fragment.bytes, fragment.info);
         }
     }
@@ -191,7 +134,7 @@ impl FragmentedEncoder {
         let one_second = NonZeroU32::new(stream.sample_rate).expect("a sample rate");
         let fragment_samples = options.fragment_samples.unwrap_or(one_second);
         Ok(Self {
-            fragmenter: Fragmenter::new(stream.frame_samples, fragment_samples),
+            fragmenter: Fragmenter::new(&track, fragment_samples),
             init_segment: init_segment(&track, options.length),
             encoder,
             length: options.length,
@@ -249,6 +192,7 @@ impl FragmentedEncoder {
         self.check_length(len).map_err(EncodeError::Length)?;
         let mut fragments = Fragments {
             fragmenter: &mut self.fragmenter,
+            frame_samples: self.encoder.samples_per_frame() as u32,
             out,
         };
         self.encoder.encode_interleaved(samples, &mut fragments)?;
@@ -277,6 +221,7 @@ impl FragmentedEncoder {
         self.check_length(len).map_err(EncodeError::Length)?;
         let mut fragments = Fragments {
             fragmenter: &mut self.fragmenter,
+            frame_samples: self.encoder.samples_per_frame() as u32,
             out,
         };
         self.encoder.encode_planar(channels, &mut fragments)?;
@@ -333,6 +278,7 @@ impl FragmentedEncoder {
         let mut ending = Ending {
             fragments: Fragments {
                 fragmenter: &mut fragmenter,
+                frame_samples,
                 out,
             },
             last: None,

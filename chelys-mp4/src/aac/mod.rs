@@ -13,8 +13,9 @@ pub use progressive::Encoder;
 
 use chelys_aac::{Config, ConfigError, Framing};
 
+use super::boxes::{FourCc, write_full_box};
 use super::descriptor::{AUDIO_ISO_IEC_14496_3, AUDIO_STREAM, DecoderConfig, es_descriptor};
-use super::movie::AudioTrack;
+use super::movie::{AudioTrack, Brands, SampleEntry};
 
 /// The encoder of raw frames of the stream `config` asks for.
 fn raw_encoder(config: Config) -> Result<chelys_aac::Encoder, ConfigError> {
@@ -67,13 +68,107 @@ impl Stream {
             specific_info: &self.audio_specific_config,
         });
         AudioTrack {
-            coding_name: *b"mp4a",
-            es_descriptor,
-            sample_rate: self.sample_rate,
+            brands: BRANDS,
+            sample_entry: sample_entry(self.sample_rate, &es_descriptor),
+            timescale: self.sample_rate,
             channels: self.channels,
-            frame_samples: self.frame_samples,
-            delay: chelys_aac::DELAY as u32,
-            roll_distance: -1,
+            delay: Some(chelys_aac::DELAY as u32),
+            default_duration: self.frame_samples,
+            roll_distance: Some(-1),
         }
+    }
+}
+
+/// The brands of the `FileTypeBox` (clause 5.2): `'mp42'`, which
+/// "identifies this version" of ISO/IEC 14496-14, of which `'mp41'` or
+/// `'mp42'` "shall appear in the compatible-brands list" (clause 5), as
+/// major brand and compatible, and `'isom'`, the first version of ISO/IEC
+/// 14496-12 (clause E.2), which the file keeps to.
+///
+/// Spec reading: the `SampleToGroupBox` and `SampleGroupDescriptionBox`
+/// of the pre-roll (see `write_roll_mapping` in `movie`) are among the
+/// boxes that `'avc1'`, and so `'iso2'`, require readers to support
+/// (clauses E.3 and E.4), and not among those of `'isom'` (Table E.1); but a
+/// reader skips a box it does not recognize (clause 4.2.2), and the file
+/// plays without them. So `'isom'` is claimed, which more readers support,
+/// and `'iso2'` is not needed. Annex E's brands "should not be used as the
+/// major brand" (clause E.1), so `'mp42'` is.
+const BRANDS: Brands = Brands {
+    major: *b"mp42",
+    compatible: &[*b"mp42", *b"isom"],
+};
+
+/// The sample entry of a stream at `sample_rate`, whose `ESDBox` holds
+/// `es_descriptor`: an `MP4AudioSampleEntry` (ISO/IEC 14496-14, clause
+/// 6.7.2), an `AudioSampleEntry` (clause 12.2.3) with an `ESDBox`.
+///
+/// `samplesize` and `samplerate` are template fields, which "When a file is
+/// created as a pure MPEG-4 file ... shall be set to their default values"
+/// (ISO/IEC 14496-14, clause 7): `samplesize` 16, and `samplerate` "{
+/// default samplerate of media}<<16", the sample rate in 16.16 fixed point
+/// (clause 12.2.3.2).
+///
+/// Spec reading: the two standards conflict above 65535 Hz, as at 88.2 and
+/// 96 kHz, where the default `samplerate` cannot be written: its 16-bit
+/// integer part cannot hold the rate. ISO/IEC 14496-14 gives no way out;
+/// clause 12.2.3.1 does, for a codec that gives its own rate, as the
+/// `AudioSpecificConfig()` does: "a SamplingRateBox is present in the
+/// AudioSampleEntryV1 or AudioSampleEntry, and it documents the actual
+/// sampling rate", and `samplerate` "should contain a value that matches
+/// the media timescale left-shifted 16 bits ... or be an integer division
+/// or multiple of it". So where the rate holds 16 bits, `samplerate` is the
+/// default, as clause 7 requires; above, where no value meets it, it is the
+/// rate divided by the least integer that brings it within 16 bits, 2 at
+/// 88.2 and 96 kHz, and a `SamplingRateBox` follows the `ESDBox`, as "the
+/// SamplingRateBox ... should follow, not precede, any boxes defined in or
+/// required by derived specifications".
+fn sample_entry(sample_rate: u32, es_descriptor: &[u8]) -> SampleEntry {
+    const MP4A: FourCc = *b"mp4a";
+    let divisor = (1..)
+        .find(|&d| sample_rate % d == 0 && sample_rate / d <= 0xffff)
+        .expect("the rate over itself, 1, holds 16 bits");
+    let mut boxes = Vec::new();
+    write_full_box(&mut boxes, b"esds", 0, 0, |out| {
+        out.extend_from_slice(es_descriptor);
+    });
+    if divisor > 1 {
+        // Spec gap: the SamplingRateBox extends FullBox('srat') without a
+        // version or flags; they are 0, as for the other boxes that define
+        // none.
+        write_full_box(&mut boxes, b"srat", 0, 0, |out| {
+            out.extend_from_slice(&sample_rate.to_be_bytes()); // sampling_rate
+        });
+    }
+    SampleEntry {
+        coding_name: MP4A,
+        sample_size: 16,
+        sample_rate: (sample_rate / divisor) << 16,
+        boxes,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::boxes::read::{FourCcs, boxes, u32_at};
+
+    #[test]
+    fn rates_past_16_bits_are_halved_and_given_in_full_in_srat() {
+        for (rate, half) in [(96_000, 48_000), (88_200, 44_100)] {
+            let entry = sample_entry(rate, &[0x03, 0x00]);
+            assert_eq!(entry.sample_rate, half << 16);
+            let found = boxes(&entry.boxes, 0);
+            assert_eq!(found.kinds(), ["esds", "srat"]);
+            assert_eq!(
+                found[1].payload,
+                [&[0; 4][..], &rate.to_be_bytes()].concat()
+            );
+        }
+        let entry = sample_entry(64_000, &[0x03, 0x00]);
+        assert_eq!(entry.sample_rate, 64_000 << 16);
+        let found = boxes(&entry.boxes, 0);
+        assert_eq!(found.kinds(), ["esds"], "no srat");
+        assert_eq!(u32_at(found[0].payload, 0), 0); // version, flags
+        assert_eq!(&found[0].payload[4..], [0x03, 0x00]);
     }
 }
