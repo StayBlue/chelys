@@ -19,11 +19,12 @@
 //! AAC is of its reading of the file, not of an independent decoder;
 //! `flacdec` wraps libFLAC, and `opusdec` libopus.
 //!
-//! The FLAC and Opus packets that `chelys-mp4`'s tests write in MP4 files
-//! are made by encoders run as black boxes, and split into packets by
+//! The FLAC, Opus and AAC-LC packets that `chelys-mp4`'s tests write in MP4
+//! files are made by encoders run as black boxes, and split into packets by
 //! ffprobe (see [`ffmpeg::packets`]): FLAC by the `flac` program 1.5.0 (see
-//! [`flac`]), and Opus by ffmpeg n9.0.2's `libopus` encoder, of libopus
-//! 1.6.1 (see [`ffmpeg::encode_opus`]).
+//! [`flac`]), Opus by ffmpeg n9.0.2's `libopus` encoder, of libopus 1.6.1
+//! (see [`ffmpeg::encode_opus`]), and AAC-LC by ffmpeg n9.0.2's native AAC
+//! encoder (see [`ffmpeg::encode_aac`]).
 //!
 //! Quality is graded with PEAQ (ITU-R BS.1387) as GstPEAQ computes it, also
 //! as a black box (see [`peaq`]). Its grades were recorded with GstPEAQ

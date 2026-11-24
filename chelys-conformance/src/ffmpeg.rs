@@ -291,12 +291,16 @@ pub fn probe_mp4(file: &[u8]) -> Mp4Stream {
 
 /// A stream's packets as ffprobe splits them, each with its duration in
 /// the stream's time base, and the stream's extradata, the codec's
-/// configuration: the data of the STREAMINFO block for FLAC, and the
-/// identification header for Opus.
+/// configuration: the data of the STREAMINFO block for FLAC, the
+/// identification header for Opus, and the `AudioSpecificConfig()` for
+/// AAC.
 pub struct Packets {
     pub config: Vec<u8>,
     pub packets: Vec<Vec<u8>>,
     pub durations: Vec<u64>,
+    /// The samples a decoder's output starts with before the input, as
+    /// ffprobe reports them (`initial_padding`): the encoder's delay.
+    pub initial_padding: u64,
 }
 
 /// The packets of the first audio stream of `file`, a file of the format
@@ -306,12 +310,16 @@ pub fn packets(file: &[u8], extension: &str) -> Packets {
     let file = TempFile::new(extension, file);
     let output = run(Command::new("ffprobe")
         .args(["-v", "error", "-select_streams", "a:0", "-show_data"])
-        .args(["-show_entries", "packet=duration,data:stream=extradata"])
+        .args([
+            "-show_entries",
+            "packet=duration,data:stream=extradata,initial_padding",
+        ])
         .arg(file.path()));
     let stdout = String::from_utf8(output.stdout).unwrap();
     let mut config = Vec::new();
     let mut packets: Vec<Vec<u8>> = Vec::new();
     let mut durations = Vec::new();
+    let mut initial_padding = None;
     let mut in_stream = false;
     for line in stdout.lines() {
         if line == "[PACKET]" {
@@ -320,6 +328,8 @@ pub fn packets(file: &[u8], extension: &str) -> Packets {
             in_stream = true;
         } else if let Some(duration) = line.strip_prefix("duration=") {
             durations.push(duration.parse().unwrap());
+        } else if let Some(padding) = line.strip_prefix("initial_padding=") {
+            initial_padding = Some(padding.parse().unwrap());
         } else if let Some((_offset, dump)) = line.split_once(": ") {
             // The hex in groups of four digits, then two spaces and the
             // bytes as text.
@@ -339,6 +349,7 @@ pub fn packets(file: &[u8], extension: &str) -> Packets {
         config,
         packets,
         durations,
+        initial_padding: initial_padding.expect("ffprobe reports initial_padding"),
     }
 }
 
@@ -362,6 +373,25 @@ pub fn encode_opus(pcm: &[f32], channels: usize, kbps: u32) -> Vec<u8> {
             "-",
         ]));
     output.stdout
+}
+
+/// An MP4 file of `pcm`, interleaved samples of `channels` at
+/// `sample_rate`, as ffmpeg's native AAC encoder makes it at `kbps`, run as
+/// a black box to make the packets that `chelys-mp4`'s tests write in MP4
+/// files.
+pub fn encode_aac(pcm: &[f32], sample_rate: u32, channels: usize, kbps: u32) -> Vec<u8> {
+    let raw: Vec<u8> = pcm.iter().flat_map(|s| s.to_le_bytes()).collect();
+    let input = TempFile::new("f32", &raw);
+    // ffmpeg writes an MP4 file whole only where it can seek.
+    let output = TempFile::new("m4a", &[]);
+    run(Command::new("ffmpeg")
+        .args(["-nostdin", "-v", "error", "-y", "-f", "f32le"])
+        .args(["-ar", &sample_rate.to_string()])
+        .args(["-ac", &channels.to_string(), "-i"])
+        .arg(input.path())
+        .args(["-c:a", "aac", "-b:a", &format!("{kbps}k")])
+        .arg(output.path()));
+    std::fs::read(output.path()).unwrap()
 }
 
 /// Decodes the first audio stream of a file of the format `extension`
