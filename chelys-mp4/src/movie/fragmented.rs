@@ -336,6 +336,16 @@ const SAMPLE_FLAGS: u32 = (2 << 26) | (2 << 24) | (2 << 20);
 /// say both "from `delay` on" and "to the end" without the length. Only
 /// decoding shows what a reader presents past the media's end, where the
 /// last frame decodes to the padding.
+///
+/// Settled by decoding with ffmpeg (black box): ffmpeg n9.0.2 presents
+/// every sample of the frames from the edit's `media_time` on, the padding
+/// included, and nothing past them. It presents the same where the length
+/// is known, the padding that the edit then leaves out included; and
+/// ffprobe gives the stream the duration of its media, the delay and the
+/// input, whether the length is known or not. The conformance tests are
+/// `ffmpeg_decodes_fragmented_files_to_the_frames_of_the_file_written_whole`,
+/// `ffprobe_reads_fragmented_files_as_long_as_their_media` and
+/// `ffmpeg_reads_empty_and_short_fragmented_files`.
 pub fn init_segment(track: &AudioTrack, length: Option<u64>) -> Vec<u8> {
     let durations = Durations {
         edit: length.unwrap_or(0),
