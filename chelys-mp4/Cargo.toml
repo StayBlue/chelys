@@ -1,6 +1,6 @@
 [package]
 name = "chelys-mp4"
-description = "Writes chelys's AAC-LC streams in MP4 files, from ISO/IEC 14496-12, 14496-14, 14496-1 and 14496-34."
+description = "Writes MP4 files of chelys's AAC-LC streams, and of FLAC and Opus packets from any encoder, from ISO/IEC 14496-12, 14496-14, 14496-1 and 14496-34 and the codecs' mappings."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,4 +8,9 @@ license.workspace = true
 publish = false
 
 [dependencies]
-chelys-aac = { path = "../chelys-aac" }
+chelys-aac = { path = "../chelys-aac", optional = true }
+
+[features]
+default = ["aac"]
+# AAC-LC from chelys-aac's encoder.
+aac = ["dep:chelys-aac"]

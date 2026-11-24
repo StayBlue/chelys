@@ -1,17 +1,21 @@
 // Copyright (c) 2026 StayBlue
 // SPDX-License-Identifier: MIT
 
-//! MP4 files (ISO/IEC 14496-14:2020) of one audio track, AAC-LC from
-//! `chelys-aac`, implemented from their specifications. The `chelys` crate
-//! offers it as `chelys::mp4`.
+//! MP4 files (ISO/IEC 14496-14:2020) of one audio track, implemented from
+//! their specifications: AAC-LC from `chelys-aac` (`aac`, with the
+//! feature of that name), and packets of FLAC ([`flac`]) and Opus
+//! ([`opus`]) that any encoder made, which a [`Writer`] or a
+//! [`FragmentedWriter`] takes. The `chelys` crate offers it as
+//! `chelys::mp4`.
 //!
 //! Clause references refer to ISO/IEC 14496-12:2026, the ISO base media
 //! file format, or where they name it, to ISO/IEC 14496-14:2020, the MP4
 //! file format, ISO/IEC 14496-1:2026, whose descriptors describe the
 //! stream, ISO/IEC 14496-34:2025, the syntax description language, or
-//! the audio standards.
+//! the audio standards. FLAC and Opus follow their mappings to the file
+//! format, as each module says.
 //!
-//! A file is written whole, from its start to its end, so that it can be
+//! An AAC file is written whole, from its start to its end, so that it can be
 //! written where nothing can be sought, as a pipe:
 //!
 //! ```text
@@ -44,7 +48,7 @@
 //! mdat                  the frames, raw_data_block()s, one after another
 //! ```
 //!
-//! A fragmented file ([`aac::FragmentedEncoder`]) is written as the frames
+//! A fragmented file (`aac::FragmentedEncoder`) is written as the frames
 //! come, as an init segment and then fragments of about a second each:
 //!
 //! ```text
@@ -81,6 +85,7 @@
 //! `UserDataBox` for them would come last in the `moov`.
 //!
 //! ```
+//! # #[cfg(feature = "aac")] {
 //! use chelys_aac::{Config, Rate};
 //! use chelys_mp4::aac::Encoder;
 //!
@@ -91,15 +96,23 @@
 //! let finished = encoder.finish(&mut mp4)?;
 //! assert_eq!(finished.samples, 44_100);
 //! assert_eq!(&mp4[4..8], b"ftyp");
+//! # }
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
+#[cfg(feature = "aac")]
 pub mod aac;
+#[cfg(feature = "aac")]
 mod bitrate;
 mod boxes;
+#[cfg(feature = "aac")]
 mod descriptor;
+pub mod flac;
 mod fragments;
 mod movie;
+pub mod opus;
+mod packets;
 
 pub use fragments::{FragmentOptions, LengthError};
 pub use movie::fragmented::{FragmentInfo, FragmentSink};
+pub use packets::{FinishError, FragmentedWriter, PacketError, PushError, Track, Writer};
