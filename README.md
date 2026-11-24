@@ -17,10 +17,10 @@ or decoders:
   at sampling frequencies from 8 to 96 kHz, in ADTS, as raw frames, or in MP4
   files; from ISO/IEC 13818-7, ISO/IEC 14496-3 for what MPEG-4 adds, and
   ISO/IEC 14496-12, 14496-14, 14496-1 and 14496-34 for MP4.
-- MP4 from other encoders: the library also writes FLAC and Opus packets that
-  any encoder made in MP4 files, whole or fragmented for streaming, from Xiph's
-  mappings of each to the ISO base media file format, RFC 9639, and RFC 7845
-  and RFC 6716.
+- MP4 from other encoders: the library also writes FLAC, Opus and AAC-LC
+  packets that any encoder made in MP4 files, whole or fragmented for
+  streaming: FLAC and Opus from Xiph's mappings of each to the ISO base media
+  file format, RFC 9639, and RFC 7845 and RFC 6716, and AAC-LC as chelys's own.
 
 ## Usage
 
