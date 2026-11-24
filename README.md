@@ -1,12 +1,13 @@
 # chelys
 
 > [!WARNING]
-> chelys is experimental. It is not meant for daily use: its output has not
-> been compared with that of established encoders, and its API may change at
-> any time.
+> chelys is experimental. It is not meant for daily use: its quality still
+> trails established encoders at some bitrates, and its API may change at any
+> time.
 
-chelys encodes PCM audio as MP3 and as AAC, written from the standards
-without reference to the source code of other encoders or decoders:
+chelys encodes PCM audio as MP3 and as AAC, and writes MP4 files, each written
+from its specifications without reference to the source code of other encoders
+or decoders:
 
 - MP3: MPEG-1 Audio Layer III, at the lower sampling frequencies of 16,
   22.05 and 24 kHz as MPEG-2 Audio Layer III, and at 8, 11.025 and 12 kHz as
@@ -17,8 +18,9 @@ without reference to the source code of other encoders or decoders:
   files; from ISO/IEC 13818-7, ISO/IEC 14496-3 for what MPEG-4 adds, and
   ISO/IEC 14496-12, 14496-14, 14496-1 and 14496-34 for MP4.
 - MP4 from other encoders: the library also writes FLAC and Opus packets that
-  any encoder made in MP4 files, from Xiph's mappings of each to the ISO base
-  media file format, RFC 9639 and RFC 7845.
+  any encoder made in MP4 files, whole or fragmented for streaming, from Xiph's
+  mappings of each to the ISO base media file format, RFC 9639, and RFC 7845
+  and RFC 6716.
 
 ## Usage
 
