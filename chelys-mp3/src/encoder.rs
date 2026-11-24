@@ -1,9 +1,10 @@
 // Copyright (c) 2026 StayBlue
 // SPDX-License-Identifier: MIT
 
-//! The encoder as the library offers it: PCM in, the stream out, as the
-//! PCM arrives.
+//! The encoder as the library offers it: PCM in, frames out, as the PCM
+//! arrives.
 
+use chelys_core::FrameSink;
 use chelys_core::sample::{self, NonFiniteSample, Sample};
 
 use super::config::{Config, ConfigError};
@@ -18,11 +19,20 @@ use super::stream::StreamEncoder;
 /// not depend on how the input is divided between calls.
 ///
 /// Output lags input: a frame is coded once the two granules after it have
-/// arrived, and its bytes are written once no later frame's main data can
-/// begin in them, up to 511 bytes after (255 at the lower sampling
-/// frequencies). [`finish`](Self::finish) writes the rest. There is no
-/// flushing short of that: a frame's bytes may yet hold a later frame's
-/// main data.
+/// arrived, and given once no later frame's main data can begin in it, as
+/// the main data of a frame may begin up to 511 bytes before it (255 at
+/// the lower sampling frequencies). [`finish`](Self::finish) gives the
+/// rest. There is no flushing short of that: a frame may yet hold a later
+/// frame's main data.
+///
+/// Each piece given to a [`FrameSink`] is one whole frame, from its header
+/// to the next frame's. Put together in order, they are the stream. A
+/// frame is not a packet that can be decoded on its own: its main data may
+/// begin in the frames before it, and it may hold the main data of the
+/// frames after it. With [`Config::info_tag`], the first frame given, if
+/// [`info_tag_len`](Self::info_tag_len) is not `None`, is the tag's
+/// placeholder, which [`Finished::info_tag`] is to be written over, and the
+/// frames given are one more than [`Finished::frames`].
 ///
 /// The decoded output lags the input by [`DELAY`](super::DELAY) samples,
 /// and ends with the silence that fills the last frame.
@@ -94,15 +104,15 @@ impl Encoder {
         self.stream.info_tag_len()
     }
 
-    /// Encodes interleaved samples, one of each channel in turn, and
-    /// appends to `out` the bytes of the stream that are final. Samples
-    /// beyond 65536 times full scale are clamped there.
+    /// Encodes interleaved samples, one of each channel in turn, and gives
+    /// `out` the frames that are final. Samples beyond 65536 times full
+    /// scale are clamped there.
     ///
     /// # Errors
     ///
     /// If a sample is NaN or infinite, the call is refused whole, and the
-    /// error names the first such sample to be played. Nothing is appended
-    /// to `out`, and the encoder is as it was: it has taken none of the
+    /// error names the first such sample to be played. `out` is given
+    /// nothing, and the encoder is as it was: it has taken none of the
     /// samples and written no Xing/Info tag's placeholder, and the
     /// ancillary data queued stays queued. The samples may be cleaned and
     /// given again, or skipped, or the stream finished. `i16` samples are
@@ -112,10 +122,10 @@ impl Encoder {
     ///
     /// If the number of samples is not a multiple of the number of
     /// channels.
-    pub fn encode_interleaved<S: Sample>(
+    pub fn encode_interleaved<S: Sample, O: FrameSink + ?Sized>(
         &mut self,
         samples: &[S],
-        out: &mut Vec<u8>,
+        out: &mut O,
     ) -> Result<(), NonFiniteSample> {
         let channels = self.channels();
         assert!(
@@ -138,25 +148,25 @@ impl Encoder {
         Ok(())
     }
 
-    /// Encodes one slice of samples per channel, and appends to `out` the
-    /// bytes of the stream that are final. Samples beyond 65536 times full
-    /// scale are clamped there.
+    /// Encodes one slice of samples per channel, and gives `out` the frames
+    /// that are final. Samples beyond 65536 times full scale are clamped
+    /// there.
     ///
     /// # Errors
     ///
     /// If a sample is NaN or infinite, the call is refused whole, as
-    /// [`encode_interleaved`](Self::encode_interleaved) refuses it: nothing
-    /// is appended to `out`, and the encoder is as it was. The error names
+    /// [`encode_interleaved`](Self::encode_interleaved) refuses it: `out` is
+    /// given nothing, and the encoder is as it was. The error names
     /// the same sample as it would in the same samples interleaved.
     ///
     /// # Panics
     ///
     /// If the number of slices is not the number of channels, or the slices
-    /// are of different lengths, before anything is appended to `out`.
-    pub fn encode_planar<S: Sample>(
+    /// are of different lengths, before `out` is given anything.
+    pub fn encode_planar<S: Sample, O: FrameSink + ?Sized>(
         &mut self,
         channels: &[&[S]],
-        out: &mut Vec<u8>,
+        out: &mut O,
     ) -> Result<(), NonFiniteSample> {
         assert_eq!(
             channels.len(),
@@ -177,7 +187,7 @@ impl Encoder {
         Ok(())
     }
 
-    fn encode_converted(&mut self, out: &mut Vec<u8>) {
+    fn encode_converted<O: FrameSink + ?Sized>(&mut self, out: &mut O) {
         let slices: Vec<&[f64]> = self.pcm.iter().map(Vec::as_slice).collect();
         self.stream.encode(&slices, out);
     }
@@ -196,9 +206,8 @@ impl Encoder {
 
     /// Ends the stream: pads the input with silence to whole frames, at
     /// least [`DELAY`](super::DELAY) samples past it, so that the decoded
-    /// output holds all of the input, and appends the rest of the stream to
-    /// `out`.
-    pub fn finish(self, out: &mut Vec<u8>) -> Finished {
+    /// output holds all of the input, and gives `out` the frames left.
+    pub fn finish<O: FrameSink + ?Sized>(self, out: &mut O) -> Finished {
         let end = self.stream.finish(out);
         Finished {
             info_tag: end.info_tag,

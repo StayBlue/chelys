@@ -175,7 +175,7 @@ impl Config {
     /// that apply them.
     ///
     /// The tag is known only once the stream has ended, so its frame is
-    /// written first as a placeholder, a silent frame that decoders play as
+    /// given first as a placeholder, a silent frame that decoders play as
     /// such, and [`Finished::info_tag`] gives the frame to write over it:
     /// ask for the tag only where the start of the stream can be rewritten.
     /// [`Encoder::info_tag_len`] gives its length. A stream in free format

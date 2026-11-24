@@ -24,6 +24,7 @@ use crate::header::{Bitrate, Emphasis, Flags, Header, Mode, SamplingFrequency};
 use crate::info_tag;
 use crate::rate::StreamRate;
 use crate::reservoir::Reservoir;
+use chelys_core::FrameSink;
 use coding::ModelCoding;
 use frame_encoder::FrameEncoder;
 
@@ -315,14 +316,14 @@ impl StreamEncoder {
     }
 
     /// Encodes `channels`, one slice of samples (nominally -1.0 to 1.0) per
-    /// channel, and appends to `out` the bytes of the stream that are final.
+    /// channel, and gives `out` the frames that are final, each whole.
     ///
     /// A frame is coded once the granule after it has arrived, as its block
-    /// type depends on whether that granule has an attack, and its bytes are
-    /// final once no later frame's main data can begin in them: the bytes
-    /// the bit reservoir holds, at most 511 of main data (255 at the lower
-    /// sampling frequencies), and the frames
-    /// after them stay behind until later calls.
+    /// type depends on whether that granule has an attack, and is final once
+    /// no later frame's main data can begin in it: the frame that holds the
+    /// first of the bytes the bit reservoir holds, at most 511 of main data
+    /// (255 at the lower sampling frequencies), and the frames after it stay
+    /// behind until later calls.
     ///
     /// The samples are to be finite and within
     /// [`MAX_MAGNITUDE`](chelys_core::sample::MAX_MAGNITUDE), as
@@ -332,23 +333,30 @@ impl StreamEncoder {
     ///
     /// If the channel count does not match the configured mode, or the
     /// channels have different numbers of samples.
-    pub fn encode(&mut self, channels: &[&[f64]], out: &mut Vec<u8>) {
-        let start = self.write_placeholder(out);
-        self.frames.encode(channels, out);
-        self.add_to_crc(&out[start..]);
+    pub fn encode<O: FrameSink + ?Sized>(&mut self, channels: &[&[f64]], out: &mut O) {
+        self.write_placeholder(out);
+        let mut out = MusicCrc {
+            crc: self.tag.as_mut().map(|tag| &mut tag.music_crc),
+            out,
+        };
+        self.frames.encode(channels, &mut out);
     }
 
     /// Ends the stream: pads the input with silence to whole frames, at
-    /// least [`DELAY`](crate::DELAY) samples past the input, and appends
-    /// the rest of the stream to `out`. For an encoder made
-    /// [`with_info_tag`](Self::with_info_tag), gives the tag's frame, if the stream has one,
-    /// to be written over the first bytes of the stream.
-    pub fn finish(mut self, out: &mut Vec<u8>) -> StreamEnd {
-        let start = self.write_placeholder(out);
+    /// least [`DELAY`](crate::DELAY) samples past the input, and gives `out`
+    /// the frames left. For an encoder made
+    /// [`with_info_tag`](Self::with_info_tag), gives the tag's frame, if the
+    /// stream has one, to be written over the placeholder, the first frame
+    /// given.
+    pub fn finish<O: FrameSink + ?Sized>(mut self, out: &mut O) -> StreamEnd {
+        self.write_placeholder(out);
         let config = self.frames.config;
-        let ended = self.frames.finish(out);
-        let info_tag = self.tag.map(|mut tag| {
-            tag.music_crc = info_tag::music_crc(tag.music_crc, &out[start..]);
+        let mut tag = self.tag;
+        let ended = self.frames.finish(&mut MusicCrc {
+            crc: tag.as_mut().map(|tag| &mut tag.music_crc),
+            out,
+        });
+        let info_tag = tag.map(|tag| {
             let stream = info_tag::Stream {
                 config: &config,
                 frame_lens: &ended.frame_lens,
@@ -365,19 +373,27 @@ impl StreamEncoder {
         }
     }
 
-    /// Writes the tag's placeholder to `out` if it is the first thing
-    /// written, and returns where the frames after it start.
-    fn write_placeholder(&mut self, out: &mut Vec<u8>) -> usize {
+    /// Gives `out` the tag's placeholder if it is the first frame.
+    fn write_placeholder<O: FrameSink + ?Sized>(&mut self, out: &mut O) {
         if let Some(tag) = self.tag.as_mut().filter(|tag| !tag.written) {
-            out.extend(info_tag::placeholder(&tag.header));
+            out.frame(&info_tag::placeholder(&tag.header));
             tag.written = true;
         }
-        out.len()
     }
+}
 
-    fn add_to_crc(&mut self, bytes: &[u8]) {
-        if let Some(tag) = &mut self.tag {
-            tag.music_crc = info_tag::music_crc(tag.music_crc, bytes);
+/// Gives each frame on to `out`, and once `out` has taken it, adds it to
+/// the music CRC of a stream with a Xing/Info tag.
+struct MusicCrc<'a, O: ?Sized> {
+    crc: Option<&'a mut u16>,
+    out: &'a mut O,
+}
+
+impl<O: FrameSink + ?Sized> FrameSink for MusicCrc<'_, O> {
+    fn frame(&mut self, frame: &[u8]) {
+        self.out.frame(frame);
+        if let Some(crc) = &mut self.crc {
+            **crc = info_tag::music_crc(**crc, frame);
         }
     }
 }
@@ -400,9 +416,10 @@ mod tests {
 
     /// However the input is divided between calls, the encoder writes the
     /// same stream, of whole frames for the input padded with silence to at
-    /// least [`DELAY`] samples past it, and holds back no more than the next frame's main data can
-    /// begin in: its `main_data_begin` bytes, and the header and side
-    /// information of each frame after the first of them.
+    /// least [`DELAY`] samples past it, and holds back no more than the
+    /// frames the next frame's main data can begin in: its `main_data_begin`
+    /// bytes, the header and side information of each frame after the first
+    /// of them, and the bytes of that first frame before them.
     #[test]
     fn streaming_does_not_depend_on_how_the_input_is_divided() {
         let config = StreamConfig {
@@ -456,24 +473,35 @@ mod tests {
                 let (left, right) = (&left, &right);
                 scope.spawn(move || {
                     let mut encoder = StreamEncoder::new(config);
-                    let mut out = Vec::new();
+                    let (mut out, mut lens) = (Vec::new(), Vec::new());
+                    let mut give = |frame: &[u8]| {
+                        out.extend_from_slice(frame);
+                        lens.push(frame.len());
+                    };
                     let mut furthest = 0;
                     for (left, right) in left.chunks(chunk).zip(right.chunks(chunk)) {
-                        encoder.encode(&[left, right], &mut out);
+                        encoder.encode(&[left, right], &mut give);
                         let begin = encoder.frames.reservoir_bytes;
                         furthest = furthest.max(begin);
                         let held = encoder.frames.writer.out.len();
-                        let most = begin + begin.div_ceil(slot) * overhead;
+                        let most =
+                            begin + begin.div_ceil(slot) * overhead + bitrate.frame_len(fs, true)
+                                - 1;
                         assert!(held <= most, "{held} bytes held in chunks of {chunk}");
                     }
-                    encoder.finish(&mut out);
-                    (chunk, out, furthest)
+                    encoder.finish(&mut give);
+                    (chunk, out, lens, furthest)
                 })
             })
             .map(|stream| stream.join().expect("the encoding passes"))
         });
-        for (chunk, stream, furthest) in streams {
+        let whole_lens: Vec<usize> = check::frames(&whole).iter().map(|f| f.len).collect();
+        for (chunk, stream, lens, furthest) in streams {
             assert!(stream == whole, "chunks of {chunk}");
+            assert_eq!(
+                lens, whole_lens,
+                "each frame given whole, in chunks of {chunk}"
+            );
             assert!(
                 furthest > slot,
                 "main data reaches back {furthest} bytes, within the frame before"

@@ -15,6 +15,7 @@ use crate::header::{Bitrate, PaddingSchedule, Version};
 use crate::rate::{MeanRateSchedule, StreamRate};
 use crate::reservoir::Reservoir;
 use crate::{filterbank, rate, scalefactor_bands};
+use chelys_core::FrameSink;
 
 /// The PCM a [`FrameEncoder`] needs past a frame before coding it: two
 /// granules, as a granule's block type depends on whether the granule after
@@ -125,8 +126,8 @@ impl<C: Coding> FrameEncoder<C> {
     }
 
     /// Codes the frames whose PCM, and the granule after it, have arrived,
-    /// and appends the bytes that are final to `out`.
-    pub(super) fn encode(&mut self, channels: &[&[f64]], out: &mut Vec<u8>) {
+    /// and gives `out` the frames that are final.
+    pub(super) fn encode<O: FrameSink + ?Sized>(&mut self, channels: &[&[f64]], out: &mut O) {
         assert_eq!(channels.len(), self.pcm.len(), "one slice per channel");
         let len = channels[0].len();
         assert!(
@@ -151,8 +152,8 @@ impl<C: Coding> FrameEncoder<C> {
 
     /// Pads the input with silence to whole frames, at least [`DELAY`]
     /// samples past it, so that the decoded output holds all of the input,
-    /// codes them, and appends the rest of the stream to `out`.
-    pub(super) fn finish(mut self, out: &mut Vec<u8>) -> Ended {
+    /// codes them, and gives `out` the frames left.
+    pub(super) fn finish<O: FrameSink + ?Sized>(mut self, out: &mut O) -> Ended {
         let frame_samples = self.samples_per_frame();
         let frames = (self.samples + DELAY as u64).div_ceil(frame_samples as u64);
         // Few: the frames of the PCM held and of DELAY.

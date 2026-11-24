@@ -21,6 +21,7 @@ use crate::{
     granule::{BlockType, GRANULE_LINES},
     header::PaddingSchedule,
 };
+use chelys_core::FrameSink;
 use chelys_core::bitstream::BitWriter;
 use chelys_core::crc;
 
@@ -79,6 +80,8 @@ pub(super) struct FrameWriter {
     /// The positions in `out` of slot bytes no main data has used, in stream
     /// order.
     unused: VecDeque<usize>,
+    /// The length of each frame in `out`, in order.
+    frame_lens: VecDeque<usize>,
 }
 
 impl FrameWriter {
@@ -96,6 +99,7 @@ impl FrameWriter {
         // Unused bytes further back stay zero: stuffing (clause C.1.5.4.2.2).
         self.unused.drain(..self.unused.len() - begin);
         let slot = write_frame_start(header, side_info, &mut self.out);
+        self.frame_lens.push_back(header.frame_len());
         self.unused.extend(slot);
         assert!(
             main_data.len() <= self.unused.len(),
@@ -116,19 +120,30 @@ impl FrameWriter {
         self.unused.drain(..self.unused.len() - keep);
     }
 
-    /// Moves to `out` the bytes before the first that later main data may
-    /// still fill.
-    pub(super) fn take_final(&mut self, out: &mut Vec<u8>) {
-        let end = self.unused.front().copied().unwrap_or(self.out.len());
-        out.extend(self.out.drain(..end));
-        for at in &mut self.unused {
-            *at -= end;
+    /// Gives `out` each frame before the one that holds the first byte
+    /// that later main data may still fill. A frame is let go only once
+    /// `out` has taken it, so that if `out` panics, the frames it did not
+    /// take are still held, to be given again.
+    pub(super) fn take_final<O: FrameSink + ?Sized>(&mut self, out: &mut O) {
+        let mut end = self.unused.front().copied().unwrap_or(self.out.len());
+        while let Some(&len) = self.frame_lens.front().filter(|&&len| len <= end) {
+            out.frame(&self.out[..len]);
+            self.frame_lens.pop_front();
+            self.out.drain(..len);
+            end -= len;
+            for at in &mut self.unused {
+                *at -= len;
+            }
         }
     }
 
-    /// Moves the rest of the stream to `out`, with no frame to follow.
-    pub(super) fn finish(self, out: &mut Vec<u8>) {
-        out.extend(self.out);
+    /// Gives `out` the frames left, with no frame to follow.
+    pub(super) fn finish<O: FrameSink + ?Sized>(self, out: &mut O) {
+        let mut start = 0;
+        for len in self.frame_lens {
+            out.frame(&self.out[start..start + len]);
+            start += len;
+        }
     }
 }
 

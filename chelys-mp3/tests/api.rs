@@ -310,6 +310,68 @@ fn finishing_gives_the_tag_and_the_counts() {
     assert_eq!(Encoder::new(untagged).unwrap().info_tag_len(), None);
 }
 
+/// Frames are given whole, one a call: the tag's placeholder first, then
+/// each frame of audio, each starting with a header, which together are
+/// the stream a vector is given.
+#[test]
+fn frames_are_given_whole() {
+    let config = Config::new(
+        44_100,
+        ChannelMode::Stereo,
+        Rate::Quality {
+            level: 60,
+            min_kbps: None,
+            max_kbps: None,
+        },
+    )
+    .info_tag(true);
+    let pcm = tone(44_100, 20_000, 2);
+    let slices: Vec<&[f64]> = pcm.iter().map(Vec::as_slice).collect();
+    let mut encoder = Encoder::new(config).unwrap();
+    let tag_len = encoder.info_tag_len().unwrap();
+    let mut frames = Vec::new();
+    let mut out = |frame: &[u8]| frames.push(frame.to_vec());
+    let (first, rest): (Vec<&[f64]>, Vec<&[f64]>) =
+        slices.iter().map(|c| c.split_at(7_000)).unzip();
+    encoder.encode_planar(&first, &mut out).unwrap();
+    encoder.encode_planar(&rest, &mut out).unwrap();
+    let finished = encoder.finish(&mut out);
+    assert_eq!(frames.len() as u64, finished.frames + 1);
+    assert_eq!(frames[0].len(), tag_len);
+    for frame in &frames {
+        assert!(frame[0] == 0xFF && frame[1] & 0xE0 == 0xE0, "a header");
+    }
+    assert_eq!(frames.concat(), encode(config, &pcm));
+}
+
+/// A sink that panics keeps the frames it did not take with the encoder,
+/// which gives them again, and the same stream and tag.
+#[test]
+fn a_sink_that_panics_loses_no_frame() {
+    let config =
+        Config::new(44_100, ChannelMode::Stereo, Rate::Constant { kbps: 64 }).info_tag(true);
+    let pcm = interleave(&tone(44_100, 30_000, 2));
+    let mut encoder = Encoder::new(config).unwrap();
+    let mut stream = Vec::new();
+    let mut taken = 0;
+    let mut failing = |frame: &[u8]| {
+        assert!(taken < 3, "the sink fails");
+        stream.extend_from_slice(frame);
+        taken += 1;
+    };
+    let call = catch_unwind(AssertUnwindSafe(|| {
+        encoder.encode_interleaved(&pcm, &mut failing)
+    }));
+    assert!(call.is_err());
+    let finished = encoder.finish(&mut stream);
+
+    let mut expected = Vec::new();
+    let mut encoder = Encoder::new(config).unwrap();
+    encoder.encode_interleaved(&pcm, &mut expected).unwrap();
+    assert_eq!(encoder.finish(&mut expected), finished);
+    assert!(stream == expected);
+}
+
 /// Samples far beyond full scale are clamped.
 #[test]
 fn samples_far_beyond_full_scale_are_clamped() {
