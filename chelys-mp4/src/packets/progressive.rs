@@ -6,8 +6,7 @@
 use std::fmt;
 use std::io::{self, Write};
 
-use super::{PacketError, Track};
-use crate::fragments::LengthError;
+use super::{EndError, PacketError, Track};
 use crate::movie::progressive::write_file;
 
 /// Writes packets of FLAC or Opus, which any encoder made, as an MP4 file,
@@ -46,9 +45,10 @@ pub struct Writer {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum FinishError {
-    /// The length given is not one the packets present: see
+    /// The stream cannot end as asked: the length given is not one the
+    /// packets present, or they end before their delay. See
     /// [`Writer::finish`]. Nothing was written.
-    Length(LengthError),
+    End(EndError),
     /// The output failed.
     Io(io::Error),
 }
@@ -56,7 +56,7 @@ pub enum FinishError {
 impl fmt::Display for FinishError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Length(e) => e.fmt(f),
+            Self::End(e) => e.fmt(f),
             Self::Io(e) => e.fmt(f),
         }
     }
@@ -65,7 +65,7 @@ impl fmt::Display for FinishError {
 impl std::error::Error for FinishError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Length(e) => Some(e),
+            Self::End(e) => Some(e),
             Self::Io(e) => Some(e),
         }
     }
@@ -135,7 +135,8 @@ impl Writer {
     ///
     /// # Errors
     ///
-    /// [`FinishError::Length`] if `length` is given and is more than the
+    /// [`FinishError::End`] if the packets end before their delay, or
+    /// `length` is given and is more than the
     /// packets present, or would end the presentation before the last
     /// packet, or for FLAC before the last frame's end; nothing is written.
     /// [`FinishError::Io`] if `out` fails; `out` may then hold the start of
@@ -153,9 +154,7 @@ impl Writer {
             samples,
         } = self;
         let last = durations.last().copied();
-        let end = track
-            .end(length, samples, last)
-            .map_err(FinishError::Length)?;
+        let end = track.end(length, samples, last).map_err(FinishError::End)?;
         let mut audio = track.audio_track();
         let presented = match last {
             // Spec reading: the Opus mapping has the last sample last only
@@ -203,6 +202,7 @@ impl Writer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::LengthError;
     use crate::boxes::read::{FourCcs, boxes, children, find, u32_at};
     use crate::flac::tests::streaminfo;
     use crate::{flac, opus};
@@ -329,10 +329,10 @@ mod tests {
         assert!(
             matches!(
                 error,
-                FinishError::Length(LengthError {
+                FinishError::End(EndError::Length(LengthError {
                     length: 999,
                     samples: 1000
-                })
+                }))
             ),
             "{error}"
         );
@@ -342,7 +342,7 @@ mod tests {
         writer.push(&opus_packet(10)).unwrap();
         // Within the first packet, so that the second is past the end.
         let error = writer.finish(Some(600), &mut file).unwrap_err();
-        assert!(matches!(error, FinishError::Length(_)), "{error}");
+        assert!(matches!(error, FinishError::End(_)), "{error}");
         assert!(file.is_empty());
     }
 

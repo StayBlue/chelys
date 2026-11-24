@@ -7,7 +7,8 @@ use std::io::{self, Write};
 
 use chelys_aac::{Config, ConfigError, Finished, FrameSink, NonFiniteSample, Sample};
 
-use super::{Stream, raw_encoder};
+use super::raw_encoder;
+use crate::aac::Stream;
 use crate::bitrate::{avg_bitrate, max_bitrate};
 use crate::movie::progressive::write_file;
 
@@ -140,6 +141,7 @@ impl Encoder {
         let track = stream.track(
             max_bitrate(&frames.sizes, frame_samples, sample_rate),
             if constant_rate { avg_bitrate } else { 0 },
+            Some(chelys_aac::DELAY as u32),
         );
         let durations = vec![frame_samples; frames.sizes.len()];
         write_file(

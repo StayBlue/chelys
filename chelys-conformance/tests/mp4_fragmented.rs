@@ -8,7 +8,8 @@ use std::f64::consts::TAU;
 
 use chelys::aac::{Config, DELAY, Rate};
 use chelys::mp4::FragmentInfo;
-use chelys::mp4::aac::{Encoder, FragmentOptions, FragmentedEncoder};
+use chelys::mp4::FragmentOptions;
+use chelys::mp4::aac::encode::{Encoder, FragmentedEncoder};
 use chelys_conformance::{ffmpeg, gstreamer};
 
 /// A sweep from 100 Hz up, `len` samples at `sample_rate`, in each of

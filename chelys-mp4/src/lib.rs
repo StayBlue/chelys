@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: MIT
 
 //! MP4 files (ISO/IEC 14496-14:2020) of one audio track, implemented from
-//! their specifications: AAC-LC from `chelys-aac` (`aac`, with the
-//! feature of that name), and packets of FLAC ([`flac`]) and Opus
+//! their specifications: AAC-LC from `chelys-aac` (`aac::encode`, with
+//! the feature `aac`), and packets of FLAC ([`flac`]) and Opus
 //! ([`opus`]) that any encoder made, which a [`Writer`] or a
 //! [`FragmentedWriter`] takes. The `chelys` crate offers it as
 //! `chelys::mp4`.
@@ -48,7 +48,7 @@
 //! mdat                  the frames, raw_data_block()s, one after another
 //! ```
 //!
-//! A fragmented file (`aac::FragmentedEncoder`) is written as the frames
+//! A fragmented file (`aac::encode::FragmentedEncoder`) is written as the frames
 //! come, as an init segment and then fragments of about a second each:
 //!
 //! ```text
@@ -87,7 +87,7 @@
 //! ```
 //! # #[cfg(feature = "aac")] {
 //! use chelys_aac::{Config, Rate};
-//! use chelys_mp4::aac::Encoder;
+//! use chelys_mp4::aac::encode::Encoder;
 //!
 //! let config = Config::new(44_100, 2, Rate::Constant { bits_per_second: 128_000 });
 //! let mut encoder = Encoder::new(config)?;
@@ -115,4 +115,4 @@ mod packets;
 
 pub use fragments::{FragmentOptions, LengthError};
 pub use movie::fragmented::{FragmentInfo, FragmentSink};
-pub use packets::{FinishError, FragmentedWriter, PacketError, PushError, Track, Writer};
+pub use packets::{EndError, FinishError, FragmentedWriter, PacketError, PushError, Track, Writer};

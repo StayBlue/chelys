@@ -6,7 +6,7 @@
 use std::f64::consts::TAU;
 
 use chelys::aac::{Config, DELAY, Rate, SAMPLE_RATES};
-use chelys::mp4::aac::Encoder;
+use chelys::mp4::aac::encode::Encoder;
 use chelys_conformance::ffmpeg;
 
 /// A sweep from 100 Hz up, `len` samples at `sample_rate`, in each of

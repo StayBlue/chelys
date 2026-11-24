@@ -263,7 +263,8 @@ fn ffmpeg_decodes_mp4_files_at_variable_and_mean_rates() {
             .flat_map(|t| input.iter().map(move |c| c[t] as f32))
             .collect();
         let mut encoder =
-            chelys::mp4::aac::Encoder::new(Config::new(sample_rate, channels, rate)).unwrap();
+            chelys::mp4::aac::encode::Encoder::new(Config::new(sample_rate, channels, rate))
+                .unwrap();
         encoder.encode_interleaved(&pcm).unwrap();
         let mut file = Vec::new();
         let finished = encoder.finish(&mut file).unwrap();

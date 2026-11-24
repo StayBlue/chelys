@@ -6,11 +6,12 @@
 use std::fmt;
 use std::num::NonZeroU32;
 
-pub use crate::fragments::{FragmentOptions, LengthError};
+use crate::fragments::{FragmentOptions, LengthError};
 
 use chelys_aac::{Config, ConfigError, Finished, FrameSink, NonFiniteSample, Rate, Sample};
 
-use super::{Stream, raw_encoder};
+use super::raw_encoder;
+use crate::aac::Stream;
 use crate::bitrate::window_frames;
 use crate::movie::fragmented::{FragmentSink, Fragmenter, init_segment};
 
@@ -74,7 +75,8 @@ impl std::error::Error for EncodeError {}
 ///
 /// ```
 /// use chelys_aac::{Config, Rate};
-/// use chelys_mp4::aac::{FragmentOptions, FragmentedEncoder};
+/// use chelys_mp4::FragmentOptions;
+/// use chelys_mp4::aac::encode::FragmentedEncoder;
 ///
 /// let config = Config::new(44_100, 2, Rate::Constant { bits_per_second: 128_000 });
 /// let mut encoder = FragmentedEncoder::new(config, FragmentOptions::default())?;
@@ -130,7 +132,7 @@ impl FragmentedEncoder {
         let encoder = raw_encoder(config)?;
         let stream = Stream::of(&encoder);
         let (max_bitrate, avg_bitrate) = bitrates_before(config.rate(), &stream);
-        let track = stream.track(max_bitrate, avg_bitrate);
+        let track = stream.track(max_bitrate, avg_bitrate, Some(chelys_aac::DELAY as u32));
         let one_second = NonZeroU32::new(stream.sample_rate).expect("a sample rate");
         let fragment_samples = options.fragment_samples.unwrap_or(one_second);
         Ok(Self {
@@ -365,7 +367,7 @@ mod tests {
     use chelys_aac::DELAY;
 
     use super::*;
-    use crate::aac::Encoder;
+    use crate::aac::encode::Encoder;
     use crate::boxes::read::{FourCcs, boxes};
 
     fn config(sample_rate: u32, channels: usize) -> Config {

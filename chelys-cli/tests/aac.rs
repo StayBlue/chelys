@@ -10,7 +10,8 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use chelys::aac::{Config, DELAY, Encoder, Rate};
-use chelys::mp4::aac::{FragmentOptions, FragmentedEncoder};
+use chelys::mp4::FragmentOptions;
+use chelys::mp4::aac::encode::FragmentedEncoder;
 
 /// Runs `chelys` with `args`, `stdin` as its input.
 fn chelys(args: &[&str], stdin: &[u8]) -> Output {

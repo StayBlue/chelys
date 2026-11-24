@@ -71,6 +71,39 @@ impl fmt::Display for PacketError {
 
 impl std::error::Error for PacketError {}
 
+/// Why a stream of packets cannot end as its file is to present it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum EndError {
+    /// The length given or declared is not one the packets present.
+    Length(LengthError),
+    /// The packets decode to fewer samples than the delay or pre-skip
+    /// that the edit list is to leave out: they end before the
+    /// presentation would start.
+    ShorterThanDelay { samples: u64, delay: u64 },
+}
+
+impl fmt::Display for EndError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Length(e) => e.fmt(f),
+            Self::ShorterThanDelay { samples, delay } => write!(
+                f,
+                "packets of {samples} samples of each channel, which end before the delay of {delay}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for EndError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Length(e) => Some(e),
+            Self::ShorterThanDelay { .. } => None,
+        }
+    }
+}
+
 impl Track {
     pub(crate) fn audio_track(&self) -> AudioTrack {
         match self {
@@ -117,16 +150,26 @@ impl Track {
     ///
     /// # Errors
     ///
-    /// [`LengthError`] if `length` is not one the packets can present.
-    fn end(&self, length: Option<u64>, total: u64, last: Option<u32>) -> Result<u64, LengthError> {
+    /// [`EndError::ShorterThanDelay`] if there are packets, but they end
+    /// before the delay, and [`EndError::Length`] if `length` is not one
+    /// the packets can present.
+    fn end(&self, length: Option<u64>, total: u64, last: Option<u32>) -> Result<u64, EndError> {
         let delay = self.delay();
-        let samples = total.saturating_sub(delay);
+        if last.is_some() && total < delay {
+            return Err(EndError::ShorterThanDelay {
+                samples: total,
+                delay,
+            });
+        }
+        let samples = total - delay.min(total);
         let length = length.unwrap_or(samples);
-        let error = LengthError { length, samples };
+        let error = EndError::Length(LengthError { length, samples });
         let Some(last) = last else {
             return if length == 0 { Ok(0) } else { Err(error) };
         };
-        let end = delay + length;
+        let Some(end) = delay.checked_add(length) else {
+            return Err(error);
+        };
         let last_start = total - u64::from(last);
         let fits = if self.ends_with_padding() {
             last_start < end && end <= total
@@ -149,29 +192,37 @@ mod tests {
         assert_eq!(opus.end(None, 2880, Some(960)), Ok(2880));
         assert_eq!(opus.end(Some(2568), 2880, Some(960)), Ok(2880));
         assert_eq!(opus.end(Some(1609), 2880, Some(960)), Ok(1921));
-        let error = |length| LengthError {
-            length,
-            samples: 2568,
+        let error = |length| {
+            EndError::Length(LengthError {
+                length,
+                samples: 2568,
+            })
         };
         assert_eq!(opus.end(Some(1608), 2880, Some(960)), Err(error(1608)));
         assert_eq!(opus.end(Some(2569), 2880, Some(960)), Err(error(2569)));
         // Packets that do not reach past the pre-skip.
         assert_eq!(
             opus.end(None, 240, Some(240)),
-            Err(LengthError {
-                length: 0,
-                samples: 0
+            Err(EndError::ShorterThanDelay {
+                samples: 240,
+                delay: 312
             })
+        );
+        assert_eq!(opus.end(Some(0), 312, Some(312)), Ok(312));
+        // A length past any the stream's samples can count.
+        assert_eq!(
+            opus.end(Some(u64::MAX), 2880, Some(960)),
+            Err(error(u64::MAX))
         );
         assert_eq!(opus.end(Some(0), 960, Some(960)), Ok(312));
         // No packets.
         assert_eq!(opus.end(None, 0, None), Ok(0));
         assert_eq!(
             opus.end(Some(1), 0, None),
-            Err(LengthError {
+            Err(EndError::Length(LengthError {
                 length: 1,
                 samples: 0
-            })
+            }))
         );
     }
 
@@ -183,10 +234,10 @@ mod tests {
         assert_eq!(flac.end(Some(5000), 5000, Some(904)), Ok(5000));
         assert_eq!(
             flac.end(Some(4999), 5000, Some(904)),
-            Err(LengthError {
+            Err(EndError::Length(LengthError {
                 length: 4999,
                 samples: 5000
-            })
+            }))
         );
     }
 }

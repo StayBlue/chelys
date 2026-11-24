@@ -9,7 +9,8 @@ use std::io::Write;
 use chelys::aac::quality::MAX_LEVEL;
 use chelys::aac::{Config, ConfigError, Encoder, Framing, Rate};
 use chelys::mp4;
-use chelys::mp4::aac::{EncodeError, FragmentOptions};
+use chelys::mp4::FragmentOptions;
+use chelys::mp4::aac::encode::EncodeError;
 
 use crate::output::Output;
 use crate::{pcm, value};
@@ -336,7 +337,8 @@ pub fn encode(options: &Options) -> Result<(), String> {
 /// stdin has ended: its sample tables, which come first, describe every
 /// frame. Written in one pass, it needs no seekable stdout.
 fn encode_mp4(options: &Options) -> Result<(), String> {
-    let mut encoder = mp4::aac::Encoder::new(options.config()).map_err(|e| e.to_string())?;
+    let mut encoder =
+        mp4::aac::encode::Encoder::new(options.config()).map_err(|e| e.to_string())?;
     pcm::read(encoder.channels(), |samples| {
         Ok(encoder.encode_interleaved(samples)?)
     })?;
@@ -351,7 +353,7 @@ fn encode_mp4(options: &Options) -> Result<(), String> {
 /// flushed at once, so that a reader of stdout has it.
 fn encode_fragmented(options: &Options) -> Result<(), String> {
     let mut encoder =
-        mp4::aac::FragmentedEncoder::new(options.config(), FragmentOptions::default())
+        mp4::aac::encode::FragmentedEncoder::new(options.config(), FragmentOptions::default())
             .map_err(|e| e.to_string())?;
     let mut output = Output::stdout();
     let mut stream = encoder.init_segment().to_vec();

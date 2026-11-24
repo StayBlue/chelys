@@ -6,7 +6,7 @@
 use std::fmt;
 use std::num::NonZeroU32;
 
-use super::{PacketError, Track};
+use super::{EndError, PacketError, Track};
 use crate::fragments::{FragmentOptions, LengthError};
 use crate::movie::fragmented::{FragmentSink, Fragmenter, init_segment};
 
@@ -151,10 +151,11 @@ impl FragmentedWriter {
         let duration = self.track.duration(packet)?;
         if let Some(length) = self.length {
             let delay = self.track.delay();
+            let end = delay.saturating_add(length);
             let past = if self.track.ends_with_padding() {
-                self.samples >= delay + length
+                self.samples >= end
             } else {
-                self.samples + u64::from(duration) > delay + length
+                self.samples + u64::from(duration) > end
             };
             if past {
                 let samples = (self.samples + u64::from(duration)).saturating_sub(delay);
@@ -194,11 +195,12 @@ impl FragmentedWriter {
     ///
     /// # Errors
     ///
-    /// [`LengthError`] if the length declared, which the init segment
-    /// already gives, is not the one the packets present: the file would
-    /// not present what it says, and is to be discarded. `out` is then
-    /// given nothing.
-    pub fn finish<O: FragmentSink + ?Sized>(self, out: &mut O) -> Result<(), LengthError> {
+    /// [`EndError::Length`] if the length declared, which the init segment
+    /// already gives, is not the one the packets present, and
+    /// [`EndError::ShorterThanDelay`] if the packets end before the delay
+    /// that the init segment's edit leaves out: the file would not present
+    /// what it says, and is to be discarded. `out` is then given nothing.
+    pub fn finish<O: FragmentSink + ?Sized>(self, out: &mut O) -> Result<(), EndError> {
         let Self {
             track,
             mut fragmenter,
@@ -341,10 +343,10 @@ mod tests {
         );
         assert_eq!(
             writer.finish(&mut file),
-            Err(LengthError {
+            Err(EndError::Length(LengthError {
                 length: 1500,
                 samples: 1000
-            })
+            }))
         );
         let options = FragmentOptions::default().length(1000);
         let mut writer = FragmentedWriter::new(opus::Config::new(1, 312).unwrap(), options);

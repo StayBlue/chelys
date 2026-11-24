@@ -1,26 +1,15 @@
 // Copyright (c) 2026 StayBlue
 // SPDX-License-Identifier: MIT
 
-//! AAC-LC from chelys's encoder in an MP4 file: its raw frames as the
-//! samples of an `'mp4a'` track, which its `AudioSpecificConfig()`
-//! describes.
+//! AAC-LC in MP4 files (ISO/IEC 14496-14): the raw frames of a stream as
+//! the samples of an `'mp4a'` track, which its `AudioSpecificConfig()`
+//! describes, coded from PCM by chelys's own encoder ([`encode`]).
 
-mod fragmented;
-mod progressive;
-
-pub use fragmented::{EncodeError, FragmentOptions, FragmentedEncoder, LengthError};
-pub use progressive::Encoder;
-
-use chelys_aac::{Config, ConfigError, Framing};
+pub mod encode;
 
 use super::boxes::{FourCc, write_full_box};
 use super::descriptor::{AUDIO_ISO_IEC_14496_3, AUDIO_STREAM, DecoderConfig, es_descriptor};
 use super::movie::{AudioTrack, Brands, SampleEntry};
-
-/// The encoder of raw frames of the stream `config` asks for.
-fn raw_encoder(config: Config) -> Result<chelys_aac::Encoder, ConfigError> {
-    chelys_aac::Encoder::new(config.framing(Framing::Raw))
-}
 
 /// What the track's boxes give of a stream, all known before its first
 /// frame but the bitrates.
@@ -33,18 +22,9 @@ struct Stream {
 }
 
 impl Stream {
-    fn of(encoder: &chelys_aac::Encoder) -> Self {
-        Self {
-            sample_rate: encoder.sample_rate(),
-            channels: encoder.channels() as u16,
-            frame_samples: encoder.samples_per_frame() as u32,
-            buffer_size: encoder.decoder_buffer_bytes(),
-            audio_specific_config: encoder.audio_specific_config(),
-        }
-    }
-
     /// The track of the stream, its `ES_Descriptor` of `max_bitrate` and
-    /// `avg_bitrate`.
+    /// `avg_bitrate`, whose decoder's output starts with `delay` samples
+    /// that its edit leaves out, if given.
     ///
     /// Spec reading: the objectTypeIndication is "Audio ISO/IEC 14496-3",
     /// 0x40, whose DecoderSpecificInfo is the AudioSpecificConfig() (ISO/IEC
@@ -58,7 +38,7 @@ impl Stream {
     /// buffer at the decoder's input (ISO/IEC 14496-1, clause 6.1.2.4), is
     /// that of the decoder's input buffer of ISO/IEC 13818-7 (clause
     /// 8.2.3.1), within which the bit reservoir keeps the stream.
-    fn track(&self, max_bitrate: u32, avg_bitrate: u32) -> AudioTrack {
+    fn track(&self, max_bitrate: u32, avg_bitrate: u32, delay: Option<u32>) -> AudioTrack {
         let es_descriptor = es_descriptor(&DecoderConfig {
             object_type_indication: AUDIO_ISO_IEC_14496_3,
             stream_type: AUDIO_STREAM,
@@ -72,7 +52,7 @@ impl Stream {
             sample_entry: sample_entry(self.sample_rate, &es_descriptor),
             timescale: self.sample_rate,
             channels: self.channels,
-            delay: Some(chelys_aac::DELAY as u32),
+            delay,
             default_duration: self.frame_samples,
             roll_distance: Some(-1),
         }
