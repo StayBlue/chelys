@@ -5,8 +5,10 @@
 //! its own MP4 demuxer, `qtdemux`, then for AAC gst-libav's `avdec_aac`,
 //! which wraps ffmpeg's AAC decoder, so that what it shows is GStreamer's
 //! reading of the file, not an independent decoder's; for FLAC
-//! gst-plugins-good's `flacdec`, which wraps libFLAC; and for Opus
-//! gst-plugins-base's `opusdec`, which wraps libopus.
+//! gst-plugins-good's `flacdec`, which wraps libFLAC; for Opus
+//! gst-plugins-base's `opusdec`, which wraps libopus; and for ALAC
+//! gst-libav's `avdec_alac`, which wraps ffmpeg's ALAC decoder, as
+//! `avdec_aac` does its AAC decoder.
 //!
 //! Observed of GStreamer 1.28.9 as a black box:
 //!
@@ -50,12 +52,26 @@ pub fn decode_flac_mp4(file: &[u8]) -> Decoded {
     decode_mp4_with(file, "flacdec")
 }
 
+/// Decodes the first audio stream of an MP4 file of ALAC as
+/// [`decode_mp4`] does AAC, through gst-libav's `avdec_alac`, which wraps
+/// ffmpeg's ALAC decoder, at `sample_rate`: the samples are taken at that
+/// rate only, which `audioconvert` does not change, so that a stream that
+/// GStreamer decodes at another fails to negotiate, an error.
+pub fn decode_alac_mp4(file: &[u8], sample_rate: u32) -> Decoded {
+    decode_mp4_at(file, "avdec_alac", Some(sample_rate))
+}
+
 fn decode_mp4_with(file: &[u8], decoder: &str) -> Decoded {
+    decode_mp4_at(file, decoder, None)
+}
+
+fn decode_mp4_at(file: &[u8], decoder: &str, sample_rate: Option<u32>) -> Decoded {
     let file = TempFile::new("mp4", file);
     let output = TempFile::new("f32", &[]);
+    let rate = sample_rate.map_or(String::new(), |rate| format!(",rate={rate}"));
     let pipeline = format!(
         "filesrc location={} ! qtdemux ! {decoder} ! audiosegmentclip ! audioconvert ! \
-         audio/x-raw,format=F32LE,layout=interleaved ! filesink location={}",
+         audio/x-raw,format=F32LE,layout=interleaved{rate} ! filesink location={}",
         file.path().display(),
         output.path().display()
     );

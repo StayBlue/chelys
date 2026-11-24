@@ -12,19 +12,21 @@
 //! the test. That evidence was recorded with ffmpeg n9.0.2, mpg123 1.33.7
 //! and LAME 4.0 (64-bit), for AAC with ffmpeg n9.0.2 and FAAD2 2.11.4,
 //! and for MP4 files with ffmpeg n9.0.2 and GStreamer 1.28.9, through
-//! `qtdemux`, gst-libav 1.28.9's `avdec_aac`, gst-plugins-good 1.28.9's
-//! `flacdec`, gst-plugins-base 1.28.9's `opusdec`, and `audiosegmentclip`
-//! (see [`gstreamer`]); other versions could decode differently.
-//! `avdec_aac` wraps ffmpeg's AAC decoder, so that GStreamer's evidence of
-//! AAC is of its reading of the file, not of an independent decoder;
-//! `flacdec` wraps libFLAC, and `opusdec` libopus.
+//! `qtdemux`, gst-libav 1.28.9's `avdec_aac` and `avdec_alac`,
+//! gst-plugins-good 1.28.9's `flacdec`, gst-plugins-base 1.28.9's
+//! `opusdec`, and `audiosegmentclip` (see [`gstreamer`]); other versions
+//! could decode differently. `avdec_aac` and `avdec_alac` wrap ffmpeg's
+//! decoders, so that GStreamer's evidence of AAC and ALAC is of its reading
+//! of the file, not of an independent decoder; `flacdec` wraps libFLAC, and
+//! `opusdec` libopus.
 //!
-//! The FLAC, Opus and AAC-LC packets that `chelys-mp4`'s tests write in MP4
-//! files are made by encoders run as black boxes, and split into packets by
-//! ffprobe (see [`ffmpeg::packets`]): FLAC by the `flac` program 1.5.0 (see
-//! [`flac`]), Opus by ffmpeg n9.0.2's `libopus` encoder, of libopus 1.6.1
-//! (see [`ffmpeg::encode_opus`]), and AAC-LC by ffmpeg n9.0.2's native AAC
-//! encoder (see [`ffmpeg::encode_aac`]).
+//! The FLAC, Opus, AAC-LC and ALAC packets that `chelys-mp4`'s tests write
+//! in MP4 files are made by encoders run as black boxes, and split into
+//! packets by ffprobe (see [`ffmpeg::packets`]): FLAC by the `flac` program
+//! 1.5.0 (see [`flac`]), Opus by ffmpeg n9.0.2's `libopus` encoder, of
+//! libopus 1.6.1 (see [`ffmpeg::encode_opus`]), AAC-LC by ffmpeg n9.0.2's
+//! native AAC encoder (see [`ffmpeg::encode_aac`]), and ALAC by ffmpeg
+//! n9.0.2's ALAC encoder (see [`ffmpeg::encode_alac`]).
 //!
 //! Quality is graded with PEAQ (ITU-R BS.1387) as GstPEAQ computes it, also
 //! as a black box (see [`peaq`]). Its grades were recorded with GstPEAQ

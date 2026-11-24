@@ -247,6 +247,14 @@ pub fn decode_mp4_seeking(file: &[u8], from: f64) -> Decoded {
     decode_mp4_with(file, &["-ss", &from.to_string()])
 }
 
+/// Decodes the first audio stream of an MP4 file from the sample ffmpeg
+/// seeks to for `from` seconds, without decoding from an earlier one and
+/// discarding samples to reach `from` exactly (`-noaccurate_seek`): its
+/// output starts with the first sample it decodes after seeking.
+pub fn decode_mp4_from_seek_point(file: &[u8], from: f64) -> Decoded {
+    decode_mp4_with(file, &["-noaccurate_seek", "-ss", &from.to_string()])
+}
+
 /// What ffprobe reports of the first audio stream of an MP4 file.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Mp4Stream {
@@ -292,8 +300,8 @@ pub fn probe_mp4(file: &[u8]) -> Mp4Stream {
 /// A stream's packets as ffprobe splits them, each with its duration in
 /// the stream's time base, and the stream's extradata, the codec's
 /// configuration: the data of the STREAMINFO block for FLAC, the
-/// identification header for Opus, and the `AudioSpecificConfig()` for
-/// AAC.
+/// identification header for Opus, the `AudioSpecificConfig()` for AAC,
+/// and for ALAC the box that holds the magic cookie in an MP4 file.
 pub struct Packets {
     pub config: Vec<u8>,
     pub packets: Vec<Vec<u8>>,
@@ -390,6 +398,37 @@ pub fn encode_aac(pcm: &[f32], sample_rate: u32, channels: usize, kbps: u32) -> 
         .args(["-ac", &channels.to_string(), "-i"])
         .arg(input.path())
         .args(["-c:a", "aac", "-b:a", &format!("{kbps}k")])
+        .arg(output.path()));
+    std::fs::read(output.path()).unwrap()
+}
+
+/// An MP4 file of `pcm`, interleaved `bits`-bit integers, 16 or 24, of
+/// `channels` at `sample_rate`, as ffmpeg's ALAC encoder makes it, run as a
+/// black box to make the packets that `chelys-mp4`'s tests write in MP4
+/// files.
+pub fn encode_alac(pcm: &[i32], sample_rate: u32, channels: usize, bits: u32) -> Vec<u8> {
+    let (raw, format, sample_format): (Vec<u8>, _, _) = match bits {
+        16 => (
+            pcm.iter().flat_map(|&s| (s as i16).to_le_bytes()).collect(),
+            "s16le",
+            "s16p",
+        ),
+        24 => (
+            pcm.iter().flat_map(|&s| (s << 8).to_le_bytes()).collect(),
+            "s32le",
+            "s32p",
+        ),
+        _ => panic!("ffmpeg's ALAC encoder takes 16 or 24 bits, not {bits}"),
+    };
+    let input = TempFile::new("pcm", &raw);
+    // ffmpeg writes an MP4 file whole only where it can seek.
+    let output = TempFile::new("m4a", &[]);
+    run(Command::new("ffmpeg")
+        .args(["-nostdin", "-v", "error", "-y", "-f", format])
+        .args(["-ar", &sample_rate.to_string()])
+        .args(["-ac", &channels.to_string(), "-i"])
+        .arg(input.path())
+        .args(["-c:a", "alac", "-sample_fmt", sample_format])
         .arg(output.path()));
     std::fs::read(output.path()).unwrap()
 }
