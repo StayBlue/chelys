@@ -27,6 +27,7 @@
 
 pub mod faad;
 pub mod ffmpeg;
+pub mod gstreamer;
 pub mod lame;
 pub mod mpg123;
 pub mod peaq;
