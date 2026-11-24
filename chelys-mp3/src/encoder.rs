@@ -59,6 +59,16 @@ pub struct Finished {
     pub frames: u64,
     /// The samples each channel was given.
     pub samples: u64,
+    /// The samples that the decoded output of each channel ends with after
+    /// [`DELAY`](super::DELAY) samples and the input, to be discarded as
+    /// those of `DELAY` are: they code the silence that pads the input. The
+    /// samples of the frames of audio, [`samples_per_frame`] times
+    /// [`frames`](Self::frames), are all three together. The Xing/Info tag
+    /// gives a padding 529 samples more, as it gives the delay as `DELAY`
+    /// less the 529 by which a decoder delays its output.
+    ///
+    /// [`samples_per_frame`]: Encoder::samples_per_frame
+    pub padding: u64,
     /// The bits of ancillary data that the last frames had no room for,
     /// dropped.
     pub ancillary_dropped: usize,
@@ -208,11 +218,13 @@ impl Encoder {
     /// least [`DELAY`](super::DELAY) samples past it, so that the decoded
     /// output holds all of the input, and gives `out` the frames left.
     pub fn finish<O: FrameSink + ?Sized>(self, out: &mut O) -> Finished {
+        let frame_samples = self.samples_per_frame() as u64;
         let end = self.stream.finish(out);
         Finished {
             info_tag: end.info_tag,
             frames: end.frames,
             samples: end.samples,
+            padding: end.frames * frame_samples - super::DELAY as u64 - end.samples,
             ancillary_dropped: end.ancillary_dropped,
         }
     }

@@ -302,6 +302,11 @@ fn finishing_gives_the_tag_and_the_counts() {
     assert_eq!(finished.samples, 5_000);
     assert_eq!(finished.frames, (5_000 + DELAY as u64).div_ceil(576));
     assert_eq!(
+        576 * finished.frames,
+        DELAY as u64 + finished.samples + finished.padding
+    );
+    assert!(finished.padding < 576);
+    assert_eq!(
         finished.ancillary_dropped as u64,
         8 * 1_000 - 8 * finished.frames
     );
