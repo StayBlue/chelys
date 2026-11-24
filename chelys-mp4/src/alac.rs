@@ -17,7 +17,11 @@
 //! of padding after it, or of whether a packet decodes without those before
 //! it. An ALAC stream is taken to have neither delay nor padding, and every
 //! packet to be a sync sample: the track has no edit list and no pre-roll,
-//! and presents every sample its packets decode to.
+//! and presents every sample its packets decode to. Settled by decoding
+//! with ffmpeg (black box): it decodes the files to the input exactly, from
+//! their start and from where it seeks to. The conformance tests are
+//! `ffmpeg_decodes_alac_in_mp4_files_to_the_input_exactly` and
+//! `ffmpeg_decodes_alac_in_mp4_files_from_where_it_seeks`.
 
 use std::fmt;
 
@@ -222,7 +226,11 @@ impl Config {
     /// above 65535 Hz, which its integer part cannot hold, an integer
     /// division of it, with a `SamplingRateBox` after the cookie's box (see
     /// [`put_sample_rate`]), as for a codec that gives its own rate, as the
-    /// cookie does.
+    /// cookie does. Settled by decoding with ffmpeg and GStreamer
+    /// (`qtdemux`, `avdec_alac`; black box): both decode the files at 96 and
+    /// 192 kHz at their rate. The conformance tests are
+    /// `ffmpeg_decodes_alac_in_mp4_files_to_the_input_exactly` and
+    /// `gstreamer_decodes_alac_in_mp4_files_to_the_input_exactly`.
     fn sample_entry(&self) -> SampleEntry {
         const ALAC: FourCc = *b"alac";
         let mut boxes = Vec::new();
