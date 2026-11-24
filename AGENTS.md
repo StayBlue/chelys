@@ -61,7 +61,17 @@ other container or file format is out of scope. The command-line tool reads
 raw interleaved 32-bit float PCM, and format conversion is left to other tools.
 Propose any new input path outside the library, and ask before adding it.
 
+The one exception is `chelys-mp4`, which may also accept packets already
+encoded by any encoder, of the codecs whose MP4 mapping it implements: their
+bytes and durations, and the codec's configuration, as the caller gives them.
+It depends on no other encoder, and it neither decodes packets nor reads files
+or containers; it reads a packet's bytes only where its mapping requires. Ask
+before adding a codec to it. The command-line tool stays PCM-only.
+
 *User, 2026-11-12.*
+*User, 2026-11-23: the exception for `chelys-mp4` added, when FLAC and Opus
+in MP4 were proposed; the wording was proposed by the agent and approved by
+the user.*
 
 ## Documenting gaps and readings of the standard
 
@@ -280,3 +290,33 @@ when the evidence is recorded again with other versions.
 *User, 2026-11-23, when ffmpeg was found not to trim the end padding of
 fragmented MP4 files: the wording was proposed by the agent and approved by the
 user.*
+
+## FLAC and Opus in MP4
+
+`chelys-mp4` writes FLAC from "Encapsulation of FLAC in ISO Base Media File
+Format" (xiph/flac, `doc/isoflac.txt` at commit 78d85dd, the version RFC 9639
+cites) and RFC 9639, and Opus from "Encapsulation of Opus in ISO Base Media
+File Format" version 1.0.0 (xiph/opus, `doc/opus_in_isobmff.html` at commit
+fa9c1e7), RFC 7845 and RFC 6716, only, under the same clean-room rules as the
+standards named under "Clean room". Other FLAC and Opus encoders and decoders,
+for example libFLAC, libopus, flacenc and opus-rs, fall under "Clean room" as
+the codecs named there do. Where these documents leave something open,
+black-box decoding with ffmpeg may settle it, documented as for the standards.
+
+*User, 2026-11-23, when the documents were given: the wording was proposed by
+the agent and approved by the user.*
+
+## Encoded packets for `chelys-mp4`'s tests
+
+Tests of `chelys-mp4` may take FLAC and Opus packets from encoders run as
+black boxes, as separate programs (for example ffmpeg, `flac` and `opusenc`),
+and read the packets, their durations and the codec's configuration from
+ffprobe's output (`-show_packets -show_data`, `-show_streams -show_data`). The
+test code parses only that output, not the files' formats. The packets are
+inputs to the tests, not evidence of how chelys should encode, and the
+encoders' source code stays under "Clean room". Record the versions of the
+encoders used in the `chelys-conformance` crate's documentation, next to the
+decoders'.
+
+*User, 2026-11-23, when tests needed real FLAC and Opus packets: the wording
+was proposed by the agent and approved by the user.*
