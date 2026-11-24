@@ -22,6 +22,22 @@ use super::stream::{FRAME_SAMPLES, FrameSink, StreamEncoder};
 /// [`Finished::padding`] samples past it, all of which are to be
 /// discarded: they code silence, but decode only to near silence, as the
 /// quantization of the input next to them spreads into them.
+///
+/// Each piece given to a [`FrameSink`] is one whole frame, which may be
+/// taken on its own: an `adts_frame()` or a `raw_data_block()`, as
+/// [`Config::framing`] asks. A closure keeps them apart:
+///
+/// ```
+/// # use chelys_aac::{Config, Encoder, Framing, Rate};
+/// let config = Config::new(48_000, 1, Rate::Constant { bits_per_second: 64_000 })
+///     .framing(Framing::Raw);
+/// let mut encoder = Encoder::new(config).unwrap();
+/// let mut frames = Vec::new();
+/// let mut out = |frame: &[u8]| frames.push(frame.to_vec());
+/// encoder.encode_interleaved(&[0i16; 4096], &mut out).unwrap();
+/// encoder.finish(&mut out);
+/// assert_eq!(frames.len(), 5);
+/// ```
 pub struct Encoder {
     stream: StreamEncoder,
     /// Each channel's samples of the part of a call being converted.

@@ -25,6 +25,7 @@ use super::sampling_frequency::SamplingFrequency;
 use super::stereo::intensity;
 use super::stereo::middle_side::MsMask;
 use super::window::{WindowSequence, Windows};
+pub use chelys_core::FrameSink;
 use element::ElementEncoder;
 use frame::FrameRate;
 
@@ -511,40 +512,6 @@ impl StreamConfig {
     /// Whether every frame of a stream so configured can be written.
     pub fn is_valid(&self) -> bool {
         self.reservoir().is_some()
-    }
-}
-
-/// Where an [`Encoder`](crate::Encoder) gives the frames it codes, one call each, in their
-/// order.
-pub trait FrameSink {
-    /// Takes a frame: an `adts_frame()` or a `raw_data_block()`, as
-    /// [`Config::framing`](crate::Config::framing) asked.
-    fn frame(&mut self, frame: &[u8]);
-}
-
-/// Appends each frame, as to a stream in ADTS.
-impl FrameSink for Vec<u8> {
-    fn frame(&mut self, frame: &[u8]) {
-        self.extend_from_slice(frame);
-    }
-}
-
-/// Calls the closure with each frame, as to keep raw frames apart:
-///
-/// ```
-/// # use chelys_aac::{Config, Encoder, Framing, Rate};
-/// let config = Config::new(48_000, 1, Rate::Constant { bits_per_second: 64_000 })
-///     .framing(Framing::Raw);
-/// let mut encoder = Encoder::new(config).unwrap();
-/// let mut frames = Vec::new();
-/// let mut out = |frame: &[u8]| frames.push(frame.to_vec());
-/// encoder.encode_interleaved(&[0i16; 4096], &mut out).unwrap();
-/// encoder.finish(&mut out);
-/// assert_eq!(frames.len(), 5);
-/// ```
-impl<F: FnMut(&[u8])> FrameSink for F {
-    fn frame(&mut self, frame: &[u8]) {
-        self(frame);
     }
 }
 
