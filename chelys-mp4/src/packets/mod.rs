@@ -3,9 +3,11 @@
 
 //! MP4 files of packets that any encoder made, of a codec whose mapping to
 //! the file format chelys implements: FLAC ([`flac`](crate::flac)), Opus
-//! ([`opus`](crate::opus)) and AAC-LC ([`aac`](crate::aac)). The packets
-//! are taken as they are: only what the mapping needs of them is read,
-//! each packet's duration, which AAC's configuration gives instead.
+//! ([`opus`](crate::opus)), AAC-LC ([`aac`](crate::aac)) and ALAC
+//! ([`alac`](crate::alac)). The packets are taken as they are: only what
+//! the mapping needs of them is read, each packet's duration, which AAC's
+//! and ALAC's configurations give instead, ALAC's unless the caller gives
+//! another.
 
 mod fragmented;
 mod progressive;
@@ -17,7 +19,7 @@ use std::fmt;
 
 use crate::fragments::LengthError;
 use crate::movie::AudioTrack;
-use crate::{aac, flac, opus};
+use crate::{aac, alac, flac, opus};
 
 /// The stream that a file of packets holds, as its codec's configuration
 /// describes it.
@@ -27,6 +29,7 @@ pub enum Track {
     Flac(flac::Config),
     Opus(opus::Config),
     Aac(aac::Config),
+    Alac(alac::Config),
 }
 
 impl From<flac::Config> for Track {
@@ -47,11 +50,18 @@ impl From<aac::Config> for Track {
     }
 }
 
+impl From<alac::Config> for Track {
+    fn from(config: alac::Config) -> Self {
+        Self::Alac(config)
+    }
+}
+
 /// Why a packet was refused: it is not one of the codec, as far as what
-/// the writer reads of it shows, its duration, or for AAC, whose duration
-/// the configuration gives, that it is not empty. The packets are not
-/// checked further: an AAC packet that still has its ADTS header is taken,
-/// and makes a file that does not decode.
+/// the writer reads of it shows, its duration, or for AAC and ALAC, whose
+/// duration the configuration gives, that it is not empty; or the duration
+/// given with it is not one it can have. The packets are not checked
+/// further: an AAC packet that still has its ADTS header is taken, and
+/// makes a file that does not decode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum PacketError {
@@ -68,6 +78,15 @@ pub enum PacketError {
     /// An empty AAC packet, which no `raw_data_block()` is: its
     /// `id_syn_ele` alone takes 3 bits.
     AacEmpty,
+    /// An empty ALAC packet, which can hold no samples.
+    AlacEmpty,
+    /// A duration given with a packet other than the one the codec's
+    /// mapping reads of it, or its configuration gives it: only an ALAC
+    /// packet's can differ.
+    Duration { given: u32, read: u32 },
+    /// A duration of 0 given with an ALAC packet, which decodes to
+    /// samples.
+    ZeroDuration,
 }
 
 impl fmt::Display for PacketError {
@@ -80,6 +99,12 @@ impl fmt::Display for PacketError {
                 "an Opus packet of {duration} samples, shorter than the {shortest} declared"
             ),
             Self::AacEmpty => write!(f, "an empty AAC packet"),
+            Self::AlacEmpty => write!(f, "an empty ALAC packet"),
+            Self::Duration { given, read } => write!(
+                f,
+                "a packet given a duration of {given}, where it lasts {read}"
+            ),
+            Self::ZeroDuration => write!(f, "an ALAC packet given a duration of 0"),
         }
     }
 }
@@ -127,16 +152,33 @@ impl Track {
             Self::Flac(config) => config.track(),
             Self::Opus(config) => config.track(),
             Self::Aac(config) => config.track(sizes),
+            Self::Alac(config) => config.track(),
         }
     }
 
-    /// The duration of `packet`, as the codec's mapping has it.
-    pub(crate) fn duration(&self, packet: &[u8]) -> Result<u32, PacketError> {
-        match self {
-            Self::Flac(_) => flac::frame_duration(packet),
-            Self::Opus(config) => config.duration(packet),
-            Self::Aac(_) if packet.is_empty() => Err(PacketError::AacEmpty),
-            Self::Aac(config) => Ok(config.frame_samples()),
+    /// The duration of `packet`, as the codec's mapping has it, or as
+    /// `given`, if given. An ALAC packet lasts the cookie's frame length
+    /// unless its header gives another number, which only the caller can
+    /// give, as the writer does not read its bitstream; a packet of
+    /// another codec lasts what its mapping has it last, which `given`, if
+    /// given, is to be.
+    pub(crate) fn duration(&self, packet: &[u8], given: Option<u32>) -> Result<u32, PacketError> {
+        let read = match self {
+            Self::Flac(_) => flac::frame_duration(packet)?,
+            Self::Opus(config) => config.duration(packet)?,
+            Self::Aac(_) if packet.is_empty() => return Err(PacketError::AacEmpty),
+            Self::Aac(config) => config.frame_samples(),
+            Self::Alac(_) if packet.is_empty() => return Err(PacketError::AlacEmpty),
+            // Spec gap: the cookie document gives the frame length as "the
+            // frames per packet when no explicit frames per packet setting is
+            // present in the packet header", but bounds no explicit setting;
+            // any duration is taken but 0, as a packet decodes to samples.
+            Self::Alac(_) if given == Some(0) => return Err(PacketError::ZeroDuration),
+            Self::Alac(config) => return Ok(given.unwrap_or(config.frame_length())),
+        };
+        match given {
+            Some(given) if given != read => Err(PacketError::Duration { given, read }),
+            _ => Ok(read),
         }
     }
 
@@ -146,6 +188,7 @@ impl Track {
             Self::Flac(_) => 0,
             Self::Opus(config) => u64::from(config.pre_skip()),
             Self::Aac(config) => config.delay().map_or(0, u64::from),
+            Self::Alac(_) => 0,
         }
     }
 
@@ -154,7 +197,8 @@ impl Track {
     /// duration in a fragmented file: an Opus stream's (the Opus mapping,
     /// clauses 4.3.4 and 4.4), and an AAC stream's whose delay is given, as
     /// chelys's own AAC files have it. A FLAC stream has no padding, and its
-    /// last frame lasts its block size, as every frame does; nor has an AAC
+    /// last frame lasts its block size, as every frame does; nor has an
+    /// ALAC stream, whose last packet lasts what it decodes to, nor an AAC
     /// stream whose delay is not known, whose track has no edit list and
     /// presents every sample.
     fn ends_with_padding(&self) -> bool {
@@ -162,6 +206,7 @@ impl Track {
             Self::Flac(_) => false,
             Self::Opus(_) => true,
             Self::Aac(config) => config.delay().is_some(),
+            Self::Alac(_) => false,
         }
     }
 

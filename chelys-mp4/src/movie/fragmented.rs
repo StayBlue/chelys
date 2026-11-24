@@ -64,7 +64,7 @@ pub struct FragmentInfo {
     /// from that many samples earlier.
     pub decode_time: u64,
     /// The frames the fragment holds, each a sample of the track: an AAC
-    /// frame, a FLAC frame or an Opus packet.
+    /// frame, a FLAC frame, an Opus packet or an ALAC packet.
     pub frames: u32,
     /// The duration of those frames in samples; in the last fragment of a
     /// stream that ends with padding, as chelys's AAC, AAC packets of a
@@ -353,7 +353,7 @@ const SAMPLE_FLAGS: u32 = (2 << 26) | (2 << 24) | (2 << 20);
 /// MovieHeaderBox should be set to indefinite or 0" (clause 8.8.2.1).
 ///
 /// A track without an edit list, whose decoder's output starts with no
-/// delay, as FLAC's, needs none to present its media from the start and to
+/// delay, as FLAC's and ALAC's, needs none to present its media from the start and to
 /// its end, where its last frame ends; where its length is known, it is the
 /// `MovieExtendsHeaderBox`'s duration alone.
 ///

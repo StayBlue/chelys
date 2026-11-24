@@ -9,11 +9,12 @@ use std::io::{self, Write};
 use super::{EndError, PacketError, Track};
 use crate::movie::progressive::write_file;
 
-/// Writes packets of FLAC, Opus or AAC-LC, which any encoder made, as an
-/// MP4 file, which [`finish`](Self::finish) writes whole.
+/// Writes packets of FLAC, Opus, AAC-LC or ALAC, which any encoder made, as
+/// an MP4 file, which [`finish`](Self::finish) writes whole.
 ///
 /// Each packet is a sample of the track: a FLAC frame, an Opus packet, one
-/// per stream for a stream of several, or an AAC `raw_data_block()`. The packets are kept in memory
+/// per stream for a stream of several, an AAC `raw_data_block()`, or an
+/// ALAC packet. The packets are kept in memory
 /// until the file is written, its sample tables before them, as they
 /// describe each packet. A [`FragmentedWriter`](super::FragmentedWriter)
 /// writes a file as the packets come instead.
@@ -79,11 +80,12 @@ impl From<io::Error> for FinishError {
 
 impl Writer {
     /// A writer of the stream `track` describes: a [`flac::Config`], an
-    /// [`opus::Config`] or an [`aac::Config`].
+    /// [`opus::Config`], an [`aac::Config`] or an [`alac::Config`].
     ///
     /// [`flac::Config`]: crate::flac::Config
     /// [`opus::Config`]: crate::opus::Config
     /// [`aac::Config`]: crate::aac::Config
+    /// [`alac::Config`]: crate::alac::Config
     pub fn new(track: impl Into<Track>) -> Self {
         Self {
             track: track.into(),
@@ -97,7 +99,10 @@ impl Writer {
     /// Takes the next packet, whose duration it reads from the packet: a
     /// FLAC frame's block size, or an Opus packet's frames. An AAC packet,
     /// a `raw_data_block()` whose ADTS header, if it had one, has been
-    /// taken off, lasts a frame, as its configuration says.
+    /// taken off, lasts a frame, as its configuration says, and an ALAC
+    /// packet the cookie's frame length; one that lasts another, as the
+    /// last packet of a stream often does, is given with its duration by
+    /// [`push_with_duration`](Self::push_with_duration).
     ///
     /// # Errors
     ///
@@ -108,7 +113,31 @@ impl Writer {
     ///
     /// If the packet reaches 4 GiB.
     pub fn push(&mut self, packet: &[u8]) -> Result<(), PacketError> {
-        let duration = self.track.duration(packet)?;
+        self.take(packet, None)
+    }
+
+    /// Takes the next packet as [`push`](Self::push) does, but of
+    /// `duration` samples of each channel, in the track's timescale: for
+    /// ALAC, the samples its header gives where it gives them, as for a
+    /// stream's last packet, which the writer does not read; for the other
+    /// codecs, the duration that `push` would read, which is checked.
+    ///
+    /// # Errors
+    ///
+    /// [`PacketError`] as for [`push`](Self::push), and
+    /// [`PacketError::ZeroDuration`] if an ALAC packet's `duration` is 0,
+    /// and [`PacketError::Duration`] if another codec's packet does not
+    /// last `duration`. The packet is not taken.
+    ///
+    /// # Panics
+    ///
+    /// If the packet reaches 4 GiB.
+    pub fn push_with_duration(&mut self, packet: &[u8], duration: u32) -> Result<(), PacketError> {
+        self.take(packet, Some(duration))
+    }
+
+    fn take(&mut self, packet: &[u8], duration: Option<u32>) -> Result<(), PacketError> {
+        let duration = self.track.duration(packet, duration)?;
         self.data.extend_from_slice(packet);
         self.sizes
             .push(u32::try_from(packet.len()).expect("a packet under 4 GiB"));
@@ -119,7 +148,7 @@ impl Writer {
 
     /// The samples of each channel that the packets taken decode to, any
     /// delay included, in the track's timescale: at the sample rate for
-    /// FLAC and AAC, and at 48 kHz for Opus.
+    /// FLAC, AAC and ALAC, and at 48 kHz for Opus.
     pub fn samples(&self) -> u64 {
         self.samples
     }
@@ -132,8 +161,8 @@ impl Writer {
     /// For Opus, and AAC whose delay is given, the samples presented follow
     /// the pre-skip or the delay, which the file's edit list leaves out, and
     /// `length` is that of the input, the samples before the padding that
-    /// the stream ends with, where the edit ends. For FLAC, which has
-    /// neither, and AAC whose delay is not given, `length`, if given, is to
+    /// the stream ends with, where the edit ends. For FLAC and ALAC, which
+    /// have neither, and AAC whose delay is not given, `length`, if given, is to
     /// be every sample the packets decode to, as a check of the stream: the
     /// file has no edit list.
     ///
@@ -210,7 +239,7 @@ pub(crate) mod tests {
     use crate::LengthError;
     use crate::boxes::read::{FourCcs, boxes, children, find, u32_at};
     use crate::flac::tests::streaminfo;
-    use crate::{aac, flac, opus};
+    use crate::{aac, alac, flac, opus};
 
     /// An Opus packet of one frame of 20 ms of CELT, of `size` bytes.
     fn opus_packet(size: usize) -> Vec<u8> {
@@ -448,6 +477,87 @@ pub(crate) mod tests {
         writer.push(&packets[0]).unwrap();
         let error = writer.finish(Some(1000), &mut file).unwrap_err();
         assert!(matches!(error, FinishError::End(_)), "{error}");
+    }
+
+    #[test]
+    fn an_alac_file_gives_each_packet_its_duration() {
+        let cookie = crate::alac::tests::cookie(4096, 16, 2, 44_100);
+        let mut writer = Writer::new(alac::Config::from_magic_cookie(&cookie).unwrap());
+        let packets = [vec![0x20; 300], vec![0x20; 310], vec![0x20; 50]];
+        writer.push(&packets[0]).unwrap();
+        writer.push_with_duration(&packets[1], 4096).unwrap();
+        writer.push_with_duration(&packets[2], 942).unwrap();
+        assert_eq!(writer.push(&[]), Err(PacketError::AlacEmpty));
+        assert_eq!(
+            writer.push_with_duration(&packets[0], 0),
+            Err(PacketError::ZeroDuration)
+        );
+        assert_eq!(writer.samples(), 2 * 4096 + 942);
+        let mut file = Vec::new();
+        writer.finish(Some(2 * 4096 + 942), &mut file).unwrap();
+        assert_eq!(find(&file, &[b"ftyp"]).payload, b"mp42\0\0\0\0mp42isom");
+        assert_eq!(find(&file, &[b"mdat"]).payload, packets.concat());
+        assert_eq!(
+            children(&find(&file, &[b"moov", b"trak"])).kinds(),
+            ["tkhd", "mdia"]
+        );
+        assert_eq!(stbl(&file, b"stts"), [2, 2, 4096, 1, 942]);
+        let stbl_box = find(&file, &[b"moov", b"trak", b"mdia", b"minf", b"stbl"]);
+        assert_eq!(
+            children(&stbl_box).kinds(),
+            ["stsd", "stts", "stsc", "stsz", "stco"]
+        );
+        // The sample description as the cookie document lays it out.
+        let stsd = find(
+            &file,
+            &[b"moov", b"trak", b"mdia", b"minf", b"stbl", b"stsd"],
+        );
+        let expected = [
+            &[0, 0, 0, 0][..],           // version, flags
+            &[0, 0, 0, 1],               // entry count
+            &(36u32 + 36).to_be_bytes(), // sample entry size
+            b"alac",
+            &[0; 6],  // reserved
+            &[0, 1],  // dref index
+            &[0; 8],  // reserved
+            &[0, 2],  // channel count
+            &[0, 16], // sample size
+            &[0, 0],  // predefined
+            &[0, 0],  // reserved
+            &(44_100u32 << 16).to_be_bytes(),
+            &36u32.to_be_bytes(), // ALAC specific info size
+            b"alac",
+            &[0, 0, 0, 0], // version flags
+            &cookie,
+        ]
+        .concat();
+        assert_eq!(stsd.payload, expected);
+    }
+
+    #[test]
+    fn a_duration_other_than_the_one_read_is_refused() {
+        let config = flac::Config::from_streaminfo(&streaminfo(1000, 1000, 44_100, 2, 16)).unwrap();
+        let mut writer = Writer::new(config);
+        writer
+            .push_with_duration(&flac_frame(1000, 40), 1000)
+            .unwrap();
+        assert_eq!(
+            writer.push_with_duration(&flac_frame(1000, 40), 999),
+            Err(PacketError::Duration {
+                given: 999,
+                read: 1000
+            })
+        );
+        let config = aac::Config::from_audio_specific_config(&[0x11, 0x90], None).unwrap();
+        let mut writer = Writer::new(config);
+        assert_eq!(
+            writer.push_with_duration(&[0x21; 30], 960),
+            Err(PacketError::Duration {
+                given: 960,
+                read: 1024
+            })
+        );
+        assert_eq!(writer.samples(), 0);
     }
 
     #[test]

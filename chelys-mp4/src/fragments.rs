@@ -9,7 +9,7 @@ use std::num::NonZeroU32;
 
 /// What a fragmented encoder or writer is to write, beyond the stream.
 /// Durations are in samples of each channel at the rate a decoder outputs:
-/// the sample rate, for AAC and FLAC, and 48 kHz for Opus.
+/// the sample rate, for AAC, FLAC and ALAC, and 48 kHz for Opus.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct FragmentOptions {
@@ -17,8 +17,8 @@ pub struct FragmentOptions {
     /// chelys's AAC encoder, as `chelys_aac::Finished::samples` counts
     /// them; of Opus packets, after the pre-skip, and of AAC packets of a
     /// known delay, after it, the samples before the padding; and of FLAC
-    /// packets, and AAC packets whose delay is not known, every sample they
-    /// decode to. `None` by default.
+    /// and ALAC packets, and AAC packets whose delay is not known, every
+    /// sample they decode to. `None` by default.
     pub length: Option<u64>,
     /// The duration that each fragment is to have; by default one second.
     pub fragment_samples: Option<NonZeroU32>,

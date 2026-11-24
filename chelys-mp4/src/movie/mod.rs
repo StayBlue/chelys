@@ -376,7 +376,8 @@ fn write_data_information(out: &mut Vec<u8>) {
 /// every sample can be independently decoded", and which the mappings of
 /// FLAC and Opus have of theirs ("every FLAC sample is a sync sample",
 /// "every Opus sample is a sync sample"), each with its "Sync Sample Box
-/// shall not be present".
+/// shall not be present". ALAC's cookie document does not say; see
+/// [`alac`](crate::alac).
 fn write_sample_table(
     out: &mut Vec<u8>,
     track: &AudioTrack,

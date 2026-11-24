@@ -2,18 +2,18 @@
 // SPDX-License-Identifier: MIT
 
 //! MP4 files (ISO/IEC 14496-14:2020) of one audio track, implemented from
-//! their specifications: packets of FLAC ([`flac`]), Opus ([`opus`]) and
-//! AAC-LC ([`aac`]) that any encoder made, which a [`Writer`] or a
-//! [`FragmentedWriter`] takes, and AAC-LC coded from PCM by `chelys-aac`
-//! (`aac::encode`, with the feature `aac`). The `chelys` crate offers it as
-//! `chelys::mp4`.
+//! their specifications: packets of FLAC ([`flac`]), Opus ([`opus`]),
+//! AAC-LC ([`aac`]) and ALAC ([`alac`]) that any encoder made, which a
+//! [`Writer`] or a [`FragmentedWriter`] takes, and AAC-LC coded from PCM
+//! by `chelys-aac` (`aac::encode`, with the feature `aac`). The `chelys`
+//! crate offers it as `chelys::mp4`.
 //!
 //! Clause references refer to ISO/IEC 14496-12:2026, the ISO base media
 //! file format, or where they name it, to ISO/IEC 14496-14:2020, the MP4
 //! file format, ISO/IEC 14496-1:2026, whose descriptors describe the
 //! stream, ISO/IEC 14496-34:2025, the syntax description language, or
-//! the audio standards. FLAC and Opus follow their mappings to the file
-//! format, as each module says.
+//! the audio standards. FLAC, Opus and ALAC follow their mappings to the
+//! file format, as each module says.
 //!
 //! An AAC file is written whole, from its start to its end, so that it can be
 //! written where nothing can be sought, as a pipe; one of packets from
@@ -102,6 +102,7 @@
 //! ```
 
 pub mod aac;
+pub mod alac;
 mod bitrate;
 mod boxes;
 mod descriptor;

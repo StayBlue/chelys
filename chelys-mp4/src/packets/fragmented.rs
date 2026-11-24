@@ -10,7 +10,7 @@ use super::{EndError, PacketError, Track};
 use crate::fragments::{FragmentOptions, LengthError};
 use crate::movie::fragmented::{FragmentSink, Fragmenter, init_segment};
 
-/// Writes packets of FLAC, Opus or AAC-LC, which any encoder made, as a
+/// Writes packets of FLAC, Opus, AAC-LC or ALAC, which any encoder made, as a
 /// fragmented MP4 file (ISO/IEC 14496-12, clause 8.8), written as the
 /// packets come: its [`init_segment`](Self::init_segment), then fragments
 /// of about a second each, which a [`FragmentSink`] takes, so that the
@@ -22,9 +22,9 @@ use crate::movie::fragmented::{FragmentSink, Fragmenter, init_segment};
 /// list leaves out the pre-skip, or an AAC file's the delay given, and its
 /// media ends with the packets, but it does not give where the
 /// presentation ends, so that a player may present the padding that the
-/// last packet decodes to. A FLAC stream has no padding, nor has an AAC
-/// stream whose delay is not given, and needs no length to end where it
-/// does.
+/// last packet decodes to. A FLAC or ALAC stream has no padding, nor has
+/// an AAC stream whose delay is not given, and needs no length to end where
+/// it does.
 ///
 /// ffmpeg n9.0.2 (black box) presents the padding of a fragmented Opus file
 /// whether its length is declared or not, as it does of AAC's. GStreamer
@@ -77,7 +77,7 @@ pub enum PushError {
     /// The packet is not one of the codec.
     Packet(PacketError),
     /// The packet would take the stream past the length declared: for
-    /// FLAC, and AAC whose delay is not given, its samples; for Opus, and
+    /// FLAC, ALAC, and AAC whose delay is not given, its samples; for Opus, and
     /// AAC whose delay is given, it would start after the input's end.
     Length(LengthError),
 }
@@ -101,14 +101,16 @@ impl From<PacketError> for PushError {
 
 impl FragmentedWriter {
     /// A writer of the stream `track` describes, a [`flac::Config`], an
-    /// [`opus::Config`] or an [`aac::Config`], into the file `options` asks
-    /// for. The length and the fragments' duration are in the track's
-    /// timescale: at the sample rate for FLAC and AAC, and at 48 kHz for
-    /// Opus, the length after the pre-skip or the delay.
+    /// [`opus::Config`], an [`aac::Config`] or an [`alac::Config`], into
+    /// the file `options` asks for. The length and the fragments' duration
+    /// are in the track's timescale: at the sample rate for FLAC, AAC and
+    /// ALAC, and at 48 kHz for Opus, the length after the pre-skip or the
+    /// delay.
     ///
     /// [`flac::Config`]: crate::flac::Config
     /// [`opus::Config`]: crate::opus::Config
     /// [`aac::Config`]: crate::aac::Config
+    /// [`alac::Config`]: crate::alac::Config
     pub fn new(track: impl Into<Track>, options: FragmentOptions) -> Self {
         let track = track.into();
         let audio = track.audio_track(None);
@@ -153,7 +155,35 @@ impl FragmentedWriter {
         packet: &[u8],
         out: &mut O,
     ) -> Result<(), PushError> {
-        let duration = self.track.duration(packet)?;
+        self.take(packet, None, out)
+    }
+
+    /// Takes the next packet of `duration` samples, as
+    /// [`Writer::push_with_duration`](super::Writer::push_with_duration)
+    /// does, and gives `out` the fragment it completes, if it completes
+    /// one.
+    ///
+    /// # Errors
+    ///
+    /// [`PushError`] as for [`push`](Self::push), and if `duration` is not
+    /// one the packet can have (see
+    /// [`Writer::push_with_duration`](super::Writer::push_with_duration)).
+    pub fn push_with_duration<O: FragmentSink + ?Sized>(
+        &mut self,
+        packet: &[u8],
+        duration: u32,
+        out: &mut O,
+    ) -> Result<(), PushError> {
+        self.take(packet, Some(duration), out)
+    }
+
+    fn take<O: FragmentSink + ?Sized>(
+        &mut self,
+        packet: &[u8],
+        duration: Option<u32>,
+        out: &mut O,
+    ) -> Result<(), PushError> {
+        let duration = self.track.duration(packet, duration)?;
         if let Some(length) = self.length {
             let delay = self.track.delay();
             let end = delay.saturating_add(length);
@@ -240,7 +270,7 @@ mod tests {
     use super::*;
     use crate::boxes::read::{FourCcs, boxes, children, find, u32_at};
     use crate::flac::tests::streaminfo;
-    use crate::{FragmentInfo, flac, opus};
+    use crate::{FragmentInfo, alac, flac, opus};
 
     /// An Opus packet of one frame of 20 ms of CELT, of `size` bytes.
     fn opus_packet(size: usize) -> Vec<u8> {
@@ -426,6 +456,52 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn an_alac_file_s_fragments_give_the_durations_that_differ() {
+        let cookie = crate::alac::tests::cookie(4096, 16, 1, 8_000);
+        let config = alac::Config::from_magic_cookie(&cookie).unwrap();
+        let options = FragmentOptions::default().length(4 * 4096 + 100);
+        let mut writer = FragmentedWriter::new(config, options);
+        let mut file = writer.init_segment().to_vec();
+        let mut infos = Vec::new();
+        let mut out = |bytes: &[u8], info: FragmentInfo| {
+            file.extend_from_slice(bytes);
+            infos.push(info);
+        };
+        let packets: Vec<Vec<u8>> = (0..5).map(|i| vec![0x20; 40 + i]).collect();
+        for packet in &packets[..4] {
+            writer.push(packet, &mut out).unwrap();
+        }
+        assert!(matches!(
+            writer.push_with_duration(&packets[4], 101, &mut out),
+            Err(PushError::Length(_))
+        ));
+        writer
+            .push_with_duration(&packets[4], 100, &mut out)
+            .unwrap();
+        writer.finish(&mut out).unwrap();
+        assert_eq!(media_data(&file), packets.concat());
+        assert_eq!(
+            children(&find(&file, &[b"moov", b"trak"])).kinds(),
+            ["tkhd", "mdia"]
+        );
+        let trex = find(&file, &[b"moov", b"mvex", b"trex"]);
+        assert_eq!(u32_at(trex.payload, 12), 4096);
+        // Fragments of a second, two packets each, the last of the last
+        // packet alone, which gives its duration.
+        let frames: Vec<u32> = infos.iter().map(|info| info.frames).collect();
+        assert_eq!(frames, [2, 2, 1]);
+        assert_eq!(infos[2].duration, 100);
+        let moofs: Vec<_> = boxes(&file, 0)
+            .into_iter()
+            .filter(|b| &b.kind == b"moof")
+            .collect();
+        let traf = |i: usize| children(&children(&moofs[i])[1]);
+        assert_eq!(traf(0).kinds(), ["tfhd", "tfdt", "trun"]);
+        assert_eq!(u32_at(traf(0)[2].payload, 0) & 0x100, 0);
+        assert_eq!(u32_at(traf(2)[2].payload, 0) & 0x100, 0x100);
     }
 
     #[test]
