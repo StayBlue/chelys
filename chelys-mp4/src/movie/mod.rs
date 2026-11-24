@@ -64,6 +64,37 @@ pub struct SampleEntry {
     pub boxes: Vec<u8>,
 }
 
+/// The `samplerate` field of a stream at `sample_rate` Hz, whose codec
+/// gives its own rate, appending a `SamplingRateBox` to the sample entry's
+/// `boxes` where the field cannot hold the rate.
+///
+/// `samplerate` is "{ default samplerate of media}<<16", the rate in 16.16
+/// fixed point (clause 12.2.3.2), where its 16-bit integer part holds the
+/// rate. Above 65535 Hz, as at 88.2 and 96 kHz, it cannot; clause 12.2.3.1
+/// gives a way out for a codec that gives its own rate: "a SamplingRateBox
+/// is present in the AudioSampleEntryV1 or AudioSampleEntry, and it
+/// documents the actual sampling rate", and `samplerate` "should contain a
+/// value that matches the media timescale left-shifted 16 bits ... or be
+/// an integer division or multiple of it". So the field is the rate
+/// divided by the least integer that brings it within 16 bits, 2 at 88.2
+/// and 96 kHz, and a `SamplingRateBox` follows the codec's boxes, as "the
+/// SamplingRateBox ... should follow, not precede, any boxes defined in or
+/// required by derived specifications".
+pub fn put_sample_rate(boxes: &mut Vec<u8>, sample_rate: u32) -> u32 {
+    let divisor = (1..)
+        .find(|&d| sample_rate % d == 0 && sample_rate / d <= 0xffff)
+        .expect("the rate over itself, 1, holds 16 bits");
+    if divisor > 1 {
+        // Spec gap: the SamplingRateBox extends FullBox('srat') without a
+        // version or flags; they are 0, as for the other boxes that define
+        // none.
+        write_full_box(boxes, b"srat", 0, 0, |out| {
+            out.extend_from_slice(&sample_rate.to_be_bytes()); // sampling_rate
+        });
+    }
+    (sample_rate / divisor) << 16
+}
+
 /// The durations of the `MovieBox`, each in samples, as both timescales
 /// are the track's.
 #[derive(Clone, Copy, Debug)]

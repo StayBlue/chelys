@@ -17,7 +17,7 @@ pub use config::{Config, ConfigError};
 
 use super::boxes::{FourCc, write_full_box};
 use super::descriptor::{AUDIO_ISO_IEC_14496_3, AUDIO_STREAM, DecoderConfig, es_descriptor};
-use super::movie::{AudioTrack, Brands, SampleEntry};
+use super::movie::{AudioTrack, Brands, SampleEntry, put_sample_rate};
 
 /// What the track's boxes give of a stream, all known before its first
 /// frame but the bitrates.
@@ -101,37 +101,21 @@ const BRANDS: Brands = Brands {
 /// 96 kHz, where the default `samplerate` cannot be written: its 16-bit
 /// integer part cannot hold the rate. ISO/IEC 14496-14 gives no way out;
 /// clause 12.2.3.1 does, for a codec that gives its own rate, as the
-/// `AudioSpecificConfig()` does: "a SamplingRateBox is present in the
-/// AudioSampleEntryV1 or AudioSampleEntry, and it documents the actual
-/// sampling rate", and `samplerate` "should contain a value that matches
-/// the media timescale left-shifted 16 bits ... or be an integer division
-/// or multiple of it". So where the rate holds 16 bits, `samplerate` is the
-/// default, as clause 7 requires; above, where no value meets it, it is the
-/// rate divided by the least integer that brings it within 16 bits, 2 at
-/// 88.2 and 96 kHz, and a `SamplingRateBox` follows the `ESDBox`, as "the
-/// SamplingRateBox ... should follow, not precede, any boxes defined in or
-/// required by derived specifications".
+/// `AudioSpecificConfig()` does, which [`put_sample_rate`] takes: where the
+/// rate holds 16 bits, `samplerate` is the default, as clause 7 requires,
+/// and above, where no value meets it, an integer division of the rate,
+/// with a `SamplingRateBox` after the `ESDBox`.
 fn sample_entry(sample_rate: u32, es_descriptor: &[u8]) -> SampleEntry {
     const MP4A: FourCc = *b"mp4a";
-    let divisor = (1..)
-        .find(|&d| sample_rate % d == 0 && sample_rate / d <= 0xffff)
-        .expect("the rate over itself, 1, holds 16 bits");
     let mut boxes = Vec::new();
     write_full_box(&mut boxes, b"esds", 0, 0, |out| {
         out.extend_from_slice(es_descriptor);
     });
-    if divisor > 1 {
-        // Spec gap: the SamplingRateBox extends FullBox('srat') without a
-        // version or flags; they are 0, as for the other boxes that define
-        // none.
-        write_full_box(&mut boxes, b"srat", 0, 0, |out| {
-            out.extend_from_slice(&sample_rate.to_be_bytes()); // sampling_rate
-        });
-    }
+    let sample_rate = put_sample_rate(&mut boxes, sample_rate);
     SampleEntry {
         coding_name: MP4A,
         sample_size: 16,
-        sample_rate: (sample_rate / divisor) << 16,
+        sample_rate,
         boxes,
     }
 }
