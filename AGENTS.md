@@ -66,12 +66,17 @@ encoded by any encoder, of the codecs whose MP4 mapping it implements: their
 bytes and durations, and the codec's configuration, as the caller gives them.
 It depends on no other encoder, and it neither decodes packets nor reads files
 or containers; it reads a packet's bytes only where its mapping requires. Ask
-before adding a codec to it. The command-line tool stays PCM-only.
+before adding a codec to it. Of AAC, it accepts AAC-LC only, as the AAC entry
+limits chelys to. The command-line tool stays PCM-only.
 
 *User, 2026-11-12.*
 *User, 2026-11-23: the exception for `chelys-mp4` added, when FLAC and Opus
 in MP4 were proposed; the wording was proposed by the agent and approved by
 the user.*
+*User, 2026-11-23: AAC-LC added to the codecs whose packets `chelys-mp4`
+accepts, so that AAC from another encoder can be put in MP4 files without
+re-encoding it; the wording was proposed by the agent and approved by the
+user.*
 
 ## Documenting gaps and readings of the standard
 
@@ -308,8 +313,9 @@ the agent and approved by the user.*
 
 ## Encoded packets for `chelys-mp4`'s tests
 
-Tests of `chelys-mp4` may take FLAC and Opus packets from encoders run as
-black boxes, as separate programs (for example ffmpeg, `flac` and `opusenc`),
+Tests of `chelys-mp4` may take FLAC, Opus and AAC-LC packets from encoders run
+as black boxes, as separate programs (for example ffmpeg, its native AAC
+encoder (`-c:a aac`), `flac` and `opusenc`),
 and read the packets, their durations and the codec's configuration from
 ffprobe's output (`-show_packets -show_data`, `-show_streams -show_data`). The
 test code parses only that output, not the files' formats. The packets are
@@ -320,3 +326,6 @@ decoders'.
 
 *User, 2026-11-23, when tests needed real FLAC and Opus packets: the wording
 was proposed by the agent and approved by the user.*
+*User, 2026-11-23: AAC-LC added, when `chelys-mp4` was to accept AAC-LC
+packets from any encoder; the wording was proposed by the agent and approved by
+the user.*
