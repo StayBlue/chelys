@@ -311,11 +311,27 @@ black-box decoding with ffmpeg may settle it, documented as for the standards.
 *User, 2026-11-23, when the documents were given: the wording was proposed by
 the agent and approved by the user.*
 
+## ALAC in MP4
+
+`chelys-mp4` writes ALAC (Apple Lossless) from "Apple Lossless Format "Magic
+Cookie" Description" (macosforge/alac, `ALACMagicCookieDescription.txt` at
+commit 3814718) only, with ISO/IEC 14496-12 for the boxes it refers to, under
+the same clean-room rules as the standards named under "Clean room". The rest
+of that repository, Apple's encoder and decoder, and other ALAC encoders and
+decoders, for example ffmpeg's and symphonia's, fall under "Clean room" as the
+codecs named there do. Where the document leaves something open or contradicts
+itself, black-box decoding with ffmpeg may settle it, documented as for the
+standards.
+
+*User, 2026-11-23, when the document was given: the wording was proposed by
+the agent and approved by the user.*
+
 ## Encoded packets for `chelys-mp4`'s tests
 
-Tests of `chelys-mp4` may take FLAC, Opus and AAC-LC packets from encoders run
-as black boxes, as separate programs (for example ffmpeg, its native AAC
-encoder (`-c:a aac`), `flac` and `opusenc`),
+Tests of `chelys-mp4` may take FLAC, Opus, AAC-LC and ALAC packets from
+encoders run as black boxes, as separate programs (for example ffmpeg, its
+native AAC encoder (`-c:a aac`), its ALAC encoder (`-c:a alac`), `flac` and
+`opusenc`),
 and read the packets, their durations and the codec's configuration from
 ffprobe's output (`-show_packets -show_data`, `-show_streams -show_data`). The
 test code parses only that output, not the files' formats. The packets are
@@ -329,3 +345,5 @@ was proposed by the agent and approved by the user.*
 *User, 2026-11-23: AAC-LC added, when `chelys-mp4` was to accept AAC-LC
 packets from any encoder; the wording was proposed by the agent and approved by
 the user.*
+*User, 2026-11-23: ALAC added, when `chelys-mp4` was to write ALAC; the
+wording was proposed by the agent and approved by the user.*
