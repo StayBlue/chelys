@@ -347,3 +347,38 @@ packets from any encoder; the wording was proposed by the agent and approved by
 the user.*
 *User, 2026-11-23: ALAC added, when `chelys-mp4` was to write ALAC; the
 wording was proposed by the agent and approved by the user.*
+
+## Vorbis
+
+chelys's Vorbis encoder is implemented from the "Vorbis I specification"
+(Xiph.Org Foundation, dated July 4, 2020;
+https://xiph.org/vorbis/doc/Vorbis_I_spec.pdf, as read on 2026-11-24) only,
+under the same clean-room rules as the standards named under "Clean room"; it
+is the one source added for Vorbis. chelys gives Vorbis packets, not Ogg
+streams, and implements neither the specification's appendix on RTP nor Ogg.
+Ask before adding a container for Vorbis.
+
+Tests may put chelys's Vorbis packets into Ogg streams, to decode them as
+black boxes, from RFC 3533 and its verified errata and from the
+specification's appendix on Ogg, under the same clean-room rules. That code
+stays in the tests. Other Ogg writers and readers, for example libogg and
+ffmpeg's Ogg muxer and demuxer, fall under "Clean room" as the codecs named
+there do.
+
+- Other Vorbis encoders and decoders, for example libvorbis, aoTuV, Tremor,
+  stb_vorbis, lewton and ffmpeg's, fall under "Clean room" as the codecs named
+  there do.
+- The specification defines only the bitstream and its decoding, and describes
+  no encoder. The encoder, including its psychoacoustic model, block-size
+  decisions, floors, residues, channel coupling and codebooks, is chelys's own
+  design. `Spec gap:` and `Spec reading:` mark what concerns the bitstream and
+  its decoding, not each choice of the encoder.
+- Codebooks, floor and residue configurations and modes are not taken from
+  other encoders, including from the setup headers of streams they produce.
+- The comment header gives chelys's vendor string and no comments.
+
+Where the specification or RFC 3533 leaves something open, black-box decoding
+with ffmpeg may settle it, documented as for the standards.
+
+*User, 2026-11-24, when the specification and RFC 3533 were given: the wording
+was proposed by the agent and approved by the user.*
