@@ -89,7 +89,9 @@ fn ffmpeg_decodes_a_tone_at_its_level_and_phase() {
 /// ffmpeg decodes each channel, at any sample rate, close to its own
 /// input: a tone of its own in each. ffmpeg gives the channels in its own
 /// order of speakers, not that of clause 4.3.9 above two channels, so each
-/// channel it gives is matched to the input it is nearest.
+/// channel it gives is matched to the input it is nearest. The tones are
+/// too short for the psychoacoustic model to find them tonal from the
+/// start, and it may take them as noise, which masks noise 6 dB below it.
 #[test]
 fn ffmpeg_decodes_each_channel_at_any_sample_rate() {
     let samples = 5 * 1024 + 300;
@@ -114,7 +116,7 @@ fn ffmpeg_decodes_each_channel_at_any_sample_rate() {
                     .map(|c| (c, snr(&channel(&pcm, c), &decoded, 0, 1)))
                     .max_by(|a, b| a.1.total_cmp(&b.1))
                     .unwrap();
-                assert!(snr > 15.0, "{context}: channel {out}, {snr:.1} dB");
+                assert!(snr > 6.0, "{context}: channel {out}, {snr:.1} dB");
                 matched.push(input);
             }
             matched.sort_unstable();
@@ -125,15 +127,16 @@ fn ffmpeg_decodes_each_channel_at_any_sample_rate() {
 }
 
 /// ffmpeg decodes noise, quiet or loud, and a mix of tones and noise, with
-/// no more noise than the floor allows.
+/// no more noise than the psychoacoustic model allows: noise masks noise 6
+/// dB below it, and tones noise 18 dB below them.
 #[test]
-fn ffmpeg_decodes_noise_and_tones_within_the_floor() {
+fn ffmpeg_decodes_noise_and_tones_within_what_the_model_allows() {
     let sample_rate = 44_100;
     let noise = noise(2 * sample_rate as usize);
     for level in [0.01, 0.3, 1.5] {
         let pcm: Vec<f32> = noise.iter().map(|&x| (level * x) as f32).collect();
         let snr = snr(&pcm, &round_trip(&pcm, sample_rate, 1), 0, 1);
-        assert!(snr > 15.0, "noise at {level}: {snr:.1} dB");
+        assert!(snr > 6.0, "noise at {level}: {snr:.1} dB");
     }
     let mut low = 0.0;
     let pcm: Vec<f32> = (noise.iter().enumerate())

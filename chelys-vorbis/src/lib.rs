@@ -11,7 +11,8 @@
 //! chelys's own.
 //!
 //! The encoder is being built: for now every block is long, each channel is
-//! coded on its own, and the psychoacoustic model is a first, simple one.
+//! coded on its own, and the psychoacoustic model's thresholds are coded as
+//! they are, with no setting of quality.
 //!
 //! The encoder gives Vorbis packets, not a container: its three
 //! [`Headers`], then each audio packet with its granule position, from

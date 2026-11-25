@@ -11,7 +11,7 @@ use super::audio::{self, Channel};
 use super::config::{Config, ConfigError};
 use super::header;
 use super::packet::{Packet, PacketSink};
-use super::psychoacoustic;
+use super::psychoacoustic::{self, Model, Tables};
 use super::residue::MAX_VALUE;
 use super::setup::{BLOCKSIZES, Mode, Setup};
 use super::window::window;
@@ -67,6 +67,9 @@ pub struct Encoder {
     config: Config,
     setup: Setup,
     mdct: Mdct,
+    tables: Tables,
+    /// The psychoacoustic model of each channel.
+    models: Vec<Model>,
     /// The window of a long block between long blocks.
     window: Vec<f64>,
     /// Each channel's samples from the start of the next packet's block,
@@ -96,10 +99,15 @@ impl Encoder {
     /// [`ConfigError`] lists.
     pub fn new(config: Config) -> Result<Self, ConfigError> {
         config.check()?;
+        let tables = Tables::new(config.sample_rate());
         Ok(Self {
             config,
             setup: Setup::new(),
             mdct: Mdct::new(BLOCK),
+            models: (0..config.channels())
+                .map(|_| Model::new(&tables))
+                .collect(),
+            tables,
             window: window(BLOCK, BLOCKSIZES[0], true, true, true),
             // The first block's first half is before the input, of silence.
             pcm: vec![vec![0.0; HOP as usize]; config.channels()],
@@ -244,10 +252,11 @@ impl Encoder {
         let lines = BLOCK / 2;
         let mut windowed = vec![0.0; BLOCK];
         let mut spectrum = vec![0.0; lines];
-        let coded: Vec<Option<(Vec<u32>, Vec<i32>)>> = self
-            .pcm
-            .iter()
-            .map(|pcm| {
+        let mut noise = vec![0.0; lines];
+        let coded: Vec<Option<(Vec<u32>, Vec<i32>)>> = (self.pcm.iter())
+            .zip(&mut self.models)
+            .map(|(pcm, model)| {
+                model.analyze(&self.tables, pcm, &mut noise);
                 for ((z, &x), &w) in windowed.iter_mut().zip(pcm).zip(&self.window) {
                     *z = x * w;
                 }
@@ -256,7 +265,7 @@ impl Encoder {
                     *line *= SPECTRUM_SCALE;
                 }
                 let floor = &self.setup.floor;
-                let values = floor.values(&psychoacoustic::floor_targets(&spectrum, floor));
+                let values = floor.values(&psychoacoustic::floor_targets(&noise, floor));
                 let curve = floor.curve(&values, lines);
                 let residue: Vec<i32> = (spectrum.iter().zip(&curve))
                     .map(|(&x, &f)| {
