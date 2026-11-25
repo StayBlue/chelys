@@ -33,7 +33,10 @@ const HOP: u64 = BLOCK as u64 / 2;
 /// `chelys_core::mdct`, with the window and the overlap and add of clauses
 /// 4.3.1 and 4.3.8, is `2 / N` times the sum of `X_k cos(2 pi / N (n +
 /// n_0)(k + 1/2))`; the decoder's inverse is taken to be that sum alone,
-/// and the spectrum is scaled by `2 / N` to match it.
+/// and the spectrum is scaled by `2 / N` to match it. Settled by decoding
+/// with ffmpeg (black box): it decodes a tone at its level, within 0.5 dB,
+/// neither delayed, advanced nor inverted; the conformance test is
+/// `ffmpeg_decodes_a_tone_at_its_level_and_phase`.
 const SPECTRUM_SCALE: f64 = 2.0 / BLOCK as f64;
 
 /// The three header packets that begin a stream, in their order (clause
