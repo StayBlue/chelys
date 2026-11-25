@@ -45,6 +45,7 @@ pub mod flac;
 pub mod gstreamer;
 pub mod lame;
 pub mod mpg123;
+pub mod ogg;
 pub mod peaq;
 
 use std::path::{Path, PathBuf};

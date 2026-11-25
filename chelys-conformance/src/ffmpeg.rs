@@ -450,3 +450,54 @@ pub fn decode_file(file: &[u8], extension: &str) -> Decoded {
         diagnostics: String::from_utf8_lossy(&output.stderr).into_owned(),
     }
 }
+
+/// Decodes the first audio stream of an Ogg stream, read as Ogg. ffmpeg
+/// n9.0.2 checks the CRC of each page whatever its `err_detect` option (see
+/// `ffmpeg_reports_a_page_whose_crc_is_wrong` in the `vorbis_silence`
+/// test). Where ffmpeg fails, as on a stream it cannot open, its diagnostics
+/// end with its exit status, rather than the call panicking, so that tests
+/// can show what it refuses.
+pub fn decode_ogg(stream: &[u8]) -> Decoded {
+    let file = TempFile::new("ogg", stream);
+    let output = Command::new("ffmpeg")
+        .args(["-nostdin", "-v", "error", "-f", "ogg", "-i"])
+        .arg(file.path())
+        .args(["-map", "0:a:0", "-f", "f32le", "-acodec", "pcm_f32le", "-"])
+        .output()
+        .unwrap_or_else(|e| panic!("could not run ffmpeg (is it on PATH?): {e}"));
+    let mut diagnostics = String::from_utf8_lossy(&output.stderr).into_owned();
+    if !output.status.success() {
+        diagnostics.push_str(&format!("ffmpeg failed: {}", output.status));
+    }
+    Decoded {
+        samples: output
+            .stdout
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect(),
+        diagnostics,
+    }
+}
+
+/// Describes the first audio stream of an Ogg stream, read as Ogg, as
+/// ffprobe reports it.
+pub fn probe_ogg(stream: &[u8]) -> StreamInfo {
+    let file = TempFile::new("ogg", stream);
+    let output = run(Command::new("ffprobe")
+        .args(["-v", "error", "-f", "ogg", "-select_streams", "a:0"])
+        .args(["-show_entries", "stream=codec_name,sample_rate,channels"])
+        .args(["-of", "default=noprint_wrappers=1"])
+        .arg(file.path()));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let field = |key: &str| {
+        stdout
+            .lines()
+            .find_map(|line| line.strip_prefix(key)?.strip_prefix('='))
+            .unwrap_or_else(|| panic!("ffprobe did not report {key}: {stdout:?}"))
+    };
+    StreamInfo {
+        codec_name: field("codec_name").to_owned(),
+        sample_rate: field("sample_rate").parse().unwrap(),
+        channels: field("channels").parse().unwrap(),
+    }
+}

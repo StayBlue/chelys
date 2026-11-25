@@ -28,3 +28,6 @@ pub use chelys_mp3 as mp3;
 #[cfg(feature = "mp4")]
 #[doc(inline)]
 pub use chelys_mp4 as mp4;
+#[cfg(feature = "vorbis")]
+#[doc(inline)]
+pub use chelys_vorbis as vorbis;

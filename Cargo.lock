@@ -9,6 +9,7 @@ dependencies = [
  "chelys-aac",
  "chelys-mp3",
  "chelys-mp4",
+ "chelys-vorbis",
 ]
 
 [[package]]
@@ -56,4 +57,11 @@ version = "0.0.1"
 dependencies = [
  "chelys",
  "chelys-conformance",
+]
+
+[[package]]
+name = "chelys-vorbis"
+version = "0.0.1"
+dependencies = [
+ "chelys-core",
 ]
