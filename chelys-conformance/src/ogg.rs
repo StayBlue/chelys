@@ -36,7 +36,12 @@ pub struct AudioPacket {
 /// page that is both is read. The first audio packet, which returns no
 /// samples, is put alone on the first audio page, whose granule position, 0,
 /// then gives the start of the stream alone, and the last page gives its
-/// end.
+/// end. Settled by decoding with ffmpeg (black box): it decodes a stream
+/// whose audio packets share one page to other lengths than its last
+/// granule position, and one whose first audio packet is alone to that
+/// length; the conformance tests are
+/// `ffmpeg_misreads_a_stream_on_one_audio_page` and
+/// `ffmpeg_trims_the_stream_to_its_last_granule_position`.
 ///
 /// # Panics
 ///
@@ -124,6 +129,12 @@ impl Writer {
 /// unreflected. (Reported erratum 8824 proposes the "unreflected" CRC, but
 /// is not verified, and says it was taken from another implementation; it
 /// is not a source.)
+///
+/// Settled by decoding with ffmpeg (black box): it checks each page's CRC,
+/// reporting a page whose CRC is wrong, and reads the pages of this CRC
+/// without error; the conformance tests are
+/// `ffmpeg_reports_a_page_whose_crc_is_wrong` and
+/// `ffmpeg_decodes_silence_at_any_sample_rate_and_channels`.
 pub fn crc(bytes: &[u8]) -> u32 {
     let mut register = 0u32;
     for &byte in bytes {
