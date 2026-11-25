@@ -77,7 +77,12 @@ pub const PROTECTED_HZ: f64 = 1500.0;
 /// curve (and thus this channel) is unused"). The channel is taken to
 /// decode to silence whatever its residue after decoupling, and its
 /// residue is taken as the other's, so that every angle is 0, which takes
-/// the fewest bits.
+/// the fewest bits. Settled by decoding with ffmpeg (black box): a silent
+/// channel beside a coded one decodes to silence, every sample of it, and a
+/// channel silent in some blocks only decodes to silence there; the
+/// conformance tests are
+/// `a_silent_channel_beside_a_coded_one_decodes_to_silence` and
+/// `a_channel_silent_in_some_blocks_decodes_to_silence_there`.
 pub fn couple(
     residues: [&mut Vec<i32>; 2],
     curves: [&[f32]; 2],
