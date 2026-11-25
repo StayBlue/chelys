@@ -13,14 +13,26 @@ const SAMPLE_RATES: [u32; 9] = [
     8_000, 11_025, 16_000, 22_050, 32_000, 44_100, 48_000, 96_000, 192_000,
 ];
 
-/// The rate of every stream: the psychoacoustic model's allowance as it is.
+/// The rate of every stream but where a test says otherwise: the noise
+/// offset 0 dB, the psychoacoustic model's allowance, raised with the width
+/// of each critical band, where the encoder finds bits scarce.
 const RATE: Rate = Rate::Variable {
     noise_offset_db: 0.0,
 };
 
 /// The headers and audio packets of `pcm`, interleaved.
 fn encode_packets(pcm: &[f32], sample_rate: u32, channels: usize) -> (Headers, Vec<AudioPacket>) {
-    let mut encoder = Encoder::new(Config::new(sample_rate, channels, RATE)).unwrap();
+    encode_packets_at(pcm, sample_rate, channels, RATE)
+}
+
+/// The headers and audio packets of `pcm`, interleaved, coded at `rate`.
+fn encode_packets_at(
+    pcm: &[f32],
+    sample_rate: u32,
+    channels: usize,
+    rate: Rate,
+) -> (Headers, Vec<AudioPacket>) {
+    let mut encoder = Encoder::new(Config::new(sample_rate, channels, rate)).unwrap();
     let headers = encoder.headers();
     let mut packets = Vec::new();
     let mut out = |packet: Packet<'_>| {
@@ -34,16 +46,16 @@ fn encode_packets(pcm: &[f32], sample_rate: u32, channels: usize) -> (Headers, V
     (headers, packets)
 }
 
-/// The Ogg stream of `pcm`, interleaved.
-fn encode(pcm: &[f32], sample_rate: u32, channels: usize) -> Vec<u8> {
-    let (headers, packets) = encode_packets(pcm, sample_rate, channels);
-    ogg::vorbis(&headers, &packets, 4)
-}
-
 /// `pcm` encoded and decoded by ffmpeg, which is to report nothing and to
 /// give back as many samples.
 fn round_trip(pcm: &[f32], sample_rate: u32, channels: usize) -> Vec<f32> {
-    let decoded = ffmpeg::decode_ogg(&encode(pcm, sample_rate, channels));
+    round_trip_at(pcm, sample_rate, channels, RATE)
+}
+
+/// `pcm` encoded at `rate` and decoded by ffmpeg, as [`round_trip`].
+fn round_trip_at(pcm: &[f32], sample_rate: u32, channels: usize, rate: Rate) -> Vec<f32> {
+    let (headers, packets) = encode_packets_at(pcm, sample_rate, channels, rate);
+    let decoded = ffmpeg::decode_ogg(&ogg::vorbis(&headers, &packets, 4));
     assert_eq!(decoded.diagnostics, "");
     assert_eq!(decoded.samples.len(), pcm.len());
     decoded.samples
@@ -139,10 +151,18 @@ fn ffmpeg_decodes_each_channel_at_any_sample_rate() {
 
 /// ffmpeg decodes noise, quiet or loud, and a mix of tones and noise, with
 /// no more noise than the psychoacoustic model allows: noise masks noise 6
-/// dB below it, and tones noise 18 dB below them.
+/// dB below it, and tones noise 18 dB below them. The streams are coded at
+/// an offset of -10.5 dB, which takes off at least as much as the encoder
+/// raises the allowance of any band for its width at their 44.1 kHz: at
+/// most 10.1 dB.
 #[test]
 fn ffmpeg_decodes_noise_and_tones_within_what_the_model_allows() {
     let sample_rate = 44_100;
+    let rate = Rate::Variable {
+        noise_offset_db: -10.5,
+    };
+    let round_trip =
+        |pcm: &[f32], sample_rate, channels| round_trip_at(pcm, sample_rate, channels, rate);
     let noise = noise(2 * sample_rate as usize);
     for level in [0.01, 0.3, 1.5] {
         let pcm: Vec<f32> = noise.iter().map(|&x| (level * x) as f32).collect();

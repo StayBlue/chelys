@@ -14,7 +14,8 @@ const SAMPLE_RATES: [u32; 9] = [
     8_000, 11_025, 16_000, 22_050, 32_000, 44_100, 48_000, 96_000, 192_000,
 ];
 
-/// The rate of every stream: the psychoacoustic model's allowance as it is.
+/// The rate of every stream: the noise offset 0 dB, the psychoacoustic
+/// model's allowance, raised with the width of each critical band.
 const RATE: Rate = Rate::Variable {
     noise_offset_db: 0.0,
 };

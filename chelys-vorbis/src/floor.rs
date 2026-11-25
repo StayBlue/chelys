@@ -15,23 +15,32 @@ use super::codebook::{Codebook, huffman_lengths};
 use super::frequencies;
 use super::setup::BLOCKSIZES;
 
-/// `floor1_multiplier`: each Y value is two steps of the table of clause
-/// 10.1, about 1.1 dB.
-pub const MULTIPLIER: u32 = 2;
+/// `floor1_multiplier`: each Y value is three steps of the table of clause
+/// 10.1, about 1.6 dB.
+///
+/// The floor is set for the least noise the lines about each post may
+/// take, and a step of 1.6 dB costs fewer bits than one of 1.1 for no less
+/// precision than that. Graded with PEAQ (GstPEAQ 0.6.1, black box) on the
+/// 51 tracks of the tuning set at 44.1 kHz, at noise offsets matched to
+/// the same mean bitrate, with the books of 45 posts, the streams graded
+/// -0.537 with 45 posts of two steps, -0.510 with 21 of two steps, -0.512
+/// with 21 of three and -0.508 with 30 of three, in stereo at 128.4 kbit/s;
+/// and -0.772, -0.688, -0.674 and -0.677 in one channel at 65.2 kbit/s.
+pub const MULTIPLIER: u32 = 3;
 
-/// The Y values' range for [`MULTIPLIER`] (clause 7.2.3): 0 to 127.
+/// The Y values' range for [`MULTIPLIER`] (clause 7.2.3): 0 to 85.
 pub const RANGE: i32 = [256, 128, 86, 64][MULTIPLIER as usize - 1];
 
 /// The Y values coded together by each partition's class.
 const CLASS_DIMENSIONS: usize = 3;
 
-/// The partitions of the floor of a long block, all of class 0: 45 posts
-/// besides the first two.
-const LONG_PARTITIONS: usize = 15;
+/// The partitions of the floor of a long block, all of class 0: 21 posts
+/// besides the first two (see [`MULTIPLIER`]).
+const LONG_PARTITIONS: usize = 7;
 
 /// The partitions of the floor of a short block, all of class 0: 9 posts
-/// besides the first two, a fifth as many as a long block's floor has
-/// over eight times as many lines.
+/// besides the first two, less than half as many as a long block's floor
+/// has over eight times as many lines.
 ///
 /// Short blocks come eight at a time, and their floors' bits count.
 /// Graded with PEAQ (GstPEAQ 0.6.1, black box) on the 51 tracks of the
@@ -193,6 +202,12 @@ impl Floor {
     /// that the posts before it in the list predict there, coded as 0,
     /// where its target is within `TOLERANCE` of it, and else its target.
     pub fn values(&self, targets: &[i32]) -> Vec<u32> {
+        self.values_exact(targets, &vec![false; targets.len()])
+    }
+
+    /// [`values`](Self::values), but the posts `exact` take their targets
+    /// wherever the prediction differs from them, by any amount.
+    fn values_exact(&self, targets: &[i32], exact: &[bool]) -> Vec<u32> {
         assert_eq!(targets.len(), self.xs.len(), "a target for each post");
         assert!(
             targets.iter().all(|t| (0..RANGE).contains(t)),
@@ -208,7 +223,8 @@ impl Floor {
                 continue;
             }
             let predicted = self.predict(&final_y, i);
-            if (target - predicted).abs() <= TOLERANCE {
+            let tolerance = if exact[i] { 0 } else { TOLERANCE };
+            if (target - predicted).abs() <= tolerance {
                 final_y[i] = predicted;
             } else {
                 final_y[i] = target;
@@ -227,8 +243,11 @@ impl Floor {
     /// Where a line is, the two posts about it are raised to the Y value
     /// whose floor is a `limit`th of the line, or by one where they are at
     /// it already and the floor drawn is still too low, and the floor drawn
-    /// again, until no line is. A line beyond `limit` steps of the highest
-    /// floor stays so.
+    /// again, until no line is. A post raised takes its target exactly,
+    /// not within `TOLERANCE`, which would leave it a step low or not drawn
+    /// at all. On either side, a post already raised to the highest Y value
+    /// is passed over for the nearest post beyond it that can still raise
+    /// the line. A line beyond `limit` steps of the highest floor stays so.
     pub fn values_within(
         &self,
         targets: &[i32],
@@ -236,9 +255,11 @@ impl Floor {
         limit: f64,
     ) -> (Vec<u32>, Vec<f32>) {
         let mut targets = targets.to_vec();
+        let mut exact = vec![false; targets.len()];
         loop {
-            let values = self.values(&targets);
+            let values = self.values_exact(&targets, &exact);
             let curve = self.curve(&values, spectrum.len());
+            let can_raise = |i: usize| !exact[i] || targets[i] < RANGE - 1;
             // The Y value each post is to be raised to, where any.
             let mut wanted: Vec<Option<i32>> = vec![None; targets.len()];
             for (k, (&x, &f)) in spectrum.iter().zip(&curve).enumerate() {
@@ -249,20 +270,40 @@ impl Floor {
                                 >= x.abs()
                         })
                         .unwrap_or(RANGE - 1);
-                    // The posts about the line, below or at it and above it.
+                    // The posts about the line, below or at it and above it,
+                    // or beyond them those that can raise it. The first and
+                    // last posts are always drawn, and so raise it until
+                    // they are at the highest Y value.
                     let above = self
                         .sorted
                         .iter()
                         .position(|&i| self.xs[i] as usize > k)
                         .expect("the last post is past every line");
-                    for i in [self.sorted[above - 1], self.sorted[above]] {
+                    let low = self.sorted[..above]
+                        .iter()
+                        .rev()
+                        .find(|&&i| can_raise(i))
+                        .unwrap_or(&self.sorted[0]);
+                    let high = self.sorted[above..]
+                        .iter()
+                        .find(|&&i| can_raise(i))
+                        .unwrap_or(&self.sorted[self.sorted.len() - 1]);
+                    for &i in [low, high] {
                         wanted[i] = Some(wanted[i].map_or(need, |w| w.max(need)));
                     }
                 }
             }
             let mut raised = false;
-            for (target, wanted) in targets.iter_mut().zip(wanted) {
+            for ((target, exact), wanted) in targets.iter_mut().zip(&mut exact).zip(wanted) {
                 if let Some(need) = wanted {
+                    if !*exact {
+                        // Taken exactly, it is drawn at its target, and
+                        // raised beyond it if that is still too low.
+                        *exact = true;
+                        *target = (*target).max(need);
+                        raised = true;
+                        continue;
+                    }
                     let new = if *target < need { need } else { *target + 1 };
                     if new < RANGE {
                         raised |= new != *target;
@@ -704,22 +745,53 @@ mod tests {
         }
     }
 
+    /// Whatever the targets, every line that the highest floor holds within
+    /// the limit is held within it, also where the posts about it lie at
+    /// the highest Y value but are not drawn.
+    #[test]
+    fn values_within_hold_every_line_the_highest_floor_holds() {
+        let limit = f64::from(crate::residue::MAX_VALUE);
+        let top = f64::from(INVERSE_DB_TABLE[((RANGE - 1) * MULTIPLIER as i32) as usize]);
+        let mut state = 7u32;
+        let mut next = |n: u32| {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (state >> 8) % n
+        };
+        for (floor, lines) in [(Floor::long(0), 1024), (Floor::short(0), 128)] {
+            for round in 0..400 {
+                let targets: Vec<i32> = (0..floor.xs().len())
+                    .map(|_| next(RANGE as u32) as i32)
+                    .collect();
+                let mut spectrum = vec![1e-6; lines];
+                for _ in 0..1 + round % 4 {
+                    let k = next(lines as u32) as usize;
+                    let loud = 0.5 + f64::from(next(1000)) / 2000.0;
+                    spectrum[k] = loud * limit * top;
+                }
+                let (values, curve) = floor.values_within(&targets, &spectrum, limit);
+                assert_eq!(curve, floor.curve(&values, lines));
+                for (k, (&x, &f)) in spectrum.iter().zip(&curve).enumerate() {
+                    assert!(
+                        x.abs() <= limit * f64::from(f),
+                        "round {round}, line {k}: {x} over {f}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn a_flat_floor_is_flat() {
-        let floor = Floor::long(0);
-        let mut values = vec![0; floor.xs().len()];
-        values[0] = 100;
-        values[1] = 100;
-        let curve = floor.curve(&values, 1024);
-        assert_eq!(curve.len(), 1024);
-        assert!(curve.iter().all(|&y| y == INVERSE_DB_TABLE[200]));
-        let short = Floor::short(0);
-        let mut values = vec![0; short.xs().len()];
-        values[0] = 100;
-        values[1] = 100;
-        let curve = short.curve(&values, 128);
-        assert_eq!(curve.len(), 128);
-        assert!(curve.iter().all(|&y| y == INVERSE_DB_TABLE[200]));
+        let y = 60;
+        let level = INVERSE_DB_TABLE[(y * MULTIPLIER) as usize];
+        for (floor, lines) in [(Floor::long(0), 1024), (Floor::short(0), 128)] {
+            let mut values = vec![0; floor.xs().len()];
+            values[0] = y;
+            values[1] = y;
+            let curve = floor.curve(&values, lines);
+            assert_eq!(curve.len(), lines);
+            assert!(curve.iter().all(|&v| v == level));
+        }
     }
 
     #[test]

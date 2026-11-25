@@ -7,8 +7,8 @@
 //! The offsets are calibrated with PEAQ (GstPEAQ 0.6.1, black box) as
 //! [`quality`] defines the scale: those of [`CALIBRATION_LEVELS`] are the
 //! offsets whose mean grade over its 51 tracks of nine kinds of music meets
-//! each level's target, interpolated between offsets of -9 to 10.5 dB swept
-//! in steps of 1.5 dB, and rounded to 0.1 dB.
+//! each level's target, interpolated between offsets of -16.5 to 7.5 dB
+//! swept in steps of 1.5 dB, and rounded to 0.1 dB.
 //!
 //! The offsets follow the encoder: they are to be calibrated again as it
 //! changes.
@@ -18,22 +18,32 @@ use chelys_core::quality::{self, CALIBRATION_LEVELS};
 /// Offsets in dB, for each of [`CALIBRATION_LEVELS`].
 type Offsets = [f64; CALIBRATION_LEVELS.len()];
 
-/// Two channels, coupled, calibrated at 44.1 kHz: from 69 kbit/s on
-/// average at level 0 to 122 at 50, 246 at 80 and 282 at 100, where the
-/// mean grades were -3.014, -0.740, -0.122 and -0.000.
+/// Two channels, coupled, calibrated at 44.1 kHz: from 62 kbit/s on
+/// average at level 0 to 105 at 50, 191 at 80 and 223 at 100, where the
+/// mean grades were -3.012, -0.746, -0.122 and 0.003.
 ///
-/// Swept, the mean grade was 0.037 at -9 dB, -0.057 at -7.5, -0.153 at -6,
-/// -0.241 at -4.5, -0.326 at -3, -0.423 at -1.5, -0.567 at 0, -0.827 at
-/// 1.5, -1.347 at 3, -2.176 at 4.5, -2.975 at 6, -3.287 at 7.5, -3.037 at 9
-/// and -2.348 at 10.5, where PEAQ had stopped following the coding (see
-/// [`quality`]).
-const STEREO: Offsets = [6.1, 5.0, 4.0, 3.2, 2.2, 1.1, -0.9, -4.0, -6.5, -7.9, -8.4];
+/// Swept, the mean grade was 0.133 at -16.5 dB, 0.111 at -15, 0.059 at
+/// -13.5, -0.021 at -12, -0.122 at -10.5, -0.237 at -9, -0.384 at -7.5,
+/// -0.545 at -6, -0.783 at -4.5, -1.134 at -3, -1.642 at -1.5, -2.269 at 0,
+/// -2.854 at 1.5, -3.257 at 3, -3.479 at 4.5, -3.595 at 6 and -3.661 at
+/// 7.5.
+const STEREO: Offsets = [
+    2.0, 0.4, -0.8, -2.0, -3.2, -4.7, -6.6, -8.7, -10.5, -11.9, -12.4,
+];
 
-/// Channels coded each on its own: those calibrated in two channels at
-/// 44.1 kHz before they were coupled, when they were coded so too, from 92
-/// kbit/s on average at level 0 to 144 at 50, 263 at 80 and 303 at 100,
-/// where the mean grades were -3.090, -0.728, -0.119 and -0.001.
-const UNCOUPLED: Offsets = [7.0, 5.9, 5.2, 4.6, 3.7, 2.6, 0.8, -2.1, -5.2, -6.9, -7.4];
+/// Channels coded each on its own, calibrated in two channels at 44.1 kHz
+/// coded so: from 72 kbit/s on average at level 0 to 119 at 50, 188 at 80
+/// and 221 at 100, where the mean grades were -3.006, -0.741, -0.120 and
+/// 0.000.
+///
+/// Swept, the mean grade was 0.109 at -16.5 dB, 0.128 at -15, 0.159 at
+/// -13.5, 0.135 at -12, 0.074 at -10.5, -0.032 at -9, -0.113 at -7.5,
+/// -0.252 at -6, -0.447 at -4.5, -0.682 at -3, -1.052 at -1.5, -1.637 at 0,
+/// -2.388 at 1.5, -3.042 at 3, -3.407 at 4.5, -3.574 at 6 and -3.656 at
+/// 7.5.
+const UNCOUPLED: Offsets = [
+    2.9, 1.6, 0.6, -0.4, -1.4, -2.7, -4.3, -5.9, -7.4, -9.0, -9.4,
+];
 
 /// The noise offset, in dB, of `level` (see
 /// [`Rate::Quality`](crate::Rate::Quality)) in a stream of `channels`
@@ -46,7 +56,7 @@ const UNCOUPLED: Offsets = [7.0, 5.9, 5.2, 4.6, 3.7, 2.6, 0.8, -2.1, -5.2, -6.9,
 /// model's allowance, whatever the sampling frequency and the channels, as
 /// each channel is coded within its own allowance, or a stereo pair's
 /// within a multiple of it (see
-/// [`ANGLE_ALLOWANCE`](crate::coupling::ANGLE_ALLOWANCE)); how far the
+/// [`angle_allowance`](crate::coupling::angle_allowance)); how far the
 /// grades of other configurations stray from the scale's has not been
 /// measured.
 ///

@@ -43,6 +43,7 @@ mod codebook;
 mod config;
 mod coupling;
 mod encoder;
+mod energy;
 mod floor;
 mod frequencies;
 mod header;

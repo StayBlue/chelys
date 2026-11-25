@@ -28,6 +28,11 @@
 //!   the tables, 24, whose width the tables do not give, take
 //!   [`TOP_WIDTH_BARK`], and the partition below them its width from its
 //!   lower neighbour alone. All are lowered by [`QUIET_LOWERED_DB`].
+//! - Step 4 takes the long FFT's unpredictability for the lines below
+//!   [`LONG_PREDICTED_HZ`], rather than for its first six lines alone.
+//! - Each partition's threshold, scaled by the rate's noise offset, is
+//!   raised further with the width of its critical band (see
+//!   [`BAND_EXPONENT`]).
 //! - Nothing past step 13 is taken: the threshold of each partition is
 //!   shared evenly among its lines, and becomes the noise each line of the
 //!   block's spectrum may take, as noise at the scale of the spectrum
@@ -76,9 +81,34 @@ pub const SHORT_BLOCKS: usize = BLOCK / SHORT_BLOCK;
 /// before the long one's center.
 pub const FIRST_SHORT: usize = BLOCK / 4 + SHORT_BLOCK / 4 - SHORT_BLOCK / 2;
 
-/// The lines of the long FFT whose unpredictability the long FFT gives;
-/// the short FFTs give it above (ISO/IEC 13818-7, clause C.1.4, step 4).
+/// The lines of the long FFT whose unpredictability the long FFT gives in
+/// ISO/IEC 13818-7, clause C.1.4, step 4; the short FFTs give it above.
+/// The model takes the long FFT's for more lines, up to
+/// [`LONG_PREDICTED_HZ`], and for these at any sample rate.
 const LONG_CW_LINES: usize = 6;
+
+/// The frequency below which the long FFT gives each line's
+/// unpredictability, where step 4 takes the short FFTs' above its sixth
+/// line.
+///
+/// chelys's own reading of step 4, for music whose partials the short FFTs
+/// do not resolve. A line of a short FFT is eight times as wide as one of
+/// the long FFT, 172 Hz at 44.1 kHz, wider than a critical band below about
+/// 1.5 kHz and than the spacing of the partials of most pitched sounds.
+/// Partials that share a line of it beat, and its phase, unlike theirs, is
+/// not predictable: steady partials are found as unpredictable as noise,
+/// and allowed noise's noise (step 7), 12 dB more than a tone's, where they
+/// are most heard. The long FFT's lines resolve them.
+///
+/// Graded with PEAQ (GstPEAQ 0.6.1, black box) on the 51 tracks of the
+/// tuning set at 44.1 kHz in stereo, at noise offsets matched to 128.4
+/// kbit/s, the streams graded -0.537 with the short FFTs' above the sixth
+/// line, and -0.514 with the long FFT's below 2 kHz and -0.522 below 4
+/// kHz; PEAQ's `EHSB`, which measures the error's harmonic structure, fell
+/// from 0.295 to 0.272 below 2 kHz. Taking the lesser of the two for every
+/// line, with the noise tilted by 2 dB per octave rather than weighted as
+/// [`BAND_EXPONENT`] weighs it, graded -0.532 against -0.542.
+const LONG_PREDICTED_HZ: f64 = 2000.0;
 
 /// `NMT(b)` and `TMN(b)` in dB, for all `b` (step 8).
 const NMT: f64 = 6.0;
@@ -167,6 +197,46 @@ const TOP_BARK: f64 = 24.0;
 /// printed and -1.387 at one Bark, for 1% more bits.
 const TOP_WIDTH_BARK: f64 = 1.0;
 
+/// The width of the narrowest critical bands, in Hz, below about 500 Hz,
+/// against which [`BAND_EXPONENT`] weighs each partition's: about one Bark
+/// of the tables' lowest partitions.
+const NARROWEST_BAND_HZ: f64 = 100.0;
+
+/// How the noise each partition is allowed grows with the width in Hz of
+/// its critical band (see [`band_weights`]): as that width, against
+/// [`NARROWEST_BAND_HZ`], to this power. At 44.1 kHz the weight is about
+/// 1.5 dB at 1 kHz, 6 dB at 4 kHz and 10 dB at 16 kHz.
+///
+/// chelys's own design, a deliberate departure from the model's threshold
+/// scaled alike in every band. The rate's offset sets how far the noise
+/// lies above or below the threshold, and at the rates chelys is asked for
+/// it mostly lies about it, where how far it lies above the threshold in
+/// one band against another is a choice of the encoder. Each critical
+/// band counts alike to how loud the noise is heard, and to PEAQ's measures,
+/// which average over bands evenly spaced in Bark; but noise lowered by a
+/// dB in a band costs bits in proportion to its lines, and the bands above
+/// 500 Hz widen with frequency, to some 35 times the narrowest at 16 kHz.
+/// Bits spent where the bands are narrow lower the noise of more bands than
+/// the same bits spent where they are wide. Spread so as to make the sum
+/// over the bands of their ratios of noise to threshold the least for the
+/// bits, each band's noise would grow with its width in lines, to the
+/// power 1; the power is lower, as the grades find, as the ratios of the
+/// bands where the noise lies furthest above the threshold count for more
+/// than their sum.
+///
+/// Graded with PEAQ (GstPEAQ 0.6.1, black box) on the 51 tracks of the
+/// tuning set at 44.1 kHz in stereo, at noise offsets matched to 128.4
+/// kbit/s, the streams graded -0.654 unweighted, and -0.538 and -0.537 with
+/// powers of 1/2 and 2/3. The gain is the in-band noise's: PEAQ's
+/// `TotalNMRB` fell from -9.73 to -10.7 dB, its `AvgModDiff1B` from 20.5 to
+/// 14.9 and its `RmsNoiseLoudB` from 0.484 to 0.296, while the bandwidth it
+/// measured fell from 853 to 838 lines. With each band's width taken as
+/// its lines for each Bark of its own width, the streams graded -0.538,
+/// -0.536, -0.543 and -0.574 with powers of 1/2, 2/3, 0.8 and 1; and
+/// weighted instead by a tilt of 1.5, 2 and 3 dB per octave above 250 Hz,
+/// -0.542, -0.542 and -0.575.
+const BAND_EXPONENT: f64 = 2.0 / 3.0;
+
 /// How far, in dB, the threshold in quiet is lowered below the tables'.
 ///
 /// The tables put it relative to an LSB of 16-bit PCM (ISO/IEC 13818-7,
@@ -235,13 +305,18 @@ fn absolute_noise(n: usize) -> f64 {
 pub struct Tables {
     long: FftTables,
     short: FftTables,
+    /// The lines of the long FFT whose unpredictability it gives itself
+    /// (see [`LONG_PREDICTED_HZ`]).
+    long_predicted: usize,
 }
 
 impl Tables {
     pub fn new(sample_rate: u32) -> Self {
+        let below = (LONG_PREDICTED_HZ * BLOCK as f64 / f64::from(sample_rate)).round();
         Self {
             long: FftTables::new(sample_rate, Fft::Long),
             short: FftTables::new(sample_rate, Fft::Short),
+            long_predicted: (below as usize).clamp(LONG_CW_LINES, LINES),
         }
     }
 
@@ -266,6 +341,9 @@ struct FftTables {
     rnorm: Vec<f64>,
     /// The threshold in quiet of each partition as an energy of the FFT.
     quiet: Vec<f64>,
+    /// The factor by which each partition's allowance is raised for the
+    /// width of its critical band (see [`band_weights`]).
+    weights: Vec<f64>,
     /// The samples of the FFT, and of its block.
     samples: usize,
 }
@@ -286,6 +364,7 @@ impl FftTables {
         let samples = 2 * fft.lines();
         Self {
             quiet: quiet(&partitions, quiet_reference(samples)),
+            weights: band_weights(&partitions, f64::from(sample_rate) / samples as f64),
             partitions,
             spreading,
             rnorm,
@@ -313,25 +392,64 @@ impl FftTables {
 /// whose line a sine wave of +-1/2 LSB is centered on has the energy
 /// `reference`, as the [module](self) describes.
 fn quiet(partitions: &[Partition], reference: f64) -> Vec<f64> {
-    let bval = |b: usize| partitions[b].bval;
-    let last = partitions
-        .iter()
-        .position(|p| p.bval >= TOP_BARK)
-        .unwrap_or(partitions.len())
-        .saturating_sub(1);
     (partitions.iter().enumerate())
         .map(|(b, p)| {
             let line = reference * 10f64.powf((p.quiet_db - QUIET_LOWERED_DB) / 10.0);
-            let width = if b > last || last == 0 {
-                TOP_WIDTH_BARK
-            } else {
-                match b {
-                    0 => bval(1) - bval(0),
-                    _ if b == last => bval(last) - bval(last - 1),
-                    _ => (bval(b + 1) - bval(b - 1)) / 2.0,
-                }
-            };
-            line * width
+            line * width_bark(partitions, b).unwrap_or(TOP_WIDTH_BARK)
+        })
+        .collect()
+}
+
+/// The last of `partitions` below [`TOP_BARK`], or the first if none is.
+fn last_below_top(partitions: &[Partition]) -> usize {
+    partitions
+        .iter()
+        .position(|p| p.bval >= TOP_BARK)
+        .unwrap_or(partitions.len())
+        .saturating_sub(1)
+}
+
+/// The width in Bark of partition `b` of `partitions`, as the
+/// [module](self) describes, or `None` for those at [`TOP_BARK`] and above,
+/// whose width the tables do not give.
+fn width_bark(partitions: &[Partition], b: usize) -> Option<f64> {
+    let bval = |b: usize| partitions[b].bval;
+    let last = last_below_top(partitions);
+    if b > last || last == 0 {
+        return None;
+    }
+    Some(match b {
+        0 => bval(1) - bval(0),
+        _ if b == last => bval(last) - bval(last - 1),
+        _ => (bval(b + 1) - bval(b - 1)) / 2.0,
+    })
+}
+
+/// The factor by which each of `partitions`, whose lines are `line_hz` Hz
+/// wide, is allowed more noise than the model's threshold scaled by the
+/// rate's offset: the width in Hz of the critical band about it, against
+/// [`NARROWEST_BAND_HZ`], raised to [`BAND_EXPONENT`], and no less than 1.
+/// That width is the Hz between the centers of its neighbours for each
+/// Bark between their `bval(b)`, or between its own and its one neighbour's
+/// at either end. The partitions at [`TOP_BARK`] and above, at which the
+/// tables' Bark values stop rising, take that of the last partition below
+/// them.
+fn band_weights(partitions: &[Partition], line_hz: f64) -> Vec<f64> {
+    let last = last_below_top(partitions);
+    let center = |b: usize| {
+        let lines = &partitions[b].lines;
+        (lines.start + lines.end) as f64 / 2.0 * line_hz
+    };
+    let band_hz = |b: usize| {
+        let (low, high) = (b.saturating_sub(1), (b + 1).min(last));
+        let bark = partitions[high].bval - partitions[low].bval;
+        (bark > 0.0).then(|| (center(high) - center(low)) / bark)
+    };
+    (0..partitions.len())
+        .map(|b| {
+            band_hz(b.min(last)).map_or(1.0, |hz| {
+                (hz / NARROWEST_BAND_HZ).max(1.0).powf(BAND_EXPONENT)
+            })
         })
         .collect()
 }
@@ -529,7 +647,8 @@ impl Partitioned {
             // Step 12, each partition weighed by one less than its lines,
             // as chelys's AAC encoder reads it.
             entropy -= (p.lines.len() - 1) as f64 * (thr / (self.e[b] + ENTROPY_UNIT)).log10();
-            let line = (thr * allowance / p.lines.len() as f64 * scale).max(least);
+            let line =
+                (thr * allowance * tables.weights[b] / p.lines.len() as f64 * scale).max(least);
             noise[p.lines.clone()].fill(line);
         }
         entropy
@@ -575,7 +694,7 @@ impl Model {
             short_fft: RealFft::new(SHORT_BLOCK),
             long_hann: hann(BLOCK),
             short_hann: hann(SHORT_BLOCK),
-            long_predictor: Predictor::new(LONG_CW_LINES),
+            long_predictor: Predictor::new(tables.long_predicted),
             short_predictor: Predictor::new(SHORT_LINES + 1),
             long: Partitioned::new(&tables.long),
             short: Partitioned::new(&tables.short),
@@ -638,9 +757,9 @@ impl Model {
         }
 
         // Steps 2 to 4: the long FFT, the energy of its lines, and their
-        // unpredictability, each line from the sixth on taking that of the
-        // short FFTs' line nearest it in frequency, as in chelys's AAC
-        // encoder.
+        // unpredictability, each line from `LONG_PREDICTED_HZ` on taking
+        // that of the short FFTs' line nearest it in frequency, as in
+        // chelys's AAC encoder.
         for ((s, &x), &w) in self.windowed.iter_mut().zip(samples).zip(&self.long_hann) {
             *s = x * w;
         }
@@ -648,9 +767,10 @@ impl Model {
         for (energy, x) in self.energy.iter_mut().zip(x) {
             *energy = x.re * x.re + x.im * x.im;
         }
+        let predicted = tables.long_predicted;
         self.long_predictor
-            .unpredictability(&x[..LONG_CW_LINES], &mut self.c[..LONG_CW_LINES]);
-        for (w, c) in self.c.iter_mut().enumerate().skip(LONG_CW_LINES) {
+            .unpredictability(&x[..predicted], &mut self.c[..predicted]);
+        for (w, c) in self.c.iter_mut().enumerate().skip(predicted) {
             *c = self.short_c_min[((w + SHORT_BLOCKS / 2) / SHORT_BLOCKS).min(SHORT_LINES)];
         }
 
@@ -773,6 +893,41 @@ mod tests {
         }
     }
 
+    /// The weights are about 1 where the critical bands are narrowest, rise
+    /// with frequency, and are alike in a long and a short block at the
+    /// same frequency.
+    #[test]
+    fn band_weights_rise_with_the_width_of_the_critical_bands() {
+        for sample_rate in [8_000, 22_050, 44_100, 48_000, 96_000] {
+            let tables = Tables::new(sample_rate);
+            for fft in [&tables.long, &tables.short] {
+                assert!(fft.weights[0] < 1.1, "{sample_rate} Hz");
+                // The tables' Bark values are rounded, and some partitions,
+                // as the last of a table, are narrower than the one below.
+                let mut most: f64 = 1.0;
+                for &weight in &fft.weights {
+                    assert!(weight >= most / 2.0, "{sample_rate} Hz");
+                    most = most.max(weight);
+                }
+            }
+        }
+        let tables = Tables::new(44_100);
+        let db_at = |fft: &FftTables, hz: f64| {
+            let line = (hz * fft.samples as f64 / 44_100.0) as usize;
+            let b = (fft.partitions.iter())
+                .position(|p| p.lines.contains(&line))
+                .unwrap();
+            10.0 * fft.weights[b].log10()
+        };
+        assert!(db_at(&tables.long, 200.0) < 0.5);
+        for (hz, db) in [(4_000.0, 6.0), (16_000.0, 10.0)] {
+            for fft in [&tables.long, &tables.short] {
+                let weight = db_at(fft, hz);
+                assert!((weight - db).abs() < 1.5, "{hz} Hz: {weight:.1} dB");
+            }
+        }
+    }
+
     #[test]
     fn the_short_blocks_lie_where_they_would_take_a_long_blocks_place() {
         // Centered from 576 to 1472: 576 after the center of the long block
@@ -811,7 +966,8 @@ mod tests {
             let scale = noise_scale(tables.samples);
             let least = absolute_noise(tables.samples);
             for (b, p) in tables.partitions.iter().enumerate() {
-                let expected = (tables.quiet[b] / p.lines.len() as f64 * scale).max(least);
+                let expected =
+                    (tables.quiet[b] * tables.weights[b] / p.lines.len() as f64 * scale).max(least);
                 assert!(noise[p.lines.clone()].iter().all(|&n| n == expected));
             }
         }
@@ -833,7 +989,9 @@ mod tests {
             .iter()
             .position(|p| p.lines.contains(&line))
             .unwrap();
-        let thr = out.long[line] * partitions[b].lines.len() as f64 / noise_scale(BLOCK);
+        let thr = out.long[line] * partitions[b].lines.len() as f64
+            / noise_scale(BLOCK)
+            / tables.long.weights[b];
         10.0 * (thr / model.long.e[b]).log10()
     }
 
@@ -848,6 +1006,21 @@ mod tests {
         assert!(
             tone_db < noise_db - 8.0,
             "{tone_db:.1} against {noise_db:.1} dB"
+        );
+    }
+
+    /// Two steady partials closer than a line of the short FFTs, below
+    /// `LONG_PREDICTED_HZ`, are found tonal, as one is.
+    #[test]
+    fn partials_that_share_a_short_line_are_tonal() {
+        let white = white(8 * BLOCK);
+        let line = 23;
+        let noise_db = margin_db(|t| white[t], 6, line);
+        let partial = |line: f64, t: usize| (2.0 * PI * line / BLOCK as f64 * t as f64).sin();
+        let pair_db = margin_db(|t| 0.3 * (partial(23.25, t) + partial(27.25, t)), 6, line);
+        assert!(
+            pair_db < noise_db - 8.0,
+            "{pair_db:.1} against {noise_db:.1} dB"
         );
     }
 

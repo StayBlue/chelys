@@ -10,6 +10,7 @@ use chelys_core::sample::{self, NonFiniteSample, Sample};
 use super::audio;
 use super::config::{Config, ConfigError};
 use super::coupling;
+use super::energy;
 use super::floor::Floor;
 use super::header;
 use super::packet::{Packet, PacketSink};
@@ -65,9 +66,10 @@ fn protected_lines(n: usize, sample_rate: u32) -> usize {
 }
 
 /// How much nearer zero than the nearest integer each line of the residue
-/// is rounded, in steps of the floor: a line is coded as `n` from `n -
-/// 1/2 + DEAD_ZONE` steps to `n + 1/2 + DEAD_ZONE`, and as 0 below 1/2 +
-/// DEAD_ZONE.
+/// is rounded where bits are scarce, in steps of the floor: a line is
+/// coded as `n` from `n - 1/2 + d` steps to `n + 1/2 + d`, and as 0 below
+/// 1/2 + `d`, for a dead zone `d` from 0 where bits are plentiful to this
+/// where they are scarce (see [`scarcity`]).
 ///
 /// More lines are coded as 0, and the rest a little low, for fewer bits.
 /// Graded with PEAQ (GstPEAQ 0.6.1, black box) on the 51 tracks of the
@@ -78,8 +80,42 @@ fn protected_lines(n: usize, sample_rate: u32) -> usize {
 /// the nearest. With it lowered by 40 dB, a dead zone of 0.15 graded
 /// -0.879 and -0.696, against -0.866 and -0.717 at 0.1, no better.
 ///
+/// Where bits are plentiful, the noise it adds, and the level it takes from
+/// each band, cost more than the bits it saves buy: once the model
+/// weighed each band's noise (see the psychoacoustic model's
+/// `BAND_EXPONENT`), at noise offsets matched to each bitrate, the streams
+/// graded -0.904 with it and -0.921 with 0.05 at 96.5 kbit/s, and, with the
+/// angles narrowed within [`coupling::LEAST_ANGLE_ALLOWANCE`], -0.295 with
+/// it, -0.284 with 0.05 and -0.282 with none at 159.2 kbit/s, where PEAQ's
+/// `ADBB` fell from 0.82 to 0.57.
+///
 /// [`frequencies`]: super::frequencies
 const DEAD_ZONE: f64 = 0.1;
+
+/// The noise offsets, in dB, at and above which bits are scarce, and at
+/// and below which they are plentiful (see [`scarcity`]): about 96 and 160
+/// kbit/s in stereo at 44.1 kHz.
+const SCARCE_OFFSET_DB: f64 = -4.0;
+const PLENTIFUL_OFFSET_DB: f64 = -9.0;
+
+/// How scarce bits are at the noise offset `noise_offset_db`: 1 at and
+/// above [`SCARCE_OFFSET_DB`], 0 at and below [`PLENTIFUL_OFFSET_DB`], and
+/// in a straight line between, by which the dead zone and the narrowing of
+/// angles that trade noise for bits are tapered.
+///
+/// chelys's own design: both were tuned where bits were scarce, and where
+/// they are plentiful the noise they add costs more than the bits they save
+/// buy (see [`DEAD_ZONE`] and [`coupling::LEAST_ANGLE_ALLOWANCE`]). Each
+/// takes more bits as the offset falls, as the offset itself does, so that
+/// a lower offset never gives a shorter stream. Graded with PEAQ (GstPEAQ
+/// 0.6.1, black box) on the 51 tracks of the tuning set at 44.1 kHz in
+/// stereo at 128.4 kbit/s, where the offset is about -6.5 dB, the streams
+/// graded -0.479 tapered so, against -0.476 with neither tapered and -0.486
+/// with both as where bits are plentiful.
+fn scarcity(noise_offset_db: f64) -> f64 {
+    ((noise_offset_db - PLENTIFUL_OFFSET_DB) / (SCARCE_OFFSET_DB - PLENTIFUL_OFFSET_DB))
+        .clamp(0.0, 1.0)
+}
 
 /// The three header packets that begin a stream, in their order (clause
 /// 4.2), which a container gives a decoder before the audio packets.
@@ -139,6 +175,11 @@ pub struct Encoder {
     hops: u64,
     /// Whether the last block coded is long.
     last_long: bool,
+    /// The dead zone of the rate's offset (see [`DEAD_ZONE`]).
+    dead_zone: f64,
+    /// The multiple of each channel's allowance that the narrowing of
+    /// angles may leave in a band (see [`coupling::angle_allowance`]).
+    angle_allowance: f64,
 }
 
 /// What [`Encoder::finish`] gives.
@@ -185,6 +226,8 @@ impl Encoder {
             packets: 0,
             hops: 0,
             last_long: true,
+            dead_zone: DEAD_ZONE * scarcity(noise_offset_db),
+            angle_allowance: coupling::angle_allowance(scarcity(noise_offset_db)),
         })
     }
 
@@ -383,7 +426,9 @@ impl Encoder {
     /// [`psychoacoustic`] sets, and its residue is quantized to it (see
     /// [`Quantized`]). A channel whose residue is all zeros is coded as
     /// unused. In a stereo stream, the two channels' residues are then
-    /// coupled (see [`coupling::couple`]).
+    /// coupled (see [`coupling::couple`]); in any other, the energy of each
+    /// used channel's lines is kept (see [`energy::keep`]), as the coupling
+    /// keeps it in stereo.
     fn block<O: PacketSink + ?Sized>(
         &mut self,
         short: Option<usize>,
@@ -443,19 +488,43 @@ impl Encoder {
                 for line in spectrum.iter_mut() {
                     *line *= spectrum_scale(n);
                 }
-                Quantized::new(floor, noise, spectrum, limit)
+                Quantized::new(floor, noise, spectrum, limit, self.dead_zone)
             })
             .collect();
         let used: Vec<bool> = channels.iter().map(Quantized::used).collect();
+        let kept = energy::kept_lines(lines, self.config.sample_rate());
+        let protected = protected_lines(n, self.config.sample_rate());
+        let partitions = &self.partitions[usize::from(mode.blockflag())];
         if let ([left, right], true) = (&mut channels[..], self.setup.coupled) {
             coupling::couple(
                 [&mut left.residue, &mut right.residue],
                 [&left.curve, &right.curve],
                 [&spectra[0], &spectra[1]],
                 [noises[0], noises[1]],
-                &self.partitions[usize::from(mode.blockflag())],
-                protected_lines(n, self.config.sample_rate()),
+                partitions,
+                protected,
+                self.angle_allowance,
+                kept,
             );
+        } else {
+            for (((channel, spectrum), noise), &used) in
+                (channels.iter_mut().zip(&spectra).zip(&noises)).zip(&used)
+            {
+                if used {
+                    let protected = energy::Protected {
+                        lines: protected,
+                        noise,
+                        partitions,
+                    };
+                    energy::keep(
+                        &mut channel.residue,
+                        spectrum,
+                        &channel.curve,
+                        protected,
+                        kept,
+                    );
+                }
+            }
         }
         let floors: Vec<Option<&[u32]>> = (channels.iter().zip(used))
             .map(|(channel, used)| used.then_some(&channel.values[..]))
@@ -517,9 +586,9 @@ impl Quantized {
     /// The floor that the model sets for the noise `noise` allows each
     /// line, raised where a line would be more than `limit` steps of it,
     /// and the residue of `spectrum`: each line divided by the floor there
-    /// and rounded, nearer zero by [`DEAD_ZONE`], and held within `limit`,
-    /// which only a line far past full scale passes.
-    fn new(floor: &Floor, noise: &[f64], spectrum: &[f64], limit: i32) -> Self {
+    /// and rounded, nearer zero by `dead_zone` (see [`DEAD_ZONE`]), and
+    /// held within `limit`, which only a line far past full scale passes.
+    fn new(floor: &Floor, noise: &[f64], spectrum: &[f64], limit: i32, dead_zone: f64) -> Self {
         // The floor the model sets, raised where it would put a line past
         // the residue's reach, as at an attack after silence, where the
         // threshold is held near the threshold in quiet.
@@ -531,7 +600,7 @@ impl Quantized {
         let residue = (spectrum.iter().zip(&curve))
             .map(|(&x, &f)| {
                 let steps = x / f64::from(f);
-                let q = steps.signum() * (steps.abs() + 0.5 - DEAD_ZONE).floor();
+                let q = steps.signum() * (steps.abs() + 0.5 - dead_zone).floor();
                 q.clamp(-f64::from(limit), f64::from(limit)) as i32
             })
             .collect();
@@ -545,5 +614,24 @@ impl Quantized {
     /// Whether any residue value is not 0.
     fn used(&self) -> bool {
         self.residue.iter().any(|&q| q != 0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The dead zone and the narrowing of angles are whole where bits are
+    /// scarce, and fall, never rising, as the offset falls.
+    #[test]
+    fn the_trades_of_noise_for_bits_taper_as_the_offset_falls() {
+        assert_eq!(scarcity(SCARCE_OFFSET_DB), 1.0);
+        assert_eq!(scarcity(10.0), 1.0);
+        assert_eq!(scarcity(PLENTIFUL_OFFSET_DB), 0.0);
+        assert_eq!(scarcity(-30.0), 0.0);
+        let offsets: Vec<f64> = (-120..=20).map(|o| f64::from(o) / 10.0).collect();
+        for pair in offsets.windows(2) {
+            assert!(scarcity(pair[0]) <= scarcity(pair[1]));
+        }
     }
 }

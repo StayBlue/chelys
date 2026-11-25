@@ -11,7 +11,8 @@ use chelys::vorbis::{Config, Encoder, Headers, Packet, Rate};
 use chelys_conformance::ffmpeg;
 use chelys_conformance::ogg::{self, AudioPacket};
 
-/// The rate of every stream: the psychoacoustic model's allowance as it is.
+/// The rate of every stream: the noise offset 0 dB, the psychoacoustic
+/// model's allowance, raised with the width of each critical band.
 const RATE: Rate = Rate::Variable {
     noise_offset_db: 0.0,
 };

@@ -10,10 +10,14 @@
 //! mapping here is chelys's own, the one that inverts it exactly, value
 //! for value.
 
+use super::energy;
+
 /// How much noise, as a multiple of each channel's allowance in a band,
-/// [`narrow_angles`] may leave in the band, above [`PROTECTED_HZ`]: up to 3
-/// times, about 4.8 dB, over the noise the psychoacoustic model allows the
-/// band at the rate's offset.
+/// [`narrow_angles`] may leave in the band, above [`PROTECTED_HZ`], where
+/// bits are scarce: up to 3 times, about 4.8 dB, over the noise the
+/// psychoacoustic model allows the band at the rate's offset. Where they
+/// are plentiful, the multiple is [`LEAST_ANGLE_ALLOWANCE`] (see
+/// [`angle_allowance`]).
 ///
 /// chelys's own design, a deliberate excess over the model's mask: the
 /// noise spent in making the channels alike buys more, in bits saved, than
@@ -32,10 +36,32 @@
 /// -0.488 unnarrowed, -1.653, -0.731 and -0.461 within 2, -1.547, -0.692
 /// and -0.449 within 3, -1.471, -0.695 and -0.452 within 4, and -1.493,
 /// -0.715 and -0.468 within 6; with [`PROTECTED_HZ`], -1.454, -0.677 and
-/// -0.424 within 3. The same multiple serves every rate, as the allowance
-/// is the rate's: within 3, with [`PROTECTED_HZ`], at 209 and 245 kbit/s,
-/// the streams graded 0.025 and 0.027 higher than unnarrowed.
+/// -0.424 within 3. Within 3, with [`PROTECTED_HZ`], at 209 and 245
+/// kbit/s, the streams graded 0.025 and 0.027 higher than unnarrowed.
 pub const ANGLE_ALLOWANCE: f64 = 3.0;
+
+/// The multiple of each channel's allowance that [`narrow_angles`] may
+/// leave in a band where bits are plentiful (see [`angle_allowance`]).
+///
+/// Once the model weighed each band's noise (see the psychoacoustic
+/// model's `BAND_EXPONENT`), graded as for [`ANGLE_ALLOWANCE`] at noise
+/// offsets matched to each bitrate, the streams graded -0.931, -0.904 and
+/// -0.922 within 2, 3 and 5 at 96.5 kbit/s; -0.553, -0.477 and -0.476
+/// within 1, 2 and 3 at 128.4; and -0.310, -0.295 and -0.320 within 1, 2
+/// and 3 at 159.2. PEAQ's `ADBB`, which measures the distortion of the
+/// frames it finds distorted against the steps above threshold of all of
+/// them, fell from 1.05 to 0.82 within 2 at 159.2: each line narrowed
+/// changes the level of each channel's band a little, and where bits are
+/// plentiful, the bits that saves buy less than the noise costs.
+pub const LEAST_ANGLE_ALLOWANCE: f64 = 2.0;
+
+/// The multiple of each channel's allowance that [`narrow_angles`] may
+/// leave in a band above [`PROTECTED_HZ`], where bits are as scarce as
+/// `scarcity`, from 0 where they are plentiful to 1 where they are
+/// scarce: from [`LEAST_ANGLE_ALLOWANCE`] to [`ANGLE_ALLOWANCE`].
+pub fn angle_allowance(scarcity: f64) -> f64 {
+    LEAST_ANGLE_ALLOWANCE + (ANGLE_ALLOWANCE - LEAST_ANGLE_ALLOWANCE) * scarcity.clamp(0.0, 1.0)
+}
 
 /// The frequency below which [`narrow_angles`] leaves no more noise in a
 /// band than each channel's allowance.
@@ -63,8 +89,12 @@ pub const PROTECTED_HZ: f64 = 1500.0;
 /// lines below the `protected` first are those below [`PROTECTED_HZ`].
 ///
 /// Where both channels are used, their angles are first narrowed where
-/// that leaves each channel's noise in each band within a multiple of its
-/// allowance (see [`narrow_angles`]).
+/// that leaves each channel's noise in each band within `allowance` times
+/// its allowance above [`PROTECTED_HZ`] (see [`narrow_angles`]). Then the
+/// energy of each used channel's first `kept` lines is kept (see
+/// [`energy::keep`]), which adds noise above [`PROTECTED_HZ`] and keeps
+/// each band within its allowance below: after the narrowing, which would
+/// code the lines it adds as 0 again, as that makes less noise.
 ///
 /// Spec reading: a channel whose residue is all zeros is coded as unused,
 /// its floor unused. Clause 4.3.3 then unsets its `no_residue` flag, as it
@@ -83,6 +113,7 @@ pub const PROTECTED_HZ: f64 = 1500.0;
 /// conformance tests are
 /// `a_silent_channel_beside_a_coded_one_decodes_to_silence` and
 /// `a_channel_silent_in_some_blocks_decodes_to_silence_there`.
+#[allow(clippy::too_many_arguments)]
 pub fn couple(
     residues: [&mut Vec<i32>; 2],
     curves: [&[f32]; 2],
@@ -90,20 +121,38 @@ pub fn couple(
     noises: [&[f64]; 2],
     partitions: &[usize],
     protected: usize,
+    allowance: f64,
+    kept: usize,
 ) {
     let [left, right] = residues;
     let used = [left.iter().any(|&v| v != 0), right.iter().any(|&v| v != 0)];
+    let guard = |c: usize| energy::Protected {
+        lines: protected,
+        noise: noises[c],
+        partitions,
+    };
     match used {
-        [true, true] => narrow_angles(
-            [left, right],
-            curves,
-            spectra,
-            noises,
-            partitions,
-            protected,
-        ),
-        [true, false] => right.clone_from(left),
-        [false, true] => left.clone_from(right),
+        [true, true] => {
+            narrow_angles(
+                [&mut *left, &mut *right],
+                curves,
+                spectra,
+                noises,
+                partitions,
+                protected,
+                allowance,
+            );
+            energy::keep(left, spectra[0], curves[0], guard(0), kept);
+            energy::keep(right, spectra[1], curves[1], guard(1), kept);
+        }
+        [true, false] => {
+            energy::keep(left, spectra[0], curves[0], guard(0), kept);
+            right.clone_from(left);
+        }
+        [false, true] => {
+            energy::keep(right, spectra[1], curves[1], guard(1), kept);
+            left.clone_from(right);
+        }
         [false, false] => {}
     }
     for (l, r) in left.iter_mut().zip(right.iter_mut()) {
@@ -146,8 +195,8 @@ pub fn square_polar(magnitude_channel: i32, angle_channel: i32) -> (i32, i32) {
 /// partition of the psychoacoustic model, `partitions` giving each line's,
 /// split at the `protected` first line: the model allows each of its lines
 /// the same share of the partition's threshold, which it takes as masked
-/// together. In each band, each channel may take [`ANGLE_ALLOWANCE`] times
-/// the noise its lines are allowed, or below the `protected` first line
+/// together. In each band, each channel may take `allowance` times the
+/// noise its lines are allowed, or below the `protected` first line
 /// the allowance itself, less the noise its rounding makes. Each line
 /// whose values differ may take the value between them, either included,
 /// of the least noise in the two channels together; the lines are taken in
@@ -163,6 +212,7 @@ fn narrow_angles(
     noises: [&[f64]; 2],
     partitions: &[usize],
     protected: usize,
+    allowance: f64,
 ) {
     let [left, right] = residues;
     let lines = left.len();
@@ -178,10 +228,10 @@ fn narrow_angles(
             room.push([0.0; 2]);
         }
         bands.push(room.len() - 1);
-        let allowance = if k < protected { 1.0 } else { ANGLE_ALLOWANCE };
+        let multiple = if k < protected { 1.0 } else { allowance };
         let room = room.last_mut().expect("a band was pushed");
-        room[0] += allowance * noises[0][k] - noise(0, k, left[k]);
-        room[1] += allowance * noises[1][k] - noise(1, k, right[k]);
+        room[0] += multiple * noises[0][k] - noise(0, k, left[k]);
+        room[1] += multiple * noises[1][k] - noise(1, k, right[k]);
     }
     // For each line whose values differ, the value of the least noise, and
     // the noise it adds in each channel.
@@ -305,6 +355,7 @@ mod tests {
             [noise, noise],
             &partitions,
             protected,
+            ANGLE_ALLOWANCE,
         );
         for start in (0..lines).step_by(16) {
             let split = protected.clamp(start, start + 16);
@@ -362,6 +413,15 @@ mod tests {
     }
 
     #[test]
+    fn the_angle_allowance_falls_as_bits_grow_plentiful() {
+        assert_eq!(angle_allowance(1.0), ANGLE_ALLOWANCE);
+        assert_eq!(angle_allowance(2.0), ANGLE_ALLOWANCE);
+        assert_eq!(angle_allowance(0.0), LEAST_ANGLE_ALLOWANCE);
+        assert_eq!(angle_allowance(-1.0), LEAST_ANGLE_ALLOWANCE);
+        assert!((angle_allowance(0.5) - 2.5).abs() < 1e-12);
+    }
+
+    #[test]
     fn an_unused_channel_takes_the_others_residue_and_no_angle() {
         let lines = 64;
         let (spectra, curve, noise) = alike(lines);
@@ -379,6 +439,8 @@ mod tests {
                 sources,
                 [&noise, &noise],
                 &vec![0; lines],
+                0,
+                ANGLE_ALLOWANCE,
                 0,
             );
             let (magnitude, angle) = (&residues[0], &residues[1]);
