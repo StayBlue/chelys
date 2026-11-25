@@ -382,3 +382,34 @@ with ffmpeg may settle it, documented as for the standards.
 
 *User, 2026-11-24, when the specification and RFC 3533 were given: the wording
 was proposed by the agent and approved by the user.*
+
+## Vorbis encoders as benchmarks
+
+aoTuV's Vorbis encoder and FFmpeg's native Vorbis encoder (`-c:a vorbis`)
+may be run as black boxes to benchmark the quality of chelys's Vorbis
+output.
+
+- aoTuV is run through FFmpeg's `-c:a libvorbis`, with aoTuV's library in
+  place of libvorbis for that run only. It is built from its source, unread,
+  apart from the system's libvorbis, which other programs keep using.
+- FFmpeg's native encoder is run with `-strict experimental`, which it
+  requires.
+- Each is run at its default settings, apart from its quality level or
+  bitrate. That setting is chosen so that its streams match chelys's in
+  total size over the same tracks. Where an encoder cannot reach that size,
+  it is run at the nearest size it can reach, and its sizes are given with
+  its grades.
+- Only the PEAQ grades and measures of their decoded output are used. They
+  are taken from the same input, and through the same decoding and grading
+  as chelys's output. No other measurement is taken of their decoded output,
+  and no signal derived from it is given to PEAQ.
+- Their streams are not inspected beyond decoding them, their setup headers
+  included, as the Vorbis entry says. Their choices are not copied: their
+  grades show how far chelys's tuning has to go, not how to get there.
+- Their source code stays under "Clean room", as the Vorbis entry says.
+
+Record the versions of aoTuV and FFmpeg the benchmark was run with in the
+`chelys-conformance` crate's documentation, next to the decoders'.
+
+*User, 2026-11-24, when a benchmark for chelys's Vorbis encoder was to be
+chosen: the wording was proposed by the agent and approved by the user.*
