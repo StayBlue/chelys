@@ -21,7 +21,7 @@ mp3 = ["dep:chelys-mp3"]
 # MP4 files of AAC-LC with `aac`, and of FLAC, Opus, AAC-LC and ALAC packets
 # from any encoder: see chelys-mp4's documentation.
 mp4 = ["dep:chelys-mp4"]
-# Vorbis I packets: codes only silence for now.
+# Vorbis I packets.
 vorbis = ["dep:chelys-vorbis"]
 # Each codec's building blocks, for chelys's own conformance tests.
 unstable = [

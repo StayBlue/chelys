@@ -4,17 +4,37 @@
 //! The encoder as the library offers it: PCM in, packets out, as the PCM
 //! arrives.
 
+use chelys_core::mdct::Mdct;
 use chelys_core::sample::{self, NonFiniteSample, Sample};
 
-use super::audio;
+use super::audio::{self, Channel};
 use super::config::{Config, ConfigError};
 use super::header;
 use super::packet::{Packet, PacketSink};
-use super::setup::{self, BLOCKSIZES, Mode};
+use super::psychoacoustic;
+use super::residue::MAX_VALUE;
+use super::setup::{BLOCKSIZES, Mode, Setup};
+use super::window::window;
+
+/// The samples of a long block.
+const BLOCK: usize = BLOCKSIZES[1];
 
 /// The samples from one long block's center to the next's: half a long
 /// block, by which the blocks overlap.
-const HOP: u64 = BLOCKSIZES[1] as u64 / 2;
+const HOP: u64 = BLOCK as u64 / 2;
+
+/// The scale of the spectrum that a decoder takes, against the MDCT of
+/// `chelys_core::mdct`, `X_k = 2 * sum z_n cos(2 pi / N (n + n_0)(k +
+/// 1/2))` of the windowed samples `z_n`, at full scale 1.0.
+///
+/// Spec gap: the specification does not define the inverse MDCT, and so
+/// neither its scale, its phase nor its sign: it refers to a paper (its
+/// reference \[1\]) that is not among chelys's sources. The inverse of
+/// `chelys_core::mdct`, with the window and the overlap and add of clauses
+/// 4.3.1 and 4.3.8, is `2 / N` times the sum of `X_k cos(2 pi / N (n +
+/// n_0)(k + 1/2))`; the decoder's inverse is taken to be that sum alone,
+/// and the spectrum is scaled by `2 / N` to match it.
+const SPECTRUM_SCALE: f64 = 2.0 / BLOCK as f64;
 
 /// The three header packets that begin a stream, in their order (clause
 /// 4.2), which a container gives a decoder before the audio packets.
@@ -42,6 +62,13 @@ pub struct Headers {
 /// on how the input is divided between calls.
 pub struct Encoder {
     config: Config,
+    setup: Setup,
+    mdct: Mdct,
+    /// The window of a long block between long blocks.
+    window: Vec<f64>,
+    /// Each channel's samples from the start of the next packet's block,
+    /// fewer than a block's between calls.
+    pcm: Vec<Vec<f64>>,
     /// The samples each channel has been given.
     samples: u64,
     /// The audio packets given.
@@ -68,6 +95,11 @@ impl Encoder {
         config.check()?;
         Ok(Self {
             config,
+            setup: Setup::new(),
+            mdct: Mdct::new(BLOCK),
+            window: window(BLOCK, BLOCKSIZES[0], true, true, true),
+            // The first block's first half is before the input, of silence.
+            pcm: vec![vec![0.0; HOP as usize]; config.channels()],
             samples: 0,
             packets: 0,
         })
@@ -88,7 +120,7 @@ impl Encoder {
         Headers {
             identification: header::identification(self.channels(), self.sample_rate(), BLOCKSIZES),
             comment: header::comment(),
-            setup: setup::setup(),
+            setup: self.setup.header(),
         }
     }
 
@@ -119,7 +151,16 @@ impl Encoder {
             samples.len(),
         );
         sample::check_interleaved(samples, channels)?;
-        self.take((samples.len() / channels) as u64, out);
+        self.take(samples.len() / channels, out, |pcm, start, end| {
+            for (c, pcm) in pcm.iter_mut().enumerate() {
+                pcm.extend(
+                    samples[start * channels + c..end * channels]
+                        .iter()
+                        .step_by(channels)
+                        .map(|&s| sample::convert(s)),
+                );
+            }
+        });
         Ok(())
     }
 
@@ -151,18 +192,36 @@ impl Encoder {
             "every channel has the same number of samples"
         );
         sample::check_planar(channels)?;
-        self.take(len as u64, out);
+        self.take(len, out, |pcm, start, end| {
+            for (pcm, samples) in pcm.iter_mut().zip(channels) {
+                pcm.extend(samples[start..end].iter().map(|&s| sample::convert(s)));
+            }
+        });
         Ok(())
     }
 
-    /// Takes `samples` more of each channel, and gives `out` the packets
-    /// whose blocks they complete.
-    fn take<O: PacketSink + ?Sized>(&mut self, samples: u64, out: &mut O) {
-        self.samples += samples;
-        // Packet k's block spans the samples from HOP * (k - 1) to
-        // HOP * (k + 1).
-        while HOP * (self.packets + 1) <= self.samples {
-            self.code(HOP * self.packets, out);
+    /// Takes `samples` more of each channel, which `append` appends to each
+    /// channel's from the `start`th to the `end`th, and gives `out` the
+    /// packets whose blocks they complete: no more at a time than complete
+    /// the next block, so that a call of any length needs no more memory
+    /// than a block's.
+    fn take<O: PacketSink + ?Sized>(
+        &mut self,
+        samples: usize,
+        out: &mut O,
+        mut append: impl FnMut(&mut [Vec<f64>], usize, usize),
+    ) {
+        let mut start = 0;
+        while start < samples {
+            let end = samples.min(start + BLOCK - self.pcm[0].len());
+            append(&mut self.pcm, start, end);
+            self.samples += (end - start) as u64;
+            start = end;
+            // Packet k's block spans the samples from HOP * (k - 1) to
+            // HOP * (k + 1).
+            if self.pcm[0].len() == BLOCK {
+                self.code(HOP * self.packets, out);
+            }
         }
     }
 
@@ -173,17 +232,58 @@ impl Encoder {
     /// decoder returns, for each packet after the first, the samples from
     /// the center of the block before it to the center of its own (clause
     /// 4.3.8): `HOP * k` samples in all once it has decoded packet k.
+    ///
+    /// Each channel's spectrum is given the floor that
+    /// [`psychoacoustic`] sets, and its residue is each line divided by
+    /// the floor there and rounded. A channel whose residue is all zeros
+    /// is coded as unused.
     fn code<O: PacketSink + ?Sized>(&mut self, granule_position: u64, out: &mut O) {
+        let lines = BLOCK / 2;
+        let mut windowed = vec![0.0; BLOCK];
+        let mut spectrum = vec![0.0; lines];
+        let coded: Vec<Option<(Vec<u32>, Vec<i32>)>> = self
+            .pcm
+            .iter()
+            .map(|pcm| {
+                for ((z, &x), &w) in windowed.iter_mut().zip(pcm).zip(&self.window) {
+                    *z = x * w;
+                }
+                self.mdct.transform(&windowed, &mut spectrum);
+                for line in &mut spectrum {
+                    *line *= SPECTRUM_SCALE;
+                }
+                let floor = &self.setup.floor;
+                let values = floor.values(&psychoacoustic::floor_targets(&spectrum, floor));
+                let curve = floor.curve(&values, lines);
+                let residue: Vec<i32> = (spectrum.iter().zip(&curve))
+                    .map(|(&x, &f)| {
+                        let q = (x / f64::from(f)).round();
+                        q.clamp(-f64::from(MAX_VALUE), f64::from(MAX_VALUE)) as i32
+                    })
+                    .collect();
+                residue.iter().any(|&q| q != 0).then_some((values, residue))
+            })
+            .collect();
+        let channels: Vec<Channel<'_>> = coded
+            .iter()
+            .map(|channel| match channel {
+                None => Channel::Unused,
+                Some((floor, residue)) => Channel::Coded { floor, residue },
+            })
+            .collect();
         // Spec gap: the first block has no block before it to lap with,
         // nor the last one after it, and the specification does not say
         // what their window flags are then. Both are set, as for long
         // blocks, as every block is: no decoder returns the half of either
         // block that the flag shapes.
-        let data = audio::silence(Mode::Long, true, true, self.channels());
+        let data = audio::packet(&self.setup, Mode::Long, true, true, &channels);
         out.packet(Packet {
             data: &data,
             granule_position,
         });
+        for pcm in &mut self.pcm {
+            pcm.drain(..HOP as usize);
+        }
         self.packets += 1;
     }
 
@@ -195,6 +295,10 @@ impl Encoder {
     pub fn finish<O: PacketSink + ?Sized>(mut self, out: &mut O) -> Finished {
         let last = self.samples.div_ceil(HOP);
         while self.packets <= last {
+            // The blocks past the input are of silence.
+            for pcm in &mut self.pcm {
+                pcm.resize(BLOCK, 0.0);
+            }
             self.code((HOP * self.packets).min(self.samples), out);
         }
         Finished {

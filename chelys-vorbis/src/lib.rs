@@ -10,8 +10,8 @@
 //! residues, mappings and modes of the setup header it writes, are
 //! chelys's own.
 //!
-//! The encoder is being built: for now each packet codes silence, whatever
-//! the input, in a stream that is valid as it will be.
+//! The encoder is being built: for now every block is long, each channel is
+//! coded on its own, and the psychoacoustic model is a first, simple one.
 //!
 //! The encoder gives Vorbis packets, not a container: its three
 //! [`Headers`], then each audio packet with its granule position, from
@@ -38,9 +38,13 @@ mod bitpack;
 mod codebook;
 mod config;
 mod encoder;
+mod floor;
 mod header;
 mod packet;
+mod psychoacoustic;
+mod residue;
 mod setup;
+mod window;
 
 pub use chelys_core::{NonFiniteSample, Sample};
 pub use config::{Config, ConfigError, MAX_CHANNELS};
@@ -62,5 +66,7 @@ pub mod internals {
             })*
         };
     }
-    reexport!(audio, bitpack, codebook, header, setup);
+    reexport!(
+        audio, bitpack, codebook, floor, header, residue, setup, window
+    );
 }
