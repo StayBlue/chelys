@@ -41,6 +41,7 @@ mod codebook;
 mod config;
 mod encoder;
 mod floor;
+mod frequencies;
 mod header;
 mod packet;
 mod psychoacoustic;

@@ -20,7 +20,7 @@ pub enum Rate {
     /// 10)`, and each packet is as long as that takes. Above 0 it allows
     /// more noise and gives shorter packets, below 0 less. No line is
     /// allowed less noise than the rounding of 16-bit PCM makes, whatever
-    /// the offset. At 44.1 kHz in stereo, music takes about 189 kbit/s at
+    /// the offset. At 44.1 kHz in stereo, music takes about 181 kbit/s at
     /// 0 dB.
     Variable { noise_offset_db: f64 },
     /// A variable rate at `level`: a level of the [`quality`](crate::quality)
@@ -29,7 +29,7 @@ pub enum Rate {
     ///
     /// It is [`Rate::Variable`] with the noise offset the level maps to,
     /// calibrated to the scale's grades at 44.1 kHz in two channels: music
-    /// in stereo averages about 174 kbit/s at level 50, 258 at 80 and 289
+    /// in stereo averages about 145 kbit/s at level 50, 266 at 80 and 306
     /// at 100. Every other configuration takes the same offsets, so that
     /// there a level gives the scale's grades only roughly.
     Quality { level: u8 },

@@ -41,6 +41,7 @@ pub struct Lattice {
 
 impl Lattice {
     /// The scalars `minimum + i * delta` for `i` below `values`.
+    #[cfg(test)]
     pub fn scalar(&self, index: u32) -> i32 {
         self.minimum + (index * self.delta) as i32
     }

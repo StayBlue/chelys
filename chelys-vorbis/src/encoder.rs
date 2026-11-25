@@ -39,6 +39,23 @@ const HOP: u64 = BLOCK as u64 / 2;
 /// `ffmpeg_decodes_a_tone_at_its_level_and_phase`.
 const SPECTRUM_SCALE: f64 = 2.0 / BLOCK as f64;
 
+/// How much nearer zero than the nearest integer each line of the residue
+/// is rounded, in steps of the floor: a line is coded as `n` from `n -
+/// 1/2 + DEAD_ZONE` steps to `n + 1/2 + DEAD_ZONE`, and as 0 below 1/2 +
+/// DEAD_ZONE.
+///
+/// More lines are coded as 0, and the rest a little low, for fewer bits.
+/// Graded with PEAQ (GstPEAQ 0.6.1, black box) on the 51 tracks of the
+/// tuning set at 44.1 kHz in stereo, interpolated between noise offsets
+/// to the same mean bitrates, with codebooks counted as in [`frequencies`]
+/// and the threshold in quiet lowered by 30 dB, the streams graded -0.952
+/// at 140 kbit/s and -0.769 at 150, against -1.076 and -0.842 rounded to
+/// the nearest. With it lowered by 40 dB, a dead zone of 0.15 graded
+/// -0.879 and -0.696, against -0.866 and -0.717 at 0.1, no better.
+///
+/// [`frequencies`]: super::frequencies
+const DEAD_ZONE: f64 = 0.1;
+
 /// The three header packets that begin a stream, in their order (clause
 /// 4.2), which a container gives a decoder before the audio packets.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -246,8 +263,8 @@ impl Encoder {
     ///
     /// Each channel's spectrum is given the floor that
     /// [`psychoacoustic`] sets, and its residue is each line divided by
-    /// the floor there and rounded. A channel whose residue is all zeros
-    /// is coded as unused.
+    /// the floor there and rounded, nearer zero by [`DEAD_ZONE`]. A
+    /// channel whose residue is all zeros is coded as unused.
     fn code<O: PacketSink + ?Sized>(&mut self, granule_position: u64, out: &mut O) {
         let lines = BLOCK / 2;
         let mut windowed = vec![0.0; BLOCK];
@@ -269,7 +286,8 @@ impl Encoder {
                 let curve = floor.curve(&values, lines);
                 let residue: Vec<i32> = (spectrum.iter().zip(&curve))
                     .map(|(&x, &f)| {
-                        let q = (x / f64::from(f)).round();
+                        let steps = x / f64::from(f);
+                        let q = steps.signum() * (steps.abs() + 0.5 - DEAD_ZONE).floor();
                         q.clamp(-f64::from(MAX_VALUE), f64::from(MAX_VALUE)) as i32
                     })
                     .collect();

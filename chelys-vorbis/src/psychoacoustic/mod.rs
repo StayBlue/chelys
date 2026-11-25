@@ -104,7 +104,24 @@ const TOP_WIDTH_BARK: f64 = 1.0;
 /// -0.712 at the same size, 9.65 dB below; the model graded higher on 30
 /// tracks, by 0.43 to 0.59 on average on electronic music, hip-hop and
 /// pop, and lower by 0.03 to 0.15 on the other kinds but rock.
-const QUIET_LOWERED_DB: f64 = 20.0;
+///
+/// Lowered further, quiet passages take more bits, and are worth them
+/// where the rest of the music is coarsely coded: on the tuning set, at
+/// 44.1 kHz in stereo, with codebooks counted as in [`frequencies`] and the
+/// encoder's dead zone, interpolated between noise offsets to the same
+/// mean bitrate, the streams graded -1.070 at 140 kbit/s lowered by 20 dB,
+/// -0.952 by 30, -0.866 by 40, -0.825 by 50 and -0.822 by 60, where no
+/// line is allowed less noise than [`ABSOLUTE_NOISE`] in any case; and
+/// -0.384 at 200 kbit/s lowered by 20 dB, -0.348 by 35 and -0.318 by 50.
+/// Where it is finely coded, they are not: about -0.22 at 230 kbit/s by
+/// any of them, and -0.004 at 280 kbit/s lowered by 20 dB, -0.060 by 35
+/// and -0.077 by 50. It is lowered alike at every offset all the same, as
+/// the offset scales the threshold in quiet with the rest: lowered less at
+/// lower offsets, by more than the offset falls, quiet passages would be
+/// coded with more noise at a higher level of quality.
+///
+/// [`frequencies`]: super::frequencies
+const QUIET_LOWERED_DB: f64 = 50.0;
 
 /// The energy, in the long FFT of samples at full scale 1.0, of the line
 /// that a sine wave of +-1/2 LSB of 16-bit PCM is centered on, to which

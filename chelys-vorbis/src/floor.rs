@@ -12,6 +12,7 @@
 
 use super::bitpack::{BitPacker, ilog};
 use super::codebook::{Codebook, huffman_lengths};
+use super::frequencies;
 
 /// `floor1_multiplier`: each Y value is two steps of the table of clause
 /// 10.1, about 1.1 dB.
@@ -41,10 +42,6 @@ const SUBCLASS_BITS: u32 = 2;
 /// The largest value of each subclass's book, the smallest values going
 /// to the first that codes them. Subclass 0 has no book, and gives 0.
 const SUBCLASS_LIMITS: [u32; 4] = [0, 3, 15, RANGE as u32 - 1];
-
-/// The weights of the subclasses, from which the master book's codeword
-/// lengths are made: chelys's guess at how often each is chosen.
-const SUBCLASS_WEIGHTS: [f64; 4] = [0.45, 0.3, 0.17, 0.08];
 
 /// By how much a Y value may differ from the one the floor predicts there
 /// and still be coded as that prediction, as 0, which takes no bits of its
@@ -89,31 +86,29 @@ impl Floor {
             .collect();
         let mut sorted: Vec<usize> = (0..xs.len()).collect();
         sorted.sort_by_key(|&i| xs[i]);
-        let master_weights: Vec<f64> = (0..1usize << (SUBCLASS_BITS * CLASS_DIMENSIONS as u32))
-            .map(|cval| {
-                (0..CLASS_DIMENSIONS)
-                    .map(|j| SUBCLASS_WEIGHTS[(cval >> (SUBCLASS_BITS as usize * j)) & 3])
-                    .product()
-            })
-            .collect();
+        // The codeword lengths of each book are those of a Huffman code for
+        // how often each of its entries was coded (see `frequencies`).
         let master = Codebook::new(
             1,
-            huffman_lengths(&master_weights)
+            huffman_lengths(&frequencies::weights(&frequencies::FLOOR_CLASSES))
                 .into_iter()
                 .map(Some)
                 .collect(),
         );
         // Each subclass's book codes values above the limit of the one
-        // before; its entries for the values below are unused. Smaller
-        // values are taken to be the more frequent.
+        // before; its entries for the values below are unused.
+        let counts: [&[u32]; 3] = [
+            &frequencies::FLOOR_SUBCLASS_1,
+            &frequencies::FLOOR_SUBCLASS_2,
+            &frequencies::FLOOR_SUBCLASS_3,
+        ];
         let subclass_books = [1, 2, 3].map(|s| {
-            let (low, high) = (SUBCLASS_LIMITS[s - 1], SUBCLASS_LIMITS[s]);
-            let scale = f64::from(high - low) / 3.0;
-            let weights: Vec<f64> = (low + 1..=high)
-                .map(|v| (-f64::from(v - low) / scale).exp())
-                .collect();
-            let mut lengths = vec![None; low as usize + 1];
-            lengths.extend(huffman_lengths(&weights).into_iter().map(Some));
+            let mut lengths = vec![None; SUBCLASS_LIMITS[s - 1] as usize + 1];
+            lengths.extend(
+                huffman_lengths(&frequencies::weights(counts[s - 1]))
+                    .into_iter()
+                    .map(Some),
+            );
             Codebook::new(1, lengths)
         });
         Self {
@@ -500,6 +495,23 @@ pub const INVERSE_DB_TABLE: [f32; 256] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn each_subclass_has_a_frequency_for_each_value_it_codes() {
+        let counts: [&[u32]; 3] = [
+            &frequencies::FLOOR_SUBCLASS_1,
+            &frequencies::FLOOR_SUBCLASS_2,
+            &frequencies::FLOOR_SUBCLASS_3,
+        ];
+        for (s, counts) in counts.iter().enumerate() {
+            let range = SUBCLASS_LIMITS[s + 1] - SUBCLASS_LIMITS[s];
+            assert_eq!(counts.len(), range as usize, "subclass {}", s + 1);
+        }
+        assert_eq!(
+            frequencies::FLOOR_CLASSES.len(),
+            1 << (SUBCLASS_BITS * CLASS_DIMENSIONS as u32)
+        );
+    }
 
     #[test]
     fn the_posts_are_unique_and_within_the_range() {

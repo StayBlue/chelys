@@ -13,6 +13,7 @@
 use super::bitpack::BitPacker;
 use super::codebook::{Codebook, Lattice, huffman_lengths};
 use super::floor::RANGEBITS;
+use super::frequencies;
 
 /// `residue_partition_size`.
 pub const PARTITION_SIZE: usize = 16;
@@ -26,16 +27,16 @@ const END: usize = 1 << RANGEBITS;
 pub const MAX_VALUE: i32 = 15 * 289 + 8 * 17 + 8;
 
 /// The value books, each a lattice of integers coded as vectors of its
-/// dimension: its dimension, its lattice, and the scale of the magnitudes
-/// of its values, in steps of its delta, from which the codeword lengths
-/// are made (see [`Residue::new`]).
-const VALUE_BOOKS: [(u16, Lattice, f64); 6] = [
-    (4, lattice(1, 1), 0.9),
-    (2, lattice(2, 1), 1.0),
-    (2, lattice(4, 1), 1.8),
-    (2, lattice(8, 1), 3.0),
-    (1, lattice(15, 17), 4.0),
-    (1, lattice(15, 289), 4.0),
+/// dimension: its dimension, its lattice, and how often each of its entries
+/// was coded, from which its codeword lengths are made (see
+/// [`frequencies`]).
+const VALUE_BOOKS: [(u16, Lattice, &[u32]); 6] = [
+    (4, lattice(1, 1), &frequencies::VALUES_0),
+    (2, lattice(2, 1), &frequencies::VALUES_1),
+    (2, lattice(4, 1), &frequencies::VALUES_2),
+    (2, lattice(8, 1), &frequencies::VALUES_3),
+    (1, lattice(15, 17), &frequencies::VALUES_4),
+    (1, lattice(15, 289), &frequencies::VALUES_5),
 ];
 
 /// The lattice of the integers from `-reach` to `reach` times `delta`.
@@ -67,11 +68,6 @@ const CLASSES: [(i32, &[usize]); 7] = [
 /// The most passes of any class.
 const PASSES: usize = 3;
 
-/// The weights of the classes, from which the codeword lengths of the
-/// classification book are made: chelys's guess at how often each is
-/// chosen.
-const CLASS_WEIGHTS: [f64; CLASSES.len()] = [0.3, 0.2, 0.15, 0.13, 0.12, 0.08, 0.02];
-
 /// The classifications coded by each codeword of the classification book:
 /// its dimension.
 const CLASSWORDS_PER_CODEWORD: usize = 2;
@@ -91,47 +87,21 @@ impl Residue {
     /// setup header's codebooks, in the order of
     /// [`codebooks`](Self::codebooks).
     ///
-    /// The codeword lengths of each value book are those of a Huffman code
-    /// for a model of its values: each scalar's magnitude, in steps of the
-    /// book's delta, falling off exponentially at the book's scale, and the
-    /// scalars of a vector independent.
+    /// The codeword lengths of each book are those of a Huffman code for
+    /// how often each of its entries was coded (see [`frequencies`]).
     pub fn new(first_book: u8) -> Self {
-        let classifications = CLASSES.len();
-        let class_weights: Vec<f64> = (0..classifications.pow(CLASSWORDS_PER_CODEWORD as u32))
-            .map(|entry| {
-                (0..CLASSWORDS_PER_CODEWORD)
-                    .map(|i| CLASS_WEIGHTS[entry / classifications.pow(i as u32) % classifications])
-                    .product()
-            })
-            .collect();
         let classbook = Codebook::new(
             CLASSWORDS_PER_CODEWORD as u16,
-            huffman_lengths(&class_weights)
+            huffman_lengths(&frequencies::weights(&frequencies::CLASSIFICATIONS))
                 .into_iter()
                 .map(Some)
                 .collect(),
         );
         let value_books = VALUE_BOOKS
             .iter()
-            .map(|&(dimensions, lattice, scale)| {
-                let scalar = |index: u32| {
-                    let steps = f64::from(lattice.scalar(index).unsigned_abs() / lattice.delta);
-                    (-steps / scale).exp()
-                };
-                let entries = (lattice.values as usize).pow(u32::from(dimensions));
-                let weights: Vec<f64> = (0..entries)
-                    .map(|entry| {
-                        let mut divisor = 1;
-                        (0..dimensions)
-                            .map(|_| {
-                                let index = entry / divisor % lattice.values as usize;
-                                divisor *= lattice.values as usize;
-                                scalar(index as u32)
-                            })
-                            .product()
-                    })
-                    .collect();
-                Codebook::with_lattice(dimensions, huffman_lengths(&weights), lattice)
+            .map(|&(dimensions, lattice, counts)| {
+                let lengths = huffman_lengths(&frequencies::weights(counts));
+                Codebook::with_lattice(dimensions, lengths, lattice)
             })
             .collect();
         Self {
@@ -296,6 +266,17 @@ mod tests {
         values[2 * PARTITION_SIZE + 3] = 9;
         values[3 * PARTITION_SIZE] = -264;
         assert_eq!(classify(&values).0, [0, 1, 5, 6]);
+    }
+
+    #[test]
+    fn each_book_has_a_frequency_for_each_entry() {
+        assert_eq!(frequencies::CLASSIFICATIONS.len(), CLASSES.len().pow(2));
+        for (dimensions, lattice, counts) in VALUE_BOOKS {
+            assert_eq!(
+                counts.len(),
+                (lattice.values as usize).pow(u32::from(dimensions))
+            );
+        }
     }
 
     #[test]

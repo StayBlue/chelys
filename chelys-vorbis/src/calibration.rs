@@ -7,8 +7,8 @@
 //! The offsets are calibrated with PEAQ (GstPEAQ 0.6.1, black box) as
 //! [`quality`] defines the scale: those of [`CALIBRATION_LEVELS`] are the
 //! offsets whose mean grade over its 51 tracks of nine kinds of music meets
-//! each level's target, interpolated between offsets of -12 to 9 dB swept
-//! in steps of 1.5 to 3 dB, and rounded to 0.1 dB.
+//! each level's target, interpolated between offsets of -9 to 10.5 dB swept
+//! in steps of 1.5 dB, and rounded to 0.1 dB.
 //!
 //! The calibration is coarse: every block is long and each channel is
 //! coded on its own, and the offsets are to be calibrated again as the
@@ -19,16 +19,16 @@ use chelys_core::quality::{self, CALIBRATION_LEVELS};
 /// Offsets in dB, for each of [`CALIBRATION_LEVELS`].
 type Offsets = [f64; CALIBRATION_LEVELS.len()];
 
-/// Two channels, calibrated at 44.1 kHz: from 111 kbit/s on average at
-/// level 0 to 174 at 50, 258 at 80 and 289 at 100, where the mean grades
-/// were -3.047, -0.742, -0.116 and 0.005.
+/// Two channels, calibrated at 44.1 kHz: from 93 kbit/s on average at
+/// level 0 to 145 at 50, 266 at 80 and 306 at 100, where the mean grades
+/// were -3.083, -0.726, -0.119 and -0.001.
 ///
-/// Swept, the mean grade was 0.159 at -12 dB, 0.112 at -9, 0.053 at -7.5,
-/// -0.033 at -6, -0.139 at -4.5, -0.265 at -3, -0.411 at -1.5, -0.578 at
-/// 0, -0.785 at 1.5, -1.098 at 3, -1.594 at 4.5, -2.354 at 6, -3.125 at
-/// 7.5, -3.453 at 9 and -2.672 at 12, where PEAQ had stopped following the
-/// coding (see [`quality`]).
-const STEREO: Offsets = [7.3, 6.1, 5.1, 4.1, 2.9, 1.2, -0.9, -2.9, -4.8, -6.0, -6.6];
+/// Swept, the mean grade was 0.074 at -9 dB, -0.001 at -7.5, -0.082 at -6,
+/// -0.158 at -4.5, -0.231 at -3, -0.305 at -1.5, -0.399 at 0, -0.545 at
+/// 1.5, -0.819 at 3, -1.410 at 4.5, -2.493 at 6, -3.226 at 7.5, -3.127 at 9
+/// and -2.460 at 10.5, where PEAQ had stopped following the coding (see
+/// [`quality`]).
+const STEREO: Offsets = [7.0, 5.9, 5.2, 4.6, 3.7, 2.6, 0.8, -2.2, -5.3, -7.0, -7.5];
 
 /// The noise offset, in dB, of `level` (see
 /// [`Rate::Quality`](crate::Rate::Quality)).
