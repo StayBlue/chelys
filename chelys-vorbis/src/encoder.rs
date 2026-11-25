@@ -98,14 +98,14 @@ impl Encoder {
     /// If the configuration asks for a stream the encoder cannot write, as
     /// [`ConfigError`] lists.
     pub fn new(config: Config) -> Result<Self, ConfigError> {
-        config.check()?;
+        let noise_offset_db = config.noise_offset_db()?;
         let tables = Tables::new(config.sample_rate());
         Ok(Self {
             config,
             setup: Setup::new(),
             mdct: Mdct::new(BLOCK),
             models: (0..config.channels())
-                .map(|_| Model::new(&tables))
+                .map(|_| Model::new(&tables, noise_offset_db))
                 .collect(),
             tables,
             window: window(BLOCK, BLOCKSIZES[0], true, true, true),

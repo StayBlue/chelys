@@ -10,9 +10,9 @@
 //! residues, mappings and modes of the setup header it writes, are
 //! chelys's own.
 //!
-//! The encoder is being built: for now every block is long, each channel is
-//! coded on its own, and the psychoacoustic model's thresholds are coded as
-//! they are, with no setting of quality.
+//! The encoder is being built: for now every block is long, and each
+//! channel is coded on its own, within the noise its psychoacoustic model
+//! allows, scaled by the [`Rate`] asked for.
 //!
 //! The encoder gives Vorbis packets, not a container: its three
 //! [`Headers`], then each audio packet with its granule position, from
@@ -20,9 +20,9 @@
 //! the stream.
 //!
 //! ```
-//! use chelys_vorbis::{Config, Encoder, Packet};
+//! use chelys_vorbis::{Config, Encoder, Packet, Rate};
 //!
-//! let mut encoder = Encoder::new(Config::new(44_100, 2))?;
+//! let mut encoder = Encoder::new(Config::new(44_100, 2, Rate::Quality { level: 50 }))?;
 //! let headers = encoder.headers();
 //! let pcm = vec![0.0f32; 2 * 44_100]; // a second of silence, interleaved
 //! let mut packets = Vec::new();
@@ -36,6 +36,7 @@
 
 mod audio;
 mod bitpack;
+mod calibration;
 mod codebook;
 mod config;
 mod encoder;
@@ -47,8 +48,8 @@ mod residue;
 mod setup;
 mod window;
 
-pub use chelys_core::{NonFiniteSample, Sample};
-pub use config::{Config, ConfigError, MAX_CHANNELS};
+pub use chelys_core::{NonFiniteSample, Sample, quality};
+pub use config::{Config, ConfigError, MAX_CHANNELS, Rate};
 pub use encoder::{Encoder, Finished, Headers};
 pub use header::VENDOR;
 pub use packet::{Packet, PacketSink};

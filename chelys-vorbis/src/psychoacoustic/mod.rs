@@ -290,6 +290,9 @@ impl Predictor {
 /// next.
 #[derive(Debug)]
 pub struct Model {
+    /// The factor by which each partition's threshold is scaled, from the
+    /// rate's noise offset.
+    allowance: f64,
     long_fft: RealFft,
     short_fft: RealFft,
     long_hann: Vec<f64>,
@@ -313,10 +316,12 @@ pub struct Model {
 
 impl Model {
     /// The model of a channel before its first block, which follows
-    /// silence.
-    pub fn new(tables: &Tables) -> Self {
+    /// silence, which allows each partition its threshold scaled by
+    /// `10^(noise_offset_db / 10)`.
+    pub fn new(tables: &Tables, noise_offset_db: f64) -> Self {
         let n = tables.partitions.len();
         Self {
+            allowance: 10f64.powf(noise_offset_db / 10.0),
             long_fft: RealFft::new(BLOCK),
             short_fft: RealFft::new(SHORT_BLOCK),
             long_hann: hann(BLOCK),
@@ -342,9 +347,9 @@ impl Model {
     /// of the spectrum that the decoder takes; each call takes the block
     /// 1024 samples after the last.
     ///
-    /// Each partition's threshold, an energy of the long FFT, is shared
-    /// evenly among its lines, and taken as noise: each line's share times
-    /// [`NOISE_SCALE`]. Line `k` of the spectrum, centered at `k + 1/2`
+    /// Each partition's threshold, an energy of the long FFT, is scaled by
+    /// the model's allowance, shared evenly among its lines, and taken as
+    /// noise: each line's share times [`NOISE_SCALE`]. Line `k` of the spectrum, centered at `k + 1/2`
     /// lines of the FFT, takes the share of line `k` of the FFT. No line
     /// takes less than [`ABSOLUTE_NOISE`].
     pub fn analyze(&mut self, tables: &Tables, samples: &[f64], noise: &mut [f64]) {
@@ -412,7 +417,7 @@ impl Model {
             let nb = ecb * tables.rnorm[b] * power_ratio(tonality(cb));
             let limited = nb.min(self.nb_last[b] * RPELEV);
             self.nb_last[b] = nb;
-            let thr = tables.quiet[b].max(limited);
+            let thr = tables.quiet[b].max(limited) * self.allowance;
             let line = (thr / p.lines.len() as f64 * NOISE_SCALE).max(ABSOLUTE_NOISE);
             noise[p.lines.clone()].fill(line);
         }
@@ -483,7 +488,7 @@ mod tests {
 
     fn analyze(sample_rate: u32, signal: impl Fn(usize) -> f64, blocks: usize) -> Vec<f64> {
         let tables = Tables::new(sample_rate);
-        let mut model = Model::new(&tables);
+        let mut model = Model::new(&tables, 0.0);
         let mut noise = vec![0.0; LINES];
         for k in 0..blocks {
             let samples: Vec<f64> = (0..BLOCK).map(|t| signal(k * LINES + t)).collect();
@@ -507,7 +512,7 @@ mod tests {
     /// in the long FFT, in dB, in the last of `blocks` blocks of `signal`.
     fn margin_db(signal: impl Fn(usize) -> f64, blocks: usize, line: usize) -> f64 {
         let tables = Tables::new(44_100);
-        let mut model = Model::new(&tables);
+        let mut model = Model::new(&tables, 0.0);
         let mut noise = vec![0.0; LINES];
         for k in 0..blocks {
             let samples: Vec<f64> = (0..BLOCK).map(|t| signal(k * LINES + t)).collect();

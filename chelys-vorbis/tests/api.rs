@@ -6,7 +6,12 @@
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use chelys_vorbis::{Config, ConfigError, Encoder, MAX_CHANNELS, NonFiniteSample, Packet};
+use chelys_vorbis::{Config, ConfigError, Encoder, MAX_CHANNELS, NonFiniteSample, Packet, Rate};
+
+/// The rate of every stream: the psychoacoustic model's allowance as it is.
+const RATE: Rate = Rate::Variable {
+    noise_offset_db: 0.0,
+};
 
 /// A tone in each channel, interleaved.
 fn pcm(len: usize, channels: usize) -> Vec<f32> {
@@ -40,7 +45,7 @@ fn panics(f: impl FnOnce()) -> bool {
 fn every_channel_count_up_to_eight_is_taken() {
     for channels in 1..=MAX_CHANNELS {
         for sample_rate in [1, 8_000, 44_100, 192_000, u32::MAX] {
-            let config = Config::new(sample_rate, channels);
+            let config = Config::new(sample_rate, channels, RATE);
             assert_eq!(config.check(), Ok(()), "{sample_rate} Hz, {channels}");
             let encoder = Encoder::new(config).unwrap();
             assert_eq!(encoder.channels(), channels);
@@ -52,20 +57,54 @@ fn every_channel_count_up_to_eight_is_taken() {
 #[test]
 fn errors_name_what_was_refused() {
     assert_eq!(
-        Encoder::new(Config::new(0, 1)).err(),
+        Encoder::new(Config::new(0, 1, RATE)).err(),
         Some(ConfigError::UnsupportedSampleRate { sample_rate: 0 })
     );
     for channels in [0, 9, 255, usize::MAX] {
         assert_eq!(
-            Encoder::new(Config::new(44_100, channels)).err(),
+            Encoder::new(Config::new(44_100, channels, RATE)).err(),
             Some(ConfigError::UnsupportedChannels { channels })
         );
+    }
+    for noise_offset_db in [f64::INFINITY, f64::NEG_INFINITY] {
+        assert_eq!(
+            Encoder::new(Config::new(44_100, 2, Rate::Variable { noise_offset_db })).err(),
+            Some(ConfigError::NoiseOffset { noise_offset_db })
+        );
+    }
+    let nan = Rate::Variable {
+        noise_offset_db: f64::NAN,
+    };
+    assert!(matches!(
+        Encoder::new(Config::new(44_100, 2, nan)).err(),
+        Some(ConfigError::NoiseOffset { noise_offset_db }) if noise_offset_db.is_nan()
+    ));
+    for level in [101, u8::MAX] {
+        assert_eq!(
+            Encoder::new(Config::new(44_100, 2, Rate::Quality { level })).err(),
+            Some(ConfigError::QualityLevel { level })
+        );
+    }
+}
+
+/// A higher level allows less noise, and so never gives a shorter stream.
+#[test]
+fn a_higher_level_gives_no_shorter_stream() {
+    let pcm = pcm(20_000, 2);
+    let mut last = 0;
+    for level in [0, 10, 25, 50, 75, 90, 100] {
+        let packets = encode_whole(Config::new(44_100, 2, Rate::Quality { level }), &pcm);
+        let bytes: usize = packets.iter().map(|(data, _)| data.len()).sum();
+        assert!(bytes >= last, "level {level}: {bytes} bytes, below {last}");
+        last = bytes;
     }
 }
 
 #[test]
 fn the_headers_describe_the_stream() {
-    let headers = Encoder::new(Config::new(32_000, 6)).unwrap().headers();
+    let headers = Encoder::new(Config::new(32_000, 6, RATE))
+        .unwrap()
+        .headers();
     assert_eq!(&headers.identification[..7], b"\x01vorbis");
     assert_eq!(headers.identification[11], 6);
     assert_eq!(&headers.identification[12..16], 32_000u32.to_le_bytes());
@@ -82,7 +121,7 @@ fn granule_positions_advance_a_hop_a_packet_and_end_at_the_input() {
         (1025, vec![0, 1024, 1025]),
         (3000, vec![0, 1024, 2048, 3000]),
     ] {
-        let packets = encode_whole(Config::new(48_000, 2), &pcm(samples, 2));
+        let packets = encode_whole(Config::new(48_000, 2, RATE), &pcm(samples, 2));
         let positions: Vec<u64> = packets.iter().map(|&(_, position)| position).collect();
         assert_eq!(positions, expected, "{samples} samples");
     }
@@ -90,7 +129,7 @@ fn granule_positions_advance_a_hop_a_packet_and_end_at_the_input() {
 
 #[test]
 fn a_packet_is_given_once_its_block_has_arrived() {
-    let mut encoder = Encoder::new(Config::new(48_000, 1)).unwrap();
+    let mut encoder = Encoder::new(Config::new(48_000, 1, RATE)).unwrap();
     let mut packets = Vec::new();
     encoder
         .encode_interleaved(&pcm(1023, 1), &mut keep(&mut packets))
@@ -110,7 +149,7 @@ fn a_packet_is_given_once_its_block_has_arrived() {
 fn the_stream_does_not_depend_on_how_the_input_is_given() {
     let channels = 3;
     let input = pcm(5000, channels);
-    let config = Config::new(44_100, channels);
+    let config = Config::new(44_100, channels, RATE);
     let whole = encode_whole(config, &input);
 
     let mut encoder = Encoder::new(config).unwrap();
@@ -138,7 +177,7 @@ fn the_stream_does_not_depend_on_how_the_input_is_given() {
 
 #[test]
 fn a_non_finite_sample_refuses_the_whole_call() {
-    let config = Config::new(48_000, 2);
+    let config = Config::new(48_000, 2, RATE);
     let mut input = pcm(3000, 2);
     input[2 * 2500 + 1] = f32::NAN;
     let mut encoder = Encoder::new(config).unwrap();
@@ -159,7 +198,7 @@ fn a_non_finite_sample_refuses_the_whole_call() {
 
 #[test]
 fn misshapen_input_panics() {
-    let mut encoder = Encoder::new(Config::new(48_000, 2)).unwrap();
+    let mut encoder = Encoder::new(Config::new(48_000, 2, RATE)).unwrap();
     let mut packets = Vec::new();
     assert!(panics(|| {
         let _ = encoder.encode_interleaved(&[0.0f32; 3], &mut keep(&mut packets));

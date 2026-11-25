@@ -28,8 +28,9 @@ pub trait PacketSink {
 /// Calls the closure with each packet, as to keep them:
 ///
 /// ```
-/// # use chelys_vorbis::{Config, Encoder, Packet};
-/// let mut encoder = Encoder::new(Config::new(48_000, 1)).unwrap();
+/// # use chelys_vorbis::{Config, Encoder, Packet, Rate};
+/// let config = Config::new(48_000, 1, Rate::Quality { level: 50 });
+/// let mut encoder = Encoder::new(config).unwrap();
 /// let mut packets = Vec::new();
 /// let mut out = |packet: Packet<'_>| packets.push((packet.data.to_vec(), packet.granule_position));
 /// encoder.encode_interleaved(&[0.0f32; 4096], &mut out).unwrap();

@@ -3,7 +3,7 @@
 
 use std::f64::consts::TAU;
 
-use chelys::vorbis::{Config, Encoder, MAX_CHANNELS, Packet};
+use chelys::vorbis::{Config, Encoder, MAX_CHANNELS, Packet, Rate};
 use chelys_conformance::ffmpeg;
 use chelys_conformance::ogg::{self, AudioPacket};
 
@@ -13,9 +13,14 @@ const SAMPLE_RATES: [u32; 9] = [
     8_000, 11_025, 16_000, 22_050, 32_000, 44_100, 48_000, 96_000, 192_000,
 ];
 
+/// The rate of every stream: the psychoacoustic model's allowance as it is.
+const RATE: Rate = Rate::Variable {
+    noise_offset_db: 0.0,
+};
+
 /// The Ogg stream of `pcm`, interleaved.
 fn encode(pcm: &[f32], sample_rate: u32, channels: usize) -> Vec<u8> {
-    let mut encoder = Encoder::new(Config::new(sample_rate, channels)).unwrap();
+    let mut encoder = Encoder::new(Config::new(sample_rate, channels, RATE)).unwrap();
     let headers = encoder.headers();
     let mut packets = Vec::new();
     let mut out = |packet: Packet<'_>| {
