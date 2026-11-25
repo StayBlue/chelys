@@ -1,7 +1,8 @@
 // Copyright (c) 2026 StayBlue
 // SPDX-License-Identifier: MIT
 
-//! The MDCT of clause C.3.1.2:
+//! The MDCT of the filterbanks, as clause C.3.1.2 of ISO/IEC 13818-7
+//! writes it:
 //!
 //! `X_k = 2 * sum_{n=0}^{N-1} z_n cos(2 pi / N (n + n_0)(k + 1/2))` for
 //! `0 <= k < N/2`, with `n_0 = (N/2 + 1) / 2`,
@@ -23,7 +24,7 @@
 
 use std::f64::consts::PI;
 
-use chelys_core::fft::{Complex, Fft};
+use crate::fft::{Complex, Fft};
 
 /// The most lines of any window: the 1024 of a long one.
 const MAX_LINES: usize = 1024;
@@ -119,11 +120,12 @@ impl Mdct {
 }
 
 #[cfg(test)]
-pub(super) mod tests {
+mod tests {
     use super::*;
 
-    /// The MDCT as clause C.3.1.2 writes it, summed directly.
-    pub fn direct(z: &[f64]) -> Vec<f64> {
+    /// The MDCT as clause C.3.1.2 of ISO/IEC 13818-7 writes it, summed
+    /// directly.
+    fn direct(z: &[f64]) -> Vec<f64> {
         let n = z.len() as f64;
         let n0 = (n / 2.0 + 1.0) / 2.0;
         (0..z.len() / 2)

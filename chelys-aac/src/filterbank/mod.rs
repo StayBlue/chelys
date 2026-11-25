@@ -9,15 +9,15 @@
 //! 15.3.3): once over the whole window, or once over each of the eight
 //! short windows of an EIGHT_SHORT_SEQUENCE.
 
-mod mdct;
 pub mod windows;
+
+use chelys_core::mdct::Mdct;
 
 use crate::channel::FRAME_LINES;
 use crate::sampling_frequency::SamplingFrequency;
 use crate::scalefactor_bands::{Transform, interleave};
 use crate::stream::FRAME_SAMPLES;
 use crate::window::{SHORT_WINDOWS, WindowSequence, WindowShape, Windows};
-use mdct::Mdct;
 use windows::window;
 
 /// The samples of a long window, `N` (clause 15.3.1): two blocks.
@@ -481,7 +481,17 @@ mod tests {
         let z: Vec<f64> = (input.iter().enumerate())
             .map(|(n, x)| x * decoder_window(WindowShape::Sine, 2048, n) * PCM_SCALE)
             .collect();
-        let direct = mdct::tests::direct(&z);
+        let n0 = (2048.0 / 2.0 + 1.0) / 2.0;
+        let direct: Vec<f64> = (0..1024)
+            .map(|k| {
+                let sum: f64 = (z.iter().enumerate())
+                    .map(|(i, &z)| {
+                        z * (2.0 * PI / 2048.0 * (i as f64 + n0) * (k as f64 + 0.5)).cos()
+                    })
+                    .sum();
+                2.0 * sum
+            })
+            .collect();
         for (k, (x, y)) in spectrum.iter().zip(&direct).enumerate() {
             assert!((x - y).abs() < 1e-6 * y.abs().max(1.0), "line {k}");
         }
