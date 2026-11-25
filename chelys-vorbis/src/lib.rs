@@ -10,9 +10,10 @@
 //! residues, mappings and modes of the setup header it writes, are
 //! chelys's own.
 //!
-//! The encoder is being built: for now every block is long, and each
-//! channel is coded on its own, within the noise its psychoacoustic model
-//! allows, scaled by the [`Rate`] asked for.
+//! The encoder is being built: for now each channel is coded on its own,
+//! in long blocks and, where its psychoacoustic model finds an attack, in
+//! short ones, within the noise the model allows, scaled by the [`Rate`]
+//! asked for.
 //!
 //! The encoder gives Vorbis packets, not a container: its three
 //! [`Headers`], then each audio packet with its granule position, from

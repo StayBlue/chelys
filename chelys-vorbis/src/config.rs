@@ -29,7 +29,7 @@ pub enum Rate {
     ///
     /// It is [`Rate::Variable`] with the noise offset the level maps to,
     /// calibrated to the scale's grades at 44.1 kHz in two channels: music
-    /// in stereo averages about 145 kbit/s at level 50, 266 at 80 and 306
+    /// in stereo averages about 144 kbit/s at level 50, 263 at 80 and 303
     /// at 100. Every other configuration takes the same offsets, so that
     /// there a level gives the scale's grades only roughly.
     Quality { level: u8 },

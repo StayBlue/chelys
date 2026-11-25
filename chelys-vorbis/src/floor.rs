@@ -13,6 +13,7 @@
 use super::bitpack::{BitPacker, ilog};
 use super::codebook::{Codebook, huffman_lengths};
 use super::frequencies;
+use super::setup::BLOCKSIZES;
 
 /// `floor1_multiplier`: each Y value is two steps of the table of clause
 /// 10.1, about 1.1 dB.
@@ -21,19 +22,24 @@ pub const MULTIPLIER: u32 = 2;
 /// The Y values' range for [`MULTIPLIER`] (clause 7.2.3): 0 to 127.
 pub const RANGE: i32 = [256, 128, 86, 64][MULTIPLIER as usize - 1];
 
-/// `rangebits`: the X values span 2^10, the 1024 lines of a long block.
-///
-/// Spec reading: a short block's 128 lines take the same posts; clause
-/// 7.2.4 draws the curve to the last post and then truncates it to the
-/// block's lines ("if \[hx\] is greater than \[n\]"), so posts past them are
-/// valid.
-pub const RANGEBITS: u32 = 10;
-
 /// The Y values coded together by each partition's class.
 const CLASS_DIMENSIONS: usize = 3;
 
-/// The partitions, all of class 0.
-const PARTITIONS: usize = 15;
+/// The partitions of the floor of a long block, all of class 0: 45 posts
+/// besides the first two.
+const LONG_PARTITIONS: usize = 15;
+
+/// The partitions of the floor of a short block, all of class 0: 9 posts
+/// besides the first two, a fifth as many as a long block's floor has
+/// over eight times as many lines.
+///
+/// Short blocks come eight at a time, and their floors' bits count.
+/// Graded with PEAQ (GstPEAQ 0.6.1, black box) on the 51 tracks of the
+/// tuning set at 44.1 kHz in stereo, interpolated between noise offsets to
+/// the same mean bitrate of 128 kbit/s, with short blocks' `rpelev` 1, the
+/// streams graded -1.165 with 2 partitions, -1.164 with 3, -1.173 with 5
+/// and -1.177 with 7.
+const SHORT_PARTITIONS: usize = 3;
 
 /// `floor1_class_subclasses` of class 0: two bits of the master book's
 /// entry choose each Y value's book.
@@ -48,13 +54,18 @@ const SUBCLASS_LIMITS: [u32; 4] = [0, 3, 15, RANGE as u32 - 1];
 /// own: chelys's choice, the envelope being smooth to within a Y step.
 const TOLERANCE: i32 = 1;
 
-/// The posts besides the first two, 0 and 2^[`RANGEBITS`]: the most that
-/// one class of three Y values fits in [`PARTITIONS`] partitions.
-const POSTS: usize = PARTITIONS * CLASS_DIMENSIONS;
-
-/// The floor's posts and books.
+/// A floor's posts and books.
+///
+/// The setup header has one floor for each block size, whose X values
+/// span the block's lines, 2^`rangebits`: the floor of a short block draws
+/// no line past its lines, and spends no Y values there. Both take the
+/// same books, which the setup header writes once.
 #[derive(Clone, Debug)]
 pub struct Floor {
+    /// `rangebits`: the X values span 2^`rangebits` lines.
+    rangebits: u32,
+    /// The partitions, of [`CLASS_DIMENSIONS`] posts each.
+    partitions: usize,
     /// `floor1_X_list`, in its order.
     xs: Vec<u32>,
     /// `low_neighbor` and `high_neighbor` of each post from the third
@@ -71,10 +82,23 @@ pub struct Floor {
 }
 
 impl Floor {
-    /// The floor, whose books are numbered from `first_book` among the
-    /// setup header's codebooks, in the order of [`codebooks`](Self::codebooks).
-    pub fn new(first_book: u8) -> Self {
-        let xs = list_order(&posts());
+    /// The floor of a long block, whose books are numbered from
+    /// `first_book` among the setup header's codebooks, in the order of
+    /// [`codebooks`](Self::codebooks).
+    pub fn long(first_book: u8) -> Self {
+        Self::new(first_book, BLOCKSIZES[1] / 2, LONG_PARTITIONS)
+    }
+
+    /// The floor of a short block, as [`long`](Self::long).
+    pub fn short(first_book: u8) -> Self {
+        Self::new(first_book, BLOCKSIZES[0] / 2, SHORT_PARTITIONS)
+    }
+
+    /// The floor of a block of `lines` lines, a power of two, of
+    /// `partitions` partitions.
+    fn new(first_book: u8, lines: usize, partitions: usize) -> Self {
+        let rangebits = lines.ilog2();
+        let xs = list_order(&posts(rangebits, partitions * CLASS_DIMENSIONS), rangebits);
         let neighbors = (0..xs.len())
             .map(|i| {
                 if i < 2 {
@@ -112,6 +136,8 @@ impl Floor {
             Codebook::new(1, lengths)
         });
         Self {
+            rangebits,
+            partitions,
             xs,
             neighbors,
             sorted,
@@ -136,8 +162,8 @@ impl Floor {
 
     /// Writes the floor's configuration (clause 7.2.2), after its type.
     pub fn write_setup(&self, out: &mut BitPacker) {
-        out.write(PARTITIONS as u32, 5);
-        for _ in 0..PARTITIONS {
+        out.write(self.partitions as u32, 5);
+        for _ in 0..self.partitions {
             out.write(0, 4); // floor1_partition_class_list: class 0
         }
         out.write(CLASS_DIMENSIONS as u32 - 1, 3);
@@ -153,9 +179,9 @@ impl Floor {
             out.write(book, 8);
         }
         out.write(MULTIPLIER - 1, 2);
-        out.write(RANGEBITS, 4);
+        out.write(self.rangebits, 4);
         for &x in &self.xs[2..] {
-            out.write(x, RANGEBITS);
+            out.write(x, self.rangebits);
         }
     }
 
@@ -191,6 +217,63 @@ impl Floor {
         }
         debug_assert_eq!(self.amplitudes(&values).0, final_y);
         values
+    }
+
+    /// [`values`](Self::values) for `targets`, raised where the floor they
+    /// draw is too low for `spectrum`, the lines of a block, so that no line
+    /// is more than `limit` steps of the floor, the most a residue value
+    /// may be; and the floor's curve, as [`curve`](Self::curve) gives it.
+    ///
+    /// Where a line is, the two posts about it are raised to the Y value
+    /// whose floor is a `limit`th of the line, or by one where they are at
+    /// it already and the floor drawn is still too low, and the floor drawn
+    /// again, until no line is. A line beyond `limit` steps of the highest
+    /// floor stays so.
+    pub fn values_within(
+        &self,
+        targets: &[i32],
+        spectrum: &[f64],
+        limit: f64,
+    ) -> (Vec<u32>, Vec<f32>) {
+        let mut targets = targets.to_vec();
+        loop {
+            let values = self.values(&targets);
+            let curve = self.curve(&values, spectrum.len());
+            // The Y value each post is to be raised to, where any.
+            let mut wanted: Vec<Option<i32>> = vec![None; targets.len()];
+            for (k, (&x, &f)) in spectrum.iter().zip(&curve).enumerate() {
+                if x.abs() > limit * f64::from(f) {
+                    let need = (0..RANGE)
+                        .find(|&y| {
+                            limit * f64::from(INVERSE_DB_TABLE[(y * MULTIPLIER as i32) as usize])
+                                >= x.abs()
+                        })
+                        .unwrap_or(RANGE - 1);
+                    // The posts about the line, below or at it and above it.
+                    let above = self
+                        .sorted
+                        .iter()
+                        .position(|&i| self.xs[i] as usize > k)
+                        .expect("the last post is past every line");
+                    for i in [self.sorted[above - 1], self.sorted[above]] {
+                        wanted[i] = Some(wanted[i].map_or(need, |w| w.max(need)));
+                    }
+                }
+            }
+            let mut raised = false;
+            for (target, wanted) in targets.iter_mut().zip(wanted) {
+                if let Some(need) = wanted {
+                    let new = if *target < need { need } else { *target + 1 };
+                    if new < RANGE {
+                        raised |= new != *target;
+                        *target = new;
+                    }
+                }
+            }
+            if !raised {
+                return (values, curve);
+            }
+        }
     }
 
     /// `render_point` at post `i` from its neighbors' final Y values.
@@ -283,7 +366,7 @@ impl Floor {
         let (final_y, step2) = self.amplitudes(values);
         let multiplier = MULTIPLIER as i32;
         // Room for a line drawn to the last post, past `lines`.
-        let mut floor = vec![0; lines.max(1 << RANGEBITS)];
+        let mut floor = vec![0; lines.max(1 << self.rangebits)];
         let (mut hx, mut hy) = (0, 0);
         let mut lx = 0;
         let mut ly = final_y[self.sorted[0]] * multiplier;
@@ -332,32 +415,33 @@ fn wrap(target: i32, predicted: i32) -> u32 {
     val as u32
 }
 
-/// The posts besides 0 and 2^[`RANGEBITS`], in ascending order: spaced
-/// evenly on a scale of frequency that is linear below 16 lines and
-/// logarithmic above, so that they are dense where hearing resolves
-/// frequency finely, and at least a line apart.
-fn posts() -> Vec<u32> {
-    const KNEE: f64 = 16.0;
-    let top = f64::from(1u32 << RANGEBITS);
-    let span = (1.0 + top / KNEE).log2();
-    let mut posts = Vec::with_capacity(POSTS);
+/// The `count` posts besides 0 and 2^`rangebits`, in ascending order:
+/// spaced evenly on a scale of frequency that is linear below a 64th of
+/// the lines, 16 lines of a long block, and logarithmic above, so that
+/// they are dense where hearing resolves frequency finely, and at least a
+/// line apart.
+fn posts(rangebits: u32, count: usize) -> Vec<u32> {
+    let top = f64::from(1u32 << rangebits);
+    let knee = top / 64.0;
+    let span = (1.0 + top / knee).log2();
+    let mut posts = Vec::with_capacity(count);
     let mut last = 0;
-    for i in 1..=POSTS {
-        let t = i as f64 / (POSTS + 1) as f64;
-        let x = (KNEE * ((t * span).exp2() - 1.0)).round() as u32;
+    for i in 1..=count {
+        let t = i as f64 / (count + 1) as f64;
+        let x = (knee * ((t * span).exp2() - 1.0)).round() as u32;
         last = x.max(last + 1);
         posts.push(last);
     }
-    assert!(last < 1 << RANGEBITS);
+    assert!(last < 1 << rangebits);
     posts
 }
 
-/// `floor1_X_list`: 0 and 2^[`RANGEBITS`], then `posts` in the order of
+/// `floor1_X_list`: 0 and 2^`rangebits`, then `posts` in the order of
 /// halving: the middle post, then the middles of the halves on each side
 /// of it, and so on, breadth first, so that each post is predicted from
 /// the two posts around it that came before it.
-fn list_order(posts: &[u32]) -> Vec<u32> {
-    let mut xs = vec![0, 1 << RANGEBITS];
+fn list_order(posts: &[u32], rangebits: u32) -> Vec<u32> {
+    let mut xs = vec![0, 1 << rangebits];
     let mut ranges = std::collections::VecDeque::from([(0, posts.len())]);
     while let Some((lo, hi)) = ranges.pop_front() {
         if lo < hi {
@@ -515,19 +599,23 @@ mod tests {
 
     #[test]
     fn the_posts_are_unique_and_within_the_range() {
-        let floor = Floor::new(0);
-        let xs = floor.xs();
-        assert_eq!(xs.len(), 2 + POSTS);
-        assert!(xs.len() <= 65, "clause 7.2.2 allows 65");
-        let mut sorted = xs.to_vec();
-        sorted.sort_unstable();
-        sorted.dedup();
-        assert_eq!(sorted.len(), xs.len());
-        assert_eq!((sorted[0], *sorted.last().unwrap()), (0, 1024));
-        assert_eq!(
-            floor.sorted.iter().map(|&i| xs[i]).collect::<Vec<_>>(),
-            sorted
-        );
+        for (floor, lines, partitions) in [
+            (Floor::long(0), 1024, LONG_PARTITIONS),
+            (Floor::short(0), 128, SHORT_PARTITIONS),
+        ] {
+            let xs = floor.xs();
+            assert_eq!(xs.len(), 2 + partitions * CLASS_DIMENSIONS);
+            assert!(xs.len() <= 65, "clause 7.2.2 allows 65");
+            let mut sorted = xs.to_vec();
+            sorted.sort_unstable();
+            sorted.dedup();
+            assert_eq!(sorted.len(), xs.len());
+            assert_eq!((sorted[0], *sorted.last().unwrap()), (0, lines));
+            assert_eq!(
+                floor.sorted.iter().map(|&i| xs[i]).collect::<Vec<_>>(),
+                sorted
+            );
+        }
     }
 
     #[test]
@@ -558,7 +646,7 @@ mod tests {
 
     #[test]
     fn values_code_their_targets_to_within_the_tolerance() {
-        let floor = Floor::new(0);
+        let floor = Floor::long(0);
         let n = floor.xs().len();
         for seed in 0..50u32 {
             let targets: Vec<i32> = (0..n)
@@ -576,7 +664,7 @@ mod tests {
 
     #[test]
     fn values_wrap_back_through_step_1() {
-        let floor = Floor::new(0);
+        let floor = Floor::long(0);
         for predicted in 0..RANGE {
             for target in 0..RANGE {
                 if target != predicted {
@@ -596,15 +684,42 @@ mod tests {
     }
 
     #[test]
+    fn values_within_raise_the_floor_under_loud_lines() {
+        for (floor, lines) in [(Floor::long(0), 1024), (Floor::short(0), 128)] {
+            let targets = vec![0; floor.xs().len()];
+            let mut spectrum = vec![1e-7; lines];
+            for (k, line) in spectrum.iter_mut().enumerate().step_by(37) {
+                *line = if k % 2 == 0 { 0.9 } else { -0.02 };
+            }
+            let limit = 4479.0;
+            let (values, curve) = floor.values_within(&targets, &spectrum, limit);
+            assert_eq!(curve, floor.curve(&values, lines));
+            for (k, (&x, &f)) in spectrum.iter().zip(&curve).enumerate() {
+                assert!(x.abs() <= limit * f64::from(f), "line {k}: {x} over {f}");
+            }
+            // Where no line is too loud, the floor is the targets'.
+            let quiet = vec![1e-9; lines];
+            let (values, _) = floor.values_within(&targets, &quiet, limit);
+            assert_eq!(values, floor.values(&targets));
+        }
+    }
+
+    #[test]
     fn a_flat_floor_is_flat() {
-        let floor = Floor::new(0);
+        let floor = Floor::long(0);
         let mut values = vec![0; floor.xs().len()];
         values[0] = 100;
         values[1] = 100;
         let curve = floor.curve(&values, 1024);
         assert_eq!(curve.len(), 1024);
         assert!(curve.iter().all(|&y| y == INVERSE_DB_TABLE[200]));
-        assert_eq!(floor.curve(&values, 128).len(), 128);
+        let short = Floor::short(0);
+        let mut values = vec![0; short.xs().len()];
+        values[0] = 100;
+        values[1] = 100;
+        let curve = short.curve(&values, 128);
+        assert_eq!(curve.len(), 128);
+        assert!(curve.iter().all(|&y| y == INVERSE_DB_TABLE[200]));
     }
 
     #[test]

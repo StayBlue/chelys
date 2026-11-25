@@ -12,15 +12,11 @@
 
 use super::bitpack::BitPacker;
 use super::codebook::{Codebook, Lattice, huffman_lengths};
-use super::floor::RANGEBITS;
 use super::frequencies;
+use super::setup::BLOCKSIZES;
 
 /// `residue_partition_size`.
 pub const PARTITION_SIZE: usize = 16;
-
-/// `residue_end`: the residue spans every line of a long block, from
-/// `residue_begin`, 0.
-const END: usize = 1 << RANGEBITS;
 
 /// The largest magnitude a residue value may have: the largest that the
 /// passes of the last class reach.
@@ -72,9 +68,17 @@ const PASSES: usize = 3;
 /// its dimension.
 const CLASSWORDS_PER_CODEWORD: usize = 2;
 
-/// The residue's configuration and books.
+/// A residue's configuration and books.
+///
+/// The setup header has one residue for each block size, which spans every
+/// line of the block, from `residue_begin`, 0, to `residue_end`; both take
+/// the same books, which the setup header writes once. A decoder would
+/// limit a long block's residue to a short block's lines (clause 8.6.2),
+/// but a residue of its own for short blocks spares a decoder the limit.
 #[derive(Clone, Debug)]
 pub struct Residue {
+    /// `residue_end`: the lines of the block.
+    end: usize,
     /// The number of the classification book among the setup header's
     /// codebooks; the value books follow it.
     first_book: u8,
@@ -83,13 +87,13 @@ pub struct Residue {
 }
 
 impl Residue {
-    /// The residue, whose books are numbered from `first_book` among the
-    /// setup header's codebooks, in the order of
-    /// [`codebooks`](Self::codebooks).
+    /// The residue of the blocks of `blockflag`, whose books are numbered
+    /// from `first_book` among the setup header's codebooks, in the order
+    /// of [`codebooks`](Self::codebooks).
     ///
     /// The codeword lengths of each book are those of a Huffman code for
     /// how often each of its entries was coded (see [`frequencies`]).
-    pub fn new(first_book: u8) -> Self {
+    pub fn new(blockflag: bool, first_book: u8) -> Self {
         let classbook = Codebook::new(
             CLASSWORDS_PER_CODEWORD as u16,
             huffman_lengths(&frequencies::weights(&frequencies::CLASSIFICATIONS))
@@ -105,6 +109,7 @@ impl Residue {
             })
             .collect();
         Self {
+            end: BLOCKSIZES[usize::from(blockflag)] / 2,
             first_book,
             classbook,
             value_books,
@@ -122,7 +127,7 @@ impl Residue {
     /// Writes the residue's configuration (clause 8.6.1), after its type.
     pub fn write_setup(&self, out: &mut BitPacker) {
         out.write(0, 24); // residue_begin
-        out.write(END as u32, 24);
+        out.write(self.end as u32, 24);
         out.write(PARTITION_SIZE as u32 - 1, 24);
         out.write(CLASSES.len() as u32 - 1, 6);
         out.write(u32::from(self.first_book), 8); // residue_classbook
@@ -147,7 +152,7 @@ impl Residue {
     /// If a vector is not of `lines` lines, or a value is beyond
     /// [`MAX_VALUE`].
     pub fn write(&self, vectors: &[Option<&[i32]>], lines: usize, out: &mut BitPacker) {
-        let partitions = END.min(lines) / PARTITION_SIZE;
+        let partitions = self.end.min(lines) / PARTITION_SIZE;
         // Each coded vector's classes, and the values of each pass.
         let coded: Vec<(Vec<usize>, Vec<Vec<i32>>)> = vectors
             .iter()
@@ -281,7 +286,7 @@ mod tests {
 
     #[test]
     fn the_classification_book_has_an_entry_for_each_pair() {
-        let residue = Residue::new(0);
+        let residue = Residue::new(true, 0);
         assert_eq!(residue.classbook.entries(), CLASSES.len().pow(2));
         assert_eq!(residue.classbook.dimensions(), CLASSWORDS_PER_CODEWORD);
         for book in &residue.value_books {

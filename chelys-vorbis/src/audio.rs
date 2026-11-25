@@ -39,13 +39,13 @@ pub fn packet(
         out.write_bool(previous_long);
         out.write_bool(next_long);
     }
-    // Every channel is of the mapping's one submap: each floor in channel
-    // order, then the residue of every channel together.
+    // Every channel is of the mode's mapping's one submap: each floor in
+    // channel order, then the residue of every channel together.
     for channel in channels {
         match channel {
             // Floor 1's nonzero flag, unset (clause 7.2.3).
             Channel::Unused => out.write_bool(false),
-            Channel::Coded { floor, .. } => setup.floor.write(floor, &mut out),
+            Channel::Coded { floor, .. } => setup.floor(mode).write(floor, &mut out),
         }
     }
     let vectors: Vec<Option<&[i32]>> = channels
@@ -58,7 +58,7 @@ pub fn packet(
     let lines = BLOCKSIZES[usize::from(mode.blockflag())] / 2;
     // With every vector marked "do not decode", residue type 1 reads
     // nothing (clause 8.6.2).
-    setup.residue.write(&vectors, lines, &mut out);
+    setup.residue(mode).write(&vectors, lines, &mut out);
     out.into_bytes()
 }
 

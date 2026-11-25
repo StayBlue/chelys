@@ -1,13 +1,15 @@
 // Copyright (c) 2026 StayBlue
 // SPDX-License-Identifier: MIT
 
-//! The model's partitions of the lines of a long block at any sample rate,
-//! from the threshold calculation partitions of ISO/IEC 13818-7 (Tables
-//! C.1 to C.24), which are printed for twelve sampling frequencies.
+//! The model's partitions of the lines of a long and of a short block at
+//! any sample rate, from the threshold calculation partitions of ISO/IEC
+//! 13818-7 (Tables C.1 to C.24), which are printed for twelve sampling
+//! frequencies.
 //!
 //! Each line of the FFT of 2048 samples that the tables partition lies at
 //! the same frequency as the line of a long Vorbis block of the same rate,
-//! so at those twelve rates the tables are taken as printed. At any other
+//! and each of the FFT of 256 samples as that of a short block, so at those
+//! twelve rates the tables are taken as printed. At any other
 //! rate, the table of the rate nearest it, in ratio, is taken by
 //! frequency: each partition keeps its frequencies, its `bval(b)` and the
 //! threshold in quiet of each of its lines, its edges moved to the nearest
@@ -18,12 +20,11 @@
 
 use std::ops::Range;
 
-use chelys_core::psychoacoustic::partitions::{self, Fft, Row, SAMPLE_RATES};
+use chelys_core::psychoacoustic::partitions::{self, Row, SAMPLE_RATES};
 
-/// The lines of a long block, which the partitions cover.
-pub const LINES: usize = 1024;
+pub use partitions::Fft;
 
-/// A partition of the lines of a long block.
+/// A partition of the lines of a block.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Partition {
     pub lines: Range<usize>,
@@ -36,12 +37,14 @@ pub struct Partition {
     pub quiet_db: f64,
 }
 
-/// The partitions of a long block at `sample_rate` Hz.
-pub fn partitions(sample_rate: u32) -> Vec<Partition> {
+/// The partitions of the lines of `fft`'s block, a long block's 1024 or a
+/// short block's 128, at `sample_rate` Hz.
+pub fn partitions(sample_rate: u32, fft: Fft) -> Vec<Partition> {
+    let lines = fft.lines();
     let rate = nearest(sample_rate);
-    let table = partitions::table(rate, Fft::Long).expect("a table for each of SAMPLE_RATES");
+    let table = partitions::table(rate, fft).expect("a table for each of SAMPLE_RATES");
     let ratio = f64::from(rate) / f64::from(sample_rate);
-    let line = |w: usize| ((w as f64 * ratio).round() as usize).min(LINES);
+    let line = |w: usize| ((w as f64 * ratio).round() as usize).min(lines);
     let partition = |lines: Range<usize>, row: &Row| Partition {
         lines,
         bval: row.bval,
@@ -64,8 +67,8 @@ pub fn partitions(sample_rate: u32) -> Vec<Partition> {
     let last = out.last().expect("a partition").clone();
     let printed = table.last().expect("a table has rows").lines().len();
     let width = last.lines.len().max(printed);
-    while start < LINES {
-        let end = (start + width).min(LINES);
+    while start < lines {
+        let end = (start + width).min(lines);
         out.push(Partition {
             lines: start..end,
             ..last.clone()
@@ -91,12 +94,14 @@ mod tests {
     #[test]
     fn the_printed_rates_take_their_tables_as_printed() {
         for rate in SAMPLE_RATES {
-            let table = partitions::table(rate, Fft::Long).unwrap();
-            let ours = partitions(rate);
-            assert_eq!(ours.len(), table.len(), "{rate}");
-            for (p, row) in ours.iter().zip(table) {
-                assert_eq!(p.lines, row.lines(), "{rate}");
-                assert_eq!(p.bval, row.bval, "{rate}");
+            for fft in [Fft::Long, Fft::Short] {
+                let table = partitions::table(rate, fft).unwrap();
+                let ours = partitions(rate, fft);
+                assert_eq!(ours.len(), table.len(), "{rate}");
+                for (p, row) in ours.iter().zip(table) {
+                    assert_eq!(p.lines, row.lines(), "{rate}");
+                    assert_eq!(p.bval, row.bval, "{rate}");
+                }
             }
         }
     }
@@ -116,14 +121,16 @@ mod tests {
             384_000,
             u32::MAX,
         ] {
-            let ours = partitions(rate);
-            assert_eq!(ours[0].lines.start, 0, "{rate}");
-            assert_eq!(ours.last().unwrap().lines.end, LINES, "{rate}");
-            for pair in ours.windows(2) {
-                assert_eq!(pair[1].lines.start, pair[0].lines.end, "{rate}");
-                assert!(pair[1].bval >= pair[0].bval, "{rate}");
+            for fft in [Fft::Long, Fft::Short] {
+                let ours = partitions(rate, fft);
+                assert_eq!(ours[0].lines.start, 0, "{rate}");
+                assert_eq!(ours.last().unwrap().lines.end, fft.lines(), "{rate}");
+                for pair in ours.windows(2) {
+                    assert_eq!(pair[1].lines.start, pair[0].lines.end, "{rate}");
+                    assert!(pair[1].bval >= pair[0].bval, "{rate}");
+                }
+                assert!(ours.iter().all(|p| !p.lines.is_empty()), "{rate}");
             }
-            assert!(ours.iter().all(|p| !p.lines.is_empty()), "{rate}");
         }
     }
 
@@ -135,7 +142,7 @@ mod tests {
         assert_eq!(nearest(192_000), 96_000);
         // At 96 kHz, line 300 lies at 14.1 kHz; at 192 kHz, line 150 does.
         let at = |rate, w| {
-            partitions(rate)
+            partitions(rate, Fft::Long)
                 .into_iter()
                 .find(|p| p.lines.contains(&w))
                 .unwrap()

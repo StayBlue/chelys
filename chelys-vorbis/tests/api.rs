@@ -112,6 +112,7 @@ fn the_headers_describe_the_stream() {
     assert_eq!(&headers.setup[..7], b"\x05vorbis");
 }
 
+/// Of a steady signal, every block is long.
 #[test]
 fn granule_positions_advance_a_hop_a_packet_and_end_at_the_input() {
     for (samples, expected) in [
@@ -121,28 +122,79 @@ fn granule_positions_advance_a_hop_a_packet_and_end_at_the_input() {
         (1025, vec![0, 1024, 1025]),
         (3000, vec![0, 1024, 2048, 3000]),
     ] {
-        let packets = encode_whole(Config::new(48_000, 2, RATE), &pcm(samples, 2));
+        let packets = encode_whole(Config::new(48_000, 2, RATE), &vec![0.0; 2 * samples]);
         let positions: Vec<u64> = packets.iter().map(|&(_, position)| position).collect();
         assert_eq!(positions, expected, "{samples} samples");
     }
 }
 
+/// The mode of an audio packet, short or long (clause 4.3.1), and for a
+/// long block its window flags.
+fn mode(packet: &[u8]) -> (bool, Option<(bool, bool)>) {
+    let bit = |i: u32| (packet[0] >> i) & 1 == 1;
+    let long = bit(1);
+    (long, long.then(|| (bit(2), bit(3))))
+}
+
 #[test]
-fn a_packet_is_given_once_its_block_has_arrived() {
+fn a_packet_is_given_once_its_block_and_the_next_hop_have_arrived() {
     let mut encoder = Encoder::new(Config::new(48_000, 1, RATE)).unwrap();
     let mut packets = Vec::new();
     encoder
-        .encode_interleaved(&pcm(1023, 1), &mut keep(&mut packets))
+        .encode_interleaved(&[0.0f32; 2047], &mut keep(&mut packets))
         .unwrap();
     assert!(packets.is_empty());
     // The first block spans the 1024 samples before the input and its
-    // first 1024.
+    // first 1024, and the encoder looks a hop further, to whether the next
+    // block has an attack.
     encoder
-        .encode_interleaved(&pcm(1, 1), &mut keep(&mut packets))
+        .encode_interleaved(&[0.0f32], &mut keep(&mut packets))
         .unwrap();
     assert_eq!(packets.len(), 1);
     let finished = encoder.finish(&mut keep(&mut packets));
-    assert_eq!((finished.packets, finished.samples), (2, 1024));
+    assert_eq!((finished.packets, finished.samples), (3, 2048));
+}
+
+/// Eight short blocks take the place of the long block whose short blocks
+/// would span a click, with the long blocks before and after them where
+/// they would be, their windows shaped for them.
+#[test]
+fn short_blocks_take_a_long_blocks_place_at_a_click() {
+    let mut input = vec![0.0f32; 10_000];
+    // In the short blocks of the long block centered at 5120, centered from
+    // 4672 to 5568.
+    input[5000] = 0.5;
+    let packets = encode_whole(Config::new(44_100, 1, RATE), &input);
+    let positions: Vec<u64> = packets.iter().map(|&(_, position)| position).collect();
+    let mut expected: Vec<u64> = (0..5).map(|k| 1024 * k).collect();
+    expected.extend((0..8).map(|k| 5120 - 448 + 128 * k));
+    expected.extend([6144, 7168, 8192, 9216, 10_000]);
+    assert_eq!(positions, expected);
+    let modes: Vec<_> = packets.iter().map(|(data, _)| mode(data)).collect();
+    assert_eq!(modes[3], (true, Some((true, true))));
+    assert_eq!(modes[4], (true, Some((true, false))));
+    assert!(modes[5..13].iter().all(|&mode| mode == (false, None)));
+    assert_eq!(modes[13], (true, Some((false, true))));
+    assert_eq!(modes[14], (true, Some((true, true))));
+}
+
+/// The stream ends at the first block centered at or past the end of the
+/// input, though it be among short blocks.
+#[test]
+fn the_stream_ends_among_short_blocks_at_the_end_of_the_input() {
+    let mut input = vec![0.0f32; 5000];
+    input[4990] = 0.5;
+    let packets = encode_whole(Config::new(44_100, 1, RATE), &input);
+    let positions: Vec<u64> = packets.iter().map(|&(_, position)| position).collect();
+    assert_eq!(
+        positions,
+        [0, 1024, 2048, 3072, 4096, 4672, 4800, 4928, 5000]
+    );
+    assert!(
+        packets[5..]
+            .iter()
+            .all(|(data, _)| mode(data) == (false, None))
+    );
 }
 
 #[test]
