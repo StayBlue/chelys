@@ -20,8 +20,10 @@ pub enum Rate {
     /// 10)`, and each packet is as long as that takes. Above 0 it allows
     /// more noise and gives shorter packets, below 0 less. No line is
     /// allowed less noise than the rounding of 16-bit PCM makes, whatever
-    /// the offset. At 44.1 kHz in stereo, music takes about 181 kbit/s at
-    /// 0 dB.
+    /// the offset. In stereo, the two channels' lines may be made alike,
+    /// which then cost fewer bits coupled, where that leaves each channel
+    /// no more noise than it is allowed, or above 1.5 kHz 3 times it. At
+    /// 44.1 kHz in stereo, music takes about 137 kbit/s at 0 dB.
     Variable { noise_offset_db: f64 },
     /// A variable rate at `level`: a level of the [`quality`](crate::quality)
     /// scale that chelys's encoders share, from 0 to
@@ -29,9 +31,11 @@ pub enum Rate {
     ///
     /// It is [`Rate::Variable`] with the noise offset the level maps to,
     /// calibrated to the scale's grades at 44.1 kHz in two channels: music
-    /// in stereo averages about 144 kbit/s at level 50, 263 at 80 and 303
-    /// at 100. Every other configuration takes the same offsets, so that
-    /// there a level gives the scale's grades only roughly.
+    /// in stereo averages about 122 kbit/s at level 50, 246 at 80 and 282
+    /// at 100. Every other configuration takes the offsets of stereo at
+    /// 44.1 kHz, as calibrated before its channels were coupled where they
+    /// are coded each on its own, so that there a level gives the scale's
+    /// grades only roughly.
     Quality { level: u8 },
 }
 
@@ -116,7 +120,7 @@ impl Config {
             }
             Rate::Variable { noise_offset_db } => Err(ConfigError::NoiseOffset { noise_offset_db }),
             Rate::Quality { level } if level <= crate::quality::MAX_LEVEL => {
-                Ok(calibration::noise_offset_db(level))
+                Ok(calibration::noise_offset_db(level, self.channels))
             }
             Rate::Quality { level } => Err(ConfigError::QualityLevel { level }),
         }

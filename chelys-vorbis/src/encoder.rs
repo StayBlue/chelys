@@ -7,8 +7,10 @@
 use chelys_core::mdct::Mdct;
 use chelys_core::sample::{self, NonFiniteSample, Sample};
 
-use super::audio::{self, Channel};
+use super::audio;
 use super::config::{Config, ConfigError};
+use super::coupling;
+use super::floor::Floor;
 use super::header;
 use super::packet::{Packet, PacketSink};
 use super::psychoacoustic::{self, Analysis, FIRST_SHORT, Model, SHORT_BLOCKS, Tables};
@@ -53,6 +55,13 @@ const KEPT: usize = BLOCK + HOP as usize;
 /// `ffmpeg_decodes_a_tone_in_short_blocks_at_its_level_and_phase`.
 fn spectrum_scale(n: usize) -> f64 {
     2.0 / n as f64
+}
+
+/// The lines of a block of `n` samples below [`coupling::PROTECTED_HZ`] at
+/// `sample_rate`: line `k` is centered at `(k + 1/2) sample_rate / n` Hz.
+fn protected_lines(n: usize, sample_rate: u32) -> usize {
+    let below = coupling::PROTECTED_HZ * n as f64 / f64::from(sample_rate) - 0.5;
+    (below.ceil().max(0.0) as usize).min(n / 2)
 }
 
 /// How much nearer zero than the nearest integer each line of the residue
@@ -103,6 +112,9 @@ pub struct Encoder {
     /// The MDCT of each block size, by blockflag.
     mdcts: [Mdct; 2],
     tables: Tables,
+    /// The psychoacoustic model's partition of each line of a block, by
+    /// blockflag.
+    partitions: [Vec<usize>; 2],
     /// The psychoacoustic model of each channel.
     models: Vec<Model>,
     /// Each channel's analysis of the long block coded next, or whose
@@ -153,11 +165,12 @@ impl Encoder {
             |previous_long, next_long| window(BLOCK, SHORT_BLOCK, true, previous_long, next_long);
         Ok(Self {
             config,
-            setup: Setup::new(),
+            setup: Setup::new(channels),
             mdcts: [Mdct::new(SHORT_BLOCK), Mdct::new(BLOCK)],
             models: (0..channels)
                 .map(|_| Model::new(&tables, noise_offset_db))
                 .collect(),
+            partitions: [false, true].map(|long| tables.partition_of_lines(long)),
             tables,
             current: vec![Analysis::default(); channels],
             next: vec![Analysis::default(); channels],
@@ -367,11 +380,10 @@ impl Encoder {
     /// whether it was the last.
     ///
     /// Each channel's spectrum is given the floor that
-    /// [`psychoacoustic`] sets, raised where a line would be more than
-    /// [`MAX_VALUE`] steps of it, and its residue is each line divided by
-    /// the floor there and rounded, nearer zero by [`DEAD_ZONE`], and held
-    /// within [`MAX_VALUE`], which only a line far past full scale passes.
-    /// A channel whose residue is all zeros is coded as unused.
+    /// [`psychoacoustic`] sets, and its residue is quantized to it (see
+    /// [`Quantized`]). A channel whose residue is all zeros is coded as
+    /// unused. In a stereo stream, the two channels' residues are then
+    /// coupled (see [`coupling::couple`]).
     fn block<O: PacketSink + ?Sized>(
         &mut self,
         short: Option<usize>,
@@ -403,49 +415,60 @@ impl Encoder {
         };
         let mdct = &mut self.mdcts[usize::from(mode.blockflag())];
         let floor = self.setup.floor(mode);
+        // Coupled, an angle is as large as the sum of the two channels'
+        // values (see `coupling::square_polar`), and is to be within the
+        // residue's reach too.
+        let limit = if self.setup.coupled {
+            MAX_VALUE / 2
+        } else {
+            MAX_VALUE
+        };
+        let noises: Vec<&[f64]> = (self.current.iter())
+            .map(|analysis| match short {
+                Some(k) => &analysis.short[k][..],
+                None => &analysis.long[..],
+            })
+            .collect();
         let lines = n / 2;
         let mut windowed = vec![0.0; n];
-        let mut spectrum = vec![0.0; lines];
-        let coded: Vec<Option<(Vec<u32>, Vec<i32>)>> = (self.pcm.iter())
-            .zip(&self.current)
-            .map(|(pcm, analysis)| {
-                let noise = match short {
-                    Some(k) => &analysis.short[k],
-                    None => &analysis.long,
-                };
+        let mut spectra = vec![vec![0.0; lines]; self.pcm.len()];
+        let mut channels: Vec<Quantized> = (self.pcm.iter())
+            .zip(&noises)
+            .zip(&mut spectra)
+            .map(|((pcm, noise), spectrum)| {
                 for ((z, &x), &w) in windowed.iter_mut().zip(&pcm[start..start + n]).zip(window) {
                     *z = x * w;
                 }
-                mdct.transform(&windowed, &mut spectrum);
-                for line in &mut spectrum {
+                mdct.transform(&windowed, spectrum);
+                for line in spectrum.iter_mut() {
                     *line *= spectrum_scale(n);
                 }
-                // The floor the model sets, raised where it would put a line
-                // past the residue's reach, as at an attack after silence,
-                // where the threshold is held near the threshold in quiet.
-                let (values, curve) = floor.values_within(
-                    &psychoacoustic::floor_targets(noise, floor),
-                    &spectrum,
-                    f64::from(MAX_VALUE),
-                );
-                let residue: Vec<i32> = (spectrum.iter().zip(&curve))
-                    .map(|(&x, &f)| {
-                        let steps = x / f64::from(f);
-                        let q = steps.signum() * (steps.abs() + 0.5 - DEAD_ZONE).floor();
-                        q.clamp(-f64::from(MAX_VALUE), f64::from(MAX_VALUE)) as i32
-                    })
-                    .collect();
-                residue.iter().any(|&q| q != 0).then_some((values, residue))
+                Quantized::new(floor, noise, spectrum, limit)
             })
             .collect();
-        let channels: Vec<Channel<'_>> = coded
-            .iter()
-            .map(|channel| match channel {
-                None => Channel::Unused,
-                Some((floor, residue)) => Channel::Coded { floor, residue },
-            })
+        let used: Vec<bool> = channels.iter().map(Quantized::used).collect();
+        if let ([left, right], true) = (&mut channels[..], self.setup.coupled) {
+            coupling::couple(
+                [&mut left.residue, &mut right.residue],
+                [&left.curve, &right.curve],
+                [&spectra[0], &spectra[1]],
+                [noises[0], noises[1]],
+                &self.partitions[usize::from(mode.blockflag())],
+                protected_lines(n, self.config.sample_rate()),
+            );
+        }
+        let floors: Vec<Option<&[u32]>> = (channels.iter().zip(used))
+            .map(|(channel, used)| used.then_some(&channel.values[..]))
             .collect();
-        let data = audio::packet(&self.setup, mode, previous_long, next_long, &channels);
+        let residues: Vec<&[i32]> = channels.iter().map(|c| &c.residue[..]).collect();
+        let data = audio::packet(
+            &self.setup,
+            mode,
+            previous_long,
+            next_long,
+            &floors,
+            &residues,
+        );
         out.packet(Packet {
             data: &data,
             granule_position: match end {
@@ -478,5 +501,49 @@ impl Encoder {
             packets: self.packets,
             samples: self.samples,
         }
+    }
+}
+
+/// A channel's floor, and its residue, before any coupling.
+struct Quantized {
+    /// The floor's values (see [`Floor::values`]).
+    values: Vec<u32>,
+    /// The floor's curve: the step each line of the residue is of.
+    curve: Vec<f32>,
+    residue: Vec<i32>,
+}
+
+impl Quantized {
+    /// The floor that the model sets for the noise `noise` allows each
+    /// line, raised where a line would be more than `limit` steps of it,
+    /// and the residue of `spectrum`: each line divided by the floor there
+    /// and rounded, nearer zero by [`DEAD_ZONE`], and held within `limit`,
+    /// which only a line far past full scale passes.
+    fn new(floor: &Floor, noise: &[f64], spectrum: &[f64], limit: i32) -> Self {
+        // The floor the model sets, raised where it would put a line past
+        // the residue's reach, as at an attack after silence, where the
+        // threshold is held near the threshold in quiet.
+        let (values, curve) = floor.values_within(
+            &psychoacoustic::floor_targets(noise, floor),
+            spectrum,
+            f64::from(limit),
+        );
+        let residue = (spectrum.iter().zip(&curve))
+            .map(|(&x, &f)| {
+                let steps = x / f64::from(f);
+                let q = steps.signum() * (steps.abs() + 0.5 - DEAD_ZONE).floor();
+                q.clamp(-f64::from(limit), f64::from(limit)) as i32
+            })
+            .collect();
+        Self {
+            values,
+            curve,
+            residue,
+        }
+    }
+
+    /// Whether any residue value is not 0.
+    fn used(&self) -> bool {
+        self.residue.iter().any(|&q| q != 0)
     }
 }

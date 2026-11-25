@@ -197,34 +197,40 @@ fn the_stream_ends_among_short_blocks_at_the_end_of_the_input() {
     );
 }
 
+/// In stereo, whose channels are coupled, and in more channels, coded each
+/// on its own, among short blocks too.
 #[test]
 fn the_stream_does_not_depend_on_how_the_input_is_given() {
-    let channels = 3;
-    let input = pcm(5000, channels);
-    let config = Config::new(44_100, channels, RATE);
-    let whole = encode_whole(config, &input);
+    for channels in [2, 3] {
+        let mut input = pcm(5000, channels);
+        // A click, which short blocks code, in the first channel only.
+        input[3000 * channels] = 0.9;
+        let config = Config::new(44_100, channels, RATE);
+        let whole = encode_whole(config, &input);
+        assert!(whole.iter().any(|(data, _)| !mode(data).0), "{channels}");
 
-    let mut encoder = Encoder::new(config).unwrap();
-    let mut chunked = Vec::new();
-    for chunk in input.chunks(7 * channels) {
+        let mut encoder = Encoder::new(config).unwrap();
+        let mut chunked = Vec::new();
+        for chunk in input.chunks(7 * channels) {
+            encoder
+                .encode_interleaved(chunk, &mut keep(&mut chunked))
+                .unwrap();
+        }
+        encoder.finish(&mut keep(&mut chunked));
+        assert_eq!(chunked, whole, "{channels}");
+
+        let planar: Vec<Vec<f32>> = (0..channels)
+            .map(|c| input.iter().skip(c).step_by(channels).copied().collect())
+            .collect();
+        let slices: Vec<&[f32]> = planar.iter().map(Vec::as_slice).collect();
+        let mut encoder = Encoder::new(config).unwrap();
+        let mut from_planar = Vec::new();
         encoder
-            .encode_interleaved(chunk, &mut keep(&mut chunked))
+            .encode_planar(&slices, &mut keep(&mut from_planar))
             .unwrap();
+        encoder.finish(&mut keep(&mut from_planar));
+        assert_eq!(from_planar, whole, "{channels}");
     }
-    encoder.finish(&mut keep(&mut chunked));
-    assert_eq!(chunked, whole);
-
-    let planar: Vec<Vec<f32>> = (0..channels)
-        .map(|c| input.iter().skip(c).step_by(channels).copied().collect())
-        .collect();
-    let slices: Vec<&[f32]> = planar.iter().map(Vec::as_slice).collect();
-    let mut encoder = Encoder::new(config).unwrap();
-    let mut from_planar = Vec::new();
-    encoder
-        .encode_planar(&slices, &mut keep(&mut from_planar))
-        .unwrap();
-    encoder.finish(&mut keep(&mut from_planar));
-    assert_eq!(from_planar, whole);
 }
 
 #[test]

@@ -6,9 +6,19 @@
 //! to three passes.
 //!
 //! The specification defines only the decoding; the residue's type,
-//! partitions, classes and books here are chelys's own. It is of type 1
-//! (clause 8.4): each channel's vector coded on its own, its scalars in
-//! order.
+//! partitions, classes and books here are chelys's own. Where channels are
+//! coded each on its own, it is of type 1 (clause 8.4): each channel's
+//! vector coded on its own, its scalars in order. Where a stereo stream
+//! couples them, as a magnitude and an angle, it is of type 2 (clause
+//! 8.5): their vectors interleaved, and coded as one, so that each
+//! partition holds the magnitude and angle of the same lines and the books
+//! code them together.
+//!
+//! Type 2 is the smaller: on the 51 tracks of the tuning set of chelys's
+//! corpus at 44.1 kHz in stereo, at a noise offset of 3 dB, coupled
+//! without narrowing the angles and each with books counted for it (see
+//! [`frequencies`]), the streams took 132.1 kbit/s of type 2 and 155.4 of
+//! type 1; coded each on its own, 132.0 of type 2 and 138.3 of type 1.
 
 use super::bitpack::BitPacker;
 use super::codebook::{Codebook, Lattice, huffman_lengths};
@@ -23,16 +33,16 @@ pub const PARTITION_SIZE: usize = 16;
 pub const MAX_VALUE: i32 = 15 * 289 + 8 * 17 + 8;
 
 /// The value books, each a lattice of integers coded as vectors of its
-/// dimension: its dimension, its lattice, and how often each of its entries
-/// was coded, from which its codeword lengths are made (see
+/// dimension: its dimension and its lattice. Each residue's codeword
+/// lengths are made from how often each entry was coded (see
 /// [`frequencies`]).
-const VALUE_BOOKS: [(u16, Lattice, &[u32]); 6] = [
-    (4, lattice(1, 1), &frequencies::VALUES_0),
-    (2, lattice(2, 1), &frequencies::VALUES_1),
-    (2, lattice(4, 1), &frequencies::VALUES_2),
-    (2, lattice(8, 1), &frequencies::VALUES_3),
-    (1, lattice(15, 17), &frequencies::VALUES_4),
-    (1, lattice(15, 289), &frequencies::VALUES_5),
+const VALUE_BOOKS: [(u16, Lattice); 6] = [
+    (4, lattice(1, 1)),
+    (2, lattice(2, 1)),
+    (2, lattice(4, 1)),
+    (2, lattice(8, 1)),
+    (1, lattice(15, 17)),
+    (1, lattice(15, 289)),
 ];
 
 /// The lattice of the integers from `-reach` to `reach` times `delta`.
@@ -68,6 +78,14 @@ const PASSES: usize = 3;
 /// its dimension.
 const CLASSWORDS_PER_CODEWORD: usize = 2;
 
+/// What a residue codes: each channel's vector on its own, or the
+/// magnitude and angle of a coupled stereo pair.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResidueKind {
+    Uncoupled,
+    Coupled,
+}
+
 /// A residue's configuration and books.
 ///
 /// The setup header has one residue for each block size, which spans every
@@ -77,7 +95,9 @@ const CLASSWORDS_PER_CODEWORD: usize = 2;
 /// but a residue of its own for short blocks spares a decoder the limit.
 #[derive(Clone, Debug)]
 pub struct Residue {
-    /// `residue_end`: the lines of the block.
+    kind: ResidueKind,
+    /// `residue_end`: the lines of the block, of each of the two channels
+    /// interleaved where coupled (clause 8.6.1).
     end: usize,
     /// The number of the classification book among the setup header's
     /// codebooks; the value books follow it.
@@ -87,32 +107,48 @@ pub struct Residue {
 }
 
 impl Residue {
-    /// The residue of the blocks of `blockflag`, whose books are numbered
-    /// from `first_book` among the setup header's codebooks, in the order
-    /// of [`codebooks`](Self::codebooks).
+    /// The residue of `kind` of the blocks of `blockflag`, whose books are
+    /// numbered from `first_book` among the setup header's codebooks, in
+    /// the order of [`codebooks`](Self::codebooks).
     ///
     /// The codeword lengths of each book are those of a Huffman code for
     /// how often each of its entries was coded (see [`frequencies`]).
-    pub fn new(blockflag: bool, first_book: u8) -> Self {
+    pub fn new(blockflag: bool, kind: ResidueKind, first_book: u8) -> Self {
+        let counts = match kind {
+            ResidueKind::Uncoupled => frequencies::UNCOUPLED,
+            ResidueKind::Coupled => frequencies::COUPLED,
+        };
         let classbook = Codebook::new(
             CLASSWORDS_PER_CODEWORD as u16,
-            huffman_lengths(&frequencies::weights(&frequencies::CLASSIFICATIONS))
+            huffman_lengths(&frequencies::weights(counts.classifications))
                 .into_iter()
                 .map(Some)
                 .collect(),
         );
-        let value_books = VALUE_BOOKS
-            .iter()
-            .map(|&(dimensions, lattice, counts)| {
+        let value_books = (VALUE_BOOKS.iter().zip(counts.values))
+            .map(|(&(dimensions, lattice), counts)| {
                 let lengths = huffman_lengths(&frequencies::weights(counts));
                 Codebook::with_lattice(dimensions, lengths, lattice)
             })
             .collect();
+        let lines = BLOCKSIZES[usize::from(blockflag)] / 2;
         Self {
-            end: BLOCKSIZES[usize::from(blockflag)] / 2,
+            kind,
+            end: match kind {
+                ResidueKind::Uncoupled => lines,
+                ResidueKind::Coupled => 2 * lines,
+            },
             first_book,
             classbook,
             value_books,
+        }
+    }
+
+    /// The residue's type: 1 uncoupled, 2 coupled.
+    pub fn residue_type(&self) -> u32 {
+        match self.kind {
+            ResidueKind::Uncoupled => 1,
+            ResidueKind::Coupled => 2,
         }
     }
 
@@ -152,13 +188,39 @@ impl Residue {
     /// If a vector is not of `lines` lines, or a value is beyond
     /// [`MAX_VALUE`].
     pub fn write(&self, vectors: &[Option<&[i32]>], lines: usize, out: &mut BitPacker) {
-        let partitions = self.end.min(lines) / PARTITION_SIZE;
-        // Each coded vector's classes, and the values of each pass.
+        for vector in vectors.iter().flatten() {
+            assert_eq!(vector.len(), lines, "a vector of the block's lines");
+        }
+        match self.kind {
+            ResidueKind::Uncoupled => {
+                let coded: Vec<&[i32]> = vectors.iter().flatten().copied().collect();
+                self.write_type_1(&coded, lines, out);
+            }
+            // Type 2 decodes every vector, interleaved, unless none is to
+            // be decoded, when it reads nothing (clause 8.6.5).
+            ResidueKind::Coupled if vectors.iter().any(Option::is_some) => {
+                let channels = vectors.len();
+                let mut interleaved = vec![0; channels * lines];
+                for (c, vector) in vectors.iter().enumerate() {
+                    for (i, &value) in vector.unwrap_or(&[]).iter().enumerate() {
+                        interleaved[i * channels + c] = value;
+                    }
+                }
+                self.write_type_1(&[&interleaved], channels * lines, out);
+            }
+            ResidueKind::Coupled => {}
+        }
+    }
+
+    /// Writes `vectors`, each of `len` values, as residue type 1 does
+    /// (clause 8.6.4).
+    fn write_type_1(&self, vectors: &[&[i32]], len: usize, out: &mut BitPacker) {
+        let partitions = self.end.min(len) / PARTITION_SIZE;
+        // Each vector's classes, and the values of each pass.
         let coded: Vec<(Vec<usize>, Vec<Vec<i32>>)> = vectors
             .iter()
-            .flatten()
             .map(|vector| {
-                assert_eq!(vector.len(), lines, "a vector of the block's lines");
+                assert_eq!(vector.len(), len, "a vector of the residue's length");
                 classify(&vector[..partitions * PARTITION_SIZE])
             })
             .collect();
@@ -275,18 +337,20 @@ mod tests {
 
     #[test]
     fn each_book_has_a_frequency_for_each_entry() {
-        assert_eq!(frequencies::CLASSIFICATIONS.len(), CLASSES.len().pow(2));
-        for (dimensions, lattice, counts) in VALUE_BOOKS {
-            assert_eq!(
-                counts.len(),
-                (lattice.values as usize).pow(u32::from(dimensions))
-            );
+        for counts in [frequencies::UNCOUPLED, frequencies::COUPLED] {
+            assert_eq!(counts.classifications.len(), CLASSES.len().pow(2));
+            for ((dimensions, lattice), values) in VALUE_BOOKS.into_iter().zip(counts.values) {
+                assert_eq!(
+                    values.len(),
+                    (lattice.values as usize).pow(u32::from(dimensions))
+                );
+            }
         }
     }
 
     #[test]
     fn the_classification_book_has_an_entry_for_each_pair() {
-        let residue = Residue::new(true, 0);
+        let residue = Residue::new(true, ResidueKind::Coupled, 0);
         assert_eq!(residue.classbook.entries(), CLASSES.len().pow(2));
         assert_eq!(residue.classbook.dimensions(), CLASSWORDS_PER_CODEWORD);
         for book in &residue.value_books {

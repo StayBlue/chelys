@@ -10,10 +10,11 @@
 //! residues, mappings and modes of the setup header it writes, are
 //! chelys's own.
 //!
-//! The encoder is being built: for now each channel is coded on its own,
-//! in long blocks and, where its psychoacoustic model finds an attack, in
-//! short ones, within the noise the model allows, scaled by the [`Rate`]
-//! asked for.
+//! The encoder is being built: for now it codes long blocks and, where its
+//! psychoacoustic model finds an attack, short ones, within the noise the
+//! model allows, scaled by the [`Rate`] asked for. A stereo stream couples
+//! its two channels, as a magnitude and an angle (clause 4.3.5); the
+//! channels of any other are coded each on its own.
 //!
 //! The encoder gives Vorbis packets, not a container: its three
 //! [`Headers`], then each audio packet with its granule position, from
@@ -40,6 +41,7 @@ mod bitpack;
 mod calibration;
 mod codebook;
 mod config;
+mod coupling;
 mod encoder;
 mod floor;
 mod frequencies;

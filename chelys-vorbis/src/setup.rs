@@ -6,14 +6,17 @@
 //!
 //! The specification defines only how a decoder reads them; each choice of
 //! them here is chelys's own: for each block size, a floor of type 1, a
-//! residue of type 1, a mapping without coupling and a mode, the floors
-//! sharing one set of codebooks and the residues another.
+//! residue, a mapping and a mode, the floors sharing one set of codebooks
+//! and the residues another. In a stereo stream, each mapping couples the
+//! two channels (see [`coupling`](super::coupling)), and the residues are
+//! of type 2; in any other, no mapping couples channels, and the residues
+//! are of type 1.
 
 use super::bitpack::BitPacker;
 use super::codebook::Codebook;
 use super::floor::Floor;
 use super::header::{self, HeaderType};
-use super::residue::Residue;
+use super::residue::{Residue, ResidueKind};
 
 /// The samples of a short block and of a long one, `blocksize_0` and
 /// `blocksize_1` (clause 4.2.2), whose spectra have 128 and 1024 lines:
@@ -37,6 +40,26 @@ pub const BLOCKSIZES: [usize; 2] = [256, 2048];
 
 /// The modes, by `mode_number`: one for each block size, whose mapping,
 /// floor and residue are those of the same number.
+///
+/// Two modes, whatever the channels: a stereo stream codes every block of
+/// either size coupled, rather than having modes of each size coupled and
+/// not to choose from. The specification allows up to 64 modes; two is a
+/// choice for compatibility with ffmpeg's Vorbis parser, which times the
+/// packets of an Ogg stream, and which in ffmpeg n9.0.2 reports streams of
+/// more than two modes as not implemented, though its decoder decodes
+/// them.
+///
+/// What it costs: measured with modes of each size coupled and not, each
+/// block in whichever took fewer bytes, the tuning set's 51 tracks at 44.1
+/// kHz in stereo took 1.4% fewer bytes than coupled throughout, before the
+/// angles were narrowed (see [`coupling`](super::coupling)). Where the
+/// channels are unlike, coupling costs more: a channel whose floor is
+/// unused is decoded all the same where coupled (clause 4.3.3), and its
+/// angles, all 0, are coded interleaved with the other's magnitudes. On 23
+/// s of a track of the tuning set at a noise offset of 3 dB, with its right
+/// channel silent, the stream took 10% more bytes than before coupling,
+/// when each channel was coded on its own; with its channels taking turns,
+/// each silent in every other 1024 samples, 20% more.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
     Short = 0,
@@ -58,18 +81,22 @@ impl Mode {
 pub struct Setup {
     pub floors: [Floor; 2],
     pub residues: [Residue; 2],
-}
-
-impl Default for Setup {
-    fn default() -> Self {
-        Self::new()
-    }
+    /// Whether the mappings couple channel 0, as the magnitude, with
+    /// channel 1, as the angle: in a stereo stream.
+    pub coupled: bool,
 }
 
 impl Setup {
-    /// The residues' codebooks first, then the floors'.
-    pub fn new() -> Self {
-        let residues = [false, true].map(|blockflag| Residue::new(blockflag, 0));
+    /// The setup of a stream of `channels` channels. The residues'
+    /// codebooks come first, then the floors'.
+    pub fn new(channels: usize) -> Self {
+        let coupled = channels == 2;
+        let kind = if coupled {
+            ResidueKind::Coupled
+        } else {
+            ResidueKind::Uncoupled
+        };
+        let residues = [false, true].map(|blockflag| Residue::new(blockflag, kind, 0));
         let first_floor_book = residues[1].codebooks().len() as u8;
         Self {
             floors: [
@@ -77,6 +104,7 @@ impl Setup {
                 Floor::long(first_floor_book),
             ],
             residues,
+            coupled,
         }
     }
 
@@ -119,14 +147,14 @@ impl Setup {
 
         out.write(self.residues.len() as u32 - 1, 6); // vorbis_residue_count
         for residue in &self.residues {
-            out.write(1, 16); // its type
+            out.write(residue.residue_type(), 16);
             residue.write_setup(&mut out);
         }
 
         out.write(Mode::ALL.len() as u32 - 1, 6); // vorbis_mapping_count
         for mode in Mode::ALL {
             out.write(0, 16); // its type
-            write_mapping(mode as u32, &mut out);
+            self.write_mapping(mode, &mut out);
         }
 
         out.write(Mode::ALL.len() as u32 - 1, 6); // vorbis_mode_count
@@ -140,18 +168,26 @@ impl Setup {
         out.write_bool(true); // the framing flag
         out.into_bytes()
     }
-}
 
-/// A mapping of type 0 (clause 4.2.4): one submap, of floor `number` and
-/// residue `number`, for every channel, and no coupling.
-fn write_mapping(number: u32, out: &mut BitPacker) {
-    out.write_bool(false); // vorbis_mapping_submaps, of one
-    out.write_bool(false); // no square polar channel mapping
-    out.write(0, 2); // reserved
-    // With one submap, no vorbis_mapping_mux; its floor and residue:
-    out.write(0, 8); // the time configuration placeholder
-    out.write(number, 8);
-    out.write(number, 8);
+    /// The mapping of `mode`, of type 0 (clause 4.2.4): one submap, of the
+    /// floor and residue of the same number, for every channel; and in a
+    /// stereo stream, one coupling step, of channel 0 as the magnitude and
+    /// channel 1 as the angle.
+    fn write_mapping(&self, mode: Mode, out: &mut BitPacker) {
+        out.write_bool(false); // vorbis_mapping_submaps, of one
+        out.write_bool(self.coupled); // square polar channel mapping
+        if self.coupled {
+            out.write(0, 8); // vorbis_mapping_coupling_steps, of one
+            // Each channel number in ilog(2 - 1) bits.
+            out.write(0, 1); // vorbis_mapping_magnitude
+            out.write(1, 1); // vorbis_mapping_angle
+        }
+        out.write(0, 2); // reserved
+        // With one submap, no vorbis_mapping_mux; its floor and residue:
+        out.write(0, 8); // the time configuration placeholder
+        out.write(mode as u32, 8);
+        out.write(mode as u32, 8);
+    }
 }
 
 #[cfg(test)]
@@ -167,7 +203,13 @@ mod tests {
 
     #[test]
     fn the_setup_header_begins_with_its_codebooks() {
-        let setup = Setup::new();
+        for channels in 1..=8 {
+            let setup = Setup::new(channels);
+            assert_eq!(setup.coupled, channels == 2);
+            let types = setup.residues.each_ref().map(Residue::residue_type);
+            assert_eq!(types, if channels == 2 { [2, 2] } else { [1, 1] });
+        }
+        let setup = Setup::new(2);
         let header = setup.header();
         assert_eq!(&header[..7], b"\x05vorbis");
         assert_eq!(usize::from(header[7]) + 1, setup.codebooks().len());

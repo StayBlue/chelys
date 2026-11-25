@@ -244,6 +244,15 @@ impl Tables {
             short: FftTables::new(sample_rate, Fft::Short),
         }
     }
+
+    /// The partition of each line of a long block, if `long`, or of a short
+    /// one: the bands whose lines the model allows the same noise each.
+    pub fn partition_of_lines(&self, long: bool) -> Vec<usize> {
+        let tables = if long { &self.long } else { &self.short };
+        (tables.partitions.iter().enumerate())
+            .flat_map(|(b, partition)| partition.lines.clone().map(move |_| b))
+            .collect()
+    }
 }
 
 /// What the model computes once for each sample rate, for the long or the
@@ -745,6 +754,23 @@ mod tests {
         }
         assert_eq!(y_value(1e-12), 0);
         assert_eq!(y_value(1e6), RANGE - 1);
+    }
+
+    #[test]
+    fn each_line_has_a_partition_in_order() {
+        for sample_rate in [8_000, 44_100, 48_000, 96_000, 192_000] {
+            let tables = Tables::new(sample_rate);
+            for (long, lines) in [(true, LINES), (false, SHORT_LINES)] {
+                let partitions = tables.partition_of_lines(long);
+                assert_eq!(partitions.len(), lines, "{sample_rate} Hz");
+                assert_eq!(partitions[0], 0);
+                assert!(
+                    partitions
+                        .windows(2)
+                        .all(|w| w[1] == w[0] || w[1] == w[0] + 1)
+                );
+            }
+        }
     }
 
     #[test]
