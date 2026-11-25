@@ -48,8 +48,9 @@ const KEPT: usize = BLOCK + HOP as usize;
 /// for blocks of either size, and the spectrum is scaled by `2 / N` to
 /// match it. Settled by decoding with ffmpeg (black box): it decodes a
 /// tone at its level, within 0.5 dB, neither delayed, advanced nor
-/// inverted; the conformance test is
-/// `ffmpeg_decodes_a_tone_at_its_level_and_phase`.
+/// inverted, in long blocks and in short ones; the conformance tests are
+/// `ffmpeg_decodes_a_tone_at_its_level_and_phase` and
+/// `ffmpeg_decodes_a_tone_in_short_blocks_at_its_level_and_phase`.
 fn spectrum_scale(n: usize) -> f64 {
     2.0 / n as f64
 }
@@ -322,7 +323,12 @@ impl Encoder {
     /// packet. Clause 4.3.8 returns no sample past a block's center,
     /// whatever the block after. The granule position is taken as the
     /// samples returned by clause 4.3.8, as the appendix's first sentence
-    /// reads, not as the samples finished.
+    /// reads, not as the samples finished. Settled by decoding with ffmpeg
+    /// (black box): with each packet on a page of its own, ffprobe times
+    /// each packet after the first two from the granule position of the
+    /// one before it to its own, long blocks before short ones too; the
+    /// conformance test is
+    /// `ffmpeg_times_each_packet_from_its_granule_position`.
     fn code<O: PacketSink + ?Sized>(&mut self, end: Option<u64>, out: &mut O) -> bool {
         if self.hops == 0 {
             for ((model, pcm), analysis) in
