@@ -10,6 +10,8 @@
 //! the floor as its quantizer's step: each line's residue is the line
 //! divided by the floor and rounded (see [`residue`](super::residue)).
 
+use std::ops::Range;
+
 use super::bitpack::{BitPacker, ilog};
 use super::codebook::{Codebook, huffman_lengths};
 use super::frequencies;
@@ -30,6 +32,13 @@ pub const MULTIPLIER: u32 = 3;
 
 /// The Y values' range for [`MULTIPLIER`] (clause 7.2.3): 0 to 85.
 pub const RANGE: i32 = [256, 128, 86, 64][MULTIPLIER as usize - 1];
+
+/// The ratio in dB of the floors of two Y values one apart: [`MULTIPLIER`]
+/// steps of the table of clause 10.1, which rises by a constant ratio.
+pub fn y_step_db() -> f64 {
+    let span = f64::from(INVERSE_DB_TABLE[255]) / f64::from(INVERSE_DB_TABLE[0]);
+    20.0 * span.log10() / 255.0 * f64::from(MULTIPLIER)
+}
 
 /// The Y values coded together by each partition's class.
 const CLASS_DIMENSIONS: usize = 3;
@@ -165,8 +174,31 @@ impl Floor {
     }
 
     /// `floor1_X_list`, in its order.
+    #[cfg_attr(not(any(test, feature = "unstable")), allow(dead_code))]
     pub fn xs(&self) -> &[u32] {
         &self.xs
+    }
+
+    /// The lines about each post, in list order, of a block of `lines`
+    /// lines: those nearer the post than any other, those halfway between
+    /// two posts going to both, and at least one line for each post.
+    pub fn post_lines(&self, lines: usize) -> Vec<Range<usize>> {
+        let mut sorted: Vec<u32> = self.xs.clone();
+        sorted.sort_unstable();
+        self.xs
+            .iter()
+            .map(|&x| {
+                let i = sorted.binary_search(&x).expect("a post of the floor");
+                let low = if i == 0 {
+                    0
+                } else {
+                    (sorted[i - 1] + x).div_ceil(2)
+                };
+                let high = sorted.get(i + 1).map_or(x + 1, |&next| (x + next) / 2 + 1);
+                let (low, high) = ((low as usize).min(lines - 1), (high as usize).min(lines));
+                low..high.max(low + 1)
+            })
+            .collect()
     }
 
     /// Writes the floor's configuration (clause 7.2.2), after its type.

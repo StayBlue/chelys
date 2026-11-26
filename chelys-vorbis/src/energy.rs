@@ -45,6 +45,24 @@ pub const KEPT_SHARE: f64 = 0.5;
 /// a line lower still would make more noise than its energy.
 pub const LEAST_STEPS: f64 = 0.15;
 
+/// How many times as large [`keep`] counts a line of one channel of a
+/// coupled pair whose value in the other channel is the one keeping would
+/// give it, so that the two channels' values of the line are alike, and
+/// its angle 0, which takes fewer bits (see the coupling's
+/// `square_polar`).
+///
+/// Graded with PEAQ (GstPEAQ 0.6.1, black box) on the 51 tracks of the
+/// tuning set at 44.1 kHz in stereo, at noise offsets matched to 96.5,
+/// 128.4 and 159.2 kbit/s, with the floors matched (see the coupling's
+/// `match_floors`) and up to twice the noise allowed in the treble where
+/// bits were scarce (see the psychoacoustic model's `TREBLE_HZ`), the
+/// streams graded -0.879, -0.416 and -0.193 with each channel's energy
+/// kept on its own, and -0.870, -0.416 and -0.193 so; with twice the noise
+/// in the treble at every rate and the two channels' values also set alike
+/// above 14 kHz, -0.877, -0.394 and -0.156 against -0.868, -0.393 and
+/// -0.157, higher on 51 of the 51 tracks at 96.5 kbit/s.
+pub const SHARED_PREFERENCE: f64 = 4.0;
+
 /// The frequency above which no energy is kept.
 ///
 /// Above it, lines coded as 1 among lines coded as 0 grade higher with
@@ -161,12 +179,17 @@ pub struct Protected<'a> {
 /// or where coding it so makes less noise than coding it as 0. A line
 /// coded as `v` makes the noise `(x - f v)^2`, where it is `x` and the
 /// floor `f`.
+///
+/// In a coupled pair, `other` is the other channel's residue: a line whose
+/// value there is the one this channel's would take counts as
+/// [`SHARED_PREFERENCE`] times as large.
 pub fn keep(
     residue: &mut [i32],
     spectrum: &[f64],
     curve: &[f32],
     protected: Protected<'_>,
     kept: usize,
+    other: Option<&[i32]>,
 ) {
     let kept = kept.min(residue.len());
     let noise = |k: usize, v: i32| (spectrum[k] - f64::from(curve[k]) * f64::from(v)).powi(2);
@@ -195,6 +218,10 @@ pub fn keep(
                 .filter(|&k| residue[k] == 0)
                 .map(|k| (k, spectrum[k].abs() / f64::from(curve[k])))
                 .filter(|&(k, steps)| steps >= LEAST_STEPS && fits(k))
+                .map(|(k, steps)| match other {
+                    Some(other) if other[k] == sign(k) => (k, steps * SHARED_PREFERENCE),
+                    _ => (k, steps),
+                })
                 .max_by(|a, b| a.1.total_cmp(&b.1));
             let Some((k, _)) = largest else { break };
             if k < protected_lines {
@@ -304,6 +331,27 @@ mod tests {
     }
 
     #[test]
+    fn a_line_alike_in_the_other_channel_is_kept_first() {
+        // Lines from 0.1 to 0.475 steps, all coded as 0; the other channel
+        // codes the line of 0.4 steps as this channel would, and the
+        // largest with the other sign.
+        let spectrum: Vec<f64> = (0..GROUP).map(|k| 0.1 + 0.025 * k as f64).collect();
+        let curve = vec![1.0; GROUP];
+        let mut other = vec![0; GROUP];
+        other[12] = 1;
+        other[GROUP - 1] = -1;
+        let mut residue = vec![0; GROUP];
+        keep(&mut residue, &spectrum, &curve, NONE, GROUP, Some(&other));
+        let filled: Vec<usize> = (0..GROUP).filter(|&k| residue[k] != 0).collect();
+        assert_eq!(filled, [12]);
+        assert_eq!(residue[12], 1);
+        // Without the other channel, the largest.
+        let mut residue = vec![0; GROUP];
+        keep(&mut residue, &spectrum, &curve, NONE, GROUP, None);
+        assert_eq!(residue.iter().position(|&v| v != 0), Some(GROUP - 1));
+    }
+
+    #[test]
     fn a_hole_is_filled_with_its_largest_lines_to_the_share() {
         // A group of lines from 0.1 to 0.475 steps, all coded as 0.
         let spectrum: Vec<f64> = (0..GROUP)
@@ -311,7 +359,7 @@ mod tests {
             .collect();
         let curve = vec![1.0; GROUP];
         let mut residue = vec![0; GROUP];
-        keep(&mut residue, &spectrum, &curve, NONE, GROUP);
+        keep(&mut residue, &spectrum, &curve, NONE, GROUP, None);
         let energy: f64 = spectrum.iter().map(|x| x * x).sum();
         assert!(decoded(&residue, &curve, 0..GROUP) >= KEPT_SHARE * energy);
         // The fewest lines that do, the largest, signed as the lines.
@@ -332,7 +380,7 @@ mod tests {
         spectrum[..GROUP].fill(0.9);
         let curve = vec![1.0; 3 * GROUP];
         let before = residue.clone();
-        keep(&mut residue, &spectrum, &curve, NONE, 2 * GROUP);
+        keep(&mut residue, &spectrum, &curve, NONE, 2 * GROUP, None);
         assert_eq!(residue[..GROUP], before[..GROUP]);
         assert!(residue[GROUP..2 * GROUP].iter().any(|&v| v != 0));
         assert!(residue[2 * GROUP..].iter().all(|&v| v == 0));
@@ -342,7 +390,7 @@ mod tests {
     fn lines_below_the_least_are_never_coded() {
         let spectrum = vec![0.9 * LEAST_STEPS; GROUP];
         let mut residue = vec![0; GROUP];
-        keep(&mut residue, &spectrum, &[1.0; GROUP], NONE, GROUP);
+        keep(&mut residue, &spectrum, &[1.0; GROUP], NONE, GROUP, None);
         assert!(residue.iter().all(|&v| v == 0));
     }
 
@@ -371,7 +419,7 @@ mod tests {
                 noise: &noise,
                 partitions: &partitions,
             };
-            keep(&mut residue, &spectrum, &curve, protected, GROUP);
+            keep(&mut residue, &spectrum, &curve, protected, GROUP, None);
             let coded = residue.iter().filter(|&&v| v != 0).count();
             for band in [0..8, 8..GROUP] {
                 if band.start < lines {
@@ -393,7 +441,7 @@ mod tests {
             noise: &[0.09; GROUP],
             partitions: &partitions,
         };
-        keep(&mut residue, &spectrum, &curve, protected, GROUP);
+        keep(&mut residue, &spectrum, &curve, protected, GROUP, None);
         assert!(residue.iter().all(|&v| v == 0));
     }
 

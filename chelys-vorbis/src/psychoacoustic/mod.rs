@@ -33,7 +33,8 @@
 //! - Step 8 takes `TMN(b)` as [`TMN`], 15 dB, rather than 18.
 //! - Each partition's threshold, scaled by the rate's noise offset, is
 //!   raised further with the width of its critical band (see
-//!   [`BAND_EXPONENT`]).
+//!   [`BAND_EXPONENT`]), and above 11 kHz in long blocks further still
+//!   (see [`TREBLE_HZ`]).
 //! - Nothing past step 13 is taken: the threshold of each partition is
 //!   shared evenly among its lines, and becomes the noise each line of the
 //!   block's spectrum may take, as noise at the scale of the spectrum
@@ -257,7 +258,8 @@ const NARROWEST_BAND_HZ: f64 = 100.0;
 /// How the noise each partition is allowed grows with the width in Hz of
 /// its critical band (see [`band_weights`]): as that width, against
 /// [`NARROWEST_BAND_HZ`], to this power. At 44.1 kHz the weight is about
-/// 1.5 dB at 1 kHz, 6 dB at 4 kHz and 10 dB at 16 kHz.
+/// 1.5 dB at 1 kHz, 6 dB at 4 kHz and 10 dB at 16 kHz, where
+/// [`TREBLE_WEIGHT`] adds up to 3 dB more.
 ///
 /// chelys's own design, a deliberate departure from the model's threshold
 /// scaled alike in every band. The rate's offset sets how far the noise
@@ -304,6 +306,72 @@ const NARROWEST_BAND_HZ: f64 = 100.0;
 /// and -0.222 with 3/4, lower on 38 of the 51 tracks at 96.5 kbit/s: the
 /// power stays 2/3.
 const BAND_EXPONENT: f64 = 2.0 / 3.0;
+
+/// The frequency above which each partition of a long block is allowed
+/// more noise still than [`BAND_EXPONENT`] allows it, rising over
+/// [`TREBLE_RAMP_HZ`] to [`treble_weight`] times as much, as the
+/// partition's center rises.
+///
+/// chelys's own design, a deliberate departure from the model's threshold,
+/// as [`BAND_EXPONENT`] is: noise there is heard least, and the bits it
+/// saves go to the bands below. PEAQ measures little of the noise there
+/// but the bandwidth it finds: on 18 tracks of the tuning set coded at 128
+/// kbit/s, the coding error above 12 kHz alone, added to the reference,
+/// made an `AvgModDiff1B` of 1.0 and a `RmsNoiseLoudB` of 0.02, against
+/// 14.0 and 0.28 for all of it, while the lines above 12 kHz took a quarter
+/// of the residue's bits. Graded with PEAQ (GstPEAQ 0.6.1, black box) on
+/// the 51 tracks of the tuning set at 44.1 kHz in one channel, at noise
+/// offsets matched to 65.2 and 81.0 kbit/s, the streams graded -0.536 and
+/// -0.209 without it, and -0.493 and -0.156 with [`TREBLE_WEIGHT`], then
+/// in short blocks too; PEAQ's `AvgModDiff1B` fell from 13.6 and 10.5 to
+/// 12.6 and 9.6.
+///
+/// In a coupled pair, the narrowing of angles takes a multiple of each
+/// channel's allowance as its room for setting the two channels' values
+/// alike (see the encoder's `coupling`), and much of the noise allowed
+/// here goes into that, which narrows the stereo image (see the coupling's
+/// `SIDE_LOSS_DB`), and where bits are scarce costs more than it saves. In
+/// stereo, at noise offsets matched to 96.5, 128.4 and 159.2 kbit/s, with
+/// the floors matched and the energy kept as the encoder keeps them, the
+/// streams graded -0.848, -0.428 and -0.203 without it, -0.882, -0.407 and
+/// -0.159 with [`TREBLE_WEIGHT`] at every rate, -0.870, -0.416 and -0.193
+/// with it where bits are scarce falling to none where they are plentiful,
+/// and -0.847, -0.410 and -0.161 as [`treble_weight`] gives it, falling
+/// from [`TREBLE_WEIGHT`] where bits are plentiful to none where they are
+/// scarce. With the narrowing's room taken from the allowance without it,
+/// the image stayed as without it, and the streams graded -0.897, -0.444
+/// and -0.195.
+///
+/// Short blocks are allowed no more noise there than [`BAND_EXPONENT`]
+/// allows them: they code attacks, and more noise in them lies before the
+/// attack. With it in short blocks too, white noise setting in after
+/// silence, coded in one channel at the rate of the conformance tests,
+/// decoded with -49.4 dBFS of noise in the 1024 samples before it, past
+/// the -50 that `ffmpeg_decodes_a_loud_onset_after_silence` allows.
+const TREBLE_HZ: f64 = 11_000.0;
+
+/// The span of frequency over which the noise allowed above [`TREBLE_HZ`]
+/// rises to [`TREBLE_WEIGHT`] times what [`BAND_EXPONENT`] allows.
+const TREBLE_RAMP_HZ: f64 = 2_000.0;
+
+/// How many times the noise that [`BAND_EXPONENT`] allows each partition
+/// is allowed above [`TREBLE_HZ`] and [`TREBLE_RAMP_HZ`], at most (see
+/// [`treble_weight`]).
+const TREBLE_WEIGHT: f64 = 2.0;
+
+/// How many times the noise that [`BAND_EXPONENT`] allows each partition
+/// of a long block is allowed above [`TREBLE_HZ`] and [`TREBLE_RAMP_HZ`]:
+/// [`TREBLE_WEIGHT`] where the channels are coded each on its own; in a
+/// coupled pair, as `coupled`, where bits are as scarce as `scarcity`, from
+/// 0 where they are plentiful to 1 where they are scarce, from
+/// [`TREBLE_WEIGHT`] to 1, none more, in proportion.
+pub fn treble_weight(coupled: bool, scarcity: f64) -> f64 {
+    if coupled {
+        TREBLE_WEIGHT.powf(1.0 - scarcity.clamp(0.0, 1.0))
+    } else {
+        TREBLE_WEIGHT
+    }
+}
 
 /// How far, in dB, the threshold in quiet is lowered below the tables'.
 ///
@@ -381,11 +449,14 @@ pub struct Tables {
 }
 
 impl Tables {
-    pub fn new(sample_rate: u32) -> Self {
+    /// The tables of `sample_rate`, whose long blocks are allowed
+    /// `treble_weight` times the noise above [`TREBLE_HZ`] (see
+    /// [`treble_weight`]).
+    pub fn new(sample_rate: u32, treble_weight: f64) -> Self {
         let below = (LONG_PREDICTED_HZ * BLOCK as f64 / f64::from(sample_rate)).round();
         Self {
-            long: FftTables::new(sample_rate, Fft::Long),
-            short: FftTables::new(sample_rate, Fft::Short),
+            long: FftTables::new(sample_rate, Fft::Long, treble_weight),
+            short: FftTables::new(sample_rate, Fft::Short, 1.0),
             long_predicted: (below as usize).clamp(LONG_CW_LINES, LINES),
             switch_pe: if sample_rate < SWITCH_PE_LOW_RATE {
                 SWITCH_PE_LOW
@@ -424,7 +495,7 @@ struct FftTables {
 }
 
 impl FftTables {
-    fn new(sample_rate: u32, fft: Fft) -> Self {
+    fn new(sample_rate: u32, fft: Fft, treble_weight: f64) -> Self {
         let partitions = partitions::partitions(sample_rate, fft);
         let n = partitions.len();
         let mut spreading = vec![0.0; n * n];
@@ -439,7 +510,11 @@ impl FftTables {
         let samples = 2 * fft.lines();
         Self {
             quiet: quiet(&partitions, quiet_reference(samples)),
-            weights: band_weights(&partitions, f64::from(sample_rate) / samples as f64),
+            weights: band_weights(
+                &partitions,
+                f64::from(sample_rate) / samples as f64,
+                treble_weight,
+            ),
             partitions,
             spreading,
             rnorm,
@@ -503,13 +578,14 @@ fn width_bark(partitions: &[Partition], b: usize) -> Option<f64> {
 /// The factor by which each of `partitions`, whose lines are `line_hz` Hz
 /// wide, is allowed more noise than the model's threshold scaled by the
 /// rate's offset: the width in Hz of the critical band about it, against
-/// [`NARROWEST_BAND_HZ`], raised to [`BAND_EXPONENT`], and no less than 1.
+/// [`NARROWEST_BAND_HZ`], raised to [`BAND_EXPONENT`], and no less than 1;
+/// and above [`TREBLE_HZ`], `treble_weight` times that.
 /// That width is the Hz between the centers of its neighbours for each
 /// Bark between their `bval(b)`, or between its own and its one neighbour's
 /// at either end. The partitions at [`TOP_BARK`] and above, at which the
 /// tables' Bark values stop rising, take that of the last partition below
 /// them.
-fn band_weights(partitions: &[Partition], line_hz: f64) -> Vec<f64> {
+fn band_weights(partitions: &[Partition], line_hz: f64, treble_weight: f64) -> Vec<f64> {
     let last = last_below_top(partitions);
     let center = |b: usize| {
         let lines = &partitions[b].lines;
@@ -522,9 +598,11 @@ fn band_weights(partitions: &[Partition], line_hz: f64) -> Vec<f64> {
     };
     (0..partitions.len())
         .map(|b| {
-            band_hz(b.min(last)).map_or(1.0, |hz| {
+            let treble = ((center(b) - TREBLE_HZ) / TREBLE_RAMP_HZ).clamp(0.0, 1.0);
+            let width = band_hz(b.min(last)).map_or(1.0, |hz| {
                 (hz / NARROWEST_BAND_HZ).max(1.0).powf(BAND_EXPONENT)
-            })
+            });
+            width * treble_weight.powf(treble)
         })
         .collect()
 }
@@ -911,24 +989,11 @@ impl Model {
 /// set for the least noise any of them may take, as the floor between two
 /// posts follows a straight line in dB from one to the other.
 pub fn floor_targets(noise: &[f64], floor: &Floor) -> Vec<i32> {
-    let xs = floor.xs();
-    let mut sorted: Vec<u32> = xs.to_vec();
-    sorted.sort_unstable();
-    let lines = noise.len();
-    xs.iter()
-        .map(|&x| {
-            let i = sorted.binary_search(&x).expect("a post of the floor");
-            let low = if i == 0 {
-                0
-            } else {
-                (sorted[i - 1] + x).div_ceil(2)
-            };
-            let high = sorted.get(i + 1).map_or(x + 1, |&next| (x + next) / 2 + 1);
-            let (low, high) = ((low as usize).min(lines - 1), (high as usize).min(lines));
-            let least = noise[low..high.max(low + 1)]
-                .iter()
-                .copied()
-                .fold(f64::INFINITY, f64::min);
+    floor
+        .post_lines(noise.len())
+        .into_iter()
+        .map(|lines| {
+            let least = noise[lines].iter().copied().fold(f64::INFINITY, f64::min);
             y_value((12.0 * least).sqrt())
         })
         .collect()
@@ -959,7 +1024,7 @@ mod tests {
     #[test]
     fn each_line_has_a_partition_in_order() {
         for sample_rate in [8_000, 44_100, 48_000, 96_000, 192_000] {
-            let tables = Tables::new(sample_rate);
+            let tables = Tables::new(sample_rate, 1.0);
             for (long, lines) in [(true, LINES), (false, SHORT_LINES)] {
                 let partitions = tables.partition_of_lines(long);
                 assert_eq!(partitions.len(), lines, "{sample_rate} Hz");
@@ -979,7 +1044,7 @@ mod tests {
     #[test]
     fn band_weights_rise_with_the_width_of_the_critical_bands() {
         for sample_rate in [8_000, 22_050, 44_100, 48_000, 96_000] {
-            let tables = Tables::new(sample_rate);
+            let tables = Tables::new(sample_rate, 1.0);
             for fft in [&tables.long, &tables.short] {
                 assert!(fft.weights[0] < 1.1, "{sample_rate} Hz");
                 // The tables' Bark values are rounded, and some partitions,
@@ -991,7 +1056,7 @@ mod tests {
                 }
             }
         }
-        let tables = Tables::new(44_100);
+        let tables = Tables::new(44_100, TREBLE_WEIGHT);
         let db_at = |fft: &FftTables, hz: f64| {
             let line = (hz * fft.samples as f64 / 44_100.0) as usize;
             let b = (fft.partitions.iter())
@@ -1000,12 +1065,31 @@ mod tests {
             10.0 * fft.weights[b].log10()
         };
         assert!(db_at(&tables.long, 200.0) < 0.5);
-        for (hz, db) in [(4_000.0, 6.0), (16_000.0, 10.0)] {
-            for fft in [&tables.long, &tables.short] {
+        // Above 13 kHz, the treble's weight too, in long blocks.
+        let treble = 10.0 * TREBLE_WEIGHT.log10();
+        for (hz, long_db, short_db) in [(4_000.0, 6.0, 6.0), (16_000.0, 10.0 + treble, 10.0)] {
+            for (fft, db) in [(&tables.long, long_db), (&tables.short, short_db)] {
                 let weight = db_at(fft, hz);
                 assert!((weight - db).abs() < 1.5, "{hz} Hz: {weight:.1} dB");
             }
         }
+    }
+
+    #[test]
+    fn a_coupled_pair_takes_less_noise_in_the_treble_as_bits_grow_scarce() {
+        for scarcity in [-1.0, 0.0, 0.5, 1.0] {
+            assert_eq!(treble_weight(false, scarcity), TREBLE_WEIGHT);
+        }
+        assert_eq!(treble_weight(true, 0.0), TREBLE_WEIGHT);
+        assert_eq!(treble_weight(true, -1.0), TREBLE_WEIGHT);
+        assert_eq!(treble_weight(true, 1.0), 1.0);
+        assert!((treble_weight(true, 0.5) - TREBLE_WEIGHT.sqrt()).abs() < 1e-12);
+        // Where bits are scarce, a pair's treble is weighed as below it.
+        let (plain, coupled) = (
+            Tables::new(44_100, 1.0),
+            Tables::new(44_100, treble_weight(true, 1.0)),
+        );
+        assert_eq!(plain.long.weights, coupled.long.weights);
     }
 
     #[test]
@@ -1020,7 +1104,7 @@ mod tests {
 
     /// The analyses of the first `blocks` blocks of `signal`.
     fn analyses(sample_rate: u32, signal: impl Fn(usize) -> f64, blocks: usize) -> Vec<Analysis> {
-        let tables = Tables::new(sample_rate);
+        let tables = Tables::new(sample_rate, 1.0);
         let mut model = Model::new(&tables, 0.0);
         (0..blocks)
             .map(|k| {
@@ -1039,7 +1123,7 @@ mod tests {
     #[test]
     fn silence_gets_the_threshold_in_quiet() {
         let analysis = analyze(44_100, |_| 0.0, 3);
-        let tables = Tables::new(44_100);
+        let tables = Tables::new(44_100, 1.0);
         for (tables, noise) in std::iter::once((&tables.long, &analysis.long))
             .chain(analysis.short.iter().map(|noise| (&tables.short, noise)))
         {
@@ -1057,7 +1141,7 @@ mod tests {
     /// The threshold of the partition holding `line`, against its energy
     /// in the long FFT, in dB, in the last of `blocks` blocks of `signal`.
     fn margin_db(signal: impl Fn(usize) -> f64, blocks: usize, line: usize) -> f64 {
-        let tables = Tables::new(44_100);
+        let tables = Tables::new(44_100, 1.0);
         let mut model = Model::new(&tables, 0.0);
         let mut out = Analysis::default();
         for k in 0..blocks {

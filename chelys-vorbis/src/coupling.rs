@@ -8,9 +8,12 @@
 //! The specification defines only the inverse, which acts on the residue
 //! vectors, before each channel's floor scales its own; the forward
 //! mapping here is chelys's own, the one that inverts it exactly, value
-//! for value.
+//! for value. So is the matching of the two channels' floors where the
+//! channels are alike (see [`match_floors`]), which makes their residues
+//! alike too.
 
 use super::energy;
+use super::floor::{self, Floor};
 
 /// How much noise, as a multiple of each channel's allowance in a band,
 /// [`narrow_angles`] may leave in the band, above [`PROTECTED_HZ`], where
@@ -88,23 +91,135 @@ pub fn angle_allowance(scarcity: f64) -> f64 {
 /// 159.6.
 pub const PROTECTED_HZ: f64 = 1500.0;
 
+/// The most, in dB, by which [`narrow_angles`] may lower the ratio of the
+/// energy of the two channels' difference to that of their sum in a band,
+/// the side to the mid, as decoded, below the lines' own, where bits are
+/// plentiful; as they grow scarce, the more (see [`side_loss_db`]).
+///
+/// chelys's own design. Setting two channels' values of a line alike makes
+/// the line decode in phase in both, each scaled by its own floor, and so
+/// narrows the stereo image, which neither the model's allowance nor PEAQ,
+/// which takes each channel on its own, measures. With the floors matched
+/// (see [`match_floors`]), more lines are set alike, and with more noise
+/// allowed in the treble (see the psychoacoustic model's `TREBLE_HZ`), more
+/// still there. Measured on the 51 tracks of the tuning set at 44.1 kHz in
+/// stereo, decoded by ffmpeg (black box), at 128.4 kbit/s, the decoded
+/// ratio from 16 to 18 kHz lay 4.0 dB below the lines' on average before
+/// the floors were matched, and more than 6 dB below on 11 of the tracks;
+/// 4.6 dB and 16 tracks with them matched; and 5.0 dB and 18 tracks with
+/// the treble's noise too. So bounded, 3.4 dB and 5 tracks, and from 14 to
+/// 16 kHz 2.6 dB below on average, against 2.1 before; at 159.2 kbit/s,
+/// 1.4 and 1.1 dB below, against 1.8 and 0.9 before; and at 96.5 kbit/s,
+/// where [`side_loss_db`] bounds little, 5.4 and 4.0 dB below, against 6.3
+/// and 3.7 before. Graded with PEAQ (GstPEAQ 0.6.1, black box) at noise
+/// offsets matched to 96.5, 128.4 and 159.2 kbit/s, the streams graded
+/// -0.847, -0.410 and -0.161 unbounded, -0.931, -0.420 and -0.157 bounded
+/// at 6 dB at every rate, and -0.857, -0.413 and -0.157 bounded as
+/// [`side_loss_db`] widens the bound.
+pub const SIDE_LOSS_DB: f64 = 6.0;
+
+/// The most, in dB, by which [`narrow_angles`] may lower a band's ratio of
+/// side to mid energy where bits are as scarce as `scarcity`, from 0 where
+/// they are plentiful to 1 where they are scarce: [`SIDE_LOSS_DB`] divided
+/// by what is left of 1 by the scarcity, without bound where it is 1, as
+/// where bits are scarce the bits narrowing saves count for most.
+pub fn side_loss_db(scarcity: f64) -> f64 {
+    SIDE_LOSS_DB / (1.0 - scarcity.clamp(0.0, 1.0))
+}
+
+/// The lines and bounds within which [`narrow_angles`] narrows a pair's
+/// angles.
+#[derive(Clone, Copy, Debug)]
+pub struct Narrowing {
+    /// The lines below [`PROTECTED_HZ`], the first of the block, where a
+    /// band may take its allowance itself.
+    pub protected: usize,
+    /// The multiple of its allowance a band may take above them (see
+    /// [`angle_allowance`]).
+    pub allowance: f64,
+    /// The most by which a band's ratio of side to mid energy may fall, in
+    /// dB (see [`side_loss_db`]).
+    pub side_loss_db: f64,
+}
+
+/// The least correlation between the two channels' lines about a post of
+/// the floor at which [`match_floors`] matches their floors there.
+///
+/// Graded with PEAQ (GstPEAQ 0.6.1, black box) on the 51 tracks of the
+/// tuning set at 44.1 kHz in stereo, at noise offsets matched to 96.5,
+/// 128.4 and 159.2 kbit/s, the streams graded -0.890, -0.451 and -0.230
+/// unmatched, -0.863, -0.431 and -0.205 matched from a correlation of 0.8,
+/// and -0.853, -0.428 and -0.203 from 0.5, higher on 43, 44 and 47 of the
+/// 51 tracks; PEAQ's `AvgModDiff1B` fell from 18.8, 14.3 and 11.2 to 18.1,
+/// 13.7 and 10.8, and its `RmsNoiseLoudB` from 0.392, 0.280 and 0.213 to
+/// 0.373, 0.267 and 0.204. Setting the two floors alike where their Y
+/// values were within one or two of each other, whatever the levels,
+/// graded lower than matching them.
+pub const MATCHED_CORRELATION: f64 = 0.5;
+
+/// Matches the floors of a stereo pair to the ratio of the channels'
+/// levels where the channels are alike: the Y values `targets` that the
+/// model sets for each channel, in the list order of `floor`, whose lines
+/// are `spectra`.
+///
+/// chelys's own design. A channel's residue is its lines divided by its
+/// floor (see [`residue`](super::residue)), and so the two channels of a
+/// sound panned between them have alike residues, which cost the fewest
+/// bits coupled, where their floors differ as their levels do. But each
+/// floor is set for its own channel's noise, in Y values about 1.6 dB
+/// apart, and the two differ by chance, by a Y value or two, so that the
+/// residues differ by as much at their larger values; [`narrow_angles`]
+/// makes them alike again only within the noise each channel may take, and
+/// the noise it adds changes their levels from one block to the next.
+///
+/// So where the lines about a post correlate by at least
+/// [`MATCHED_CORRELATION`] between the channels, the two Y values are set
+/// the whole Y values apart nearest the ratio of the channels' energies
+/// there: one stays as the model sets it, and the other is lowered to lie
+/// that far from it. Neither floor is raised, and neither channel takes
+/// more noise than the model allows it.
+pub fn match_floors(targets: [&mut [i32]; 2], spectra: [&[f64]; 2], floor: &Floor) {
+    let [left, right] = targets;
+    let step_db = floor::y_step_db();
+    for (i, lines) in floor.post_lines(spectra[0].len()).into_iter().enumerate() {
+        let (mut el, mut er, mut cross) = (0.0, 0.0, 0.0);
+        for k in lines {
+            let (l, r) = (spectra[0][k], spectra[1][k]);
+            el += l * l;
+            er += r * r;
+            cross += l * r;
+        }
+        if el == 0.0 || er == 0.0 || cross < MATCHED_CORRELATION * (el * er).sqrt() {
+            continue;
+        }
+        let apart = (10.0 * (er / el).log10() / step_db).round() as i32;
+        let l = left[i].min(right[i] - apart);
+        let r = l + apart;
+        if (0..floor::RANGE).contains(&l) && (0..floor::RANGE).contains(&r) {
+            (left[i], right[i]) = (l, r);
+        }
+    }
+}
+
 /// Maps the residues of a stereo pair, channel 0 and channel 1, in place,
 /// to the magnitude and angle that clause 4.3.5 maps back to them: each
 /// channel's residue quantized to its floor `curves`, of its lines
 /// `spectra`, which may take the noise `noises`, and which lie in the
-/// psychoacoustic model's partitions `partitions`, one for each line. The
-/// lines below the `protected` first are those below [`PROTECTED_HZ`].
+/// psychoacoustic model's partitions `partitions`, one for each line.
 ///
 /// Where both channels are used, their angles are first narrowed where
-/// that leaves each channel's noise in each band within `allowance` times
-/// its allowance above [`PROTECTED_HZ`] (see [`narrow_angles`]). Then the
+/// that leaves each channel's noise in each band within the multiple of
+/// its allowance that `narrowing` gives the band, and the band's image
+/// within its bound (see [`narrow_angles`]). Then the
 /// energy of each used channel's first `kept` lines is balanced toward
 /// `share` of their energy, as no more than `limit` (see
 /// [`energy::balance`]), but on the lines whose values the two channels
 /// share, whose angles are 0; the balance may take a band past its
 /// allowance below [`PROTECTED_HZ`] too. Last, the energy is kept (see
-/// [`energy::keep`]), which adds noise above [`PROTECTED_HZ`] and none
-/// beyond a band's allowance below. Both come after the narrowing, which
+/// [`energy::keep`]), the left channel's first, each preferring the lines
+/// that the other codes as it would, which adds noise above
+/// [`PROTECTED_HZ`] and none beyond a band's allowance below. Both come
+/// after the narrowing, which
 /// would code the lines that keeping adds as 0 again, as that makes less
 /// noise, and would take back much of the energy that the balance gives.
 ///
@@ -132,8 +247,7 @@ pub fn couple(
     spectra: [&[f64]; 2],
     noises: [&[f64]; 2],
     partitions: &[usize],
-    protected: usize,
-    allowance: f64,
+    narrowing: Narrowing,
     kept: usize,
     limit: i32,
     share: f64,
@@ -141,7 +255,7 @@ pub fn couple(
     let [left, right] = residues;
     let used = [left.iter().any(|&v| v != 0), right.iter().any(|&v| v != 0)];
     let guard = |c: usize| energy::Protected {
-        lines: protected,
+        lines: narrowing.protected,
         noise: noises[c],
         partitions,
     };
@@ -153,8 +267,7 @@ pub fn couple(
                 spectra,
                 noises,
                 partitions,
-                protected,
-                allowance,
+                narrowing,
             );
             let alike: Vec<bool> = left.iter().zip(right.iter()).map(|(l, r)| l == r).collect();
             for (c, residue) in [&mut *left, &mut *right].into_iter().enumerate() {
@@ -167,17 +280,18 @@ pub fn couple(
                     kept,
                     share,
                 );
-                energy::keep(residue, spectra[c], curves[c], guard(c), kept);
             }
+            energy::keep(left, spectra[0], curves[0], guard(0), kept, Some(right));
+            energy::keep(right, spectra[1], curves[1], guard(1), kept, Some(left));
         }
         [true, false] => {
             energy::balance(left, spectra[0], curves[0], limit, |_| false, kept, share);
-            energy::keep(left, spectra[0], curves[0], guard(0), kept);
+            energy::keep(left, spectra[0], curves[0], guard(0), kept, None);
             right.clone_from(left);
         }
         [false, true] => {
             energy::balance(right, spectra[1], curves[1], limit, |_| false, kept, share);
-            energy::keep(right, spectra[1], curves[1], guard(1), kept);
+            energy::keep(right, spectra[1], curves[1], guard(1), kept, None);
             left.clone_from(right);
         }
         [false, false] => {}
@@ -220,15 +334,18 @@ pub fn square_polar(magnitude_channel: i32, angle_channel: i32) -> (i32, i32) {
 /// `k` coded as `v` decodes to `f v`, and makes the noise `(x - f v)^2`, in
 /// a channel whose line is `x` and whose floor is `f` there. A band is a
 /// partition of the psychoacoustic model, `partitions` giving each line's,
-/// split at the `protected` first line: the model allows each of its lines
-/// the same share of the partition's threshold, which it takes as masked
-/// together. In each band, each channel may take `allowance` times the
-/// noise its lines are allowed, or below the `protected` first line
-/// the allowance itself, less the noise its rounding makes. Each line
-/// whose values differ may take the value between them, either included,
-/// of the least noise in the two channels together; the lines are taken in
-/// the order of that noise, the least first, each where it fits the room
-/// left to both channels in its band.
+/// split at `narrowing`'s `protected` first line: the model allows each of
+/// its lines the same share of the partition's threshold, which it takes
+/// as masked together. In each band, each channel may take `narrowing`'s
+/// `allowance` times the noise its lines are allowed, or below the
+/// `protected` first line the allowance itself, less the noise its
+/// rounding makes. Each line whose values differ may take the value
+/// between them, either included, of the least noise in the two channels
+/// together; the lines are taken in the order of that noise, the least
+/// first, each where it fits the room left to both channels in its band,
+/// and where it leaves the band's ratio of side to mid energy, as decoded,
+/// no more than `side_loss_db` below the lines' own, or no lower than it
+/// was (see [`SIDE_LOSS_DB`]).
 ///
 /// The values stay between the channels' own, and so within the residue's
 /// reach.
@@ -238,9 +355,13 @@ fn narrow_angles(
     spectra: [&[f64]; 2],
     noises: [&[f64]; 2],
     partitions: &[usize],
-    protected: usize,
-    allowance: f64,
+    narrowing: Narrowing,
 ) {
+    let Narrowing {
+        protected,
+        allowance,
+        side_loss_db,
+    } = narrowing;
     let [left, right] = residues;
     let lines = left.len();
     let noise = |c: usize, k: usize, v: i32| {
@@ -282,14 +403,70 @@ fn narrow_angles(
         })
         .collect();
     changes.sort_by(|a, b| (a.2[0] + a.2[1]).total_cmp(&(b.2[0] + b.2[1])));
+    // Each band's energy of the channels' difference and of their sum, of
+    // the lines and as decoded.
+    let decoded = |c: usize, k: usize, v: i32| f64::from(curves[c][k]) * f64::from(v);
+    let mut image = vec![Image::default(); room.len()];
+    for k in 0..lines {
+        let (x, y) = (spectra[0][k], spectra[1][k]);
+        image[bands[k]].add(x, y, decoded(0, k, left[k]), decoded(1, k, right[k]));
+    }
+    let least = 10f64.powf(-side_loss_db / 10.0);
     for (k, v, added) in changes {
-        let room = &mut room[bands[k]];
-        if (0..2).all(|c| added[c] <= 0.0 || added[c] <= room[c]) {
-            room[0] -= added[0];
-            room[1] -= added[1];
-            left[k] = v;
-            right[k] = v;
+        let band = bands[k];
+        if !(0..2).all(|c| added[c] <= 0.0 || added[c] <= room[band][c]) {
+            continue;
         }
+        let (old, new) = (
+            (decoded(0, k, left[k]), decoded(1, k, right[k])),
+            (decoded(0, k, v), decoded(1, k, v)),
+        );
+        let after = image[band].replaced(old, new);
+        if !after.within(least, &image[band]) {
+            continue;
+        }
+        image[band] = after;
+        room[band][0] -= added[0];
+        room[band][1] -= added[1];
+        left[k] = v;
+        right[k] = v;
+    }
+}
+
+/// A band's energy of the difference of a pair's channels, the side, and
+/// of their sum, the mid: of their lines, and as decoded.
+#[derive(Clone, Copy, Debug, Default)]
+struct Image {
+    side: f64,
+    mid: f64,
+    decoded_side: f64,
+    decoded_mid: f64,
+}
+
+impl Image {
+    /// Adds the line whose channels are `x` and `y`, and decode to `dx` and
+    /// `dy`.
+    fn add(&mut self, x: f64, y: f64, dx: f64, dy: f64) {
+        self.side += (x - y).powi(2);
+        self.mid += (x + y).powi(2);
+        self.decoded_side += (dx - dy).powi(2);
+        self.decoded_mid += (dx + dy).powi(2);
+    }
+
+    /// The band with a line decoded as `old` decoded as `new` instead.
+    fn replaced(&self, old: (f64, f64), new: (f64, f64)) -> Self {
+        Self {
+            decoded_side: self.decoded_side - (old.0 - old.1).powi(2) + (new.0 - new.1).powi(2),
+            decoded_mid: self.decoded_mid - (old.0 + old.1).powi(2) + (new.0 + new.1).powi(2),
+            ..*self
+        }
+    }
+
+    /// Whether the band's decoded ratio of side to mid is at least `least`
+    /// times its lines' own, or no lower than `before`'s.
+    fn within(&self, least: f64, before: &Self) -> bool {
+        self.decoded_side * self.mid >= least * self.side * self.decoded_mid
+            || self.decoded_side * before.decoded_mid >= before.decoded_side * self.decoded_mid
     }
 }
 
@@ -381,8 +558,11 @@ mod tests {
             [&spectra[0], &spectra[1]],
             [noise, noise],
             &partitions,
-            protected,
-            ANGLE_ALLOWANCE,
+            Narrowing {
+                protected,
+                allowance: ANGLE_ALLOWANCE,
+                side_loss_db: f64::INFINITY,
+            },
         );
         for start in (0..lines).step_by(16) {
             let split = protected.clamp(start, start + 16);
@@ -439,6 +619,68 @@ mod tests {
         narrow_and_check(&[left, right], &[1.0; 16], &[0.1; 16], 8);
     }
 
+    /// Two channels with a little of their difference left, each line
+    /// allowed far more noise than setting it alike adds: unbounded, every
+    /// line is narrowed; bounded, each band keeps its ratio of side to mid
+    /// within the bound, or as rounding left it.
+    #[test]
+    fn narrowing_keeps_each_bands_side_within_its_bound() {
+        let lines = 128;
+        let (spectra, curve, _) = alike(lines);
+        let noise = vec![100.0; lines];
+        let partitions: Vec<usize> = (0..lines).map(|k| k / 16).collect();
+        let ratio = |residues: &[Vec<i32>; 2], band: Range<usize>| {
+            let (mut side, mut mid) = (0.0, 0.0);
+            for k in band {
+                let (l, r) = (f64::from(residues[0][k]), f64::from(residues[1][k]));
+                side += (l - r).powi(2);
+                mid += (l + r).powi(2);
+            }
+            side / mid
+        };
+        let narrow = |side_loss_db: f64| {
+            let mut residues = [round(&spectra[0]), round(&spectra[1])];
+            let [left, right] = &mut residues;
+            narrow_angles(
+                [left, right],
+                [&curve, &curve],
+                [&spectra[0], &spectra[1]],
+                [&noise, &noise],
+                &partitions,
+                Narrowing {
+                    protected: 0,
+                    allowance: ANGLE_ALLOWANCE,
+                    side_loss_db,
+                },
+            );
+            residues
+        };
+        let unbounded = narrow(f64::INFINITY);
+        assert_eq!(unbounded[0], unbounded[1]);
+        let bounded = narrow(3.0);
+        let rounded = [round(&spectra[0]), round(&spectra[1])];
+        assert_ne!(bounded[0], bounded[1]);
+        for start in (0..lines).step_by(16) {
+            let band = start..start + 16;
+            let (x, y) = (&spectra[0][band.clone()], &spectra[1][band.clone()]);
+            let side: f64 = x.iter().zip(y).map(|(a, b)| (a - b).powi(2)).sum();
+            let mid: f64 = x.iter().zip(y).map(|(a, b)| (a + b).powi(2)).sum();
+            let least = (side / mid * 10f64.powf(-0.3)).min(ratio(&rounded, band.clone()));
+            assert!(
+                ratio(&bounded, band.clone()) >= least - 1e-12,
+                "lines {band:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_side_loss_widens_as_bits_grow_scarce() {
+        assert_eq!(side_loss_db(0.0), SIDE_LOSS_DB);
+        assert_eq!(side_loss_db(-1.0), SIDE_LOSS_DB);
+        assert_eq!(side_loss_db(0.5), 2.0 * SIDE_LOSS_DB);
+        assert_eq!(side_loss_db(1.0), f64::INFINITY);
+    }
+
     #[test]
     fn the_angle_allowance_falls_as_bits_grow_plentiful() {
         assert_eq!(angle_allowance(1.0), ANGLE_ALLOWANCE);
@@ -467,8 +709,11 @@ mod tests {
                 sources,
                 [&noise, &noise],
                 &vec![0; lines],
-                0,
-                ANGLE_ALLOWANCE,
+                Narrowing {
+                    protected: 0,
+                    allowance: ANGLE_ALLOWANCE,
+                    side_loss_db: SIDE_LOSS_DB,
+                },
                 0,
                 i32::MAX,
                 1.0,
@@ -476,6 +721,46 @@ mod tests {
             let (magnitude, angle) = (&residues[0], &residues[1]);
             assert_eq!(magnitude, &coded);
             assert!(angle.iter().all(|&a| a == 0));
+        }
+    }
+
+    /// Lines of a long block, some loud and some quiet, none 0.
+    fn lines_of_a_long_block() -> Vec<f64> {
+        (0..1024)
+            .map(|k| ((k * 37 % 23) as f64 - 11.5) * 1e-3 * (1.0 + (k % 5) as f64))
+            .collect()
+    }
+
+    #[test]
+    fn matched_floors_follow_the_ratio_of_alike_channels() {
+        let floor = Floor::long(0);
+        let posts = floor.xs().len();
+        let left = lines_of_a_long_block();
+        // 6 dB lower: nearest 4 Y values lower.
+        let right: Vec<f64> = left.iter().map(|x| 0.5 * x).collect();
+        let (mut l, mut r) = (vec![40; posts], vec![37; posts]);
+        match_floors([&mut l, &mut r], [&left, &right], &floor);
+        for i in 0..posts {
+            assert_eq!(r[i] - l[i], -4, "post {i}");
+            assert!(l[i] <= 40 && r[i] <= 37, "post {i}: neither is raised");
+        }
+        // The louder channel on the right, its floor the lower.
+        let (mut l, mut r) = (vec![30; posts], vec![36; posts]);
+        match_floors([&mut l, &mut r], [&right, &left], &floor);
+        assert!((0..posts).all(|i| (l[i], r[i]) == (30, 34)));
+    }
+
+    #[test]
+    fn unlike_channels_keep_their_floors() {
+        let floor = Floor::long(0);
+        let posts = floor.xs().len();
+        let left = lines_of_a_long_block();
+        let inverted: Vec<f64> = left.iter().map(|x| -x).collect();
+        let silent = vec![0.0; left.len()];
+        for right in [&inverted, &silent] {
+            let (mut l, mut r) = (vec![40; posts], vec![35; posts]);
+            match_floors([&mut l, &mut r], [&left, right], &floor);
+            assert_eq!((l, r), (vec![40; posts], vec![35; posts]));
         }
     }
 }

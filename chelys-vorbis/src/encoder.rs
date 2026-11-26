@@ -58,10 +58,10 @@ fn spectrum_scale(n: usize) -> f64 {
     2.0 / n as f64
 }
 
-/// The lines of a block of `n` samples below [`coupling::PROTECTED_HZ`] at
-/// `sample_rate`: line `k` is centered at `(k + 1/2) sample_rate / n` Hz.
-fn protected_lines(n: usize, sample_rate: u32) -> usize {
-    let below = coupling::PROTECTED_HZ * n as f64 / f64::from(sample_rate) - 0.5;
+/// The lines of a block of `n` samples below `hz` at `sample_rate`: line
+/// `k` is centered at `(k + 1/2) sample_rate / n` Hz.
+fn lines_below(hz: f64, n: usize, sample_rate: u32) -> usize {
+    let below = hz * n as f64 / f64::from(sample_rate) - 0.5;
     (below.ceil().max(0.0) as usize).min(n / 2)
 }
 
@@ -94,7 +94,7 @@ fn protected_lines(n: usize, sample_rate: u32) -> usize {
 const DEAD_ZONE: f64 = 0.1;
 
 /// The noise offsets, in dB, at and above which bits are scarce, and at
-/// and below which they are plentiful (see [`scarcity`]): about 92 and 182
+/// and below which they are plentiful (see [`scarcity`]): about 95 and 168
 /// kbit/s in stereo at 44.1 kHz.
 const SCARCE_OFFSET_DB: f64 = -4.0;
 const PLENTIFUL_OFFSET_DB: f64 = -9.0;
@@ -102,8 +102,9 @@ const PLENTIFUL_OFFSET_DB: f64 = -9.0;
 /// How scarce bits are at the noise offset `noise_offset_db`: 1 at and
 /// above [`SCARCE_OFFSET_DB`], 0 at and below [`PLENTIFUL_OFFSET_DB`], and
 /// in a straight line between, by which the dead zone, the narrowing of
-/// angles and the share of energy that the balance aims for, which trade
-/// noise for bits, are tapered.
+/// angles, the share of energy that the balance aims for, which trade
+/// noise for bits, and in stereo the noise allowed in the treble and the
+/// narrowing of the image are tapered.
 ///
 /// chelys's own design: each was tuned where bits were scarce, and where
 /// they are plentiful the noise it adds costs more than the bits it saves
@@ -183,6 +184,9 @@ pub struct Encoder {
     /// The multiple of each channel's allowance that the narrowing of
     /// angles may leave in a band (see [`coupling::angle_allowance`]).
     angle_allowance: f64,
+    /// The most by which the narrowing of angles may lower a band's ratio
+    /// of side to mid energy, in dB (see [`coupling::side_loss_db`]).
+    side_loss_db: f64,
     /// The share of each group's energy that its balance aims for (see
     /// [`energy::balanced_share`]).
     balanced_share: f64,
@@ -206,13 +210,17 @@ impl Encoder {
     /// [`ConfigError`] lists.
     pub fn new(config: Config) -> Result<Self, ConfigError> {
         let noise_offset_db = config.noise_offset_db()?;
-        let tables = Tables::new(config.sample_rate());
         let channels = config.channels();
+        let setup = Setup::new(channels);
+        let tables = Tables::new(
+            config.sample_rate(),
+            psychoacoustic::treble_weight(setup.coupled, scarcity(noise_offset_db)),
+        );
         let long_window =
             |previous_long, next_long| window(BLOCK, SHORT_BLOCK, true, previous_long, next_long);
         Ok(Self {
             config,
-            setup: Setup::new(channels),
+            setup,
             mdcts: [Mdct::new(SHORT_BLOCK), Mdct::new(BLOCK)],
             models: (0..channels)
                 .map(|_| Model::new(&tables, noise_offset_db))
@@ -234,6 +242,7 @@ impl Encoder {
             last_long: true,
             dead_zone: DEAD_ZONE * scarcity(noise_offset_db),
             angle_allowance: coupling::angle_allowance(scarcity(noise_offset_db)),
+            side_loss_db: coupling::side_loss_db(scarcity(noise_offset_db)),
             balanced_share: energy::balanced_share(scarcity(noise_offset_db)),
         })
     }
@@ -432,11 +441,13 @@ impl Encoder {
     /// Each channel's spectrum is given the floor that
     /// [`psychoacoustic`] sets, and its residue is quantized to it (see
     /// [`Quantized`]). A channel whose residue is all zeros is coded as
-    /// unused. In a stereo stream, the two channels' residues are then
-    /// coupled (see [`coupling::couple`]); in any other, the energy of each
-    /// used channel's lines is balanced (see [`energy::balance`]) and kept
-    /// (see [`energy::keep`]), as the coupling balances and keeps it in
-    /// stereo.
+    /// unused. In a stereo stream, where both are used, the two channels'
+    /// floors are then matched where the channels are alike, and their
+    /// residues quantized to them again (see [`coupling::match_floors`]),
+    /// and the residues coupled (see [`coupling::couple`]); in any other,
+    /// the energy of each used channel's lines is balanced (see
+    /// [`energy::balance`]) and kept (see [`energy::keep`]), as the
+    /// coupling balances and keeps it in stereo.
     fn block<O: PacketSink + ?Sized>(
         &mut self,
         short: Option<usize>,
@@ -485,7 +496,7 @@ impl Encoder {
         let lines = n / 2;
         let mut windowed = vec![0.0; n];
         let mut spectra = vec![vec![0.0; lines]; self.pcm.len()];
-        let mut channels: Vec<Quantized> = (self.pcm.iter())
+        let (mut targets, mut channels): (Vec<Vec<i32>>, Vec<Quantized>) = (self.pcm.iter())
             .zip(&noises)
             .zip(&mut spectra)
             .map(|((pcm, noise), spectrum)| {
@@ -496,12 +507,23 @@ impl Encoder {
                 for line in spectrum.iter_mut() {
                     *line *= spectrum_scale(n);
                 }
-                Quantized::new(floor, noise, spectrum, limit, self.dead_zone)
+                let targets = psychoacoustic::floor_targets(noise, floor);
+                let quantized = Quantized::new(floor, &targets, spectrum, limit, self.dead_zone);
+                (targets, quantized)
             })
-            .collect();
+            .unzip();
+        // Coupled, where both channels are used, their floors are matched
+        // where the channels are alike (see `coupling::match_floors`).
+        let both_used = channels.iter().all(Quantized::used);
+        if let ([left, right], true) = (&mut targets[..], self.setup.coupled && both_used) {
+            coupling::match_floors([left, right], [&spectra[0], &spectra[1]], floor);
+            for ((channel, targets), spectrum) in channels.iter_mut().zip(&targets).zip(&spectra) {
+                *channel = Quantized::new(floor, targets, spectrum, limit, self.dead_zone);
+            }
+        }
         let used: Vec<bool> = channels.iter().map(Quantized::used).collect();
         let kept = energy::kept_lines(lines, self.config.sample_rate());
-        let protected = protected_lines(n, self.config.sample_rate());
+        let protected = lines_below(coupling::PROTECTED_HZ, n, self.config.sample_rate());
         let partitions = &self.partitions[usize::from(mode.blockflag())];
         if let ([left, right], true) = (&mut channels[..], self.setup.coupled) {
             coupling::couple(
@@ -510,8 +532,11 @@ impl Encoder {
                 [&spectra[0], &spectra[1]],
                 [noises[0], noises[1]],
                 partitions,
-                protected,
-                self.angle_allowance,
+                coupling::Narrowing {
+                    protected,
+                    allowance: self.angle_allowance,
+                    side_loss_db: self.side_loss_db,
+                },
                 kept,
                 limit,
                 self.balanced_share,
@@ -541,6 +566,7 @@ impl Encoder {
                         &channel.curve,
                         protected,
                         kept,
+                        None,
                     );
                 }
             }
@@ -602,20 +628,16 @@ struct Quantized {
 }
 
 impl Quantized {
-    /// The floor that the model sets for the noise `noise` allows each
-    /// line, raised where a line would be more than `limit` steps of it,
-    /// and the residue of `spectrum`: each line divided by the floor there
-    /// and rounded, nearer zero by `dead_zone` (see [`DEAD_ZONE`]), and
-    /// held within `limit`, which only a line far past full scale passes.
-    fn new(floor: &Floor, noise: &[f64], spectrum: &[f64], limit: i32, dead_zone: f64) -> Self {
+    /// The floor of the Y values `targets`, raised where a line would be
+    /// more than `limit` steps of it, and the residue of `spectrum`: each
+    /// line divided by the floor there and rounded, nearer zero by
+    /// `dead_zone` (see [`DEAD_ZONE`]), and held within `limit`, which only
+    /// a line far past full scale passes.
+    fn new(floor: &Floor, targets: &[i32], spectrum: &[f64], limit: i32, dead_zone: f64) -> Self {
         // The floor the model sets, raised where it would put a line past
         // the residue's reach, as at an attack after silence, where the
         // threshold is held near the threshold in quiet.
-        let (values, curve) = floor.values_within(
-            &psychoacoustic::floor_targets(noise, floor),
-            spectrum,
-            f64::from(limit),
-        );
+        let (values, curve) = floor.values_within(targets, spectrum, f64::from(limit));
         let residue = (spectrum.iter().zip(&curve))
             .map(|(&x, &f)| {
                 let steps = x / f64::from(f);
