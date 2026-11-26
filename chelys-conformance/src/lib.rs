@@ -11,7 +11,7 @@
 //! says "Settled by decoding with" the decoders that settled it and names
 //! the test. That evidence was recorded with ffmpeg n9.0.2, mpg123 1.33.7
 //! and LAME 4.0 (64-bit), for AAC with ffmpeg n9.0.2 and FAAD2 2.11.4,
-//! for Vorbis, in the tests' Ogg streams (see [`ogg`]), with ffmpeg
+//! for Vorbis, in Ogg streams of `chelys-ogg` (see [`ogg`]), with ffmpeg
 //! n9.0.2, and for MP4 files with ffmpeg n9.0.2 and GStreamer 1.28.9, through
 //! `qtdemux`, gst-libav 1.28.9's `avdec_aac` and `avdec_alac`,
 //! gst-plugins-good 1.28.9's `flacdec`, gst-plugins-base 1.28.9's

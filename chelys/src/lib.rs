@@ -3,8 +3,9 @@
 
 //! Research audio encoders implemented from their specifications, one
 //! crate each, offered here as a module each behind a feature of the same
-//! name, and the MP4 file format as `mp4`, which holds chelys's AAC, and
-//! FLAC, Opus, AAC-LC and ALAC packets from any encoder.
+//! name, the MP4 file format as `mp4`, which holds chelys's AAC, and
+//! FLAC, Opus, AAC-LC and ALAC packets from any encoder, and the Ogg format
+//! as `ogg`, which holds chelys's Vorbis.
 //!
 //! ```
 //! # #[cfg(feature = "mp3")] {
@@ -28,6 +29,9 @@ pub use chelys_mp3 as mp3;
 #[cfg(feature = "mp4")]
 #[doc(inline)]
 pub use chelys_mp4 as mp4;
+#[cfg(feature = "ogg")]
+#[doc(inline)]
+pub use chelys_ogg as ogg;
 #[cfg(feature = "vorbis")]
 #[doc(inline)]
 pub use chelys_vorbis as vorbis;

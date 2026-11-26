@@ -1,0 +1,16 @@
+[package]
+name = "chelys-ogg"
+description = "Writes chelys's Vorbis streams in Ogg, from RFC 3533 and the Vorbis I specification."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+chelys-vorbis = { path = "../chelys-vorbis" }
+
+[features]
+# The page writer, for chelys's own conformance tests: see
+# `chelys_ogg::internals`.
+unstable = []

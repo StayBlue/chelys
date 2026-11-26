@@ -19,7 +19,7 @@
 //! The encoder gives Vorbis packets, not a container: its three
 //! [`Headers`], then each audio packet with its granule position, from
 //! which a container such as Ogg (Appendix A) times it and trims the end of
-//! the stream.
+//! the stream. `chelys-ogg` writes them in Ogg streams.
 //!
 //! ```
 //! use chelys_vorbis::{Config, Encoder, Packet, Rate};

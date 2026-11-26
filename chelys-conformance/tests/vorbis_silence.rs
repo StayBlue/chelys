@@ -95,7 +95,7 @@ fn ffmpeg_misreads_a_stream_on_one_audio_page() {
     }
 }
 
-/// Guards the CRC that the test's Ogg writer computes: ffmpeg reports a
+/// Guards the CRC that `chelys::ogg` computes: ffmpeg reports a
 /// page whose CRC is wrong, and so checks the CRC of the pages it reads
 /// without error.
 #[test]

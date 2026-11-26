@@ -11,6 +11,7 @@ publish = false
 chelys-aac = { path = "../chelys-aac", optional = true }
 chelys-mp3 = { path = "../chelys-mp3", optional = true }
 chelys-mp4 = { path = "../chelys-mp4", optional = true, default-features = false }
+chelys-ogg = { path = "../chelys-ogg", optional = true }
 chelys-vorbis = { path = "../chelys-vorbis", optional = true }
 
 [features]
@@ -23,10 +24,13 @@ mp3 = ["dep:chelys-mp3"]
 mp4 = ["dep:chelys-mp4"]
 # Vorbis I packets.
 vorbis = ["dep:chelys-vorbis"]
+# Ogg streams of chelys's Vorbis: see chelys-ogg's documentation.
+ogg = ["dep:chelys-ogg", "vorbis"]
 # Each codec's building blocks, for chelys's own conformance tests.
 unstable = [
     "chelys-aac?/unstable",
     "chelys-mp3?/unstable",
+    "chelys-ogg?/unstable",
     "chelys-vorbis?/unstable",
 ]
 
