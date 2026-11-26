@@ -18,9 +18,9 @@ encoders or decoders:
   files; from ISO/IEC 13818-7, ISO/IEC 14496-3 for what MPEG-4 adds, and
   ISO/IEC 14496-12, 14496-14, 14496-1 and 14496-34 for MP4.
 - Vorbis: Vorbis I, from mono to 8 channels, at a variable rate set by a
-  quality level, as packets with their granule positions or in Ogg streams;
-  from the Xiph.Org Foundation's "Vorbis I specification", and RFC 3533 for
-  Ogg.
+  quality level or steered toward a mean bitrate, as packets with their
+  granule positions or in Ogg streams; from the Xiph.Org Foundation's
+  "Vorbis I specification", and RFC 3533 for Ogg.
 - MP4 from other encoders: the library also writes FLAC, Opus, AAC-LC and
   ALAC packets that any encoder made in MP4 files, whole or fragmented for
   streaming: FLAC and Opus from Xiph's mappings of each to the ISO base media
@@ -48,4 +48,5 @@ ffmpeg -i song.flac -f f32le -ar 44100 -ac 2 - \
 The codec comes first; run it with `--help` for the codecs, with `mp3 --help`
 for the bitrates, sampling frequencies and stereo modes of MP3, with
 `aac --help` for the sampling frequencies, channels and bitrates of AAC, and
-with `vorbis --help` for the channels and quality levels of Vorbis.
+with `vorbis --help` for the channels, quality levels and mean bitrates of
+Vorbis.
