@@ -14,4 +14,4 @@ path = "src/main.rs"
 doc = false
 
 [dependencies]
-chelys = { path = "../chelys" }
+chelys = { path = "../chelys", features = ["ogg"] }

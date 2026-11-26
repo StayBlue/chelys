@@ -12,6 +12,7 @@ mod aac;
 mod mp3;
 mod output;
 mod pcm;
+mod vorbis;
 
 use std::process::ExitCode;
 use std::str::FromStr;
@@ -25,6 +26,8 @@ to stdout, encoded with CODEC:
   aac   MPEG-2 AAC in the Low Complexity profile, in ADTS or an MP4 file
   mp3   MPEG-1 Layer III, MPEG-2 Layer III at its lower sampling
         frequencies, and MPEG-2.5
+  vorbis
+        Vorbis I, in an Ogg stream
 
 Run chelys CODEC --help for its options.";
 
@@ -41,6 +44,7 @@ fn main() -> ExitCode {
     match args.next().as_deref() {
         Some("aac") => run(aac::USAGE, aac::parse(args), |o| aac::encode(&o)),
         Some("mp3") => run(mp3::USAGE, mp3::parse(args), |o| mp3::encode(&o)),
+        Some("vorbis") => run(vorbis::USAGE, vorbis::parse(args), |o| vorbis::encode(&o)),
         Some("-h" | "--help") => {
             println!("{USAGE}");
             ExitCode::SUCCESS
