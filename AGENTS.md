@@ -354,16 +354,13 @@ chelys's Vorbis encoder is implemented from the "Vorbis I specification"
 (Xiph.Org Foundation, dated July 4, 2020;
 https://xiph.org/vorbis/doc/Vorbis_I_spec.pdf, as read on 2026-11-24) only,
 under the same clean-room rules as the standards named under "Clean room"; it
-is the one source added for Vorbis. chelys gives Vorbis packets, not Ogg
-streams, and implements neither the specification's appendix on RTP nor Ogg.
-Ask before adding a container for Vorbis.
-
-Tests may put chelys's Vorbis packets into Ogg streams, to decode them as
-black boxes, from RFC 3533 and its verified errata and from the
-specification's appendix on Ogg, under the same clean-room rules. That code
-stays in the tests. Other Ogg writers and readers, for example libogg and
-ffmpeg's Ogg muxer and demuxer, fall under "Clean room" as the codecs named
-there do.
+is the one source added for Vorbis. chelys gives Vorbis packets, and
+`chelys-ogg` writes them in Ogg streams, from RFC 3533 and its verified errata
+and from the specification's appendix on Ogg, under the same clean-room rules.
+It implements neither the specification's appendix on RTP nor any other
+container for Vorbis. Ask before adding one. Other Ogg writers and readers,
+for example libogg and ffmpeg's Ogg muxer and demuxer, fall under "Clean room"
+as the codecs named there do.
 
 - Other Vorbis encoders and decoders, for example libvorbis, aoTuV, Tremor,
   stb_vorbis, lewton and ffmpeg's, fall under "Clean room" as the codecs named
@@ -382,6 +379,9 @@ with ffmpeg may settle it, documented as for the standards.
 
 *User, 2026-11-24, when the specification and RFC 3533 were given: the wording
 was proposed by the agent and approved by the user.*
+*User, 2026-11-26: `chelys-ogg` added, to write chelys's Vorbis in Ogg streams
+as `chelys-mp4` writes its AAC in MP4 files, where the Ogg code had stayed in
+the tests; the wording was proposed by the agent and approved by the user.*
 
 ## Vorbis encoders as benchmarks
 
