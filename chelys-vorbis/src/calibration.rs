@@ -19,30 +19,31 @@ use chelys_core::quality::{self, CALIBRATION_LEVELS};
 type Offsets = [f64; CALIBRATION_LEVELS.len()];
 
 /// Two channels, coupled, calibrated at 44.1 kHz: from 62 kbit/s on
-/// average at level 0 to 105 at 50, 191 at 80 and 223 at 100, where the
-/// mean grades were -3.012, -0.746, -0.122 and 0.003.
+/// average at level 0 to 104 at 50, 179 at 80 and 205 at 100, where the
+/// mean grades, interpolated between the offsets swept, were -2.989,
+/// -0.760, -0.126 and 0.003.
 ///
-/// Swept, the mean grade was 0.133 at -16.5 dB, 0.111 at -15, 0.059 at
-/// -13.5, -0.021 at -12, -0.122 at -10.5, -0.237 at -9, -0.384 at -7.5,
-/// -0.545 at -6, -0.783 at -4.5, -1.134 at -3, -1.642 at -1.5, -2.269 at 0,
-/// -2.854 at 1.5, -3.257 at 3, -3.479 at 4.5, -3.595 at 6 and -3.661 at
+/// Swept, the mean grade was 0.118 at -16.5 dB, 0.143 at -15, 0.128 at
+/// -13.5, 0.082 at -12, 0.003 at -10.5, -0.110 at -9, -0.343 at -7.5,
+/// -0.574 at -6, -0.884 at -4.5, -1.304 at -3, -1.870 at -1.5, -2.501 at 0,
+/// -3.024 at 1.5, -3.357 at 3, -3.535 at 4.5, -3.629 at 6 and -3.679 at
 /// 7.5.
 const STEREO: Offsets = [
-    2.0, 0.4, -0.8, -2.0, -3.2, -4.7, -6.6, -8.7, -10.5, -11.9, -12.4,
+    1.4, -0.2, -1.4, -2.6, -3.8, -5.1, -6.6, -8.0, -8.9, -10.1, -10.5,
 ];
 
 /// Channels coded each on its own, calibrated in two channels at 44.1 kHz
-/// coded so: from 72 kbit/s on average at level 0 to 119 at 50, 188 at 80
-/// and 221 at 100, where the mean grades were -3.006, -0.741, -0.120 and
-/// 0.000.
+/// coded so: from 76 kbit/s on average at level 0 to 117 at 50, 181 at 80
+/// and 207 at 100, where the mean grades, interpolated between the offsets
+/// swept, were -3.009, -0.760, -0.117 and -0.002.
 ///
-/// Swept, the mean grade was 0.109 at -16.5 dB, 0.128 at -15, 0.159 at
-/// -13.5, 0.135 at -12, 0.074 at -10.5, -0.032 at -9, -0.113 at -7.5,
-/// -0.252 at -6, -0.447 at -4.5, -0.682 at -3, -1.052 at -1.5, -1.637 at 0,
-/// -2.388 at 1.5, -3.042 at 3, -3.407 at 4.5, -3.574 at 6 and -3.656 at
+/// Swept, the mean grade was 0.102 at -16.5 dB, 0.134 at -15, 0.141 at
+/// -13.5, 0.111 at -12, 0.058 at -10.5, -0.024 at -9, -0.131 at -7.5,
+/// -0.275 at -6, -0.466 at -4.5, -0.732 at -3, -1.149 at -1.5, -1.776 at 0,
+/// -2.527 at 1.5, -3.130 at 3, -3.455 at 4.5, -3.605 at 6 and -3.677 at
 /// 7.5.
 const UNCOUPLED: Offsets = [
-    2.9, 1.6, 0.6, -0.4, -1.4, -2.7, -4.3, -5.9, -7.4, -9.0, -9.4,
+    2.7, 1.3, 0.3, -0.7, -1.7, -2.9, -4.4, -6.1, -7.7, -8.9, -9.4,
 ];
 
 /// The noise offset, in dB, of `level` (see

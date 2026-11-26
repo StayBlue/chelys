@@ -30,6 +30,7 @@
 //!   lower neighbour alone. All are lowered by [`QUIET_LOWERED_DB`].
 //! - Step 4 takes the long FFT's unpredictability for the lines below
 //!   [`LONG_PREDICTED_HZ`], rather than for its first six lines alone.
+//! - Step 8 takes `TMN(b)` as [`TMN`], 15 dB, rather than 18.
 //! - Each partition's threshold, scaled by the rate's noise offset, is
 //!   raised further with the width of its critical band (see
 //!   [`BAND_EXPONENT`]).
@@ -110,9 +111,24 @@ const LONG_CW_LINES: usize = 6;
 /// [`BAND_EXPONENT`] weighs it, graded -0.532 against -0.542.
 const LONG_PREDICTED_HZ: f64 = 2000.0;
 
-/// `NMT(b)` and `TMN(b)` in dB, for all `b` (step 8).
+/// `NMT(b)` in dB, for all `b` (step 8).
 const NMT: f64 = 6.0;
-const TMN: f64 = 18.0;
+
+/// `TMN(b)` in dB, for all `b`: 15, where step 8 gives 18.
+///
+/// chelys's own choice, a deliberate departure from step 8: at the rates
+/// chelys is asked for, the noise lies about the threshold, and how far
+/// below a tonal partition's energy the threshold lies against a noisy
+/// one's is a choice of the encoder, as how far it lies above it in one
+/// band against another is (see [`BAND_EXPONENT`]). Graded with PEAQ
+/// (GstPEAQ 0.6.1, black box) on the 51 tracks of the tuning set at 44.1
+/// kHz in stereo, at noise offsets matched to 96.5, 128.4 and 159.2
+/// kbit/s, once the energy of each band was balanced (see the encoder's
+/// `energy::balance`), the streams graded -0.892, -0.454 and -0.242 with
+/// 15, -0.884, -0.456 and -0.243 with 12, and -0.905, -0.463 and -0.250
+/// with 18; and with 24, 0.04 to 0.09 lower than with 18. With 15, PEAQ's
+/// `AvgModDiff1B` fell from 19.2, 14.6 and 11.4 to 18.7, 14.2 and 11.3.
+const TMN: f64 = 15.0;
 
 /// `rpelev` of long blocks (step 11).
 const RPELEV: f64 = 2.0;
@@ -163,15 +179,51 @@ const SHORT_NOISE_ABOVE_LONG: f64 = 4.0;
 /// coding; its energies are taken at the scale of 16-bit PCM, to which
 /// step 12 adds 1 (see [`ENTROPY_UNIT`]).
 ///
-/// The constants are those of chelys's AAC encoder. Measured as for
-/// [`RPELEV_SHORT`], the streams graded -1.163, -1.158, -1.159 and -1.167
-/// with this at 50, 70, 100 and 140, and [`SWITCH_PE_STEP`] at twice it;
-/// and -1.072, -1.062, -1.061 and -1.072 on the 12 tracks with the most
-/// short blocks. Long blocks alone graded -1.185, and -1.159 on the 12.
-const SWITCH_PE: f64 = 100.0;
+/// Half that of chelys's AAC encoder, whose [`SWITCH_PE_STEP`] is kept.
+/// Measured as for [`RPELEV_SHORT`],
+/// the streams graded -1.163, -1.158, -1.159 and -1.167 with this at 50,
+/// 70, 100 and 140, and [`SWITCH_PE_STEP`] at twice it; and -1.072,
+/// -1.062, -1.061 and -1.072 on the 12 tracks with the most short blocks.
+/// Long blocks alone graded -1.185, and -1.159 on the 12. Once the encoder
+/// coupled the channels and balanced each band's energy (see the encoder's
+/// `energy::balance`), at noise offsets matched to 96.5, 128.4 and 159.2
+/// kbit/s, the streams graded -0.904, -0.465 and -0.253 with 100, and
+/// -0.905, -0.463 and -0.250 with 50, higher on 34 and 50 of the 51 tracks
+/// at the two higher rates; PEAQ's `ADBB` fell from 0.31 to 0.29 at 159.2.
+/// They graded alike with [`SWITCH_PE_STEP`] at 100 or 200. In one channel
+/// at 65.2 and 81.0 kbit/s, -0.552 and -0.230 with 100, and -0.551 and
+/// -0.227 with 50 (the step at 100). With 25, and the step at 50, the
+/// streams graded lower at every rate.
+///
+/// Below [`SWITCH_PE_LOW_RATE`], the rise is [`SWITCH_PE_LOW`] instead.
+const SWITCH_PE: f64 = 50.0;
+
+/// The sample rate, in Hz, below which [`SWITCH_PE_LOW`] takes the place of
+/// [`SWITCH_PE`].
+const SWITCH_PE_LOW_RATE: u32 = 32_000;
+
+/// `switch_pe` below [`SWITCH_PE_LOW_RATE`]: that of chelys's AAC encoder.
+///
+/// A short block lasts longer at a lower sample rate, 256 samples being
+/// more than 8 ms below 32 kHz, and its FFT's lines are narrower: a loud
+/// partial that wavers in pitch, as with vibrato, moves across them from
+/// one short block to the next, and the entropy rises by more than
+/// [`SWITCH_PE`] as at an attack. An 880 Hz tone at 0.9 of full scale, its
+/// pitch swinging by 2% 5.5 times a second, coded in one channel at a
+/// noise offset of -6.5 dB, took short blocks in 399 of 506 packets at 8
+/// kHz with [`SWITCH_PE`], and its bitrate rose from 4.0 to 17.9 kbit/s;
+/// at 16 kHz, from 8.0 to 15.9; at 32 kHz and above, it took none. Graded
+/// with PEAQ (GstPEAQ 0.6.1, black box) on the tuning set converted to
+/// 22.05 and 11.025 kHz in stereo, the streams graded 0.04 and 0.05 higher
+/// with [`SWITCH_PE`] than with this, but with three times the short
+/// blocks, and up to 26% of them on one track; with this, the switching
+/// below 32 kHz is that of chelys's earlier streams.
+const SWITCH_PE_LOW: f64 = 100.0;
 
 /// The rise of a short block's perceptual entropy above the one before it
-/// that is an attack too (see [`SWITCH_PE`]).
+/// that is an attack too (see [`SWITCH_PE`]): that of chelys's AAC encoder,
+/// four times [`SWITCH_PE`]. At twice it, 100, a steady tone of 80 Hz
+/// setting in after silence is found an attack once it has set in.
 const SWITCH_PE_STEP: f64 = 200.0;
 
 /// What step 12 adds to each partition's energy, 1 at the scale of 16-bit
@@ -235,6 +287,22 @@ const NARROWEST_BAND_HZ: f64 = 100.0;
 /// -0.536, -0.543 and -0.574 with powers of 1/2, 2/3, 0.8 and 1; and
 /// weighted instead by a tilt of 1.5, 2 and 3 dB per octave above 250 Hz,
 /// -0.542, -0.542 and -0.575.
+///
+/// Once the energy of each band was balanced (see the encoder's
+/// `energy::balance`), with [`TMN`] at 15 dB, at noise offsets matched to
+/// 96.5, 128.4 and 159.2 kbit/s, the streams graded -0.892, -0.454 and
+/// -0.242 with 2/3, -0.900, -0.452 and -0.237 with 3/4, and -0.912, -0.452
+/// and -0.239 with 0.8. Each step trades the bandwidth PEAQ measures for
+/// lower noise in the band below: with 3/4, its `AvgModDiff1B` fell from
+/// 18.7, 14.2 and 11.3 to 18.1, 13.7 and 10.9, and its `RmsNoiseLoudB` from
+/// 0.390, 0.279 and 0.216 to 0.372, 0.266 and 0.207, while the bandwidth
+/// it measured fell from 817, 839 and 849 lines to 813, 835 and 846. With
+/// the energy's balance aimed lower where bits are scarce (see the
+/// encoder's `energy::balanced_share`), [`SWITCH_PE`] at 50 and the
+/// narrowing where bits are plentiful within the allowance itself, the
+/// streams graded -0.890, -0.451 and -0.230 with 2/3, and -0.896, -0.445
+/// and -0.222 with 3/4, lower on 38 of the 51 tracks at 96.5 kbit/s: the
+/// power stays 2/3.
 const BAND_EXPONENT: f64 = 2.0 / 3.0;
 
 /// How far, in dB, the threshold in quiet is lowered below the tables'.
@@ -308,6 +376,8 @@ pub struct Tables {
     /// The lines of the long FFT whose unpredictability it gives itself
     /// (see [`LONG_PREDICTED_HZ`]).
     long_predicted: usize,
+    /// `switch_pe` at the sample rate (see [`SWITCH_PE_LOW`]).
+    switch_pe: f64,
 }
 
 impl Tables {
@@ -317,6 +387,11 @@ impl Tables {
             long: FftTables::new(sample_rate, Fft::Long),
             short: FftTables::new(sample_rate, Fft::Short),
             long_predicted: (below as usize).clamp(LONG_CW_LINES, LINES),
+            switch_pe: if sample_rate < SWITCH_PE_LOW_RATE {
+                SWITCH_PE_LOW
+            } else {
+                SWITCH_PE
+            },
         }
     }
 
@@ -553,6 +628,9 @@ pub struct Analysis {
     /// [`SWITCH_PE`]).
     pub entropy_rise: f64,
     pub entropy_step: f64,
+    /// The rise of `entropy_rise` that is an attack at the sample rate (see
+    /// [`SWITCH_PE_LOW`]).
+    pub switch_pe: f64,
 }
 
 impl Default for Analysis {
@@ -562,6 +640,7 @@ impl Default for Analysis {
             short: vec![vec![0.0; SHORT_LINES]; SHORT_BLOCKS],
             entropy_rise: f64::NEG_INFINITY,
             entropy_step: f64::NEG_INFINITY,
+            switch_pe: SWITCH_PE,
         }
     }
 }
@@ -570,7 +649,7 @@ impl Analysis {
     /// Whether the block has an attack, which short blocks are to code
     /// (step 13).
     pub fn attack(&self) -> bool {
-        self.entropy_rise > SWITCH_PE || self.entropy_step > SWITCH_PE_STEP
+        self.entropy_rise > self.switch_pe || self.entropy_step > SWITCH_PE_STEP
     }
 }
 
@@ -811,6 +890,7 @@ impl Model {
             .recent_entropies
             .unwrap_or([entropies[0]; SHORT_BLOCKS]);
         let mut last = recent[SHORT_BLOCKS - 1];
+        out.switch_pe = tables.switch_pe;
         out.entropy_rise = f64::NEG_INFINITY;
         out.entropy_step = f64::NEG_INFINITY;
         for (k, &entropy) in entropies.iter().enumerate() {
@@ -1060,23 +1140,33 @@ mod tests {
     #[test]
     fn steady_tones_and_noise_have_no_attack() {
         let noise = white(20 * LINES);
-        let tone = |f: f64, t: usize| (2.0 * PI * f * t as f64 / 44_100.0).sin();
-        let signal = |name: &str, t: usize| match name {
-            "80 Hz" => 0.5 * tone(80.0, t),
-            "1 kHz" => 0.5 * tone(1000.0, t),
-            "noise" => 0.5 * noise[t],
-            _ => 0.3 * tone(440.0, t) + 0.05 * noise[t],
-        };
-        for name in ["80 Hz", "1 kHz", "noise", "tone in noise"] {
-            // The first block has none, after the silence before it.
-            let signal = |t| signal(name, t);
-            for (k, analysis) in analyses(44_100, signal, 18).iter().enumerate().skip(1) {
-                assert!(
-                    !analysis.attack(),
-                    "{name}, block {k}: {} and {}",
-                    analysis.entropy_rise,
-                    analysis.entropy_step
-                );
+        for sample_rate in [8_000, 11_025, 16_000, 22_050, 44_100, 48_000] {
+            let fs = f64::from(sample_rate);
+            let tone = |f: f64, t: usize| (2.0 * PI * f * t as f64 / fs).sin();
+            // 880 Hz, its pitch swinging by 2% 5.5 times a second.
+            let vibrato = |t: usize| {
+                let t = t as f64 / fs;
+                let swing = 880.0 * 0.02 / (2.0 * PI * 5.5);
+                (2.0 * PI * (880.0 * t - swing * (2.0 * PI * 5.5 * t).cos())).sin()
+            };
+            let signal = |name: &str, t: usize| match name {
+                "80 Hz" => 0.5 * tone(80.0, t),
+                "1 kHz" => 0.5 * tone(1000.0, t),
+                "noise" => 0.5 * noise[t],
+                "vibrato" => 0.9 * vibrato(t),
+                _ => 0.3 * tone(440.0, t) + 0.05 * noise[t],
+            };
+            for name in ["80 Hz", "1 kHz", "noise", "tone in noise", "vibrato"] {
+                // The first block has none, after the silence before it.
+                let signal = |t| signal(name, t);
+                for (k, analysis) in analyses(sample_rate, signal, 18).iter().enumerate().skip(1) {
+                    assert!(
+                        !analysis.attack(),
+                        "{name} at {sample_rate} Hz, block {k}: {} and {}",
+                        analysis.entropy_rise,
+                        analysis.entropy_step
+                    );
+                }
             }
         }
     }

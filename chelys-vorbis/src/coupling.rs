@@ -53,7 +53,14 @@ pub const ANGLE_ALLOWANCE: f64 = 3.0;
 /// them, fell from 1.05 to 0.82 within 2 at 159.2: each line narrowed
 /// changes the level of each channel's band a little, and where bits are
 /// plentiful, the bits that saves buy less than the noise costs.
-pub const LEAST_ANGLE_ALLOWANCE: f64 = 2.0;
+///
+/// Once the energy of each band was balanced (see [`energy::balance`]),
+/// which leaves the narrowed lines as they are, the streams graded -0.464
+/// and -0.264 within 2 at 128.4 and 159.2 kbit/s, -0.465 and -0.253 within
+/// 1, and -0.465 and -0.257 within 1/2; within 1, PEAQ's `ADBB` fell from
+/// 0.45 to 0.31 at 159.2, and its `AvgModDiff1B` from 14.8 and 11.7 to
+/// 14.6 and 11.5.
+pub const LEAST_ANGLE_ALLOWANCE: f64 = 1.0;
 
 /// The multiple of each channel's allowance that [`narrow_angles`] may
 /// leave in a band above [`PROTECTED_HZ`], where bits are as scarce as
@@ -91,10 +98,15 @@ pub const PROTECTED_HZ: f64 = 1500.0;
 /// Where both channels are used, their angles are first narrowed where
 /// that leaves each channel's noise in each band within `allowance` times
 /// its allowance above [`PROTECTED_HZ`] (see [`narrow_angles`]). Then the
-/// energy of each used channel's first `kept` lines is kept (see
-/// [`energy::keep`]), which adds noise above [`PROTECTED_HZ`] and keeps
-/// each band within its allowance below: after the narrowing, which would
-/// code the lines it adds as 0 again, as that makes less noise.
+/// energy of each used channel's first `kept` lines is balanced toward
+/// `share` of their energy, as no more than `limit` (see
+/// [`energy::balance`]), but on the lines whose values the two channels
+/// share, whose angles are 0; the balance may take a band past its
+/// allowance below [`PROTECTED_HZ`] too. Last, the energy is kept (see
+/// [`energy::keep`]), which adds noise above [`PROTECTED_HZ`] and none
+/// beyond a band's allowance below. Both come after the narrowing, which
+/// would code the lines that keeping adds as 0 again, as that makes less
+/// noise, and would take back much of the energy that the balance gives.
 ///
 /// Spec reading: a channel whose residue is all zeros is coded as unused,
 /// its floor unused. Clause 4.3.3 then unsets its `no_residue` flag, as it
@@ -123,6 +135,8 @@ pub fn couple(
     protected: usize,
     allowance: f64,
     kept: usize,
+    limit: i32,
+    share: f64,
 ) {
     let [left, right] = residues;
     let used = [left.iter().any(|&v| v != 0), right.iter().any(|&v| v != 0)];
@@ -142,14 +156,27 @@ pub fn couple(
                 protected,
                 allowance,
             );
-            energy::keep(left, spectra[0], curves[0], guard(0), kept);
-            energy::keep(right, spectra[1], curves[1], guard(1), kept);
+            let alike: Vec<bool> = left.iter().zip(right.iter()).map(|(l, r)| l == r).collect();
+            for (c, residue) in [&mut *left, &mut *right].into_iter().enumerate() {
+                energy::balance(
+                    residue,
+                    spectra[c],
+                    curves[c],
+                    limit,
+                    |k| alike[k],
+                    kept,
+                    share,
+                );
+                energy::keep(residue, spectra[c], curves[c], guard(c), kept);
+            }
         }
         [true, false] => {
+            energy::balance(left, spectra[0], curves[0], limit, |_| false, kept, share);
             energy::keep(left, spectra[0], curves[0], guard(0), kept);
             right.clone_from(left);
         }
         [false, true] => {
+            energy::balance(right, spectra[1], curves[1], limit, |_| false, kept, share);
             energy::keep(right, spectra[1], curves[1], guard(1), kept);
             left.clone_from(right);
         }
@@ -418,7 +445,8 @@ mod tests {
         assert_eq!(angle_allowance(2.0), ANGLE_ALLOWANCE);
         assert_eq!(angle_allowance(0.0), LEAST_ANGLE_ALLOWANCE);
         assert_eq!(angle_allowance(-1.0), LEAST_ANGLE_ALLOWANCE);
-        assert!((angle_allowance(0.5) - 2.5).abs() < 1e-12);
+        let halfway = (LEAST_ANGLE_ALLOWANCE + ANGLE_ALLOWANCE) / 2.0;
+        assert!((angle_allowance(0.5) - halfway).abs() < 1e-12);
     }
 
     #[test]
@@ -442,6 +470,8 @@ mod tests {
                 0,
                 ANGLE_ALLOWANCE,
                 0,
+                i32::MAX,
+                1.0,
             );
             let (magnitude, angle) = (&residues[0], &residues[1]);
             assert_eq!(magnitude, &coded);

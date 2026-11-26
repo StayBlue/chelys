@@ -23,11 +23,14 @@ pub enum Rate {
     /// than the rounding of 16-bit PCM makes, whatever the offset. In
     /// stereo, the two channels' lines may be made alike, which then cost
     /// fewer bits coupled, where that leaves each channel no more noise
-    /// than it is allowed, or above 1.5 kHz 2 to 3 times it, the more the
-    /// higher the offset. Where most of a band's lines would be coded as 0,
+    /// than it is allowed, or above 1.5 kHz 1 to 3 times it, the more the
+    /// higher the offset. Lines that lie near halfway between two values
+    /// may then be rounded to the other, so that each band decodes with
+    /// about its energy, which may add noise to what a band is allowed,
+    /// below 1.5 kHz too. Where most of a band's lines would be coded as 0,
     /// some are coded as 1 so that it keeps part of its energy, which above
     /// 1.5 kHz adds noise to what it is allowed. At 44.1 kHz in stereo,
-    /// music takes about 70 kbit/s at 0 dB and 142 at -7.5.
+    /// music takes about 67 kbit/s at 0 dB and 142 at -7.5.
     Variable { noise_offset_db: f64 },
     /// A variable rate at `level`: a level of the [`quality`](crate::quality)
     /// scale that chelys's encoders share, from 0 to
@@ -35,7 +38,7 @@ pub enum Rate {
     ///
     /// It is [`Rate::Variable`] with the noise offset the level maps to,
     /// calibrated to the scale's grades at 44.1 kHz in two channels: music
-    /// in stereo averages about 105 kbit/s at level 50, 191 at 80 and 223
+    /// in stereo averages about 104 kbit/s at level 50, 179 at 80 and 205
     /// at 100. Every other configuration takes the offsets of stereo at
     /// 44.1 kHz, as calibrated with its channels coded each on its own
     /// where they are coded so, so that there a level gives the scale's

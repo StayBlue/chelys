@@ -85,33 +85,36 @@ fn protected_lines(n: usize, sample_rate: u32) -> usize {
 /// weighed each band's noise (see the psychoacoustic model's
 /// `BAND_EXPONENT`), at noise offsets matched to each bitrate, the streams
 /// graded -0.904 with it and -0.921 with 0.05 at 96.5 kbit/s, and, with the
-/// angles narrowed within [`coupling::LEAST_ANGLE_ALLOWANCE`], -0.295 with
-/// it, -0.284 with 0.05 and -0.282 with none at 159.2 kbit/s, where PEAQ's
-/// `ADBB` fell from 0.82 to 0.57.
+/// angles narrowed within twice each channel's allowance where bits are
+/// plentiful, as [`coupling::LEAST_ANGLE_ALLOWANCE`] then allowed, -0.295
+/// with it, -0.284 with 0.05 and -0.282 with none at 159.2 kbit/s, where
+/// PEAQ's `ADBB` fell from 0.82 to 0.57.
 ///
 /// [`frequencies`]: super::frequencies
 const DEAD_ZONE: f64 = 0.1;
 
 /// The noise offsets, in dB, at and above which bits are scarce, and at
-/// and below which they are plentiful (see [`scarcity`]): about 96 and 160
+/// and below which they are plentiful (see [`scarcity`]): about 92 and 182
 /// kbit/s in stereo at 44.1 kHz.
 const SCARCE_OFFSET_DB: f64 = -4.0;
 const PLENTIFUL_OFFSET_DB: f64 = -9.0;
 
 /// How scarce bits are at the noise offset `noise_offset_db`: 1 at and
 /// above [`SCARCE_OFFSET_DB`], 0 at and below [`PLENTIFUL_OFFSET_DB`], and
-/// in a straight line between, by which the dead zone and the narrowing of
-/// angles that trade noise for bits are tapered.
+/// in a straight line between, by which the dead zone, the narrowing of
+/// angles and the share of energy that the balance aims for, which trade
+/// noise for bits, are tapered.
 ///
-/// chelys's own design: both were tuned where bits were scarce, and where
-/// they are plentiful the noise they add costs more than the bits they save
-/// buy (see [`DEAD_ZONE`] and [`coupling::LEAST_ANGLE_ALLOWANCE`]). Each
-/// takes more bits as the offset falls, as the offset itself does, so that
-/// a lower offset never gives a shorter stream. Graded with PEAQ (GstPEAQ
-/// 0.6.1, black box) on the 51 tracks of the tuning set at 44.1 kHz in
-/// stereo at 128.4 kbit/s, where the offset is about -6.5 dB, the streams
-/// graded -0.479 tapered so, against -0.476 with neither tapered and -0.486
-/// with both as where bits are plentiful.
+/// chelys's own design: each was tuned where bits were scarce, and where
+/// they are plentiful the noise it adds costs more than the bits it saves
+/// buy (see [`DEAD_ZONE`], [`coupling::LEAST_ANGLE_ALLOWANCE`] and
+/// [`energy::BALANCED_SHARE_SCARCE`]). Each takes more bits as the offset
+/// falls, as the offset itself does, so that a lower offset never gives a
+/// shorter stream. Graded with PEAQ (GstPEAQ 0.6.1, black box) on the 51
+/// tracks of the tuning set at 44.1 kHz in stereo at 128.4 kbit/s, where
+/// the offset was then about -6.5 dB, the streams graded -0.479 with the
+/// dead zone and the narrowing tapered so, against -0.476 with neither
+/// tapered and -0.486 with both as where bits are plentiful.
 fn scarcity(noise_offset_db: f64) -> f64 {
     ((noise_offset_db - PLENTIFUL_OFFSET_DB) / (SCARCE_OFFSET_DB - PLENTIFUL_OFFSET_DB))
         .clamp(0.0, 1.0)
@@ -180,6 +183,9 @@ pub struct Encoder {
     /// The multiple of each channel's allowance that the narrowing of
     /// angles may leave in a band (see [`coupling::angle_allowance`]).
     angle_allowance: f64,
+    /// The share of each group's energy that its balance aims for (see
+    /// [`energy::balanced_share`]).
+    balanced_share: f64,
 }
 
 /// What [`Encoder::finish`] gives.
@@ -228,6 +234,7 @@ impl Encoder {
             last_long: true,
             dead_zone: DEAD_ZONE * scarcity(noise_offset_db),
             angle_allowance: coupling::angle_allowance(scarcity(noise_offset_db)),
+            balanced_share: energy::balanced_share(scarcity(noise_offset_db)),
         })
     }
 
@@ -427,8 +434,9 @@ impl Encoder {
     /// [`Quantized`]). A channel whose residue is all zeros is coded as
     /// unused. In a stereo stream, the two channels' residues are then
     /// coupled (see [`coupling::couple`]); in any other, the energy of each
-    /// used channel's lines is kept (see [`energy::keep`]), as the coupling
-    /// keeps it in stereo.
+    /// used channel's lines is balanced (see [`energy::balance`]) and kept
+    /// (see [`energy::keep`]), as the coupling balances and keeps it in
+    /// stereo.
     fn block<O: PacketSink + ?Sized>(
         &mut self,
         short: Option<usize>,
@@ -505,12 +513,23 @@ impl Encoder {
                 protected,
                 self.angle_allowance,
                 kept,
+                limit,
+                self.balanced_share,
             );
         } else {
             for (((channel, spectrum), noise), &used) in
                 (channels.iter_mut().zip(&spectra).zip(&noises)).zip(&used)
             {
                 if used {
+                    energy::balance(
+                        &mut channel.residue,
+                        spectrum,
+                        &channel.curve,
+                        limit,
+                        |_| false,
+                        kept,
+                        self.balanced_share,
+                    );
                     let protected = energy::Protected {
                         lines: protected,
                         noise,

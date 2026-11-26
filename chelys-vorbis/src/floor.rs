@@ -201,6 +201,10 @@ impl Floor {
     /// The first two posts take their targets. Each other takes the Y value
     /// that the posts before it in the list predict there, coded as 0,
     /// where its target is within `TOLERANCE` of it, and else its target.
+    ///
+    /// The encoder takes [`values_within`](Self::values_within); this is for
+    /// tests and the conformance tests' `internals`.
+    #[cfg_attr(not(any(test, feature = "unstable")), allow(dead_code))]
     pub fn values(&self, targets: &[i32]) -> Vec<u32> {
         self.values_exact(targets, &vec![false; targets.len()])
     }

@@ -151,7 +151,7 @@ fn ffmpeg_decodes_each_channel_at_any_sample_rate() {
 
 /// ffmpeg decodes noise, quiet or loud, and a mix of tones and noise, with
 /// no more noise than the psychoacoustic model allows: noise masks noise 6
-/// dB below it, and tones noise 18 dB below them. The streams are coded at
+/// dB below it, and tones noise 15 dB below them. The streams are coded at
 /// an offset of -10.5 dB, which takes off at least as much as the encoder
 /// raises the allowance of any band for its width at their 44.1 kHz: at
 /// most 10.1 dB.
@@ -371,9 +371,22 @@ fn ffmpeg_times_each_packet_from_its_granule_position() {
 /// control holds the threshold of the blocks at the onset near the
 /// threshold in quiet, and the floor is raised where it would put a line
 /// past the residue's reach.
+///
+/// The noise before each onset is measured in streams coded at `RATE`, and
+/// the signal to noise after it in streams coded at -10.5 dB, as in
+/// `ffmpeg_decodes_noise_and_tones_within_what_the_model_allows`, and for
+/// the same reason: the samples measured after an onset lie in blocks
+/// coded at the allowance, which noise, masked by itself 6 dB below it,
+/// takes more of in the widest bands, where the encoder raises it for
+/// their width (see `RATE`). At 0 dB, the signal to noise of loud white
+/// noise there is that allowance's, and not bounded by 6 dB: it ranges
+/// from about 4.5 to 6.5 dB with the onset, the noise's seed and its level.
 #[test]
 fn ffmpeg_decodes_a_loud_onset_after_silence() {
     let sample_rate = 44_100;
+    let rate = Rate::Variable {
+        noise_offset_db: -10.5,
+    };
     let tone = |t: usize| 0.9 * (TAU * 1000.0 * t as f64 / f64::from(sample_rate)).sin();
     let noise = noise(40_000);
     for onset in [5000, 5420, 9000] {
@@ -391,9 +404,10 @@ fn ffmpeg_decodes_a_loud_onset_after_silence() {
                     }
                 })
                 .collect();
-            let decoded = round_trip(&pcm, sample_rate, 1);
+            let decoded = round_trip_at(&pcm, sample_rate, 1, rate);
             let snr = snr(&pcm, &decoded[..onset + 512], onset, 1);
             assert!(snr > 6.0, "{context}: {snr:.1} dB");
+            let decoded = round_trip(&pcm, sample_rate, 1);
             let before: f64 = (onset - 1024..onset)
                 .map(|i| f64::from(decoded[i]).powi(2))
                 .sum::<f64>()
