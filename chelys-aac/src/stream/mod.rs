@@ -852,7 +852,40 @@ impl StreamEncoder {
     /// again, once, after all the others, in its bits and those the frame
     /// has left, within its share of the buffer. With one element, the
     /// frame's bits are its share, and the element is not quantized again.
+    ///
+    /// The fewest bits an element can be coded in, counted so, leave out
+    /// its bands of noise and in intensity stereo, which the loops do not
+    /// leave unsent (see [`ElementEncoder::least_coded_bits`]). At a
+    /// variable or mean rate, where a frame is fitted to its least bits, a
+    /// center channel's share in 5.1 did not pay for its noise energies.
+    /// Where an element's share would not, the frame's elements are
+    /// quantized again, each given the fewest bits it can be coded in with
+    /// those bands, and a share of the rest.
     fn quantize(&mut self, available_bits: u32) -> Vec<CodedElement> {
+        match self.quantize_with(available_bits, false) {
+            Some(elements) => elements,
+            None => self
+                .quantize_with(available_bits, true)
+                .expect("each element given its least"),
+        }
+    }
+
+    /// [`Self::quantize`], each element given the fewest bits it can be
+    /// coded in by [`ElementEncoder::least_bits`], or where `with_pseudo` is
+    /// set, by [`ElementEncoder::least_coded_bits`]; or, where it is not,
+    /// `None` if an element's share would not pay for the latter.
+    fn quantize_with(
+        &mut self,
+        available_bits: u32,
+        with_pseudo: bool,
+    ) -> Option<Vec<CodedElement>> {
+        let least_bits = |element: &ElementEncoder| {
+            if with_pseudo {
+                element.least_coded_bits()
+            } else {
+                element.least_bits()
+            }
+        };
         let mut order: Vec<usize> = (0..self.elements.len()).collect();
         order.sort_by(|&a, &b| {
             let key = |e: usize| {
@@ -874,7 +907,7 @@ impl StreamEncoder {
             let budget = if rest.len() == 1 {
                 remaining
             } else {
-                let least: u32 = rest.iter().map(|&i| self.elements[i].least_bits()).sum();
+                let least: u32 = rest.iter().map(|&i| least_bits(&self.elements[i])).sum();
                 let channels: u32 = (rest.iter())
                     .map(|&i| self.elements[i].coded_channels())
                     .sum();
@@ -882,10 +915,13 @@ impl StreamEncoder {
                 let share = (beyond * u64::from(element.coded_channels()))
                     .checked_div(u64::from(channels))
                     .unwrap_or(0);
-                element.least_bits() + share as u32
+                least_bits(element) + share as u32
             };
             let budget =
                 reservoir::element_max_bits(element.kind()).map_or(budget, |max| budget.min(max));
+            if !with_pseudo && self.elements.len() > 1 && budget < element.least_coded_bits() {
+                return None;
+            }
             let element = self.elements[e].quantize(budget);
             remaining = remaining.saturating_sub(element.bits());
             budgets[e] = budget;
@@ -909,7 +945,7 @@ impl StreamEncoder {
                 coded[e] = Some(element);
             }
         }
-        coded.into_iter().map(|e| e.expect("quantized")).collect()
+        Some(coded.into_iter().map(|e| e.expect("quantized")).collect())
     }
 }
 
@@ -2177,5 +2213,48 @@ mod tests {
         let mean = 128_000.0 * FRAME_SAMPLES as f64 / 44_100.0 / 8.0;
         let ratio = bytes as f64 / (frames.len() as f64 * mean);
         assert!((1.0..1.1).contains(&ratio), "{ratio}");
+    }
+
+    /// At a variable rate in 5.1, the center channel noise from 7 to 19
+    /// kHz, coded by perceptual noise substitution, and the others quiet
+    /// tones, the frames take their least bits, of which the center
+    /// channel's share, by the channels the elements code, would not pay
+    /// for its bands of noise; it is given what they cost.
+    #[test]
+    fn each_element_pays_for_its_noise_in_the_least_bits() {
+        let config = StreamConfig {
+            channel_configuration: ChannelConfiguration::FiveOne,
+            noise_substitution: true,
+            bits_per_second: 172_000,
+            ..variable(Framing::Adts, crate::calibration::noise_offset_db(0, 2))
+        };
+        let len = 40 * FRAME_SAMPLES;
+        // Noise low-passed by four moving averages of 8 samples, to 5.5
+        // kHz, and moved up by 13 kHz.
+        let mut band = noise(len, 30);
+        for _ in 0..4 {
+            band = (0..len)
+                .map(|t| band[t.saturating_sub(7)..=t].iter().sum::<f64>() / 8.0)
+                .collect();
+        }
+        let carrier = |t: usize| (std::f64::consts::TAU * 13_000.0 * t as f64 / 44_100.0).cos();
+        let center: Vec<f64> = (0..len).map(|t| 4.0 * band[t] * carrier(t)).collect();
+        let tone = |hz: f64| -> Vec<f64> {
+            (0..len)
+                .map(|t| 0.01 * (std::f64::consts::TAU * hz * t as f64 / 44_100.0).sin())
+                .collect()
+        };
+        let [left, right, left_surround, right_surround] = [440.0, 550.0, 660.0, 770.0].map(tone);
+        let lfe = vec![0.0; len];
+        let channels = [
+            &center[..],
+            &left,
+            &right,
+            &left_surround,
+            &right_surround,
+            &lfe,
+        ];
+        let frames = frames_of(config, &channels);
+        assert_eq!(frames.len(), 41);
     }
 }

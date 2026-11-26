@@ -1197,10 +1197,12 @@ impl ElementEncoder {
     /// The filters of a channel are dropped, and its lines coded unshaped,
     /// where the channels without lines, with their filters, do not fit in
     /// the element's bits, or the channel's share of them (see
-    /// [`code_element`](Self::code_element)); and where, coded, the filters
-    /// shape no line that the channel sends: where its loops left all the
-    /// lines of the bands they span zero, or sent none of those bands. One
-    /// such channel, a tone of 2131 Hz at 96 kHz in a pair at 19.5 kbit/s,
+    /// [`code_element`](Self::code_element)); those of every channel
+    /// where, with their bands of noise and in intensity stereo, they still
+    /// do not (see [`least_coded_bits`](Self::least_coded_bits)); and
+    /// where, coded, the filters shape no line that the channel sends:
+    /// where its loops left all the lines of the bands they span zero, or
+    /// sent none of those bands. One such channel, a tone of 2131 Hz at 96 kHz in a pair at 19.5 kbit/s,
     /// whose filters took most of its bits, decoded to silence in most
     /// frames (the conformance test
     /// `a_tone_keeps_its_lines_beside_filters_it_cannot_afford`).
@@ -1214,6 +1216,11 @@ impl ElementEncoder {
             if !self.prepared[c].silent
                 && self.share(available_bits) < self.lineless.channels_with_tns[c]
             {
+                self.unshape(c);
+            }
+        }
+        if self.least_bits_with(true) > available_bits {
+            for c in 0..self.prepared.len() {
                 self.unshape(c);
             }
         }
@@ -1376,46 +1383,50 @@ impl ElementEncoder {
     /// cannot pay even for its bands without lines, the first is quantized
     /// again in fewer bits.
     ///
+    /// A channel sends its bands of noise, and a right channel quantized
+    /// first its bands in intensity stereo, whatever its lines: the loops
+    /// do not leave them unsent. Where they cost the channel quantized
+    /// first more than its share, it is given what they cost, and the
+    /// second what is left; at a variable or mean rate, where a frame is
+    /// fitted to its least bits, the noise energies of one channel took
+    /// more than half of them beside a channel that took fewer. Where the
+    /// first is quantized again, it keeps what they cost, and where the
+    /// second's bits then do not pay for its own, it is given the bits that
+    /// the shares, in whole bits, leave over.
+    ///
     /// # Panics
     ///
     /// If `available_bits` do not pay for the element's channels without
-    /// lines, with their filters: a caller's error.
+    /// lines, with their filters and the bands of noise and in intensity
+    /// stereo that they send whatever their lines (see
+    /// [`least_coded_bits`](Self::least_coded_bits)): a caller's error.
     fn code_element(&mut self, available_bits: u32) -> CodedElement {
         let fs = self.sampling_frequency;
         let share = self.share(available_bits);
         let lineless = self.lineless;
-        let budget = |c: usize| {
-            if self.prepared[c].silent {
+        let mut budgets = [0; 2];
+        for (c, budget) in budgets.iter_mut().enumerate().take(self.prepared.len()) {
+            *budget = if self.prepared[c].silent {
                 lineless.channels_with_tns[c]
             } else {
                 share
-            }
-        };
-        let mut order: Vec<usize> = (0..self.prepared.len()).collect();
-        // A pair in intensity stereo codes its left channel first, which the
-        // right channel's bands in intensity stereo scale, and whose
-        // `max_sfb` sets which of them it sends; but not for the bands of
-        // noise alone, which the left channel sends whatever its lines.
-        let in_intensity = self.in_intensity();
-        let left_first = (0..SHORT_WINDOWS).any(|g| {
-            let noise = self.noise_intensity.bands[g];
-            (0..MAX_BANDS).any(|sfb| {
-                self.intensity.bands[g].codebook(sfb).is_some() && noise.codebook(sfb).is_none()
-            })
-        });
-        order.sort_by(|&a, &b| {
-            if left_first {
-                return a.cmp(&b);
-            }
-            let key = |c: usize| {
-                (
-                    !self.prepared[c].silent,
-                    self.prepared[c].perceptual_entropy,
-                )
             };
-            let (a, b) = (key(a), key(b));
-            a.0.cmp(&b.0).then(a.1.total_cmp(&b.1))
-        });
+        }
+        let order = self.order();
+        let in_intensity = self.in_intensity();
+        // The channel of a pair quantized first is given at least what it
+        // costs, its bands of noise and in intensity stereo among them, and
+        // the second what is left.
+        let mut first_least = 0;
+        if let [first, second] = order[..] {
+            let least = self.least_channel_of(first, self.first_intensity(first), true);
+            first_least = least.bits(self.common_window);
+            let raise = first_least.saturating_sub(budgets[first]);
+            budgets[first] += raise;
+            budgets[second] = budgets[second].saturating_sub(raise);
+        }
+        let budget = |c: usize| budgets[c];
+        let spare = available_bits.saturating_sub(lineless.fields + budgets.iter().sum::<u32>());
         match order[..] {
             [only] => {
                 let prepared = &self.prepared[only];
@@ -1466,12 +1477,17 @@ impl ElementEncoder {
                         least_channel(windows, fs, least_sfb, &intensity, &b.noise, &b.tns)
                             .bits(true)
                             + b_coding.element_bits[least_sfb];
-                    let floor = lineless.channels_with_tns[first];
-                    if b_least <= b_coding.available_bits || coding.available_bits <= floor {
+                    if b_least <= b_coding.available_bits {
+                        break (a_channel, intensity, b_coding);
+                    }
+                    if coding.available_bits <= first_least {
+                        // The bits that the shares, whole bits, leave.
+                        b_coding.available_bits += spare;
                         break (a_channel, intensity, b_coding);
                     }
                     let short = b_least - b_coding.available_bits;
-                    coding.available_bits = coding.available_bits.saturating_sub(short).max(floor);
+                    coding.available_bits =
+                        coding.available_bits.saturating_sub(short).max(first_least);
                 };
                 #[cfg(test)]
                 let second_channel = SecondChannel {
@@ -1512,6 +1528,136 @@ impl ElementEncoder {
                 }
                 let [left, right] = channels.map(|c| c.expect("coded"));
                 CodedElement::pair(left, right)
+            }
+            _ => unreachable!("an element of one channel or two"),
+        }
+    }
+
+    /// The order in which [`code_element`](Self::code_element) quantizes the
+    /// frame's channels.
+    ///
+    /// A pair in intensity stereo codes its left channel first, which the
+    /// right channel's bands in intensity stereo scale, and whose `max_sfb`
+    /// sets which of them it sends; but not for the bands of noise alone,
+    /// which the left channel sends whatever its lines. Otherwise the
+    /// channels are quantized in order of their perceptual entropy, the
+    /// least first, a silent channel before any other.
+    fn order(&self) -> Vec<usize> {
+        let mut order: Vec<usize> = (0..self.prepared.len()).collect();
+        let left_first = (0..SHORT_WINDOWS).any(|g| {
+            let noise = self.noise_intensity.bands[g];
+            (0..MAX_BANDS).any(|sfb| {
+                self.intensity.bands[g].codebook(sfb).is_some() && noise.codebook(sfb).is_none()
+            })
+        });
+        order.sort_by(|&a, &b| {
+            if left_first {
+                return a.cmp(&b);
+            }
+            let key = |c: usize| {
+                (
+                    !self.prepared[c].silent,
+                    self.prepared[c].perceptual_entropy,
+                )
+            };
+            let (a, b) = (key(a), key(b));
+            a.0.cmp(&b.0).then(a.1.total_cmp(&b.1))
+        });
+        order
+    }
+
+    /// The bands in intensity stereo that channel `c` sends whatever its
+    /// lines where it is quantized first: all of the pair's, where it is
+    /// the right channel.
+    fn first_intensity(&self, c: usize) -> Option<&Intensity> {
+        (c == 1 && self.in_intensity()).then_some(&self.intensity)
+    }
+
+    /// Channel `c` of the frame prepared without lines, as the first of its
+    /// element: with its bands of noise and the bands of `intensity`, if
+    /// given, which it sends whatever its lines, and with its filters as
+    /// they stand, or where `shaped` is not set, without any, its noise
+    /// energies measured again as [`unshape`](Self::unshape) measures them.
+    /// No coding of it takes fewer bits.
+    fn least_channel_of(
+        &self,
+        c: usize,
+        intensity: Option<&Intensity>,
+        shaped: bool,
+    ) -> CodedChannel {
+        let prepared = &self.prepared[c];
+        let fs = self.sampling_frequency;
+        let windows = prepared.windows;
+        let intensity = intensity.unwrap_or(&Intensity::NONE);
+        let max_sfb = (intensity.bands.iter())
+            .map(|bands| bands.end())
+            .fold(prepared.noise.end(), usize::max);
+        if shaped || !prepared.tns.is_present() {
+            return least_channel(
+                windows,
+                fs,
+                max_sfb,
+                intensity,
+                &prepared.noise,
+                &prepared.tns,
+            );
+        }
+        let mut noise = prepared.noise.clone();
+        noise_substitution::measure(windows, fs, &mut noise, &prepared.unshaped);
+        least_channel(windows, fs, max_sfb, intensity, &noise, &Tns::NONE)
+    }
+
+    /// The fewest bits the frame prepared can be coded in, as
+    /// [`quantize`](Self::quantize) codes it, with its filters of temporal
+    /// noise shaping as they stand or without any, whichever takes fewer
+    /// (see [`least_bits_with`](Self::least_bits_with)).
+    ///
+    /// Unlike [`least_bits`](Self::least_bits), these count the bands of
+    /// noise and in intensity stereo, which the loops do not leave unsent.
+    pub fn least_coded_bits(&self) -> u32 {
+        self.least_bits_with(true).min(self.least_bits_with(false))
+    }
+
+    /// The fewest bits the frame prepared can be coded in, as
+    /// [`code_element`](Self::code_element) codes it: its fields, and its
+    /// channels without lines, with the bands of noise and in intensity
+    /// stereo that they send whatever their lines, and with their filters
+    /// as they stand, or without any where `shaped` is not set (see
+    /// [`least_channel_of`](Self::least_channel_of)).
+    fn least_bits_with(&self, shaped: bool) -> u32 {
+        let order = self.order();
+        let first = self.least_channel_of(order[0], self.first_intensity(order[0]), shaped);
+        let fields = self.lineless.fields;
+        match order[..] {
+            [_] => fields + first.bits(false),
+            [_, second] if self.common_window => {
+                // As the second channel's least in `code_element`.
+                let fs = self.sampling_frequency;
+                let b = &self.prepared[second];
+                let windows = b.windows;
+                let least_max_sfb = first.max_sfb();
+                let intensity = if second == 1 {
+                    self.intensity.below(least_max_sfb)
+                } else {
+                    Intensity::NONE
+                };
+                let mut noise = b.noise.clone();
+                let tns = if shaped { b.tns } else { Tns::NONE };
+                if !shaped && b.tns.is_present() {
+                    noise_substitution::measure(windows, fs, &mut noise, &b.unshaped);
+                }
+                let least_sfb = least_max_sfb.max(noise.end());
+                let groups = windows.groups(fs).count();
+                let b_least = least_channel(windows, fs, least_sfb, &intensity, &noise, &tns);
+                fields
+                    + first.bits(true)
+                    + b_least.bits(true)
+                    + first.extension_bits(least_sfb)
+                    + self.ms.flag_bits(groups, least_sfb)
+            }
+            [_, second] => {
+                let second = self.least_channel_of(second, None, shaped);
+                fields + first.bits(false) + second.bits(false)
             }
             _ => unreachable!("an element of one channel or two"),
         }
@@ -2210,5 +2356,56 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A pair with bands of noise is coded in the fewest bits it can be
+    /// coded in, which its noise energies take most of, however unequally
+    /// its channels' noise costs: the channel quantized first is given what
+    /// its bands of noise cost, not just an equal share. Noise in both
+    /// channels, in one at a level falling by 30 dB over each 300 ms, and
+    /// steady in the other.
+    #[test]
+    fn a_pair_pays_for_its_noise_in_the_fewest_bits() {
+        let fs = SamplingFrequency::Hz44100;
+        let len = 40 * FRAME_SAMPLES;
+        let ramp: Vec<f64> = (noise(len, 21).iter().enumerate())
+            .map(|(t, x)| x * 10f64.powf(-1.5 * (t % 13_230) as f64 / 13_230.0))
+            .collect();
+        let steady: Vec<f64> = noise(len, 22).iter().map(|x| 0.1 * x).collect();
+        let input = [ramp, steady];
+        let mut encoder = ElementEncoder::new(
+            fs,
+            ElementKind::Pair,
+            None,
+            Some(noise_substitution::BORDER_HZ),
+            QuietThreshold::Noise,
+            false,
+        );
+        let channels: Vec<&[f64]> = input.iter().map(Vec::as_slice).collect();
+        encoder.push(&channels);
+        encoder.prime();
+        let (mut start, mut substituted) = (0, 0);
+        while encoder.buffered() - start >= 2 * FRAME_SAMPLES {
+            encoder.look_ahead(start + FRAME_SAMPLES, true);
+            encoder.prepare(start, true);
+            let least = encoder.least_coded_bits();
+            for bits in [least, least + 30] {
+                let coded = encoder.quantize(bits);
+                assert!(coded.bits() <= bits, "{} bits in {bits}", coded.bits());
+                let mut w = BitWriter::new();
+                w.write(u32::from(coded.is_pair()), 3);
+                coded.write(&mut w, 0);
+                w.write(0x7, 3);
+                let bytes = w.into_bytes();
+                let decoded = element_of(&mut BitReader::new(&bytes), fs, true);
+                for ics in &decoded.channels {
+                    substituted += (0..ics.info.max_sfb)
+                        .filter(|&sfb| ics.codebook(0, sfb) == 13)
+                        .count();
+                }
+            }
+            start += FRAME_SAMPLES;
+        }
+        assert!(substituted > 1000, "{substituted} bands substituted");
     }
 }
