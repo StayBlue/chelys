@@ -72,6 +72,7 @@ pub(crate) fn noise_offset_db(level: u8, channels: usize) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Control;
     use crate::{Config, ConfigError, Rate};
 
     /// A higher level never allows more noise.
@@ -102,7 +103,12 @@ mod tests {
                     .copied()
                     .unwrap_or_else(|| (offsets[5] + offsets[6]) / 2.0);
                 let config = Config::new(sample_rate, channels, Rate::Quality { level });
-                let offset = config.noise_offset_db().unwrap();
+                let Ok(Control::Variable {
+                    noise_offset_db: offset,
+                }) = config.control()
+                else {
+                    panic!("{sample_rate} Hz, {channels} channels, level {level}");
+                };
                 assert!(
                     (offset - expected).abs() < 1e-12,
                     "{sample_rate} Hz, {channels} channels, level {level}"

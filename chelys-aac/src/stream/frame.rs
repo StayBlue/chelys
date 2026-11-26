@@ -63,7 +63,7 @@ impl FrameRate {
                 noise_offset_db: 0.0,
                 shift_db,
                 least_bits,
-                steering: Some(MeanSteering::new(
+                steering: Some(rate::mean_steering(
                     config.bits_per_second,
                     config.sampling_frequency.hz(),
                     config.bits_per_sample(),

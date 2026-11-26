@@ -49,12 +49,15 @@ mod frequencies;
 mod header;
 mod packet;
 mod psychoacoustic;
+mod rate;
 mod residue;
 mod setup;
 mod window;
 
 pub use chelys_core::{NonFiniteSample, Sample, quality};
-pub use config::{Config, ConfigError, MAX_CHANNELS, Rate};
+pub use config::{
+    Config, ConfigError, MAX_BITS_PER_SAMPLE, MAX_CHANNELS, MIN_BITS_PER_SAMPLE, Rate,
+};
 pub use encoder::{Encoder, Finished, Headers};
 pub use header::VENDOR;
 pub use packet::{Packet, PacketSink};

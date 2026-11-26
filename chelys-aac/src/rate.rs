@@ -4,6 +4,9 @@
 //! How the frames' lengths are chosen at a variable or mean rate: the
 //! noise each band is allowed, and for a mean rate how it is steered.
 
+use chelys_core::steering;
+pub use chelys_core::steering::MeanSteering;
+
 /// How the frames' lengths are chosen, as a [`StreamConfig`] has it: a
 /// [`Rate`](crate::Rate) with what it fixes for the stream.
 ///
@@ -161,21 +164,17 @@ pub fn noise_factor(noise_offset_db: f64) -> f64 {
 /// [`StreamConfig::quiet_threshold`]: crate::stream::StreamConfig::quiet_threshold
 /// [`StreamConfig::intensity_border`]: crate::stream::StreamConfig::intensity_border
 pub fn nominal_bits_per_sample(noise_offset_db: f64) -> f64 {
-    let log = NOMINAL.map(|(offset, bits)| (offset, bits.ln()));
-    interpolate(&log, noise_offset_db).exp()
+    steering::nominal_bits_per_sample(&NOMINAL, noise_offset_db)
 }
 
 /// The offset whose [`nominal_bits_per_sample`] is `bits_per_sample`.
 pub fn nominal_noise_offset_db(bits_per_sample: f64) -> f64 {
-    // The bits fall as the offset rises: the inverse, its logarithm
-    // rising.
-    let inverse = NOMINAL.map(|(offset, bits)| (-bits.ln(), offset));
-    interpolate(&inverse, -bits_per_sample.ln())
+    steering::nominal_noise_offset_db(&NOMINAL, bits_per_sample)
 }
 
 /// Pairs of a noise offset in dB and the bits a sample it takes (see
-/// [`nominal_bits_per_sample`]), the offset rising: the logarithm of the
-/// bits is taken to be linear between them, and beyond the ends.
+/// [`nominal_bits_per_sample`]), as
+/// [`steering::nominal_bits_per_sample`] takes them.
 const NOMINAL: [(f64, f64); 17] = [
     (-15.0, 3.504),
     (-12.0, 3.079),
@@ -196,64 +195,31 @@ const NOMINAL: [(f64, f64); 17] = [
     (18.0, 0.153),
 ];
 
-/// `y` at `x` on the line through the pairs `points`, `x` rising: between
-/// the two around `x`, or beyond the ends, the two at that end.
-fn interpolate(points: &[(f64, f64)], x: f64) -> f64 {
-    let i = (points[1..points.len() - 1].iter())
-        .take_while(|&&(px, _)| px < x)
-        .count();
-    let ((x0, y0), (x1, y1)) = (points[i], points[i + 1]);
-    y0 + (y1 - y0) * (x - x0) / (x1 - x0)
-}
-
-/// The noise offset of each frame of a stream at a mean rate: that at
-/// which the recent frames would have taken the bits the mean brings the
-/// next, less a share of what the frames so far took beyond it.
+/// The steering of a stream at a mean rate of `bits_per_second` at
+/// `sample_rate`, which has `bits_per_sample` for each sample of each
+/// channel of its NCC: from the offset of its nominal rate (see
+/// [`nominal_noise_offset_db`]), each frame's bits taken to fall by
+/// `BITS_PER_DB` for each dB of offset.
 ///
 /// Spec gap: Annex C has no variable rate, and so no mean rate kept by
-/// one (see [`Variable`](crate::Rate::Variable)). A frame's bits fall
-/// with its noise offset by about `BITS_PER_DB` for each dB, in the
-/// logarithm, whatever its content, while what the content takes at a
-/// given offset varies from stream to stream by a factor of 3 or more. So
-/// each frame's bits are taken back to what they would have been at 0 dB,
-/// `bits * e^(BITS_PER_DB * offset)`, and their mean over the last
-/// `MEMORY_FRAMES` or so gives the offset at which the next frame would
-/// take the bits it is to take: those of the mean, less the bits the
-/// frames so far took beyond it spread over `REPAYMENT_FRAMES` frames.
-///
-/// Within music, the frames so far keep within some 20 frames' bits of
-/// the mean. The steering sets only the frames to come, and nothing makes
-/// up at the end for what the frames so far took beyond the mean or
-/// short of it. Frames that take few bits at any offset, of silence or of
-/// a quiet end, leave the stream short by what they could not take. The
-/// first frames are steered from the nominal rate's offset, which tells
-/// little of the content, and can run over or under: a stream of a few
-/// seconds can miss the mean by much more than a long one. One second of
-/// loud white noise in stereo at 44.1 kHz and 128 kbit/s took 133 kbit/s,
-/// and its first five frames 160 kbit/s; 168 kbit/s before the start was
-/// steered faster (see `START_MEMORY_FRAMES`).
+/// one (see [`Variable`](crate::Rate::Variable)). The offset is steered as
+/// [`MeanSteering`] describes. Within music, the frames so far keep within
+/// some 20 frames' bits of the mean. One second of loud white noise in
+/// stereo at 44.1 kHz and 128 kbit/s took 133 kbit/s, and its first five
+/// frames 160 kbit/s.
 ///
 /// On the tuning set of 51 tracks at 44.1 kHz in stereo, at means of 64,
 /// 128 and 192 kbit/s, the tracks were 2.1%, 2.0% and 2.0% short on
 /// average, 7.7% at most, the one ending in some 13 s of a quiet fade, and
-/// none over. Steered faster, forgetting over 100 frames and giving back
-/// over 250, they were 1.6% to 1.8% short, the offset varying within a
-/// track by 3.1 dB, a standard deviation, against 2.2 dB; slower, over 400
-/// and 1000, 2.2% to 2.4% short, varying by 1.8 dB.
-#[derive(Clone, Debug)]
-pub struct MeanSteering {
-    /// The bits of a frame at the mean.
-    mean: f64,
-    /// The bits the recent frames would have taken at 0 dB, a mean that
-    /// forgets each frame over `MEMORY_FRAMES`.
-    at_0_db: f64,
-    /// The frames taken so far.
-    frames: f64,
-    /// The bits the frames so far took beyond the mean; below it if
-    /// negative.
-    excess: f64,
-    /// The noise offset of the next frame.
-    noise_offset_db: f64,
+/// none over.
+pub fn mean_steering(bits_per_second: u32, sample_rate: u32, bits_per_sample: f64) -> MeanSteering {
+    MeanSteering::new(
+        bits_per_second,
+        sample_rate,
+        crate::stream::FRAME_SAMPLES,
+        nominal_noise_offset_db(bits_per_sample),
+        BITS_PER_DB,
+    )
 }
 
 /// How far the logarithm of a frame's bits falls for each dB of noise
@@ -261,63 +227,6 @@ pub struct MeanSteering {
 /// their mean bitrate fell from 151 to 72 kbit/s from -3 to 6 dB (0.083),
 /// and from 124 to 72 from 0 to 6 dB (0.091).
 const BITS_PER_DB: f64 = 0.09;
-
-/// The frames over which [`MeanSteering`] forgets a frame's bits: the
-/// steering starts out as if the frames before the first had taken the
-/// nominal rate's bits at its offset.
-const MEMORY_FRAMES: f64 = 200.0;
-
-/// The frames over which the bits the stream took beyond its mean, or
-/// short of it, are given back.
-const REPAYMENT_FRAMES: f64 = 500.0;
-
-/// The frames, beyond those taken so far, over which the steering forgets
-/// a frame's bits and gives back what the frames took beyond the mean,
-/// where they are fewer than [`MEMORY_FRAMES`] and [`REPAYMENT_FRAMES`]: at
-/// the start of a stream, of which the nominal rate's offset tells little.
-/// The tuning set's means were as before, within 0.1%.
-const START_MEMORY_FRAMES: f64 = 8.0;
-const START_REPAYMENT_FRAMES: f64 = 40.0;
-
-/// The noise offsets a mean rate steers within.
-const OFFSETS_DB: std::ops::RangeInclusive<f64> = -30.0..=40.0;
-
-impl MeanSteering {
-    /// The steering of a stream at `bits_per_second` and `sample_rate`,
-    /// which has `bits_per_sample` for each sample of each channel of its
-    /// NCC.
-    pub fn new(bits_per_second: u32, sample_rate: u32, bits_per_sample: f64) -> Self {
-        let mean = f64::from(bits_per_second) * crate::stream::FRAME_SAMPLES as f64
-            / f64::from(sample_rate);
-        let start_db = nominal_noise_offset_db(bits_per_sample);
-        Self {
-            mean,
-            at_0_db: mean * (BITS_PER_DB * start_db).exp(),
-            frames: 0.0,
-            excess: 0.0,
-            noise_offset_db: start_db,
-        }
-    }
-
-    /// The noise offset of the next frame.
-    pub fn noise_offset_db(&self) -> f64 {
-        self.noise_offset_db
-    }
-
-    /// Takes a frame of `len` bytes, coded at [`Self::noise_offset_db`].
-    pub fn spend(&mut self, len: usize) {
-        let bits = 8.0 * len as f64;
-        let at_0_db = bits * (BITS_PER_DB * self.noise_offset_db).exp();
-        self.frames += 1.0;
-        let memory = MEMORY_FRAMES.min(self.frames + START_MEMORY_FRAMES);
-        self.at_0_db += (at_0_db - self.at_0_db) / memory;
-        self.excess += bits - self.mean;
-        let repayment = REPAYMENT_FRAMES.min(self.frames + START_REPAYMENT_FRAMES);
-        let wanted = (self.mean - self.excess / repayment).max(self.mean / 4.0);
-        let offset = (self.at_0_db / wanted).ln() / BITS_PER_DB;
-        self.noise_offset_db = offset.clamp(*OFFSETS_DB.start(), *OFFSETS_DB.end());
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -335,47 +244,6 @@ mod tests {
                 "{offset}"
             );
             last = bits;
-        }
-    }
-
-    /// Frames whose bits fall with the offset more slowly or faster than
-    /// the steering takes them to, of passages loud and quiet, keep the
-    /// mean over a stream of a few minutes within 3%; and a quiet end,
-    /// whose frames take few bits at any offset, leaves it short by what
-    /// those frames could not take.
-    #[test]
-    fn a_mean_rate_keeps_its_mean() {
-        let mean = 128_000.0 * 1024.0 / 44_100.0;
-        for slope in [0.05, 0.09, 0.14] {
-            for quiet_end in [false, true] {
-                let mut steering = MeanSteering::new(128_000, 44_100, 1.45);
-                let frames = 8000;
-                let (mut total, mut least) = (0.0, 0.0);
-                for k in 0..frames {
-                    // Passages of 20 s, a third at 3 times the bits of the
-                    // rest.
-                    let level = if (k / 860) % 3 == 0 { 3.0 } else { 1.0 };
-                    let at_0_db = 1.2 * mean * level;
-                    let offset = steering.noise_offset_db();
-                    let bits = if quiet_end && k >= frames - 400 {
-                        100.0
-                    } else {
-                        (at_0_db * (-slope * offset).exp()).max(100.0)
-                    };
-                    let len = (bits / 8.0).round() as usize;
-                    steering.spend(len);
-                    total += 8.0 * len as f64;
-                    if bits == 100.0 {
-                        least += mean - 8.0 * len as f64;
-                    }
-                }
-                let error = total / (frames as f64 * mean) - 1.0;
-                let short = least / (frames as f64 * mean);
-                assert!(
-                    (error + short).abs() < 0.03,
-                    "slope {slope}, quiet end {quiet_end}: {error:+.4}, {short:+.4}"
-                );
-            }
         }
     }
 }

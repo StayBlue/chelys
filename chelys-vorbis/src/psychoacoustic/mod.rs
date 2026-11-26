@@ -38,7 +38,7 @@
 //! - Nothing past step 13 is taken: the threshold of each partition is
 //!   shared evenly among its lines, and becomes the noise each line of the
 //!   block's spectrum may take, as noise at the scale of the spectrum
-//!   that the decoder takes (see [`Model::analyze`]).
+//!   that the decoder takes (see [`Analysis::noise`]).
 //! - Step 13 finds an attack where the perceptual entropy of the short
 //!   blocks rises, as chelys's AAC encoder finds one, rather than from the
 //!   long block's (see [`SWITCH_PE`]).
@@ -446,22 +446,15 @@ pub struct Tables {
     long_predicted: usize,
     /// `switch_pe` at the sample rate (see [`SWITCH_PE_LOW`]).
     switch_pe: f64,
-    /// The weight of the noise long blocks are allowed in the treble (see
-    /// [`treble_weight`]).
-    #[cfg_attr(not(test), allow(dead_code))]
-    treble_weight: f64,
 }
 
 impl Tables {
-    /// The tables of `sample_rate`, whose long blocks are allowed
-    /// `treble_weight` times the noise above [`TREBLE_HZ`] (see
-    /// [`treble_weight`]).
-    pub fn new(sample_rate: u32, treble_weight: f64) -> Self {
+    /// The tables of `sample_rate`.
+    pub fn new(sample_rate: u32) -> Self {
         let below = (LONG_PREDICTED_HZ * BLOCK as f64 / f64::from(sample_rate)).round();
         Self {
-            long: FftTables::new(sample_rate, Fft::Long, treble_weight),
-            short: FftTables::new(sample_rate, Fft::Short, 1.0),
-            treble_weight,
+            long: FftTables::new(sample_rate, Fft::Long),
+            short: FftTables::new(sample_rate, Fft::Short),
             long_predicted: (below as usize).clamp(LONG_CW_LINES, LINES),
             switch_pe: if sample_rate < SWITCH_PE_LOW_RATE {
                 SWITCH_PE_LOW
@@ -469,13 +462,6 @@ impl Tables {
                 SWITCH_PE
             },
         }
-    }
-
-    /// The weight of the noise long blocks are allowed above
-    /// [`TREBLE_HZ`], as [`new`](Self::new) took it.
-    #[cfg(test)]
-    pub fn treble_weight(&self) -> f64 {
-        self.treble_weight
     }
 
     /// The partition of each line of a long block, if `long`, or of a short
@@ -500,14 +486,16 @@ struct FftTables {
     /// The threshold in quiet of each partition as an energy of the FFT.
     quiet: Vec<f64>,
     /// The factor by which each partition's allowance is raised for the
-    /// width of its critical band (see [`band_weights`]).
-    weights: Vec<f64>,
+    /// width of its critical band, and the share of the treble's weight it
+    /// takes (see [`band_weights`]).
+    widths: Vec<f64>,
+    trebles: Vec<f64>,
     /// The samples of the FFT, and of its block.
     samples: usize,
 }
 
 impl FftTables {
-    fn new(sample_rate: u32, fft: Fft, treble_weight: f64) -> Self {
+    fn new(sample_rate: u32, fft: Fft) -> Self {
         let partitions = partitions::partitions(sample_rate, fft);
         let n = partitions.len();
         let mut spreading = vec![0.0; n * n];
@@ -520,17 +508,53 @@ impl FftTables {
             .map(|b| 1.0 / (0..n).map(|bb| spreading[bb * n + b]).sum::<f64>())
             .collect();
         let samples = 2 * fft.lines();
+        let (widths, trebles) = band_weights(&partitions, f64::from(sample_rate) / samples as f64);
         Self {
             quiet: quiet(&partitions, quiet_reference(samples)),
-            weights: band_weights(
-                &partitions,
-                f64::from(sample_rate) / samples as f64,
-                treble_weight,
-            ),
+            widths,
+            trebles,
             partitions,
             spreading,
             rnorm,
             samples,
+        }
+    }
+
+    /// The factor by which partition `b`'s allowance is raised, where the
+    /// treble's weight is `treble_weight` (see [`band_weights`]).
+    fn weight(&self, b: usize, treble_weight: f64) -> f64 {
+        let (width, treble) = (self.widths[b], self.trebles[b]);
+        // As `width * treble_weight.powf(treble)`, which is `width` where
+        // either is 1 or the share 0.
+        if treble == 0.0 || treble_weight == 1.0 {
+            width
+        } else {
+            width * treble_weight.powf(treble)
+        }
+    }
+
+    /// Each partition's weight where the treble's weight is
+    /// `treble_weight`.
+    #[cfg(test)]
+    fn weights(&self, treble_weight: f64) -> Vec<f64> {
+        (0..self.partitions.len())
+            .map(|b| self.weight(b, treble_weight))
+            .collect()
+    }
+
+    /// Each partition's threshold, `thresholds`, scaled by `factor` and by
+    /// its weight where the treble's weight is `treble_weight`, shared
+    /// evenly among its lines, and taken as noise, into `noise`: each
+    /// line's share times [`noise_scale`] of the block. Line `k` of the
+    /// spectrum, centered at `k + 1/2` lines of the FFT, takes the share of
+    /// line `k` of the FFT. No line takes less than [`absolute_noise`].
+    fn noise(&self, thresholds: &[f64], factor: f64, treble_weight: f64, noise: &mut [f64]) {
+        let scale = noise_scale(self.samples);
+        let least = absolute_noise(self.samples);
+        for (b, (p, &thr)) in self.partitions.iter().zip(thresholds).enumerate() {
+            let weight = self.weight(b, treble_weight);
+            let line = (thr * factor * weight / p.lines.len() as f64 * scale).max(least);
+            noise[p.lines.clone()].fill(line);
         }
     }
 
@@ -591,14 +615,16 @@ fn width_bark(partitions: &[Partition], b: usize) -> Option<f64> {
 /// wide, is allowed more noise than the model's threshold scaled by the
 /// rate's offset: the width in Hz of the critical band about it, against
 /// [`NARROWEST_BAND_HZ`], raised to [`BAND_EXPONENT`], and no less than 1;
-/// and above [`TREBLE_HZ`] up to `treble_weight` times that, rising in dB
-/// in a straight line over [`TREBLE_RAMP_HZ`] with the partition's center.
+/// and above [`TREBLE_HZ`] up to the treble's weight times that (see
+/// [`treble_weight`]), rising in dB in a straight line over
+/// [`TREBLE_RAMP_HZ`] with the partition's center: the width's factor, and
+/// the share of the treble's weight, from 0 to 1, by which it is raised.
 /// That width is the Hz between the centers of its neighbours for each
 /// Bark between their `bval(b)`, or between its own and its one neighbour's
 /// at either end. The partitions at [`TOP_BARK`] and above, at which the
 /// tables' Bark values stop rising, take that of the last partition below
 /// them.
-fn band_weights(partitions: &[Partition], line_hz: f64, treble_weight: f64) -> Vec<f64> {
+fn band_weights(partitions: &[Partition], line_hz: f64) -> (Vec<f64>, Vec<f64>) {
     let last = last_below_top(partitions);
     let center = |b: usize| {
         let lines = &partitions[b].lines;
@@ -615,9 +641,9 @@ fn band_weights(partitions: &[Partition], line_hz: f64, treble_weight: f64) -> V
             let width = band_hz(b.min(last)).map_or(1.0, |hz| {
                 (hz / NARROWEST_BAND_HZ).max(1.0).powf(BAND_EXPONENT)
             });
-            width * treble_weight.powf(treble)
+            (width, treble)
         })
-        .collect()
+        .unzip()
 }
 
 /// The Hann window of 2 `iblen` samples (step 2): `0.5 - 0.5 cos(pi (i +
@@ -705,14 +731,16 @@ impl Predictor {
 }
 
 /// What the model gives for a long block and the short blocks that may take
-/// its place: the noise power each of their lines may take, at the scale of
-/// the spectrum that the decoder takes, and whether the short blocks are to
-/// take its place.
+/// its place: the threshold of each of their partitions, from which the
+/// noise each of their lines may take follows (see [`Analysis::noise`]),
+/// and whether the short blocks are to take its place.
 #[derive(Clone, Debug)]
 pub struct Analysis {
-    /// The noise of each line of the long block.
+    /// The threshold of each partition of the long block, an energy of its
+    /// FFT (steps 5 to 11).
     pub long: Vec<f64>,
-    /// The noise of each line of each short block, in their order.
+    /// The threshold of each partition of each short block, in their
+    /// order.
     pub short: Vec<Vec<f64>>,
     /// The largest rise of a short block's perceptual entropy above the
     /// most of the eight before it, and above the one before it (see
@@ -727,8 +755,8 @@ pub struct Analysis {
 impl Default for Analysis {
     fn default() -> Self {
         Self {
-            long: vec![0.0; LINES],
-            short: vec![vec![0.0; SHORT_LINES]; SHORT_BLOCKS],
+            long: Vec::new(),
+            short: vec![Vec::new(); SHORT_BLOCKS],
             entropy_rise: f64::NEG_INFINITY,
             entropy_step: f64::NEG_INFINITY,
             switch_pe: SWITCH_PE,
@@ -741,6 +769,71 @@ impl Analysis {
     /// (step 13).
     pub fn attack(&self) -> bool {
         self.entropy_rise > self.switch_pe || self.entropy_step > SWITCH_PE_STEP
+    }
+
+    /// The noise each line of the long block and of each short block may
+    /// take at `allowance`, at the scale of the spectrum that the decoder
+    /// takes, into `out`: each partition's threshold scaled by the
+    /// allowance's factor, and in long blocks by the treble's weight, as
+    /// [`band_weights`] weighs it. No line of a short block takes more
+    /// noise than the long block allows the lines of its frequencies (see
+    /// [`SHORT_NOISE_ABOVE_LONG`]).
+    pub fn noise(&self, tables: &Tables, allowance: Allowance, out: &mut Noise) {
+        let Allowance {
+            factor,
+            treble_weight,
+        } = allowance;
+        tables
+            .long
+            .noise(&self.long, factor, treble_weight, &mut out.long);
+        for (thresholds, noise) in self.short.iter().zip(&mut out.short) {
+            tables.short.noise(thresholds, factor, 1.0, noise);
+            for (j, noise) in noise.iter_mut().enumerate() {
+                let lines = &out.long[j * SHORT_BLOCKS..(j + 1) * SHORT_BLOCKS];
+                let least = lines.iter().copied().fold(f64::INFINITY, f64::min);
+                *noise = noise.min(least * SHORT_BLOCKS as f64 * SHORT_NOISE_ABOVE_LONG);
+            }
+        }
+    }
+}
+
+/// How far each partition's threshold is raised into the noise its lines
+/// may take (see [`Analysis::noise`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Allowance {
+    /// The factor by which every partition's threshold is scaled.
+    pub factor: f64,
+    /// The weight of the noise long blocks are allowed above
+    /// [`TREBLE_HZ`] (see [`treble_weight`]).
+    pub treble_weight: f64,
+}
+
+impl Allowance {
+    /// The allowance of the noise offset `noise_offset_db`, which scales
+    /// each threshold by `10^(noise_offset_db / 10)`, and of the treble's
+    /// weight `treble_weight`.
+    pub fn new(noise_offset_db: f64, treble_weight: f64) -> Self {
+        Self {
+            factor: 10f64.powf(noise_offset_db / 10.0),
+            treble_weight,
+        }
+    }
+}
+
+/// The noise power each line of a long block, and of each of the short
+/// blocks that may take its place, may take (see [`Analysis::noise`]).
+#[derive(Clone, Debug)]
+pub struct Noise {
+    pub long: Vec<f64>,
+    pub short: Vec<Vec<f64>>,
+}
+
+impl Default for Noise {
+    fn default() -> Self {
+        Self {
+            long: vec![0.0; LINES],
+            short: vec![vec![0.0; SHORT_LINES]; SHORT_BLOCKS],
+        }
     }
 }
 
@@ -773,19 +866,17 @@ impl Partitioned {
 
     /// Steps 5 to 12 for a block of the FFT of `tables`, from the energy
     /// `r(w)^2` and the unpredictability `c(w)` of each of its lines, with
-    /// pre-echo control by `rpelev`: the noise each line of the block may
-    /// take, into `noise`, its threshold scaled by `allowance` and shared
-    /// as [`Model::analyze`] describes; and the block's perceptual entropy,
-    /// from its threshold before the allowance scales it.
+    /// pre-echo control by `rpelev`: the threshold of each partition, into
+    /// `thresholds`, and the block's perceptual entropy.
     fn threshold(
         &mut self,
         tables: &FftTables,
         energy: &[f64],
         c: &[f64],
         rpelev: f64,
-        allowance: f64,
-        noise: &mut [f64],
+        thresholds: &mut Vec<f64>,
     ) -> f64 {
+        thresholds.resize(tables.partitions.len(), 0.0);
         // Step 5: each partition's energy and weighted unpredictability.
         for (b, p) in tables.partitions.iter().enumerate() {
             let lines = p.lines.clone();
@@ -800,10 +891,7 @@ impl Partitioned {
         tables.spread(&self.e, &mut self.ecb);
         tables.spread(&self.weighted, &mut self.ct);
 
-        // Steps 7 to 12, each partition's threshold, shared among its
-        // lines.
-        let scale = noise_scale(tables.samples);
-        let least = absolute_noise(tables.samples);
+        // Steps 7 to 12, each partition's threshold.
         let mut entropy = 0.0;
         for (b, p) in tables.partitions.iter().enumerate() {
             let ecb = self.ecb[b];
@@ -817,9 +905,7 @@ impl Partitioned {
             // Step 12, each partition weighed by one less than its lines,
             // as chelys's AAC encoder reads it.
             entropy -= (p.lines.len() - 1) as f64 * (thr / (self.e[b] + ENTROPY_UNIT)).log10();
-            let line =
-                (thr * allowance * tables.weights[b] / p.lines.len() as f64 * scale).max(least);
-            noise[p.lines.clone()].fill(line);
+            thresholds[b] = thr;
         }
         entropy
     }
@@ -829,9 +915,6 @@ impl Partitioned {
 /// next.
 #[derive(Debug)]
 pub struct Model {
-    /// The factor by which each partition's threshold is scaled, from the
-    /// rate's noise offset.
-    allowance: f64,
     long_fft: RealFft,
     short_fft: RealFft,
     long_hann: Vec<f64>,
@@ -855,11 +938,9 @@ pub struct Model {
 
 impl Model {
     /// The model of a channel before its first block, which follows
-    /// silence, which allows each partition its threshold scaled by
-    /// `10^(noise_offset_db / 10)`.
-    pub fn new(tables: &Tables, noise_offset_db: f64) -> Self {
+    /// silence.
+    pub fn new(tables: &Tables) -> Self {
         Self {
-            allowance: 10f64.powf(noise_offset_db / 10.0),
             long_fft: RealFft::new(BLOCK),
             short_fft: RealFft::new(SHORT_BLOCK),
             long_hann: hann(BLOCK),
@@ -881,14 +962,10 @@ impl Model {
 
     /// Analyzes the long block of `samples`, at full scale 1.0, and the
     /// short blocks that may take its place, into `out`; each call takes the
-    /// block 1024 samples after the last.
-    ///
-    /// Each partition's threshold, an energy of its FFT, is scaled by the
-    /// model's allowance, shared evenly among its lines, and taken as
-    /// noise: each line's share times [`noise_scale`] of the block. Line
-    /// `k` of the spectrum, centered at `k + 1/2` lines of the FFT, takes
-    /// the share of line `k` of the FFT. No line takes less than
-    /// [`absolute_noise`].
+    /// block 1024 samples after the last. The noise its lines may take
+    /// follows from it at the allowance of the block's rate (see
+    /// [`Analysis::noise`]), which the analysis does not depend on, so
+    /// that a block may be analyzed before its rate is known.
     ///
     /// The thresholds of the long and of the short blocks are computed for
     /// every block, as the two processes of ISO/IEC 13818-7, clause C.1.1,
@@ -945,33 +1022,19 @@ impl Model {
         }
 
         // Steps 5 to 11.
-        self.long.threshold(
-            &tables.long,
-            &self.energy,
-            &self.c,
-            RPELEV,
-            self.allowance,
-            &mut out.long,
-        );
+        self.long
+            .threshold(&tables.long, &self.energy, &self.c, RPELEV, &mut out.long);
 
         // Steps 5 to 12 for each short block.
         let mut entropies = [0.0; SHORT_BLOCKS];
-        for (k, (noise, entropy)) in out.short.iter_mut().zip(&mut entropies).enumerate() {
+        for (k, (thresholds, entropy)) in out.short.iter_mut().zip(&mut entropies).enumerate() {
             *entropy = self.short.threshold(
                 &tables.short,
                 &self.short_energy[k],
                 &self.short_c[k],
                 RPELEV_SHORT,
-                self.allowance,
-                noise,
+                thresholds,
             );
-            // No line takes more noise than the long block allows the
-            // lines of its frequencies (see `SHORT_NOISE_ABOVE_LONG`).
-            for (j, noise) in noise.iter_mut().enumerate() {
-                let lines = &out.long[j * SHORT_BLOCKS..(j + 1) * SHORT_BLOCKS];
-                let least = lines.iter().copied().fold(f64::INFINITY, f64::min);
-                *noise = noise.min(least * SHORT_BLOCKS as f64 * SHORT_NOISE_ABOVE_LONG);
-            }
         }
 
         // Step 13: each short block rises from the most of the eight before
@@ -1037,7 +1100,7 @@ mod tests {
     #[test]
     fn each_line_has_a_partition_in_order() {
         for sample_rate in [8_000, 44_100, 48_000, 96_000, 192_000] {
-            let tables = Tables::new(sample_rate, 1.0);
+            let tables = Tables::new(sample_rate);
             for (long, lines) in [(true, LINES), (false, SHORT_LINES)] {
                 let partitions = tables.partition_of_lines(long);
                 assert_eq!(partitions.len(), lines, "{sample_rate} Hz");
@@ -1057,32 +1120,36 @@ mod tests {
     #[test]
     fn band_weights_rise_with_the_width_of_the_critical_bands() {
         for sample_rate in [8_000, 22_050, 44_100, 48_000, 96_000] {
-            let tables = Tables::new(sample_rate, 1.0);
+            let tables = Tables::new(sample_rate);
             for fft in [&tables.long, &tables.short] {
-                assert!(fft.weights[0] < 1.1, "{sample_rate} Hz");
+                let weights = fft.weights(1.0);
+                assert!(weights[0] < 1.1, "{sample_rate} Hz");
                 // The tables' Bark values are rounded, and some partitions,
                 // as the last of a table, are narrower than the one below.
                 let mut most: f64 = 1.0;
-                for &weight in &fft.weights {
+                for &weight in &weights {
                     assert!(weight >= most / 2.0, "{sample_rate} Hz");
                     most = most.max(weight);
                 }
             }
         }
-        let tables = Tables::new(44_100, TREBLE_WEIGHT);
-        let db_at = |fft: &FftTables, hz: f64| {
+        let tables = Tables::new(44_100);
+        let db_at = |fft: &FftTables, treble_weight: f64, hz: f64| {
             let line = (hz * fft.samples as f64 / 44_100.0) as usize;
             let b = (fft.partitions.iter())
                 .position(|p| p.lines.contains(&line))
                 .unwrap();
-            10.0 * fft.weights[b].log10()
+            10.0 * fft.weight(b, treble_weight).log10()
         };
-        assert!(db_at(&tables.long, 200.0) < 0.5);
-        // Above 13 kHz, the treble's weight too, in long blocks.
+        assert!(db_at(&tables.long, TREBLE_WEIGHT, 200.0) < 0.5);
+        // Above 13 kHz, the treble's weight too, as long blocks take it.
         let treble = 10.0 * TREBLE_WEIGHT.log10();
         for (hz, long_db, short_db) in [(4_000.0, 6.0, 6.0), (16_000.0, 10.0 + treble, 10.0)] {
-            for (fft, db) in [(&tables.long, long_db), (&tables.short, short_db)] {
-                let weight = db_at(fft, hz);
+            for (fft, weight, db) in [
+                (&tables.long, TREBLE_WEIGHT, long_db),
+                (&tables.short, 1.0, short_db),
+            ] {
+                let weight = db_at(fft, weight, hz);
                 assert!((weight - db).abs() < 1.5, "{hz} Hz: {weight:.1} dB");
             }
         }
@@ -1098,11 +1165,18 @@ mod tests {
         assert_eq!(treble_weight(true, 1.0), 1.0);
         assert!((treble_weight(true, 0.5) - TREBLE_WEIGHT.sqrt()).abs() < 1e-12);
         // Where bits are scarce, a pair's treble is weighed as below it.
-        let (plain, coupled) = (
-            Tables::new(44_100, 1.0),
-            Tables::new(44_100, treble_weight(true, 1.0)),
+        let tables = Tables::new(44_100);
+        assert_eq!(
+            tables.long.weights(1.0),
+            tables.long.weights(treble_weight(true, 1.0))
         );
-        assert_eq!(plain.long.weights, coupled.long.weights);
+        // The weight is the width's, times the treble's weight to the
+        // partition's share of it.
+        for (b, &treble) in tables.long.trebles.iter().enumerate() {
+            let weight = tables.long.widths[b] * TREBLE_WEIGHT.powf(treble);
+            assert_eq!(tables.long.weight(b, TREBLE_WEIGHT), weight);
+        }
+        assert!(tables.long.trebles.iter().any(|&t| t > 0.0 && t < 1.0));
     }
 
     #[test]
@@ -1117,8 +1191,8 @@ mod tests {
 
     /// The analyses of the first `blocks` blocks of `signal`.
     fn analyses(sample_rate: u32, signal: impl Fn(usize) -> f64, blocks: usize) -> Vec<Analysis> {
-        let tables = Tables::new(sample_rate, 1.0);
-        let mut model = Model::new(&tables, 0.0);
+        let tables = Tables::new(sample_rate);
+        let mut model = Model::new(&tables);
         (0..blocks)
             .map(|k| {
                 let samples: Vec<f64> = (0..BLOCK).map(|t| signal(k * LINES + t)).collect();
@@ -1133,29 +1207,63 @@ mod tests {
         analyses(sample_rate, signal, blocks).pop().unwrap()
     }
 
+    /// The noise of `analysis` at 44.1 kHz at the noise offset 0 dB, the
+    /// treble unweighed.
+    fn noise(analysis: &Analysis) -> Noise {
+        let mut noise = Noise::default();
+        analysis.noise(&Tables::new(44_100), Allowance::new(0.0, 1.0), &mut noise);
+        noise
+    }
+
     #[test]
     fn silence_gets_the_threshold_in_quiet() {
         let analysis = analyze(44_100, |_| 0.0, 3);
-        let tables = Tables::new(44_100, 1.0);
-        for (tables, noise) in std::iter::once((&tables.long, &analysis.long))
-            .chain(analysis.short.iter().map(|noise| (&tables.short, noise)))
+        let noise = noise(&analysis);
+        let tables = Tables::new(44_100);
+        for (tables, noise) in std::iter::once((&tables.long, &noise.long))
+            .chain(noise.short.iter().map(|noise| (&tables.short, noise)))
         {
             let scale = noise_scale(tables.samples);
             let least = absolute_noise(tables.samples);
             for (b, p) in tables.partitions.iter().enumerate() {
-                let expected =
-                    (tables.quiet[b] * tables.weights[b] / p.lines.len() as f64 * scale).max(least);
+                let weight = tables.weight(b, 1.0);
+                let expected = (tables.quiet[b] * weight / p.lines.len() as f64 * scale).max(least);
                 assert!(noise[p.lines.clone()].iter().all(|&n| n == expected));
             }
         }
         assert!(!analysis.attack());
     }
 
+    /// The allowance scales every line's noise above the least, and the
+    /// treble's weight that of the long block's treble alone.
+    #[test]
+    fn the_allowance_scales_the_noise() {
+        let white = white(4 * BLOCK);
+        let analysis = analyze(44_100, |t| white[t], 3);
+        let tables = Tables::new(44_100);
+        let at = |noise_offset_db, treble_weight| {
+            let mut noise = Noise::default();
+            let allowance = Allowance::new(noise_offset_db, treble_weight);
+            analysis.noise(&tables, allowance, &mut noise);
+            noise
+        };
+        let (plain, raised, treble) = (at(0.0, 1.0), at(10.0, 1.0), at(0.0, TREBLE_WEIGHT));
+        for (&plain, &raised) in plain.long.iter().zip(&raised.long) {
+            assert!((raised / plain - 10.0).abs() < 1e-9);
+        }
+        let partitions = tables.partition_of_lines(true);
+        for ((&plain, &treble), &b) in plain.long.iter().zip(&treble.long).zip(&partitions) {
+            let expected = TREBLE_WEIGHT.powf(tables.long.trebles[b]);
+            assert!((treble / plain - expected).abs() < 1e-9);
+        }
+        assert_eq!(plain.short, treble.short);
+    }
+
     /// The threshold of the partition holding `line`, against its energy
     /// in the long FFT, in dB, in the last of `blocks` blocks of `signal`.
     fn margin_db(signal: impl Fn(usize) -> f64, blocks: usize, line: usize) -> f64 {
-        let tables = Tables::new(44_100, 1.0);
-        let mut model = Model::new(&tables, 0.0);
+        let tables = Tables::new(44_100);
+        let mut model = Model::new(&tables);
         let mut out = Analysis::default();
         for k in 0..blocks {
             let samples: Vec<f64> = (0..BLOCK).map(|t| signal(k * LINES + t)).collect();
@@ -1166,10 +1274,7 @@ mod tests {
             .iter()
             .position(|p| p.lines.contains(&line))
             .unwrap();
-        let thr = out.long[line] * partitions[b].lines.len() as f64
-            / noise_scale(BLOCK)
-            / tables.long.weights[b];
-        10.0 * (thr / model.long.e[b]).log10()
+        10.0 * (out.long[b] / model.long.e[b]).log10()
     }
 
     #[test]
@@ -1211,8 +1316,8 @@ mod tests {
                 0.0
             }
         };
-        let held = analyze(44_100, loud, 3);
-        let steady = analyze(44_100, |t| 0.5 * (t as f64 * 0.3).sin(), 6);
+        let held = noise(&analyze(44_100, loud, 3));
+        let steady = noise(&analyze(44_100, |t| 0.5 * (t as f64 * 0.3).sin(), 6));
         let line = (0.3 / (2.0 * PI) * BLOCK as f64) as usize;
         assert!(held.long[line] < steady.long[line] / 100.0);
         // The first short block in which it sets in is held near the one

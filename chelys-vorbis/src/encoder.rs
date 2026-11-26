@@ -6,15 +6,19 @@
 
 use chelys_core::mdct::Mdct;
 use chelys_core::sample::{self, NonFiniteSample, Sample};
+use chelys_core::steering::MeanSteering;
 
 use super::audio;
-use super::config::{Config, ConfigError};
+use super::config::{Config, ConfigError, Control};
 use super::coupling;
 use super::energy;
 use super::floor::Floor;
 use super::header;
 use super::packet::{Packet, PacketSink};
-use super::psychoacoustic::{self, Analysis, FIRST_SHORT, Model, SHORT_BLOCKS, Tables};
+use super::psychoacoustic::{
+    self, Allowance, Analysis, FIRST_SHORT, Model, Noise, SHORT_BLOCKS, Tables,
+};
+use super::rate;
 use super::residue::MAX_VALUE;
 use super::setup::{BLOCKSIZES, Mode, Setup};
 use super::window::window;
@@ -28,7 +32,7 @@ const SHORT_BLOCK: usize = BLOCKSIZES[0];
 /// The samples from one long block's center to the next's: half a long
 /// block, by which long blocks overlap. Short blocks take the place of a
 /// long block as many at a time as keep this (see [`SHORT_BLOCKS`]).
-const HOP: u64 = BLOCK as u64 / 2;
+pub(crate) const HOP: u64 = BLOCK as u64 / 2;
 
 /// The samples the encoder keeps of each channel to code the next long
 /// block or the short blocks that take its place: those of the long block,
@@ -121,6 +125,35 @@ fn scarcity(noise_offset_db: f64) -> f64 {
         .clamp(0.0, 1.0)
 }
 
+/// The trades of noise for bits that a block is coded with, which
+/// [`scarcity`] tapers with its noise offset.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Trades {
+    /// The dead zone (see [`DEAD_ZONE`]).
+    dead_zone: f64,
+    /// The multiple of each channel's allowance that the narrowing of
+    /// angles may leave in a band (see [`coupling::angle_allowance`]).
+    angle_allowance: f64,
+    /// The most by which the narrowing of angles may lower a band's ratio
+    /// of side to mid energy, in dB (see [`coupling::side_loss_db`]).
+    side_loss_db: f64,
+    /// The share of each group's energy that its balance aims for (see
+    /// [`energy::balanced_share`]).
+    balanced_share: f64,
+}
+
+impl Trades {
+    fn new(noise_offset_db: f64) -> Self {
+        let scarcity = scarcity(noise_offset_db);
+        Self {
+            dead_zone: DEAD_ZONE * scarcity,
+            angle_allowance: coupling::angle_allowance(scarcity),
+            side_loss_db: coupling::side_loss_db(scarcity),
+            balanced_share: energy::balanced_share(scarcity),
+        }
+    }
+}
+
 /// The three header packets that begin a stream, in their order (clause
 /// 4.2), which a container gives a decoder before the audio packets.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -162,6 +195,10 @@ pub struct Encoder {
     current: Vec<Analysis>,
     /// Each channel's analysis of the long block after it.
     next: Vec<Analysis>,
+    /// The noise each line of the current long block, and of the short
+    /// blocks that may take its place, may take in each channel, at the
+    /// hop's noise offset.
+    noise: Vec<Noise>,
     /// The window of a short block.
     short_window: Vec<f64>,
     /// The window of a long block, by its `previous_window_flag` and
@@ -179,17 +216,16 @@ pub struct Encoder {
     hops: u64,
     /// Whether the last block coded is long.
     last_long: bool,
-    /// The dead zone of the rate's offset (see [`DEAD_ZONE`]).
-    dead_zone: f64,
-    /// The multiple of each channel's allowance that the narrowing of
-    /// angles may leave in a band (see [`coupling::angle_allowance`]).
-    angle_allowance: f64,
-    /// The most by which the narrowing of angles may lower a band's ratio
-    /// of side to mid energy, in dB (see [`coupling::side_loss_db`]).
-    side_loss_db: f64,
-    /// The share of each group's energy that its balance aims for (see
-    /// [`energy::balanced_share`]).
-    balanced_share: f64,
+    /// The noise offset of a variable rate, and at a mean rate the steering
+    /// that sets each hop's.
+    noise_offset_db: f64,
+    steering: Option<MeanSteering>,
+    /// The trades of noise for bits that the current long block, or the
+    /// short blocks that take its place, are coded with, at the hop's
+    /// noise offset.
+    trades: Trades,
+    /// The bytes of the packets coded since the last hop.
+    hop_bytes: usize,
 }
 
 /// What [`Encoder::finish`] gives.
@@ -209,26 +245,28 @@ impl Encoder {
     /// If the configuration asks for a stream the encoder cannot write, as
     /// [`ConfigError`] lists.
     pub fn new(config: Config) -> Result<Self, ConfigError> {
-        let noise_offset_db = config.noise_offset_db()?;
         let channels = config.channels();
+        let (noise_offset_db, steering) = match config.control()? {
+            Control::Variable { noise_offset_db } => (noise_offset_db, None),
+            Control::Mean { bits_per_second } => {
+                let steering = rate::mean_steering(bits_per_second, config.sample_rate(), channels);
+                (steering.noise_offset_db(), Some(steering))
+            }
+        };
         let setup = Setup::new(channels);
-        let tables = Tables::new(
-            config.sample_rate(),
-            psychoacoustic::treble_weight(setup.coupled, scarcity(noise_offset_db)),
-        );
+        let tables = Tables::new(config.sample_rate());
         let long_window =
             |previous_long, next_long| window(BLOCK, SHORT_BLOCK, true, previous_long, next_long);
         Ok(Self {
             config,
             setup,
             mdcts: [Mdct::new(SHORT_BLOCK), Mdct::new(BLOCK)],
-            models: (0..channels)
-                .map(|_| Model::new(&tables, noise_offset_db))
-                .collect(),
+            models: (0..channels).map(|_| Model::new(&tables)).collect(),
             partitions: [false, true].map(|long| tables.partition_of_lines(long)),
             tables,
             current: vec![Analysis::default(); channels],
             next: vec![Analysis::default(); channels],
+            noise: vec![Noise::default(); channels],
             short_window: window(SHORT_BLOCK, SHORT_BLOCK, false, true, true),
             long_windows: [
                 [long_window(false, false), long_window(false, true)],
@@ -240,11 +278,25 @@ impl Encoder {
             packets: 0,
             hops: 0,
             last_long: true,
-            dead_zone: DEAD_ZONE * scarcity(noise_offset_db),
-            angle_allowance: coupling::angle_allowance(scarcity(noise_offset_db)),
-            side_loss_db: coupling::side_loss_db(scarcity(noise_offset_db)),
-            balanced_share: energy::balanced_share(scarcity(noise_offset_db)),
+            noise_offset_db,
+            steering,
+            trades: Trades::new(noise_offset_db),
+            hop_bytes: 0,
         })
+    }
+
+    /// The noise offset of the next hop: the variable rate's, or that the
+    /// hops coded so far steer the mean rate to.
+    fn hop_offset_db(&self) -> f64 {
+        (self.steering.as_ref()).map_or(self.noise_offset_db, MeanSteering::noise_offset_db)
+    }
+
+    /// The model's allowance at `noise_offset_db`: its factor, and the
+    /// treble's weight at the scarcity of bits it brings.
+    fn allowance(&self, noise_offset_db: f64) -> Allowance {
+        let treble_weight =
+            psychoacoustic::treble_weight(self.setup.coupled, scarcity(noise_offset_db));
+        Allowance::new(noise_offset_db, treble_weight)
     }
 
     /// The number of channels the input has.
@@ -260,7 +312,12 @@ impl Encoder {
     /// The header packets that begin the stream.
     pub fn headers(&self) -> Headers {
         Headers {
-            identification: header::identification(self.channels(), self.sample_rate(), BLOCKSIZES),
+            identification: header::identification(
+                self.channels(),
+                self.sample_rate(),
+                self.config.nominal_bits_per_second(),
+                BLOCKSIZES,
+            ),
             comment: header::comment(),
             setup: self.setup.header(),
         }
@@ -412,6 +469,14 @@ impl Encoder {
         for ((model, pcm), analysis) in self.models.iter_mut().zip(&self.pcm).zip(&mut self.next) {
             model.analyze(&self.tables, &pcm[HOP as usize..KEPT], analysis);
         }
+        // The hop is coded at its offset, which at a mean rate the hops
+        // coded so far steer it to, and spent at it.
+        let offset = self.hop_offset_db();
+        let allowance = self.allowance(offset);
+        for (analysis, noise) in self.current.iter().zip(&mut self.noise) {
+            analysis.noise(&self.tables, allowance, noise);
+        }
+        self.trades = Trades::new(offset);
         let short = self.hops > 0 && self.current.iter().any(Analysis::attack);
         let mut ended = false;
         if short {
@@ -429,6 +494,10 @@ impl Encoder {
             pcm.drain(..HOP as usize);
         }
         std::mem::swap(&mut self.current, &mut self.next);
+        if let Some(steering) = &mut self.steering {
+            steering.spend(self.hop_bytes);
+        }
+        self.hop_bytes = 0;
         self.hops += 1;
         ended
     }
@@ -487,10 +556,10 @@ impl Encoder {
         } else {
             MAX_VALUE
         };
-        let noises: Vec<&[f64]> = (self.current.iter())
-            .map(|analysis| match short {
-                Some(k) => &analysis.short[k][..],
-                None => &analysis.long[..],
+        let noises: Vec<&[f64]> = (self.noise.iter())
+            .map(|noise| match short {
+                Some(k) => &noise.short[k][..],
+                None => &noise.long[..],
             })
             .collect();
         let lines = n / 2;
@@ -508,7 +577,8 @@ impl Encoder {
                     *line *= spectrum_scale(n);
                 }
                 let targets = psychoacoustic::floor_targets(noise, floor);
-                let quantized = Quantized::new(floor, &targets, spectrum, limit, self.dead_zone);
+                let quantized =
+                    Quantized::new(floor, &targets, spectrum, limit, self.trades.dead_zone);
                 (targets, quantized)
             })
             .unzip();
@@ -518,7 +588,7 @@ impl Encoder {
         if let ([left, right], true) = (&mut targets[..], self.setup.coupled && both_used) {
             coupling::match_floors([left, right], [&spectra[0], &spectra[1]], floor);
             for ((channel, targets), spectrum) in channels.iter_mut().zip(&targets).zip(&spectra) {
-                *channel = Quantized::new(floor, targets, spectrum, limit, self.dead_zone);
+                *channel = Quantized::new(floor, targets, spectrum, limit, self.trades.dead_zone);
             }
         }
         let used: Vec<bool> = channels.iter().map(Quantized::used).collect();
@@ -534,12 +604,12 @@ impl Encoder {
                 partitions,
                 coupling::Narrowing {
                     protected,
-                    allowance: self.angle_allowance,
-                    side_loss_db: self.side_loss_db,
+                    allowance: self.trades.angle_allowance,
+                    side_loss_db: self.trades.side_loss_db,
                 },
                 kept,
                 limit,
-                self.balanced_share,
+                self.trades.balanced_share,
             );
         } else {
             for (((channel, spectrum), noise), &used) in
@@ -553,7 +623,7 @@ impl Encoder {
                         limit,
                         |_| false,
                         kept,
-                        self.balanced_share,
+                        self.trades.balanced_share,
                     );
                     let protected = energy::Protected {
                         lines: protected,
@@ -591,6 +661,7 @@ impl Encoder {
             },
         });
         self.packets += 1;
+        self.hop_bytes += data.len();
         self.last_long = mode.blockflag();
         last
     }
@@ -675,22 +746,100 @@ mod tests {
             encoder(2, PLENTIFUL_OFFSET_DB),
             encoder(2, SCARCE_OFFSET_DB),
         );
+        let treble = |encoder: &Encoder, offset| encoder.allowance(offset).treble_weight;
         assert_eq!(
-            plentiful.tables.treble_weight(),
+            treble(&plentiful, PLENTIFUL_OFFSET_DB),
             psychoacoustic::treble_weight(true, 0.0)
         );
-        assert_eq!(scarce.tables.treble_weight(), 1.0);
-        assert_eq!(plentiful.side_loss_db, coupling::SIDE_LOSS_DB);
-        assert_eq!(scarce.side_loss_db, f64::INFINITY);
+        assert_eq!(treble(&scarce, SCARCE_OFFSET_DB), 1.0);
+        assert_eq!(plentiful.trades.side_loss_db, coupling::SIDE_LOSS_DB);
+        assert_eq!(scarce.trades.side_loss_db, f64::INFINITY);
         for offset in [PLENTIFUL_OFFSET_DB, SCARCE_OFFSET_DB] {
             let mono = encoder(1, offset);
             assert_eq!(
-                mono.tables.treble_weight(),
+                treble(&mono, offset),
                 psychoacoustic::treble_weight(false, 0.0)
             );
-            assert!(mono.tables.treble_weight() > 1.0);
+            assert!(treble(&mono, offset) > 1.0);
         }
-        assert!(plentiful.tables.treble_weight() > 1.0);
+        assert!(treble(&plentiful, PLENTIFUL_OFFSET_DB) > 1.0);
+    }
+
+    /// The packets of `pcm`, stereo at 44.1 kHz, given a hop at a time,
+    /// coded at `rate`, and the noise offset of each hop coded; with
+    /// `offsets`, each hop is coded at its offset there in place of the
+    /// rate's.
+    fn encode(pcm: &[f32], rate: crate::Rate, offsets: Option<&[f64]>) -> (Vec<Vec<u8>>, Vec<f64>) {
+        let mut encoder = Encoder::new(Config::new(44_100, 2, rate)).unwrap();
+        let (mut packets, mut coded) = (Vec::new(), Vec::new());
+        for chunk in pcm.chunks(2 * HOP as usize) {
+            let hops = encoder.hops as usize;
+            if let Some(&offset) = offsets.and_then(|offsets| offsets.get(hops)) {
+                encoder.noise_offset_db = offset;
+            }
+            let offset = encoder.hop_offset_db();
+            let mut out = |packet: Packet<'_>| packets.push(packet.data.to_vec());
+            encoder.encode_interleaved(chunk, &mut out).unwrap();
+            // A hop of input completes at most one hop of blocks.
+            match encoder.hops as usize - hops {
+                0 => {}
+                1 => coded.push(offset),
+                n => panic!("{n} hops at once"),
+            }
+        }
+        (packets, coded)
+    }
+
+    /// Ten seconds of a chord and of noise, louder in its second half.
+    fn music() -> Vec<f32> {
+        let mut seed = 0x9e37_79b9u32;
+        (0..2 * 10 * 44_100)
+            .map(|i| {
+                let t = (i / 2) as f64 / 44_100.0;
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let noise = f64::from(seed >> 8) / f64::from(1u32 << 24) - 0.5;
+                let level = if t < 5.0 { 0.02 } else { 0.3 };
+                let chord: f64 = [220.0, 277.2, 329.6]
+                    .iter()
+                    .map(|hz| (std::f64::consts::TAU * hz * t).sin())
+                    .sum();
+                (0.1 * chord + level * noise) as f32
+            })
+            .collect()
+    }
+
+    /// At a mean rate, the packets keep near it whatever it is, the offset
+    /// moving from hop to hop; and each hop is coded as the variable rate of
+    /// its offset codes it, byte for byte.
+    #[test]
+    fn a_mean_rate_codes_each_hop_as_the_variable_rate_of_its_offset() {
+        let pcm = music();
+        for bits_per_second in [96_000, 160_000] {
+            let (packets, offsets) = encode(&pcm, crate::Rate::Mean { bits_per_second }, None);
+            let bits = 8.0 * packets.iter().map(Vec::len).sum::<usize>() as f64;
+            let achieved = bits * 44_100.0 / (offsets.len() as u64 * HOP) as f64;
+            let error = achieved / f64::from(bits_per_second) - 1.0;
+            assert!(error.abs() < 0.05, "{bits_per_second}: {achieved:.0}");
+            let start = rate::mean_steering(bits_per_second, 44_100, 2).noise_offset_db();
+            assert_eq!(offsets[0], start);
+            assert!(offsets.iter().any(|&offset| (offset - start).abs() > 1.0));
+            let variable = crate::Rate::Variable {
+                noise_offset_db: start,
+            };
+            let (replayed, replayed_offsets) = encode(&pcm, variable, Some(&offsets));
+            assert_eq!(replayed_offsets, offsets);
+            assert!(replayed == packets, "{bits_per_second}");
+        }
+    }
+
+    /// At a variable rate, every hop is coded at the rate's offset.
+    #[test]
+    fn a_variable_rate_keeps_its_offset() {
+        let rate = crate::Rate::Variable {
+            noise_offset_db: -5.0,
+        };
+        let (_, offsets) = encode(&music(), rate, None);
+        assert!(offsets.iter().all(|&offset| offset == -5.0));
     }
 
     /// The dead zone and the narrowing of angles are whole where bits are

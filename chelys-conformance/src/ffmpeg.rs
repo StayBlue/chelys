@@ -502,6 +502,25 @@ pub fn probe_ogg(stream: &[u8]) -> StreamInfo {
     }
 }
 
+/// The bitrate of the first audio stream of an Ogg stream, as ffprobe
+/// reports it, or `None` where it reports none.
+pub fn bit_rate_ogg(stream: &[u8]) -> Option<u32> {
+    let file = TempFile::new("ogg", stream);
+    let output = run(Command::new("ffprobe")
+        .args(["-v", "error", "-f", "ogg", "-select_streams", "a:0"])
+        .args(["-show_entries", "stream=bit_rate", "-of", "csv=p=0"])
+        .arg(file.path()));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    match stdout.trim() {
+        "N/A" => None,
+        bit_rate => Some(
+            bit_rate
+                .parse()
+                .unwrap_or_else(|_| panic!("ffprobe reported {stdout:?}")),
+        ),
+    }
+}
+
 /// The timestamp and duration of each packet of the first audio stream of
 /// an Ogg stream, in samples, as ffprobe reports them from the stream's
 /// granule positions.
