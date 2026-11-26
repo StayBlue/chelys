@@ -38,7 +38,10 @@
 //! grades of its decoded output are compared with chelys's. The benchmark
 //! was run with LAME 4.0 (64-bit). For AAC, ffmpeg's native AAC encoder is
 //! the benchmark, run alike at its default settings apart from the bitrate,
-//! with ffmpeg n9.0.2.
+//! with ffmpeg n9.0.2. For Vorbis, the benchmarks are aoTuV beta6.03 (2020),
+//! run through ffmpeg n9.0.2's `libvorbis` encoder with aoTuV's library in
+//! place of libvorbis, and ffmpeg n9.0.2's native Vorbis encoder, each at
+//! its default settings apart from its quality level.
 
 pub mod faad;
 pub mod ffmpeg;
