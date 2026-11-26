@@ -232,6 +232,12 @@ impl Pager {
 /// unreflected. (Reported erratum 8824 proposes the "unreflected" CRC, but
 /// is not verified, and says it was taken from another implementation; it
 /// is not a source.)
+///
+/// Settled by decoding with ffmpeg (black box): it checks each page's CRC,
+/// reporting a page whose CRC is wrong, and reads the pages of this CRC
+/// without error; the conformance tests are
+/// `ffmpeg_reports_a_page_whose_crc_is_wrong` and
+/// `ffmpeg_decodes_silence_at_any_sample_rate_and_channels`.
 pub fn crc(bytes: &[u8]) -> u32 {
     let mut register = 0u32;
     for &byte in bytes {

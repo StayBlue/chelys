@@ -79,6 +79,14 @@ impl<O: PageSink + ?Sized> PacketSink for Pages<'_, O> {
         // which returns no samples, is put alone on the first audio page,
         // whose granule position, 0, then gives the start of the stream
         // alone, and the last page gives its end.
+        //
+        // Settled by decoding with ffmpeg (black box): it decodes a stream
+        // whose audio packets share one page to other lengths than its
+        // last granule position, and one whose first audio packet is alone
+        // to that length; the conformance tests are
+        // `ffmpeg_misreads_a_stream_on_one_audio_page`,
+        // `ffmpeg_trims_the_stream_to_its_last_granule_position` and
+        // `ffmpeg_decodes_the_encoders_streams_to_the_inputs_length`.
         if !*self.started {
             *self.started = true;
             self.pager.close();
@@ -123,6 +131,12 @@ impl Encoder {
         // headers" the granule position 0, where RFC 3533 gives a page on
         // which no packet ends -1 (clause 6): a setup header that spans
         // pages leaves such pages. Appendix A.2, the mapping, is followed.
+        //
+        // Settled by decoding with ffmpeg (black box): it decodes a stream
+        // whose headers span pages of granule position 0, and whose audio
+        // pages that end no packet are of -1, to the samples of one whose
+        // pages each end a packet; the conformance test is
+        // `ffmpeg_decodes_packets_continued_across_pages`.
         let mut pager = Pager::new(serial_number, limits, 0);
         let mut header_pages = Vec::new();
         pager.packet(&headers.identification, 0, &mut header_pages);
