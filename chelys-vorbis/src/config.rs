@@ -17,10 +17,10 @@ pub const MAX_CHANNELS: usize = 8;
 pub enum Rate {
     /// A variable rate: each line of a block is allowed the noise that the
     /// psychoacoustic model allows it, raised with the width of its
-    /// critical band, and in long blocks above about 12 kHz by up to twice
-    /// that, in stereo the less the higher the offset, scaled by
-    /// `10^(noise_offset_db / 10)`, and each packet is as long as that
-    /// takes. Above 0 it allows more noise and gives shorter packets,
+    /// critical band, and in long blocks from 11 kHz by up to twice that,
+    /// rising to it at 13 kHz, in stereo the less the higher the offset,
+    /// scaled by `10^(noise_offset_db / 10)`, and each packet is as long as
+    /// that takes. Above 0 it allows more noise and gives shorter packets,
     /// below 0 less. No line is allowed less noise than the rounding of
     /// 16-bit PCM makes, whatever the offset. In stereo, where the two
     /// channels are alike, the floor of one may be lowered so that the two
@@ -35,7 +35,8 @@ pub enum Rate {
     /// add noise to what a band is allowed, below 1.5 kHz too. Where most
     /// of a band's lines would be coded as 0, some are coded as 1 so that
     /// it keeps part of its energy, which above 1.5 kHz adds noise to what
-    /// it is allowed. At 44.1 kHz in stereo, music takes about 67 kbit/s
+    /// it is allowed. Either may take a band's difference against its sum
+    /// below that bound, in about one band in seventy. At 44.1 kHz in stereo, music takes about 67 kbit/s
     /// at 0 dB and 137 at -7.5.
     Variable { noise_offset_db: f64 },
     /// A variable rate at `level`: a level of the [`quality`](crate::quality)

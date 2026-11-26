@@ -210,18 +210,29 @@ pub fn match_floors(targets: [&mut [i32]; 2], spectra: [&[f64]; 2], floor: &Floo
 /// Where both channels are used, their angles are first narrowed where
 /// that leaves each channel's noise in each band within the multiple of
 /// its allowance that `narrowing` gives the band, and the band's image
-/// within its bound (see [`narrow_angles`]). Then the
-/// energy of each used channel's first `kept` lines is balanced toward
-/// `share` of their energy, as no more than `limit` (see
-/// [`energy::balance`]), but on the lines whose values the two channels
-/// share, whose angles are 0; the balance may take a band past its
-/// allowance below [`PROTECTED_HZ`] too. Last, the energy is kept (see
-/// [`energy::keep`]), the left channel's first, each preferring the lines
-/// that the other codes as it would, which adds noise above
-/// [`PROTECTED_HZ`] and none beyond a band's allowance below. Both come
-/// after the narrowing, which
-/// would code the lines that keeping adds as 0 again, as that makes less
-/// noise, and would take back much of the energy that the balance gives.
+/// within its bound (see [`narrow_angles`]). Then the energy of each used
+/// channel's first `kept` lines is balanced toward `share` of their
+/// energy, as no more than `limit` (see [`energy::balance`]), but on the
+/// lines whose values the two channels share, whose angles are 0; the
+/// balance may take a band past its allowance below [`PROTECTED_HZ`] too.
+/// Last, the energy is kept (see [`energy::keep`]), the left channel's
+/// first, each preferring the lines that the other codes as it would,
+/// which adds noise above [`PROTECTED_HZ`] and none beyond a band's
+/// allowance below. Both come after the narrowing, which would code the
+/// lines that keeping adds as 0 again, as that makes less noise, and would
+/// take back much of the energy that the balance gives.
+///
+/// Neither is held to the narrowing's bound on the image (see
+/// [`SIDE_LOSS_DB`]), and either may take a band past it: on the tuning
+/// set at 44.1 kHz in stereo, the balance took 1.4% of the bands that the
+/// narrowing left within it past it at -9 dB, and 1.1% at -7 dB, by 2.7 to
+/// 3.5 dB at the median, about 11 dB at the 90th percentile and at most
+/// 58 dB, a third of them below 1.5 kHz and a third in short blocks; the
+/// keeping of energy, about 0.06%. Held to the bound too, both rejecting
+/// what would take a band below the bound or below the ratio the
+/// narrowing left it with, the streams graded 0.006, 0.004 and 0.003 lower
+/// at noise offsets matched to 96.5, 128.4 and 159.2 kbit/s, on every
+/// track.
 ///
 /// Spec reading: a channel whose residue is all zeros is coded as unused,
 /// its floor unused. Clause 4.3.3 then unsets its `no_residue` flag, as it
@@ -347,6 +358,11 @@ pub fn square_polar(magnitude_channel: i32, angle_channel: i32) -> (i32, i32) {
 /// no more than `side_loss_db` below the lines' own, or no lower than it
 /// was (see [`SIDE_LOSS_DB`]).
 ///
+/// A band whose lines are all coded as 0 in both channels decodes with
+/// neither side nor mid, and is taken as within the bound: it is so coded
+/// only where its noise fits the room left to it, and whether its image
+/// is heard is then the noise budget's to say.
+///
 /// The values stay between the channels' own, and so within the residue's
 /// reach.
 fn narrow_angles(
@@ -454,18 +470,23 @@ impl Image {
     }
 
     /// The band with a line decoded as `old` decoded as `new` instead.
+    /// The sums are kept from falling below 0 by rounding.
     fn replaced(&self, old: (f64, f64), new: (f64, f64)) -> Self {
+        let side = self.decoded_side - (old.0 - old.1).powi(2) + (new.0 - new.1).powi(2);
+        let mid = self.decoded_mid - (old.0 + old.1).powi(2) + (new.0 + new.1).powi(2);
         Self {
-            decoded_side: self.decoded_side - (old.0 - old.1).powi(2) + (new.0 - new.1).powi(2),
-            decoded_mid: self.decoded_mid - (old.0 + old.1).powi(2) + (new.0 + new.1).powi(2),
+            decoded_side: side.max(0.0),
+            decoded_mid: mid.max(0.0),
             ..*self
         }
     }
 
     /// Whether the band's decoded ratio of side to mid is at least `least`
-    /// times its lines' own, or no lower than `before`'s.
+    /// times its lines' own, or no lower than `before`'s; always where
+    /// `least` is 0, without bound.
     fn within(&self, least: f64, before: &Self) -> bool {
-        self.decoded_side * self.mid >= least * self.side * self.decoded_mid
+        least == 0.0
+            || self.decoded_side * self.mid >= least * self.side * self.decoded_mid
             || self.decoded_side * before.decoded_mid >= before.decoded_side * self.decoded_mid
     }
 }
@@ -619,31 +640,51 @@ mod tests {
         narrow_and_check(&[left, right], &[1.0; 16], &[0.1; 16], 8);
     }
 
-    /// Two channels with a little of their difference left, each line
-    /// allowed far more noise than setting it alike adds: unbounded, every
-    /// line is narrowed; bounded, each band keeps its ratio of side to mid
-    /// within the bound, or as rounding left it.
+    /// Two channels of wide bands of many lines a little unlike, on unlike
+    /// floors, each line allowed far more noise than setting it alike adds:
+    /// unbounded, every line is narrowed; bounded, each band keeps its
+    /// decoded ratio of side to mid within the bound, or as rounding left
+    /// it, and some band comes close to the bound, so that the bound sets
+    /// how far each is narrowed.
     #[test]
     fn narrowing_keeps_each_bands_side_within_its_bound() {
-        let lines = 128;
-        let (spectra, curve, _) = alike(lines);
+        let (lines, width) = (512, 128);
+        let left: Vec<f64> = (0..lines)
+            .map(|k| 3.0 + (k * 7 % 13) as f64 / 6.5)
+            .collect();
+        let right: Vec<f64> = (left.iter().enumerate())
+            .map(|(k, &x)| x + 0.9 * ((k * 37 % 29) as f64 / 14.0 - 1.0))
+            .collect();
+        let curves: [Vec<f32>; 2] = [
+            vec![1.0; lines],
+            (0..lines)
+                .map(|k| if k % 3 == 0 { 1.1 } else { 0.95 })
+                .collect(),
+        ];
+        let spectra = [left, right];
         let noise = vec![100.0; lines];
-        let partitions: Vec<usize> = (0..lines).map(|k| k / 16).collect();
+        let partitions: Vec<usize> = (0..lines).map(|k| k / width).collect();
+        let rounded: [Vec<i32>; 2] = [0, 1].map(|c| {
+            (spectra[c].iter().zip(&curves[c]))
+                .map(|(&x, &f)| (x / f64::from(f)).round() as i32)
+                .collect()
+        });
         let ratio = |residues: &[Vec<i32>; 2], band: Range<usize>| {
             let (mut side, mut mid) = (0.0, 0.0);
             for k in band {
-                let (l, r) = (f64::from(residues[0][k]), f64::from(residues[1][k]));
+                let l = f64::from(curves[0][k]) * f64::from(residues[0][k]);
+                let r = f64::from(curves[1][k]) * f64::from(residues[1][k]);
                 side += (l - r).powi(2);
                 mid += (l + r).powi(2);
             }
             side / mid
         };
         let narrow = |side_loss_db: f64| {
-            let mut residues = [round(&spectra[0]), round(&spectra[1])];
+            let mut residues = rounded.clone();
             let [left, right] = &mut residues;
             narrow_angles(
                 [left, right],
-                [&curve, &curve],
+                [&curves[0], &curves[1]],
                 [&spectra[0], &spectra[1]],
                 [&noise, &noise],
                 &partitions,
@@ -657,20 +698,64 @@ mod tests {
         };
         let unbounded = narrow(f64::INFINITY);
         assert_eq!(unbounded[0], unbounded[1]);
-        let bounded = narrow(3.0);
-        let rounded = [round(&spectra[0]), round(&spectra[1])];
-        assert_ne!(bounded[0], bounded[1]);
-        for start in (0..lines).step_by(16) {
-            let band = start..start + 16;
-            let (x, y) = (&spectra[0][band.clone()], &spectra[1][band.clone()]);
-            let side: f64 = x.iter().zip(y).map(|(a, b)| (a - b).powi(2)).sum();
-            let mid: f64 = x.iter().zip(y).map(|(a, b)| (a + b).powi(2)).sum();
-            let least = (side / mid * 10f64.powf(-0.3)).min(ratio(&rounded, band.clone()));
-            assert!(
-                ratio(&bounded, band.clone()) >= least - 1e-12,
-                "lines {band:?}"
-            );
+        let (three, six) = (narrow(3.0), narrow(6.0));
+        assert_ne!(three, six, "the bound sets how far bands are narrowed");
+        for (residues, side_loss_db) in [(&three, 3.0), (&six, 6.0)] {
+            let least = 10f64.powf(-side_loss_db / 10.0);
+            let mut nearest = f64::INFINITY;
+            for start in (0..lines).step_by(width) {
+                let band = start..start + width;
+                let (x, y) = (&spectra[0][band.clone()], &spectra[1][band.clone()]);
+                let side: f64 = x.iter().zip(y).map(|(a, b)| (a - b).powi(2)).sum();
+                let mid: f64 = x.iter().zip(y).map(|(a, b)| (a + b).powi(2)).sum();
+                let bound = least * side / mid;
+                let decoded = ratio(residues, band.clone());
+                let floor = bound.min(ratio(&rounded, band.clone()));
+                assert!(decoded >= floor * (1.0 - 1e-9), "lines {band:?}");
+                nearest = nearest.min(decoded / bound);
+            }
+            // Some band is narrowed to within 0.5 dB of the bound.
+            assert!(nearest < 10f64.powf(0.05), "{side_loss_db} dB: {nearest}");
         }
+    }
+
+    /// A band already narrower than its bound may change only so as to
+    /// widen; one within it, so as to stay within it; and without bound,
+    /// in any way.
+    #[test]
+    fn a_band_is_held_within_its_bound_or_no_narrower() {
+        let least = 10f64.powf(-0.3);
+        // Lines whose side is a quarter of their mid, decoded with a side of
+        // a hundredth of it: far past a bound of 3 dB.
+        let mut narrow = Image::default();
+        narrow.add(3.0, 1.0, 1.0, 1.0);
+        narrow.add(1.0, 1.0, 2.0, 1.8);
+        // Narrower still: refused; wider: admitted, though still past it.
+        assert!(
+            !narrow
+                .replaced((2.0, 1.8), (1.9, 1.9))
+                .within(least, &narrow)
+        );
+        assert!(
+            narrow
+                .replaced((2.0, 1.8), (2.0, 1.5))
+                .within(least, &narrow)
+        );
+        // Within the bound, narrowed as far as it allows.
+        let mut wide = Image::default();
+        wide.add(2.0, 1.0, 2.0, 1.0);
+        let within = wide.replaced((2.0, 1.0), (2.0, 1.15));
+        assert!(within.within(least, &wide));
+        assert!(
+            !within
+                .replaced((2.0, 1.15), (2.0, 1.4))
+                .within(least, &within)
+        );
+        // Without bound, narrowed to nothing, rounding notwithstanding.
+        let near = wide.replaced((2.0, 1.0), (1.0 + 1e-9, 1.0));
+        let alike = near.replaced((1.0 + 1e-9, 1.0), (1.0, 1.0));
+        assert!(alike.decoded_side >= 0.0);
+        assert!(alike.within(0.0, &near));
     }
 
     #[test]

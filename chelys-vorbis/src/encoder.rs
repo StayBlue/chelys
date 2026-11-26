@@ -662,6 +662,37 @@ impl Quantized {
 mod tests {
     use super::*;
 
+    /// A stereo pair takes the treble's noise and the bound of its image as
+    /// bits are scarce or plentiful; one channel the treble's noise whatever
+    /// the rate.
+    #[test]
+    fn the_encoder_weighs_the_treble_and_bounds_the_image_by_the_rate() {
+        let encoder = |channels: usize, noise_offset_db: f64| {
+            let rate = crate::Rate::Variable { noise_offset_db };
+            Encoder::new(Config::new(44_100, channels, rate)).unwrap()
+        };
+        let (plentiful, scarce) = (
+            encoder(2, PLENTIFUL_OFFSET_DB),
+            encoder(2, SCARCE_OFFSET_DB),
+        );
+        assert_eq!(
+            plentiful.tables.treble_weight(),
+            psychoacoustic::treble_weight(true, 0.0)
+        );
+        assert_eq!(scarce.tables.treble_weight(), 1.0);
+        assert_eq!(plentiful.side_loss_db, coupling::SIDE_LOSS_DB);
+        assert_eq!(scarce.side_loss_db, f64::INFINITY);
+        for offset in [PLENTIFUL_OFFSET_DB, SCARCE_OFFSET_DB] {
+            let mono = encoder(1, offset);
+            assert_eq!(
+                mono.tables.treble_weight(),
+                psychoacoustic::treble_weight(false, 0.0)
+            );
+            assert!(mono.tables.treble_weight() > 1.0);
+        }
+        assert!(plentiful.tables.treble_weight() > 1.0);
+    }
+
     /// The dead zone and the narrowing of angles are whole where bits are
     /// scarce, and fall, never rising, as the offset falls.
     #[test]

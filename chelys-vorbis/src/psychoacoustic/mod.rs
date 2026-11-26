@@ -364,7 +364,7 @@ const TREBLE_WEIGHT: f64 = 2.0;
 /// [`TREBLE_WEIGHT`] where the channels are coded each on its own; in a
 /// coupled pair, as `coupled`, where bits are as scarce as `scarcity`, from
 /// 0 where they are plentiful to 1 where they are scarce, from
-/// [`TREBLE_WEIGHT`] to 1, none more, in proportion.
+/// [`TREBLE_WEIGHT`] to 1, none more, in a straight line in dB.
 pub fn treble_weight(coupled: bool, scarcity: f64) -> f64 {
     if coupled {
         TREBLE_WEIGHT.powf(1.0 - scarcity.clamp(0.0, 1.0))
@@ -446,6 +446,10 @@ pub struct Tables {
     long_predicted: usize,
     /// `switch_pe` at the sample rate (see [`SWITCH_PE_LOW`]).
     switch_pe: f64,
+    /// The weight of the noise long blocks are allowed in the treble (see
+    /// [`treble_weight`]).
+    #[cfg_attr(not(test), allow(dead_code))]
+    treble_weight: f64,
 }
 
 impl Tables {
@@ -457,6 +461,7 @@ impl Tables {
         Self {
             long: FftTables::new(sample_rate, Fft::Long, treble_weight),
             short: FftTables::new(sample_rate, Fft::Short, 1.0),
+            treble_weight,
             long_predicted: (below as usize).clamp(LONG_CW_LINES, LINES),
             switch_pe: if sample_rate < SWITCH_PE_LOW_RATE {
                 SWITCH_PE_LOW
@@ -464,6 +469,13 @@ impl Tables {
                 SWITCH_PE
             },
         }
+    }
+
+    /// The weight of the noise long blocks are allowed above
+    /// [`TREBLE_HZ`], as [`new`](Self::new) took it.
+    #[cfg(test)]
+    pub fn treble_weight(&self) -> f64 {
+        self.treble_weight
     }
 
     /// The partition of each line of a long block, if `long`, or of a short
@@ -579,7 +591,8 @@ fn width_bark(partitions: &[Partition], b: usize) -> Option<f64> {
 /// wide, is allowed more noise than the model's threshold scaled by the
 /// rate's offset: the width in Hz of the critical band about it, against
 /// [`NARROWEST_BAND_HZ`], raised to [`BAND_EXPONENT`], and no less than 1;
-/// and above [`TREBLE_HZ`], `treble_weight` times that.
+/// and above [`TREBLE_HZ`] up to `treble_weight` times that, rising in dB
+/// in a straight line over [`TREBLE_RAMP_HZ`] with the partition's center.
 /// That width is the Hz between the centers of its neighbours for each
 /// Bark between their `bval(b)`, or between its own and its one neighbour's
 /// at either end. The partitions at [`TOP_BARK`] and above, at which the
