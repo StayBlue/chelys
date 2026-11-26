@@ -5,9 +5,9 @@
 > trails established encoders at some bitrates, and its API may change at any
 > time.
 
-chelys encodes PCM audio as MP3 and as AAC, and writes MP4 files, each written
-from its specifications without reference to the source code of other encoders
-or decoders:
+chelys encodes PCM audio as MP3, AAC and Vorbis, and writes MP4 files, each
+written from its specifications without reference to the source code of other
+encoders or decoders:
 
 - MP3: MPEG-1 Audio Layer III, at the lower sampling frequencies of 16,
   22.05 and 24 kHz as MPEG-2 Audio Layer III, and at 8, 11.025 and 12 kHz as
@@ -17,6 +17,10 @@ or decoders:
   at sampling frequencies from 8 to 96 kHz, in ADTS, as raw frames, or in MP4
   files; from ISO/IEC 13818-7, ISO/IEC 14496-3 for what MPEG-4 adds, and
   ISO/IEC 14496-12, 14496-14, 14496-1 and 14496-34 for MP4.
+- Vorbis: Vorbis I, from mono to 8 channels, at a variable rate set by a
+  quality level, as packets with their granule positions for a container such
+  as Ogg to carry, which chelys does not write; from the Xiph.Org Foundation's
+  "Vorbis I specification".
 - MP4 from other encoders: the library also writes FLAC, Opus, AAC-LC and
   ALAC packets that any encoder made in MP4 files, whole or fragmented for
   streaming: FLAC and Opus from Xiph's mappings of each to the ISO base media
