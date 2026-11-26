@@ -18,9 +18,9 @@ encoders or decoders:
   files; from ISO/IEC 13818-7, ISO/IEC 14496-3 for what MPEG-4 adds, and
   ISO/IEC 14496-12, 14496-14, 14496-1 and 14496-34 for MP4.
 - Vorbis: Vorbis I, from mono to 8 channels, at a variable rate set by a
-  quality level, as packets with their granule positions for a container such
-  as Ogg to carry, which chelys does not write; from the Xiph.Org Foundation's
-  "Vorbis I specification".
+  quality level, as packets with their granule positions or in Ogg streams;
+  from the Xiph.Org Foundation's "Vorbis I specification", and RFC 3533 for
+  Ogg.
 - MP4 from other encoders: the library also writes FLAC, Opus, AAC-LC and
   ALAC packets that any encoder made in MP4 files, whole or fragmented for
   streaming: FLAC and Opus from Xiph's mappings of each to the ISO base media
@@ -30,7 +30,8 @@ encoders or decoders:
 ## Usage
 
 The command-line encoder reads raw interleaved 32-bit float PCM from stdin and
-writes MP3 or AAC-LC (in ADTS, or an MP4 file with `aac --mp4`) to stdout.
+writes MP3, AAC-LC (in ADTS, or an MP4 file with `aac --mp4`) or Vorbis (in an
+Ogg stream) to stdout.
 Other tools convert from other formats, for example:
 
 ```sh
@@ -40,8 +41,11 @@ ffmpeg -i song.flac -f f32le -ar 44100 -ac 2 - \
   | cargo run --release -p chelys-cli -- aac --sample-rate 44100 --channels 2 > song.aac
 ffmpeg -i song.flac -f f32le -ar 44100 -ac 2 - \
   | cargo run --release -p chelys-cli -- aac --mp4 --sample-rate 44100 --channels 2 > song.mp4
+ffmpeg -i song.flac -f f32le -ar 44100 -ac 2 - \
+  | cargo run --release -p chelys-cli -- vorbis --sample-rate 44100 --channels 2 > song.ogg
 ```
 
 The codec comes first; run it with `--help` for the codecs, with `mp3 --help`
-for the bitrates, sampling frequencies and stereo modes of MP3, and with
-`aac --help` for the sampling frequencies, channels and bitrates of AAC.
+for the bitrates, sampling frequencies and stereo modes of MP3, with
+`aac --help` for the sampling frequencies, channels and bitrates of AAC, and
+with `vorbis --help` for the channels and quality levels of Vorbis.
