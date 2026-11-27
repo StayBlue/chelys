@@ -197,6 +197,15 @@ const SHORT_NOISE_ABOVE_LONG: f64 = 4.0;
 /// streams graded lower at every rate.
 ///
 /// Below [`SWITCH_PE_LOW_RATE`], the rise is [`SWITCH_PE_LOW`] instead.
+///
+/// The first short block of a long block's place rises from the short
+/// blocks before the last of the place before, whose second half it
+/// shares (see [`Model::analyze`]). Where it rose from that last one too,
+/// white noise setting in after silence from 476 to 564 samples after a
+/// long block's center was found an attack of that block alone: the next
+/// block stayed long, its window spanning the onset, and left as much as
+/// -27 dBFS over the 1024 samples before it, decoded by ffmpeg (black
+/// box).
 const SWITCH_PE: f64 = 50.0;
 
 /// The sample rate, in Hz, below which [`SWITCH_PE_LOW`] takes the place of
@@ -868,6 +877,18 @@ impl Partitioned {
     /// `r(w)^2` and the unpredictability `c(w)` of each of its lines, with
     /// pre-echo control by `rpelev`: the threshold of each partition, into
     /// `thresholds`, and the block's perceptual entropy.
+    ///
+    /// A short block shares its first half with the second half of the one
+    /// before it, whose `nb(b)` an onset in that half has already raised,
+    /// and so step 11 hardly limits it: white noise setting in after
+    /// silence leaves up to about -35 dBFS over the 1024 samples before
+    /// the onset, decoded by ffmpeg (black box), all within the 128
+    /// samples before it, within the span of backward masking. That is left
+    /// by choice: limiting each short block's threshold by the `nb(b)` of
+    /// the one before the last too, which ends where it begins, left no
+    /// more than -92 dBFS, but graded 0.003 to 0.012 lower with PEAQ
+    /// (GstPEAQ 0.6.1, black box) at the same total size at 96 to 160
+    /// kbit/s.
     fn threshold(
         &mut self,
         tables: &FftTables,
@@ -923,9 +944,9 @@ pub struct Model {
     short_predictor: Predictor,
     long: Partitioned,
     short: Partitioned,
-    /// The perceptual entropy of the last eight short blocks, `None`
-    /// before the first.
-    recent_entropies: Option<[f64; SHORT_BLOCKS]>,
+    /// The perceptual entropy of the last nine short blocks, from the
+    /// earliest, `None` before the first.
+    recent_entropies: Option<[f64; SHORT_BLOCKS + 1]>,
     // Buffers kept from one block to the next for their memory.
     windowed: Vec<f64>,
     short_windowed: Vec<f64>,
@@ -1039,20 +1060,29 @@ impl Model {
 
         // Step 13: each short block rises from the most of the eight before
         // it and from the one before it, the first of the stream from
-        // itself.
+        // itself. The first short block of the block rises from those
+        // before the last of the block before, whose second half is its
+        // first: there the window of this block, were it long, rises after
+        // short blocks (clause 4.3.1), and an attack there, which the last
+        // short block of the block before has already risen to, is an
+        // attack of this block too.
         let mut recent = self
             .recent_entropies
-            .unwrap_or([entropies[0]; SHORT_BLOCKS]);
-        let mut last = recent[SHORT_BLOCKS - 1];
+            .unwrap_or([entropies[0]; SHORT_BLOCKS + 1]);
         out.switch_pe = tables.switch_pe;
         out.entropy_rise = f64::NEG_INFINITY;
         out.entropy_step = f64::NEG_INFINITY;
         for (k, &entropy) in entropies.iter().enumerate() {
-            let most = recent.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let before = if k == 0 {
+                &recent[..SHORT_BLOCKS]
+            } else {
+                &recent[1..]
+            };
+            let most = before.iter().copied().fold(f64::NEG_INFINITY, f64::max);
             out.entropy_rise = out.entropy_rise.max(entropy - most);
-            out.entropy_step = out.entropy_step.max(entropy - last);
-            recent[k] = entropy;
-            last = entropy;
+            out.entropy_step = out.entropy_step.max(entropy - before[SHORT_BLOCKS - 1]);
+            recent.rotate_left(1);
+            recent[SHORT_BLOCKS] = entropy;
         }
         self.recent_entropies = Some(recent);
     }

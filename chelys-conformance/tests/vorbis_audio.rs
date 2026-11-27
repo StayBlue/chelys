@@ -426,6 +426,59 @@ fn ffmpeg_decodes_a_loud_onset_after_silence() {
     }
 }
 
+/// ffmpeg decodes little noise before a loud onset after digital silence
+/// wherever it lies from 448 to 1008 samples after a long block's center.
+/// Past 448 and before 576, the onset lies in the second half of the last
+/// short block that may take that block's place, where the next long
+/// block's window rises: short blocks take the place of both, and the
+/// next long block is not coded. Elsewhere, short blocks take the next block's place. A
+/// short block whose first half the onset lies in spreads some noise
+/// before it, within 128 samples, which the encoder leaves (see the
+/// encoder's `psychoacoustic::Partitioned::threshold`): the noise is
+/// bounded at -35 dBFS, where a long block over the onset left as much as
+/// -29.
+#[test]
+fn ffmpeg_decodes_little_noise_before_an_onset_between_two_blocks() {
+    let sample_rate = 44_100;
+    let tone = |t: usize| 0.9 * (TAU * 1000.0 * t as f64 / f64::from(sample_rate)).sin();
+    let noise = noise(20_000);
+    let center = 8192;
+    let mut failures = Vec::new();
+    for offset in (448..1024).step_by(16) {
+        let onset = center + offset;
+        for (name, signal) in [
+            ("tone", &tone as &dyn Fn(usize) -> f64),
+            ("noise", &|t| 1.6 * noise[t]),
+        ] {
+            let pcm: Vec<f32> = (0..20_000)
+                .map(|t| if t < onset { 0.0 } else { signal(t) as f32 })
+                .collect();
+            let (headers, packets) = encode_packets(&pcm, sample_rate, 1);
+            let decoded = ffmpeg::decode_ogg(&ogg::vorbis(&headers, &packets, 4));
+            assert_eq!(decoded.diagnostics, "");
+            let before: f64 = (onset - 1024..onset)
+                .map(|i| f64::from(decoded.samples[i]).powi(2))
+                .sum::<f64>()
+                / 1024.0;
+            let before_db = 10.0 * before.log10();
+            if before_db > -35.0 {
+                failures.push(format!(
+                    "{name} from {onset}: {before_db:.1} dBFS before it"
+                ));
+            }
+            // A packet's granule position is its block's center.
+            let next = (center + 1024) as u64;
+            let next_long = packets
+                .iter()
+                .any(|p| !is_short(p) && p.granule_position == next);
+            if (449..576).contains(&offset) && next_long {
+                failures.push(format!("{name} from {onset}: the next block is long"));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
 /// ffmpeg decodes a tone in short blocks at its level and in phase, as in
 /// long ones (see `ffmpeg_decodes_a_tone_at_its_level_and_phase`): over
 /// the samples between the centers of two short blocks, which they alone
