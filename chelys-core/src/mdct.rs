@@ -52,7 +52,7 @@ impl Mdct {
     /// # Panics
     ///
     /// If `window_len` is not a power of two from 8 to twice
-    /// [`MAX_LINES`]: a caller's error.
+    /// `MAX_LINES`, 1024: a caller's error.
     pub fn new(window_len: usize) -> Self {
         assert!(
             window_len.is_power_of_two() && (8..=2 * MAX_LINES).contains(&window_len),

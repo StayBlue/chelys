@@ -112,7 +112,7 @@ impl Residue {
     /// the order of [`codebooks`](Self::codebooks).
     ///
     /// The codeword lengths of each book are those of a Huffman code for
-    /// how often each of its entries was coded (see [`frequencies`]).
+    /// how often each of its entries was coded (see `frequencies`).
     pub fn new(blockflag: bool, kind: ResidueKind, first_book: u8) -> Self {
         let counts = match kind {
             ResidueKind::Uncoupled => frequencies::UNCOUPLED,

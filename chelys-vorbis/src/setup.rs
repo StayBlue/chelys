@@ -52,7 +52,7 @@ pub const BLOCKSIZES: [usize; 2] = [256, 2048];
 /// What it costs: measured with modes of each size coupled and not, each
 /// block in whichever took fewer bytes, the tuning set's 51 tracks at 44.1
 /// kHz in stereo took 1.4% fewer bytes than coupled throughout, before the
-/// angles were narrowed (see [`coupling`](super::coupling)). Where the
+/// angles were narrowed (see `coupling`). Where the
 /// channels are unlike, coupling costs more: a channel whose floor is
 /// unused is decoded all the same where coupled (clause 4.3.3), and its
 /// angles, all 0, are coded interleaved with the other's magnitudes. On 23
