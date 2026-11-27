@@ -578,7 +578,10 @@ impl Encoder {
     /// residue (clause 4.3), whose decoding ends with its last partition
     /// (clause 8.6.2). The specification does not say what padding
     /// contains; it is zero bytes, as the unused bits of a packet's last
-    /// byte are zeroed (clause 2.1.8).
+    /// byte are zeroed (clause 2.1.8). Settled by decoding with ffmpeg
+    /// (black box): packets padded with zero bytes, by up to some 2000
+    /// each, decode to the same samples as unpadded, without a diagnostic;
+    /// the conformance test is `ffmpeg_decodes_padded_packets_as_unpadded`.
     ///
     /// Spec reading: clause 1.1.3 lets a packet be "truncated" too, and a
     /// packet that ends early decodes, in its floors, as silence (clause
@@ -586,7 +589,12 @@ impl Encoder {
     /// (clause 8.6.2), which would fit any block to the buffer. No packet
     /// is truncated: a block is cut to fit as a whole packet instead, so
     /// that the stream does not rest on how a decoder reads a packet that
-    /// ends early.
+    /// ends early. Settled by decoding with ffmpeg (black box): it decodes
+    /// a packet cut in its floors as silence, but reads one cut in its
+    /// residue past its end, reporting each such read, and decodes what it
+    /// reads there as if the packet went on, here to samples up to 9 times
+    /// full scale; the conformance test is
+    /// `ffmpeg_decodes_truncated_packets_unlike_the_specification`.
     fn block<O: PacketSink + ?Sized>(
         &mut self,
         short: Option<usize>,
