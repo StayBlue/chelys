@@ -860,24 +860,39 @@ impl StreamEncoder {
     /// center channel's share in 5.1 did not pay for its noise energies.
     /// Where an element's share would not, the frame's elements are
     /// quantized again, each given the fewest bits it can be coded in with
-    /// those bands, and a share of the rest.
+    /// those bands, and a share of the rest. Where the frame's bits do not
+    /// pay for every element's bands of noise and in intensity stereo, as
+    /// at the lowest constant rates, they are shared as they are without
+    /// them, and each element leaves those that its bits do not pay for
+    /// unsent (see [`first_inner_loop`](crate::loops::inner::first_inner_loop)).
     fn quantize(&mut self, available_bits: u32) -> Vec<CodedElement> {
-        match self.quantize_with(available_bits, false) {
+        let affords = self.elements.len() > 1
+            && (self.elements.iter())
+                .map(ElementEncoder::least_coded_bits)
+                .sum::<u32>()
+                <= available_bits;
+        if !affords {
+            return self
+                .quantize_with(available_bits, false, false)
+                .expect("not quantized again");
+        }
+        match self.quantize_with(available_bits, false, true) {
             Some(elements) => elements,
             None => self
-                .quantize_with(available_bits, true)
+                .quantize_with(available_bits, true, false)
                 .expect("each element given its least"),
         }
     }
 
     /// [`Self::quantize`], each element given the fewest bits it can be
     /// coded in by [`ElementEncoder::least_bits`], or where `with_pseudo` is
-    /// set, by [`ElementEncoder::least_coded_bits`]; or, where it is not,
-    /// `None` if an element's share would not pay for the latter.
+    /// set, by [`ElementEncoder::least_coded_bits`]; or, where `bail` is
+    /// set, `None` if an element's share would not pay for the latter.
     fn quantize_with(
         &mut self,
         available_bits: u32,
         with_pseudo: bool,
+        bail: bool,
     ) -> Option<Vec<CodedElement>> {
         let least_bits = |element: &ElementEncoder| {
             if with_pseudo {
@@ -919,7 +934,7 @@ impl StreamEncoder {
             };
             let budget =
                 reservoir::element_max_bits(element.kind()).map_or(budget, |max| budget.min(max));
-            if !with_pseudo && self.elements.len() > 1 && budget < element.least_coded_bits() {
+            if bail && budget < element.least_coded_bits() {
                 return None;
             }
             let element = self.elements[e].quantize(budget);
@@ -2256,5 +2271,31 @@ mod tests {
         ];
         let frames = frames_of(config, &channels);
         assert_eq!(frames.len(), 41);
+    }
+
+    /// At the lowest constant rates, where a frame's bits do not pay for
+    /// the noise energies of every band of noise, in stereo and in 5.1, the
+    /// frames leave the highest of them unsent and keep the rate.
+    #[test]
+    fn the_lowest_rates_leave_noise_they_cannot_pay_for_unsent() {
+        let len = 20 * FRAME_SAMPLES;
+        for (configuration, bits_per_second) in [
+            (ChannelConfiguration::Stereo, 8_000),
+            (ChannelConfiguration::FiveOne, 32_000),
+        ] {
+            let config = StreamConfig {
+                channel_configuration: configuration,
+                noise_substitution: true,
+                ..config(Framing::Adts, bits_per_second)
+            };
+            let channels: Vec<Vec<f64>> = (0..configuration.channels())
+                .map(|c| noise(len, 40 + c as u64))
+                .collect();
+            let channels: Vec<&[f64]> = channels.iter().map(Vec::as_slice).collect();
+            let frames = frames_of(config, &channels);
+            let bytes: usize = frames.iter().map(Vec::len).sum();
+            let mean = f64::from(bits_per_second) * FRAME_SAMPLES as f64 / 44_100.0 / 8.0;
+            assert!(bytes as f64 <= frames.len() as f64 * mean + 1.0);
+        }
     }
 }

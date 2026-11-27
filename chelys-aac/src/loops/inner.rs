@@ -398,6 +398,11 @@ pub struct Counting<'a> {
     /// The clippings of a long window's lines counted last (see
     /// [`clipping::clippings`]), kept to reuse their memory.
     clippings: Vec<Clipping>,
+    /// The bands of noise and in intensity stereo that the coding sends
+    /// whatever its lines: those below these, all of them unless
+    /// [`first_inner_loop`] leaves some unsent.
+    noise_limit: usize,
+    intensity_limit: usize,
     /// The sections chosen for each group at the step counted last, if
     /// it fits, and the pulses chosen with them.
     sections: Vec<Sections>,
@@ -432,6 +437,8 @@ impl<'a> Counting<'a> {
                 .map(Counted::new)
                 .collect(),
             clippings: Vec::new(),
+            noise_limit: MAX_BANDS,
+            intensity_limit: MAX_BANDS,
             sections: Vec::with_capacity(groups),
             pulses: Pulses::NONE,
             sf_decoder: vec![Vec::with_capacity(MAX_BANDS); groups],
@@ -528,9 +535,11 @@ impl<'a> Counting<'a> {
             ..
         } = self.coding;
         let (intensity, noise) = (self.coding.intensity, self.coding.noise);
+        let (noise_limit, intensity_limit) = (self.noise_limit, self.intensity_limit);
         let pseudo = |g: usize| {
             let intensity = intensity.map_or(PseudoBands::NONE, |i| i.bands[g]);
-            intensity.union(noise.map_or(PseudoBands::NONE, |n| n.bands[g]))
+            let noise = noise.map_or(PseudoBands::NONE, |n| n.bands[g]);
+            (intensity.below(intensity_limit)).union(noise.below(noise_limit))
         };
         let pseudo_end = (0..self.largest.len())
             .map(|g| pseudo(g).end())
@@ -846,6 +855,23 @@ fn successive_approximation(
 /// of frames of channels without lines (see
 /// [`StreamConfig::min_bits_per_second`](crate::stream::StreamConfig::min_bits_per_second)).
 ///
+/// Spec gap: nor does ISO/IEC 14496-3 say what to do where the bands of
+/// perceptual noise substitution cost more than the channel's bits, which
+/// Annex 4.B.11 chooses by the signal alone, or the bands in intensity
+/// stereo that a right channel sends whatever its lines. A channel sends
+/// those whatever its step, and at the lowest constant rates their noise
+/// energies alone took more than a frame's bits: in stereo at 44.1 kHz
+/// from 32 kbit/s down, and in mono from 16. Where not even the largest
+/// step fits with every band sent, the highest bands of noise are left
+/// unsent, one at a time, and then those in intensity stereo, until it
+/// does; their lines are zero, and they decode to silence. The step is
+/// then searched for as above, so that the lines take what the bands left
+/// leave. Only frames that do not fit otherwise are coded so: of a rock
+/// track at 44.1 kHz, in stereo half of the frames at 16 kbit/s and most
+/// below, and a few at 24 and 32; in mono most at 8 kbit/s and below, and
+/// a few at 12 and 16. Choosing
+/// fewer bands of noise beforehand, to leave the lines more, is not done.
+///
 /// # Panics
 ///
 /// If not even a channel without lines fits in the available bits: a
@@ -854,24 +880,25 @@ pub fn first_inner_loop(counting: &mut Counting) -> (u8, usize) {
     let floor = counting.lines.start_gain();
     let start = estimated_gain(counting).max(floor);
     if let Some(smallest) = search_from(counting, floor, start) {
-        // The step the successive approximation of clause C.7.4.5 ends on
-        // where the bits fall as the step grows: the smallest that fits or
-        // the one above it.
-        let mut gain =
-            successive_approximation(floor, floor, FIRST_CHANGE, |gain| gain >= smallest)
-                .expect("the largest step fits");
-        while gain != smallest && !counting.count_at(gain, MAX_BANDS) {
-            if gain == u8::MAX {
-                gain = smallest;
-                break;
-            }
-            gain += 1;
+        return approximated(counting, floor, smallest);
+    }
+    for band_limit in (0..MAX_BANDS).rev() {
+        if counting.count_at(u8::MAX, band_limit) {
+            return (u8::MAX, band_limit);
         }
-        // The coding kept is that of the step counted last.
-        if counting.fitted_at != Some((gain, MAX_BANDS)) {
-            assert!(counting.count_at(gain, MAX_BANDS), "a step that fitted");
+    }
+    // The highest bands of noise left unsent, one at a time, and then
+    // those in intensity stereo, until the largest step fits.
+    let limits = (0..MAX_BANDS)
+        .rev()
+        .map(|limit| (limit, MAX_BANDS))
+        .chain((0..MAX_BANDS).rev().map(|limit| (0, limit)));
+    for (noise_limit, intensity_limit) in limits {
+        (counting.noise_limit, counting.intensity_limit) = (noise_limit, intensity_limit);
+        if counting.count_at(u8::MAX, MAX_BANDS) {
+            let smallest = search_from(counting, floor, start).expect("the largest step fits");
+            return approximated(counting, floor, smallest);
         }
-        return (gain, MAX_BANDS);
     }
     for band_limit in (0..MAX_BANDS).rev() {
         if counting.count_at(u8::MAX, band_limit) {
@@ -882,6 +909,28 @@ pub fn first_inner_loop(counting: &mut Counting) -> (u8, usize) {
         "not even a channel without lines fits in {} bits",
         counting.coding.available_bits
     );
+}
+
+/// The step that [`first_inner_loop`] codes where `smallest` is the
+/// smallest step that fits, no finer than `floor`, with every band sent:
+/// the step the successive approximation of clause C.7.4.5 ends on where
+/// the bits fall as the step grows, the smallest that fits or the one above
+/// it.
+fn approximated(counting: &mut Counting, floor: u8, smallest: u8) -> (u8, usize) {
+    let mut gain = successive_approximation(floor, floor, FIRST_CHANGE, |gain| gain >= smallest)
+        .expect("the largest step fits");
+    while gain != smallest && !counting.count_at(gain, MAX_BANDS) {
+        if gain == u8::MAX {
+            gain = smallest;
+            break;
+        }
+        gain += 1;
+    }
+    // The coding kept is that of the step counted last.
+    if counting.fitted_at != Some((gain, MAX_BANDS)) {
+        assert!(counting.count_at(gain, MAX_BANDS), "a step that fitted");
+    }
+    (gain, MAX_BANDS)
 }
 
 /// `quantizer_change` of the first run of the inner loop (clause
@@ -1213,6 +1262,42 @@ mod tests {
                 assert_eq!(channel.global_gain(), u8::MAX);
             }
         }
+    }
+
+    /// Where a channel's bits do not pay even for its noise energies, as
+    /// at the lowest constant rates, its highest bands of noise are left
+    /// unsent until the rest fit; where they pay for them, all are sent.
+    #[test]
+    fn noise_too_costly_for_the_bits_loses_its_highest_bands() {
+        let fs = SamplingFrequency::Hz44100;
+        let mut lines = noise(7);
+        let set = [!0 << 20, 0, 0, 0, 0, 0, 0, 0];
+        let windows = Windows::LONG_SINE;
+        let noise = crate::noise_substitution::substitute(windows, fs, &set, &mut lines);
+        let all = noise.bands[0].end() - 20;
+        let silent = CodedChannel::silent(windows, fs).bits(false);
+        let mut sent = Vec::new();
+        for available in [silent, silent + 60, silent + 2000] {
+            let coding = ChannelCoding {
+                noise: Some(&noise),
+                ..ChannelCoding::single(windows, fs, available)
+            };
+            let mut counting = Counting::new(Lines::new(&lines), coding);
+            let (gain, band_limit) = first_inner_loop(&mut counting);
+            let channel = counting.into_channel(gain, band_limit);
+            assert!(channel.bits(false) <= available, "{available}");
+            let (group, _) = channel.groups().next().expect("a group");
+            let noise_bands = (group.sections.bands_with_values())
+                .filter(|&(_, value)| value == BandValue::NoiseEnergy)
+                .map(|(sb, _)| sb)
+                .collect::<Vec<_>>();
+            // The bands sent are the lowest.
+            assert!(noise_bands.iter().enumerate().all(|(k, &sb)| sb == 20 + k));
+            sent.push(noise_bands.len());
+        }
+        assert_eq!(sent[0], 0);
+        assert!(0 < sent[1] && sent[1] < all, "{sent:?} of {all}");
+        assert_eq!(sent[2], all);
     }
 
     #[test]

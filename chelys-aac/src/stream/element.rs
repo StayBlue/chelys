@@ -1392,14 +1392,16 @@ impl ElementEncoder {
     /// more than half of them beside a channel that took fewer. Where the
     /// first is quantized again, it keeps what they cost, and where the
     /// second's bits then do not pay for its own, it is given the bits that
-    /// the shares, in whole bits, leave over.
+    /// the shares, in whole bits, leave over. Where the element's bits do
+    /// not pay for those bands at all, as at the lowest constant rates, the
+    /// channels share them as they do without, and each leaves those that
+    /// its bits do not pay for unsent (see
+    /// [`first_inner_loop`](crate::loops::inner::first_inner_loop)).
     ///
     /// # Panics
     ///
     /// If `available_bits` do not pay for the element's channels without
-    /// lines, with their filters and the bands of noise and in intensity
-    /// stereo that they send whatever their lines (see
-    /// [`least_coded_bits`](Self::least_coded_bits)): a caller's error.
+    /// lines, with their filters: a caller's error.
     fn code_element(&mut self, available_bits: u32) -> CodedElement {
         let fs = self.sampling_frequency;
         let share = self.share(available_bits);
@@ -1414,13 +1416,21 @@ impl ElementEncoder {
         }
         let order = self.order();
         let in_intensity = self.in_intensity();
-        // The channel of a pair quantized first is given at least what it
-        // costs, its bands of noise and in intensity stereo among them, and
-        // the second what is left.
+        // Where the element's bits pay for its bands of noise and in
+        // intensity stereo, the channel of a pair quantized first is given
+        // at least what it costs with them, and the second what is left.
+        // Where they do not, each channel leaves those that its bits do not
+        // pay for unsent (see `first_inner_loop`), and costs at least what
+        // it costs without them.
+        let affords = order.len() == 2 && self.least_bits_with(true) <= available_bits;
         let mut first_least = 0;
         if let [first, second] = order[..] {
-            let least = self.least_channel_of(first, self.first_intensity(first), true);
-            first_least = least.bits(self.common_window);
+            first_least = if affords {
+                let least = self.least_channel_of(first, self.first_intensity(first), true);
+                least.bits(self.common_window)
+            } else {
+                lineless.channels_with_tns[first]
+            };
             let raise = first_least.saturating_sub(budgets[first]);
             budgets[first] += raise;
             budgets[second] = budgets[second].saturating_sub(raise);
@@ -1472,11 +1482,16 @@ impl ElementEncoder {
                     } else {
                         Intensity::NONE
                     };
-                    let least_sfb = least_max_sfb.max(b.noise.end());
-                    let b_least =
+                    let b_least = if affords {
+                        let least_sfb = least_max_sfb.max(b.noise.end());
                         least_channel(windows, fs, least_sfb, &intensity, &b.noise, &b.tns)
                             .bits(true)
-                            + b_coding.element_bits[least_sfb];
+                            + b_coding.element_bits[least_sfb]
+                    } else {
+                        let (none, noise) = (Intensity::NONE, Noise::NONE);
+                        least_channel(windows, fs, least_max_sfb, &none, &noise, &b.tns).bits(true)
+                            + b_coding.element_bits[least_max_sfb]
+                    };
                     if b_least <= b_coding.available_bits {
                         break (a_channel, intensity, b_coding);
                     }
