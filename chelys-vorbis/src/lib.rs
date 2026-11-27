@@ -38,6 +38,7 @@
 
 mod audio;
 mod bitpack;
+mod buffer;
 mod calibration;
 mod codebook;
 mod config;

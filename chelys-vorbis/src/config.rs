@@ -6,6 +6,7 @@
 use std::fmt;
 
 use super::calibration;
+use super::header::Bitrates;
 
 /// The most channels the encoder takes: those of the largest layout that
 /// clause 4.3.9 orders, 7.1.
@@ -87,16 +88,60 @@ pub enum Rate {
     /// kbit/s in mono and from 12 to 529 in stereo. The identification
     /// header gives it as the stream's nominal bitrate.
     Mean { bits_per_second: u32 },
+    /// A constant rate: the audio packets kept within a buffer of a second
+    /// of `bits_per_second`, a variable rate whose noise offset is steered
+    /// from one long block, or the short blocks that take its place, to the
+    /// next, toward keeping the buffer half full. A packet's length still
+    /// follows its content, from block to block, but the stream's follows
+    /// the rate within the buffer.
+    ///
+    /// The buffer is filled at the rate, by `bits_per_second /
+    /// sample_rate` bits for each sample by which a packet's granule
+    /// position passes the one before, the first's from 0, and emptied by
+    /// each packet's bits. It holds half of its size before the first
+    /// packet, and after each packet holds from none to its size: a second
+    /// of the rate, or of the 2048 samples of a long block below 2048 Hz.
+    /// So the bits of any run of packets are those the rate brings over the
+    /// samples they pass, give or take the size, and those of the whole
+    /// stream give or take half of it. The header packets are not counted,
+    /// nor what a container adds, as at a mean rate.
+    ///
+    /// A packet that would overfill the buffer is padded with zero bytes,
+    /// which a decoder does not read: where the content takes fewer bits
+    /// than the rate even at the lowest offset the steering keeps, as
+    /// silence does. A block that would take more bits than the buffer
+    /// holds is coded again at a higher offset, up to the highest the
+    /// steering keeps, and failing that its residue is cut above the lines
+    /// that fit, and failing that the block is coded as silence: content
+    /// that takes more bits than the rate at any offset, such as loud noise
+    /// near the lowest rates, is then cut to fit. No packet is truncated.
+    ///
+    /// On the tuning set of 51 tracks at 44.1 kHz, at 96, 128 and 160
+    /// kbit/s in stereo and 64, 96 and 128 in mono, the tracks' audio
+    /// packets were 0.15% to 0.18% short of the rate on average, where at
+    /// a mean rate they were 0.6% to 0.9% short and ran up to 2.4 s of the
+    /// rate past where the buffer would have been empty; the buffer came
+    /// within 0.03% of empty, and filled, on some tracks at each rate.
+    /// Graded with PEAQ (GstPEAQ 0.6.1, black box) in stereo, they graded
+    /// -0.848, -0.401 and -0.144, against -0.845, -0.398 and -0.141 at a
+    /// mean rate; in mono, -0.512, -0.010 and 0.120, against -0.511, -0.010
+    /// and 0.114.
+    ///
+    /// The rate is from [`MIN_BITS_PER_SAMPLE`] to [`MAX_BITS_PER_SAMPLE`]
+    /// bits for each sample of each channel, as at a mean rate. The
+    /// identification header gives it as the stream's maximum, nominal and
+    /// minimum bitrates.
+    Constant { bits_per_second: u32 },
 }
 
 /// The fewest bits for each sample of each channel that [`Rate::Mean`]
-/// takes: about what music takes at a noise offset of 19 dB, where little
-/// but its floors is coded.
+/// and [`Rate::Constant`] take: about what music takes at a noise offset
+/// of 19 dB, where little but its floors is coded.
 pub const MIN_BITS_PER_SAMPLE: f64 = 0.125;
 
-/// The most bits for each sample of each channel that [`Rate::Mean`]
-/// takes: about what music takes at a noise offset of -29 dB, near the
-/// lowest the steering keeps (see
+/// The most bits for each sample of each channel that [`Rate::Mean`] and
+/// [`Rate::Constant`] take: about what music takes at a noise offset of
+/// -29 dB, near the lowest the steering keeps (see
 /// [`OFFSETS_DB`](chelys_core::steering::OFFSETS_DB)).
 pub const MAX_BITS_PER_SAMPLE: f64 = 6.0;
 
@@ -162,13 +207,13 @@ impl Config {
         self.control().map(|_| ())
     }
 
-    /// The range of [`Rate::Mean`] at the sample rate and channels, in bits
-    /// per second: from [`MIN_BITS_PER_SAMPLE`] to [`MAX_BITS_PER_SAMPLE`]
-    /// for each sample of each channel, rounded inward, and no more than
-    /// the identification header's signed field of 32 bits holds. Empty,
-    /// the minimum above the maximum, where that field cannot hold the
-    /// minimum.
-    fn mean_range(&self) -> (u32, u32) {
+    /// The range of [`Rate::Mean`] and [`Rate::Constant`] at the sample
+    /// rate and channels, in bits per second: from [`MIN_BITS_PER_SAMPLE`]
+    /// to [`MAX_BITS_PER_SAMPLE`] for each sample of each channel, rounded
+    /// inward, and no more than the identification header's signed fields
+    /// of 32 bits hold. Empty, the minimum above the maximum, where those
+    /// fields cannot hold the minimum.
+    fn bitrate_range(&self) -> (u32, u32) {
         let samples = f64::from(self.sample_rate) * self.channels as f64;
         let min = (MIN_BITS_PER_SAMPLE * samples).ceil();
         let max = (MAX_BITS_PER_SAMPLE * samples).floor();
@@ -178,12 +223,22 @@ impl Config {
         )
     }
 
-    /// The bitrate the identification header gives as nominal: that of
-    /// [`Rate::Mean`], and 0, none, at the other rates.
-    pub(crate) fn nominal_bits_per_second(&self) -> u32 {
+    /// The bitrates the identification header gives (see
+    /// [`identification`](super::header::identification)): that of
+    /// [`Rate::Constant`] as all three, that of [`Rate::Mean`] as nominal
+    /// alone, and none, 0, at the other rates.
+    pub(crate) fn bitrates(&self) -> Bitrates {
         match self.rate {
-            Rate::Mean { bits_per_second } => bits_per_second,
-            Rate::Variable { .. } | Rate::Quality { .. } => 0,
+            Rate::Constant { bits_per_second } => Bitrates {
+                maximum: bits_per_second,
+                nominal: bits_per_second,
+                minimum: bits_per_second,
+            },
+            Rate::Mean { bits_per_second } => Bitrates {
+                nominal: bits_per_second,
+                ..Bitrates::NONE
+            },
+            Rate::Variable { .. } | Rate::Quality { .. } => Bitrates::NONE,
         }
     }
 
@@ -211,17 +266,19 @@ impl Config {
                 })
             }
             Rate::Quality { level } => Err(ConfigError::QualityLevel { level }),
-            Rate::Mean { bits_per_second } => {
-                let (min, max) = self.mean_range();
-                if (min..=max).contains(&bits_per_second) {
-                    Ok(Control::Mean { bits_per_second })
-                } else {
-                    Err(ConfigError::UnsupportedBitrate {
+            Rate::Mean { bits_per_second } | Rate::Constant { bits_per_second } => {
+                let (min, max) = self.bitrate_range();
+                if !(min..=max).contains(&bits_per_second) {
+                    return Err(ConfigError::UnsupportedBitrate {
                         bits_per_second,
                         min,
                         max,
-                    })
+                    });
                 }
+                Ok(match self.rate {
+                    Rate::Constant { .. } => Control::Constant { bits_per_second },
+                    _ => Control::Mean { bits_per_second },
+                })
             }
         }
     }
@@ -234,6 +291,9 @@ pub(crate) enum Control {
     Variable { noise_offset_db: f64 },
     /// Steered toward a mean of `bits_per_second` (see [`Rate::Mean`]).
     Mean { bits_per_second: u32 },
+    /// Steered within a buffer of `bits_per_second` (see
+    /// [`Rate::Constant`]).
+    Constant { bits_per_second: u32 },
 }
 
 /// Why a [`Config`] cannot be encoded.
@@ -249,8 +309,8 @@ pub enum ConfigError {
     /// The level of [`Rate::Quality`] is above
     /// [`MAX_LEVEL`](crate::quality::MAX_LEVEL).
     QualityLevel { level: u8 },
-    /// The bitrate of [`Rate::Mean`] is outside its range at the sample
-    /// rate and channels, from `min` to `max`.
+    /// The bitrate of [`Rate::Mean`] or [`Rate::Constant`] is outside its
+    /// range at the sample rate and channels, from `min` to `max`.
     UnsupportedBitrate {
         bits_per_second: u32,
         min: u32,
@@ -300,8 +360,12 @@ mod tests {
         Config::new(sample_rate, channels, Rate::Mean { bits_per_second })
     }
 
+    fn constant(sample_rate: u32, channels: usize, bits_per_second: u32) -> Config {
+        Config::new(sample_rate, channels, Rate::Constant { bits_per_second })
+    }
+
     #[test]
-    fn a_mean_rate_is_taken_within_its_range() {
+    fn a_mean_or_constant_rate_is_taken_within_its_range() {
         // 0.125 to 6 bits a sample of each channel.
         for (sample_rate, channels, min, max) in [
             (44_100, 1, 5_513, 264_600),
@@ -317,23 +381,30 @@ mod tests {
                     Ok(Control::Mean { bits_per_second }),
                     "{sample_rate} Hz, {channels} channels"
                 );
-            }
-            for bits_per_second in [0, min - 1, max + 1] {
-                let config = mean(sample_rate, channels, bits_per_second);
+                let config = constant(sample_rate, channels, bits_per_second);
                 assert_eq!(
-                    config.check(),
-                    Err(ConfigError::UnsupportedBitrate {
-                        bits_per_second,
-                        min,
-                        max
-                    }),
+                    config.control(),
+                    Ok(Control::Constant { bits_per_second }),
                     "{sample_rate} Hz, {channels} channels"
                 );
+            }
+            for bits_per_second in [0, min - 1, max + 1] {
+                for config in [mean, constant] {
+                    assert_eq!(
+                        config(sample_rate, channels, bits_per_second).check(),
+                        Err(ConfigError::UnsupportedBitrate {
+                            bits_per_second,
+                            min,
+                            max
+                        }),
+                        "{sample_rate} Hz, {channels} channels"
+                    );
+                }
             }
         }
     }
 
-    /// The identification header's field is a signed integer of 32 bits.
+    /// The identification header's fields are signed integers of 32 bits.
     #[test]
     fn a_mean_rate_fits_the_identification_header() {
         let config = mean(192_000_000, 8, u32::MAX);
@@ -357,6 +428,31 @@ mod tests {
                 max
             })
         );
+    }
+
+    /// A constant rate is given as all three bitrates, a mean rate as the
+    /// nominal alone, and the other rates as none.
+    #[test]
+    fn the_header_gives_the_bitrates_of_the_rate() {
+        let all = Bitrates {
+            maximum: 96_000,
+            nominal: 96_000,
+            minimum: 96_000,
+        };
+        assert_eq!(constant(44_100, 2, 96_000).bitrates(), all);
+        let nominal = Bitrates {
+            nominal: 96_000,
+            ..Bitrates::NONE
+        };
+        assert_eq!(mean(44_100, 2, 96_000).bitrates(), nominal);
+        for rate in [
+            Rate::Quality { level: 50 },
+            Rate::Variable {
+                noise_offset_db: 0.0,
+            },
+        ] {
+            assert_eq!(Config::new(44_100, 2, rate).bitrates(), Bitrates::NONE);
+        }
     }
 
     #[test]

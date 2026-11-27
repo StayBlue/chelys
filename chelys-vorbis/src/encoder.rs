@@ -6,9 +6,10 @@
 
 use chelys_core::mdct::Mdct;
 use chelys_core::sample::{self, NonFiniteSample, Sample};
-use chelys_core::steering::MeanSteering;
+use chelys_core::steering::{MeanSteering, OFFSETS_DB};
 
 use super::audio;
+use super::buffer::Buffer;
 use super::config::{Config, ConfigError, Control};
 use super::coupling;
 use super::energy;
@@ -18,7 +19,7 @@ use super::packet::{Packet, PacketSink};
 use super::psychoacoustic::{
     self, Allowance, Analysis, FIRST_SHORT, Model, Noise, SHORT_BLOCKS, Tables,
 };
-use super::rate;
+use super::rate::{self, ConstantSteering};
 use super::residue::MAX_VALUE;
 use super::setup::{BLOCKSIZES, Mode, Setup};
 use super::window::window;
@@ -154,6 +155,28 @@ impl Trades {
     }
 }
 
+/// How each hop's noise offset is set.
+enum Steering {
+    /// At the encoder's `noise_offset_db`, a variable rate's.
+    Fixed,
+    /// By the steering of a mean rate.
+    Mean(MeanSteering),
+    /// By the steering of a constant rate, each packet kept within its
+    /// buffer.
+    Constant {
+        steering: ConstantSteering,
+        buffer: Buffer,
+        /// The bits the packets coded since the last hop would have taken
+        /// at 0 dB (see [`rate::at_0_db`]).
+        hop_at_0_db: f64,
+    },
+}
+
+/// The least by which a block that takes more bits than a constant rate's
+/// buffer holds is coded again at a higher noise offset, in dB, where the
+/// bits it took and those the buffer holds would raise it less.
+const RAISE_STEP_DB: f64 = 1.5;
+
 /// The three header packets that begin a stream, in their order (clause
 /// 4.2), which a container gives a decoder before the audio packets.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -216,13 +239,16 @@ pub struct Encoder {
     hops: u64,
     /// Whether the last block coded is long.
     last_long: bool,
-    /// The noise offset of a variable rate, and at a mean rate the steering
-    /// that sets each hop's.
+    /// The noise offset of a variable rate, and at a mean or constant rate
+    /// the steering that sets each hop's.
     noise_offset_db: f64,
-    steering: Option<MeanSteering>,
+    steering: Steering,
+    /// The noise offset the current long block, or the short blocks that
+    /// take its place, are coded at: the hop's, or at a constant rate one
+    /// higher, where a block took more bits than the buffer held.
+    offset_db: f64,
     /// The trades of noise for bits that the current long block, or the
-    /// short blocks that take its place, are coded with, at the hop's
-    /// noise offset.
+    /// short blocks that take its place, are coded with, at `offset_db`.
     trades: Trades,
     /// The bytes of the packets coded since the last hop.
     hop_bytes: usize,
@@ -246,15 +272,26 @@ impl Encoder {
     /// [`ConfigError`] lists.
     pub fn new(config: Config) -> Result<Self, ConfigError> {
         let channels = config.channels();
+        let sample_rate = config.sample_rate();
         let (noise_offset_db, steering) = match config.control()? {
-            Control::Variable { noise_offset_db } => (noise_offset_db, None),
+            Control::Variable { noise_offset_db } => (noise_offset_db, Steering::Fixed),
             Control::Mean { bits_per_second } => {
-                let steering = rate::mean_steering(bits_per_second, config.sample_rate(), channels);
-                (steering.noise_offset_db(), Some(steering))
+                let steering = rate::mean_steering(bits_per_second, sample_rate, channels);
+                (steering.noise_offset_db(), Steering::Mean(steering))
+            }
+            Control::Constant { bits_per_second } => {
+                let steering = ConstantSteering::new(bits_per_second, sample_rate, channels);
+                let noise_offset_db = steering.noise_offset_db();
+                let steering = Steering::Constant {
+                    steering,
+                    buffer: Buffer::new(bits_per_second, sample_rate),
+                    hop_at_0_db: 0.0,
+                };
+                (noise_offset_db, steering)
             }
         };
         let setup = Setup::new(channels);
-        let tables = Tables::new(config.sample_rate());
+        let tables = Tables::new(sample_rate);
         let long_window =
             |previous_long, next_long| window(BLOCK, SHORT_BLOCK, true, previous_long, next_long);
         Ok(Self {
@@ -280,15 +317,32 @@ impl Encoder {
             last_long: true,
             noise_offset_db,
             steering,
+            offset_db: noise_offset_db,
             trades: Trades::new(noise_offset_db),
             hop_bytes: 0,
         })
     }
 
     /// The noise offset of the next hop: the variable rate's, or that the
-    /// hops coded so far steer the mean rate to.
+    /// hops coded so far steer the mean or constant rate to.
     fn hop_offset_db(&self) -> f64 {
-        (self.steering.as_ref()).map_or(self.noise_offset_db, MeanSteering::noise_offset_db)
+        match &self.steering {
+            Steering::Fixed => self.noise_offset_db,
+            Steering::Mean(steering) => steering.noise_offset_db(),
+            Steering::Constant { steering, .. } => steering.noise_offset_db(),
+        }
+    }
+
+    /// Codes the current long block, or the short blocks that take its
+    /// place, at `noise_offset_db` from here on: the noise each line may
+    /// take, and the trades of noise for bits.
+    fn set_offset(&mut self, noise_offset_db: f64) {
+        self.offset_db = noise_offset_db;
+        let allowance = self.allowance(noise_offset_db);
+        for (analysis, noise) in self.current.iter().zip(&mut self.noise) {
+            analysis.noise(&self.tables, allowance, noise);
+        }
+        self.trades = Trades::new(noise_offset_db);
     }
 
     /// The model's allowance at `noise_offset_db`: its factor, and the
@@ -315,7 +369,7 @@ impl Encoder {
             identification: header::identification(
                 self.channels(),
                 self.sample_rate(),
-                self.config.nominal_bits_per_second(),
+                self.config.bitrates(),
                 BLOCKSIZES,
             ),
             comment: header::comment(),
@@ -469,14 +523,9 @@ impl Encoder {
         for ((model, pcm), analysis) in self.models.iter_mut().zip(&self.pcm).zip(&mut self.next) {
             model.analyze(&self.tables, &pcm[HOP as usize..KEPT], analysis);
         }
-        // The hop is coded at its offset, which at a mean rate the hops
-        // coded so far steer it to, and spent at it.
-        let offset = self.hop_offset_db();
-        let allowance = self.allowance(offset);
-        for (analysis, noise) in self.current.iter().zip(&mut self.noise) {
-            analysis.noise(&self.tables, allowance, noise);
-        }
-        self.trades = Trades::new(offset);
+        // The hop is coded at its offset, which at a mean or constant rate
+        // the hops coded so far steer it to, and spent at it.
+        self.set_offset(self.hop_offset_db());
         let short = self.hops > 0 && self.current.iter().any(Analysis::attack);
         let mut ended = false;
         if short {
@@ -494,8 +543,17 @@ impl Encoder {
             pcm.drain(..HOP as usize);
         }
         std::mem::swap(&mut self.current, &mut self.next);
-        if let Some(steering) = &mut self.steering {
-            steering.spend(self.hop_bytes);
+        match &mut self.steering {
+            Steering::Fixed => {}
+            Steering::Mean(steering) => steering.spend(self.hop_bytes),
+            Steering::Constant {
+                steering,
+                buffer,
+                hop_at_0_db,
+            } => {
+                steering.spend(*hop_at_0_db, buffer.fullness());
+                *hop_at_0_db = 0.0;
+            }
         }
         self.hop_bytes = 0;
         self.hops += 1;
@@ -507,16 +565,28 @@ impl Encoder {
     /// past `end`; whose block after it is long if `next_long`. Gives
     /// whether it was the last.
     ///
-    /// Each channel's spectrum is given the floor that
-    /// [`psychoacoustic`] sets, and its residue is quantized to it (see
-    /// [`Quantized`]). A channel whose residue is all zeros is coded as
-    /// unused. In a stereo stream, where both are used, the two channels'
-    /// floors are then matched where the channels are alike, and their
-    /// residues quantized to them again (see [`coupling::match_floors`]),
-    /// and the residues coupled (see [`coupling::couple`]); in any other,
-    /// the energy of each used channel's lines is balanced (see
-    /// [`energy::balance`]) and kept (see [`energy::keep`]), as the
-    /// coupling balances and keeps it in stereo.
+    /// At a constant rate, the packet is kept within the buffer (see
+    /// [`Buffer::len_range`]): a block that takes more bits than the buffer
+    /// holds is coded again at a higher noise offset, by
+    /// [`RAISE_STEP_DB`] at least, up to the highest the steering keeps, and
+    /// the rest of the hop with it; failing that, its residue is cut (see
+    /// [`Coded::packet_within`]). A packet that would overfill the buffer
+    /// is padded with zero bytes.
+    ///
+    /// Spec reading: clause 1.1.3 lets a packet be "padded" and "remain
+    /// decodable", and a decoder reads nothing of an audio packet past its
+    /// residue (clause 4.3), whose decoding ends with its last partition
+    /// (clause 8.6.2). The specification does not say what padding
+    /// contains; it is zero bytes, as the unused bits of a packet's last
+    /// byte are zeroed (clause 2.1.8).
+    ///
+    /// Spec reading: clause 1.1.3 lets a packet be "truncated" too, and a
+    /// packet that ends early decodes, in its floors, as silence (clause
+    /// 4.3.2), and in its residue as the vectors decoded up to the end
+    /// (clause 8.6.2), which would fit any block to the buffer. No packet
+    /// is truncated: a block is cut to fit as a whole packet instead, so
+    /// that the stream does not rest on how a decoder reads a packet that
+    /// ends early.
     fn block<O: PacketSink + ?Sized>(
         &mut self,
         short: Option<usize>,
@@ -535,6 +605,10 @@ impl Encoder {
         let start = short.map_or(0, |k| FIRST_SHORT + k * SHORT_BLOCK / 2);
         let center = HOP * self.hops + (start + n / 2) as u64 - HOP;
         let last = end.is_some_and(|end| center >= end);
+        let granule_position = match end {
+            Some(end) if last => end,
+            _ => center,
+        };
         // Spec gap: the first block has no block before it to lap with,
         // nor the last one after it, and the specification does not say
         // what their window flags are then. Each is set, as if the block it
@@ -542,6 +616,65 @@ impl Encoder {
         // that the flag shapes.
         let previous_long = self.last_long;
         let next_long = next_long || last;
+        let mut coded = self.code_block(short, previous_long, next_long);
+        let mut data = coded.packet(&self.setup);
+        if let Steering::Constant { buffer, .. } = &self.steering {
+            let (shortest, longest) = buffer.len_range(granule_position, last);
+            let highest = *OFFSETS_DB.end();
+            while data.len() > longest && self.offset_db < highest {
+                let raised =
+                    rate::raised_offset_db(self.offset_db, data.len(), longest, RAISE_STEP_DB);
+                self.set_offset(raised);
+                coded = self.code_block(short, previous_long, next_long);
+                data = coded.packet(&self.setup);
+            }
+            let at_0_db = rate::at_0_db(data.len(), self.offset_db);
+            if data.len() > longest {
+                data = coded.packet_within(&self.setup, longest);
+            }
+            data.resize(data.len().max(shortest), 0);
+            if let Steering::Constant {
+                buffer,
+                hop_at_0_db,
+                ..
+            } = &mut self.steering
+            {
+                buffer.spend(data.len(), granule_position);
+                *hop_at_0_db += at_0_db;
+            }
+        }
+        out.packet(Packet {
+            data: &data,
+            granule_position,
+        });
+        self.packets += 1;
+        self.hop_bytes += data.len();
+        self.last_long = mode.blockflag();
+        last
+    }
+
+    /// Codes the `short`th short block that takes the current long block's
+    /// place, or the long block itself, whose window has `previous_long`
+    /// and, for a long block, `next_long` (clause 4.3.1), at `offset_db`.
+    ///
+    /// Each channel's spectrum is given the floor that
+    /// [`psychoacoustic`] sets, and its residue is quantized to it (see
+    /// [`Quantized`]). A channel whose residue is all zeros is coded as
+    /// unused. In a stereo stream, where both are used, the two channels'
+    /// floors are then matched where the channels are alike, and their
+    /// residues quantized to them again (see [`coupling::match_floors`]),
+    /// and the residues coupled (see [`coupling::couple`]); in any other,
+    /// the energy of each used channel's lines is balanced (see
+    /// [`energy::balance`]) and kept (see [`energy::keep`]), as the
+    /// coupling balances and keeps it in stereo.
+    fn code_block(&mut self, short: Option<usize>, previous_long: bool, next_long: bool) -> Coded {
+        let mode = if short.is_some() {
+            Mode::Short
+        } else {
+            Mode::Long
+        };
+        let n = BLOCKSIZES[usize::from(mode.blockflag())];
+        let start = short.map_or(0, |k| FIRST_SHORT + k * SHORT_BLOCK / 2);
         let window = match mode {
             Mode::Short => &self.short_window,
             Mode::Long => &self.long_windows[usize::from(previous_long)][usize::from(next_long)],
@@ -641,29 +774,17 @@ impl Encoder {
                 }
             }
         }
-        let floors: Vec<Option<&[u32]>> = (channels.iter().zip(used))
-            .map(|(channel, used)| used.then_some(&channel.values[..]))
+        let floors = (channels.iter_mut().zip(used))
+            .map(|(channel, used)| used.then(|| std::mem::take(&mut channel.values)))
             .collect();
-        let residues: Vec<&[i32]> = channels.iter().map(|c| &c.residue[..]).collect();
-        let data = audio::packet(
-            &self.setup,
+        let residues = channels.into_iter().map(|c| c.residue).collect();
+        Coded {
             mode,
             previous_long,
             next_long,
-            &floors,
-            &residues,
-        );
-        out.packet(Packet {
-            data: &data,
-            granule_position: match end {
-                Some(end) if last => end,
-                _ => center,
-            },
-        });
-        self.packets += 1;
-        self.hop_bytes += data.len();
-        self.last_long = mode.blockflag();
-        last
+            floors,
+            residues,
+        }
     }
 
     /// Ends the stream, and gives `out` the packets left: up to the first
@@ -726,6 +847,80 @@ impl Quantized {
     /// Whether any residue value is not 0.
     fn used(&self) -> bool {
         self.residue.iter().any(|&q| q != 0)
+    }
+}
+
+/// A block coded, before its packet is written: what [`audio::packet`]
+/// takes.
+struct Coded {
+    mode: Mode,
+    previous_long: bool,
+    next_long: bool,
+    /// Each channel's floor's values, `None` where unused.
+    floors: Vec<Option<Vec<u32>>>,
+    /// Each channel's residue, after any coupling.
+    residues: Vec<Vec<i32>>,
+}
+
+impl Coded {
+    /// The block's packet.
+    fn packet(&self, setup: &Setup) -> Vec<u8> {
+        self.write(setup, &self.floors, &self.residues)
+    }
+
+    /// The block's packet, each residue's lines from `cut` on coded as 0.
+    fn packet_below(&self, setup: &Setup, cut: usize) -> Vec<u8> {
+        let residues: Vec<Vec<i32>> = (self.residues.iter())
+            .map(|residue| {
+                let mut residue = residue.clone();
+                let cut = cut.min(residue.len());
+                residue[cut..].fill(0);
+                residue
+            })
+            .collect();
+        self.write(setup, &self.floors, &residues)
+    }
+
+    /// The block's packet in `longest` bytes at most, where it is longer:
+    /// each residue's lines coded as 0 from a line found by bisection, the
+    /// highest at which the packet fits where its length rises with the
+    /// line, as it does but for a few bits; or, where even every line coded
+    /// as 0 leaves its floors too long, the block coded as silence, every
+    /// channel unused, in two bytes at most.
+    fn packet_within(&self, setup: &Setup, longest: usize) -> Vec<u8> {
+        let fits = |cut| {
+            let data = self.packet_below(setup, cut);
+            (data.len() <= longest).then_some(data)
+        };
+        let Some(mut within) = fits(0) else {
+            let silent = vec![None; self.floors.len()];
+            let zeros = vec![vec![0; self.residues[0].len()]; self.residues.len()];
+            return self.write(setup, &silent, &zeros);
+        };
+        // The packet fits with its residues cut from `low` on, and not from
+        // `high` on.
+        let (mut low, mut high) = (0, self.residues[0].len());
+        while high - low > 1 {
+            let mid = (low + high) / 2;
+            match fits(mid) {
+                Some(data) => (low, within) = (mid, data),
+                None => high = mid,
+            }
+        }
+        within
+    }
+
+    fn write(&self, setup: &Setup, floors: &[Option<Vec<u32>>], residues: &[Vec<i32>]) -> Vec<u8> {
+        let floors: Vec<Option<&[u32]>> = floors.iter().map(Option::as_deref).collect();
+        let residues: Vec<&[i32]> = residues.iter().map(Vec::as_slice).collect();
+        audio::packet(
+            setup,
+            self.mode,
+            self.previous_long,
+            self.next_long,
+            &floors,
+            &residues,
+        )
     }
 }
 
@@ -853,6 +1048,150 @@ mod tests {
         let offsets: Vec<f64> = (-120..=20).map(|o| f64::from(o) / 10.0).collect();
         for pair in offsets.windows(2) {
             assert!(scarcity(pair[0]) <= scarcity(pair[1]));
+        }
+    }
+
+    /// The packets of `pcm`, interleaved, of `channels` channels at
+    /// `sample_rate`, coded at `rate`, each with its granule position.
+    fn packets(
+        pcm: &[f32],
+        sample_rate: u32,
+        channels: usize,
+        rate: crate::Rate,
+    ) -> Vec<(Vec<u8>, u64)> {
+        let mut encoder = Encoder::new(Config::new(sample_rate, channels, rate)).unwrap();
+        let mut packets = Vec::new();
+        let mut out = |packet: Packet<'_>| {
+            packets.push((packet.data.to_vec(), packet.granule_position));
+        };
+        encoder.encode_interleaved(pcm, &mut out).unwrap();
+        encoder.finish(&mut out);
+        packets
+    }
+
+    /// What the buffer of a constant rate of `bits_per_second` at
+    /// `sample_rate` holds after each of `packets`, in bits times the
+    /// sample rate, counted afresh from the definition of
+    /// [`crate::Rate::Constant`], and its size.
+    fn held(
+        packets: &[(Vec<u8>, u64)],
+        bits_per_second: u32,
+        sample_rate: u32,
+    ) -> (Vec<i128>, i128) {
+        let (rate, fs) = (i128::from(bits_per_second), i128::from(sample_rate));
+        let size = rate * fs.max(2048);
+        let (mut held, mut position) = (size / 2, 0);
+        let held = (packets.iter())
+            .map(|(data, granule_position)| {
+                let samples = i128::from(*granule_position) - position;
+                assert!(samples >= 0);
+                position = i128::from(*granule_position);
+                held += rate * samples - 8 * data.len() as i128 * fs;
+                held
+            })
+            .collect();
+        (held, size)
+    }
+
+    /// At a constant rate, the buffer holds from none to its size after
+    /// every packet, in stereo and mono, at rates from the lowest to high,
+    /// of music loud and quiet; its packets' lengths vary, and the
+    /// identification header gives the rate as all three bitrates.
+    #[test]
+    fn a_constant_rate_keeps_its_packets_within_the_buffer() {
+        let stereo = music();
+        let mono: Vec<f32> = stereo.chunks(2).map(|pair| pair[0]).collect();
+        for (pcm, channels, bits_per_second) in [
+            (&stereo, 2, 96_000),
+            (&stereo, 2, 160_000),
+            (&stereo, 2, 11_025),
+            (&mono, 1, 64_000),
+            (&mono, 1, 5_513),
+        ] {
+            let rate = crate::Rate::Constant { bits_per_second };
+            let packets = packets(pcm, 44_100, channels, rate);
+            let (held, size) = held(&packets, bits_per_second, 44_100);
+            for (k, &held) in held.iter().enumerate() {
+                assert!((0..=size).contains(&held), "{bits_per_second}: packet {k}");
+            }
+            let lengths: Vec<usize> = packets.iter().map(|(data, _)| data.len()).collect();
+            assert!(lengths.iter().min() < lengths.iter().max());
+            let encoder = Encoder::new(Config::new(44_100, channels, rate)).unwrap();
+            let header = encoder.headers().identification;
+            let rate = (bits_per_second as i32).to_le_bytes();
+            assert_eq!(header[16..28], [rate, rate, rate].concat());
+        }
+    }
+
+    /// Silence takes far fewer bits than the rate: its packets are padded
+    /// with zero bytes, once the buffer is full, so that the stream takes
+    /// the rate's bits less half the buffer, within a byte.
+    #[test]
+    fn silence_is_padded_to_the_rate() {
+        let pcm = vec![0.0; 2 * 10 * 44_100];
+        let packets = packets(
+            &pcm,
+            44_100,
+            2,
+            crate::Rate::Constant {
+                bits_per_second: 128_000,
+            },
+        );
+        let bits: usize = packets.iter().map(|(data, _)| 8 * data.len()).sum();
+        let expected = 128_000 * 10 - 64_000;
+        assert!(bits <= expected && expected - bits < 8, "{bits}");
+        // The first packets, while the buffer fills, are of one byte;
+        // the rest padded with zeros.
+        assert_eq!(packets[1].0, [0b0_1110]);
+        let last = &packets[packets.len() - 2].0;
+        assert!(last.len() > 300 && last[1..].iter().all(|&b| b == 0));
+    }
+
+    /// Bursts of loud noise after silence, 64 samples of every 512, take
+    /// more bits than 128 kbit/s in stereo, even at the highest offset the
+    /// steering keeps, as the floor of each short block after silence is
+    /// raised to keep the burst's lines within the residue's reach. Each
+    /// block is cut to fit the buffer, which holds from none to its size
+    /// after every packet: at 128 kbit/s in its residue alone, and at the
+    /// lowest rate, 11 kbit/s, where the floors of many blocks take more
+    /// than the buffer holds, those blocks are coded as silence.
+    #[test]
+    fn bursts_past_the_rate_at_any_offset_are_cut_to_fit() {
+        let mut seed = 0x1234_5678u32;
+        let pcm: Vec<f32> = (0..2 * 5 * 44_100)
+            .map(|i| {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let noise = f64::from(seed >> 8) / f64::from(1u32 << 23) - 1.0;
+                if (i / 2) % 512 < 64 {
+                    noise as f32
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+        let variable = crate::Rate::Variable {
+            noise_offset_db: *OFFSETS_DB.end(),
+        };
+        let uncut = packets(&pcm, 44_100, 2, variable);
+        let bytes: usize = uncut.iter().map(|(data, _)| data.len()).sum();
+        assert!(8 * bytes > 5 * 128_000, "{bytes}");
+        let coded = uncut.iter().filter(|(data, _)| data.len() > 2).count();
+        for (bits_per_second, silenced) in [(128_000, false), (11_025, true)] {
+            let rate = crate::Rate::Constant { bits_per_second };
+            let packets = packets(&pcm, 44_100, 2, rate);
+            let (held, size) = held(&packets, bits_per_second, 44_100);
+            assert!(held.iter().all(|held| (0..=size).contains(held)));
+            // The blocks are those of the variable rate, which the offset
+            // does not choose.
+            assert_eq!(packets.len(), uncut.len());
+            let silent = (packets.iter().zip(&uncut))
+                .filter(|((data, _), (uncut, _))| data.len() <= 2 && uncut.len() > 2)
+                .count();
+            assert_eq!(
+                silent > 0,
+                silenced,
+                "{bits_per_second}: {silent} of {coded}"
+            );
         }
     }
 }

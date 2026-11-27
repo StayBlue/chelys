@@ -15,7 +15,7 @@ use crate::{pcm, value};
 pub const USAGE: &str = "\
 usage: chelys vorbis --sample-rate HZ --channels N
                      [--quality LEVEL | --vbr-noise DB |
-                     [--bitrate KBPS] --abr]
+                     --bitrate KBPS [--abr] | --abr]
                      [--serial-number N]
                      < input.f32 > output.ogg
 
@@ -45,26 +45,30 @@ tells a player the input's exact length.
                      more noise than the psychoacoustic model does, or less
                      if negative: about 137 kbit/s at -7.5 and 67 at 0 in
                      stereo at 44.1 kHz
+  --bitrate KBPS     in place of --quality, the constant bitrate of the
+                     audio packets, to which Ogg adds about 1% from 64 to
+                     160 kbit/s, and more at lower rates: each packet as
+                     long as its content needs within a buffer of a
+                     second of the rate, or of 2048 samples below 2048 Hz,
+                     and padded where the buffer would overfill, as in
+                     silence; a whole number from 1/8 to 6
+                     bits for each sample of each channel, at 44.1 kHz 6
+                     to 264 in mono and 12 to 529 in stereo
   --abr              steer the stream toward --bitrate as its mean, each
                      packet as long as its content needs: silence leaves
                      it short, and a stream of a few seconds can miss the
-                     mean either way
-  --bitrate KBPS     with --abr, the mean bitrate of the audio packets, to
-                     which Ogg adds about 1%: a whole number from 1/8 to 6
-                     bits for each sample of each channel, at 44.1 kHz 6
-                     to 264 in mono and 12 to 529 in stereo
-                     (default 128 in mono and stereo, and 64 for each
-                     channel but the LFE in more: 192 in 3 channels, 320
-                     in 5.1, 448 in 7.1; or the nearest the sample rate
-                     and channels allow); Vorbis has no constant bitrate,
-                     so --bitrate needs --abr
+                     mean either way (default: a constant bitrate); without
+                     --bitrate, at 128 kbit/s in mono and stereo, and 64
+                     for each channel but the LFE in more: 192 in 3
+                     channels, 320 in 5.1, 448 in 7.1; or the nearest the
+                     sample rate and channels allow
   --serial-number N  the Ogg stream's serial number, from 0 to 4294967295,
                      which streams chained one after another must not share
                      (default: drawn at random)";
 
-/// The level of quality coded at unless `--quality`, `--vbr-noise` or
-/// `--abr` says otherwise: that of `chelys mp3 --vbr` and `chelys aac
-/// --vbr`.
+/// The level of quality coded at unless `--quality`, `--vbr-noise`,
+/// `--bitrate` or `--abr` says otherwise: that of `chelys mp3 --vbr` and
+/// `chelys aac --vbr`.
 const DEFAULT_QUALITY: u8 = 80;
 
 /// The mean bitrate of `--abr` without `--bitrate` in mono and stereo, in
@@ -110,20 +114,21 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> 
     }
     let sample_rate = sample_rate.ok_or("--sample-rate is required")?;
     let channels = channels.ok_or("--channels is required")? as usize;
-    if bitrate.is_some() && !abr {
-        return Err(
-            "--bitrate needs --abr: Vorbis has no constant bitrate, only a mean one".to_owned(),
-        );
-    }
-    if abr && (quality.is_some() || vbr_noise.is_some()) {
+    if (bitrate.is_some() || abr) && (quality.is_some() || vbr_noise.is_some()) {
         return Err("--bitrate and --abr exclude --quality and --vbr-noise".to_owned());
     }
-    let kbps = abr.then(|| bitrate.unwrap_or_else(|| default_kbps(sample_rate, channels)));
+    let kbps = match bitrate {
+        None if abr => Some(default_kbps(sample_rate, channels)),
+        bitrate => bitrate,
+    };
     let rate = match (kbps, quality, vbr_noise) {
         // A bitrate beyond a u32 of bit/s saturates, which the encoder
         // refuses as out of range like any other, and `describe` gives in
         // kbit/s.
-        (Some(kbps), ..) => Rate::Mean {
+        (Some(kbps), ..) if abr => Rate::Mean {
+            bits_per_second: kbps.saturating_mul(1000),
+        },
+        (Some(kbps), ..) => Rate::Constant {
             bits_per_second: kbps.saturating_mul(1000),
         },
         (None, Some(_), Some(_)) => {
@@ -177,7 +182,8 @@ fn random_serial_number() -> u32 {
 }
 
 /// The message for a configuration the encoder does not take, in terms of
-/// the command line's flags, of which `--bitrate` asked for `kbps`.
+/// the command line's flags, of which `--bitrate` asked for `kbps`, or
+/// `--abr` without it.
 fn describe(error: ConfigError, options: &Options, kbps: u32) -> String {
     match error {
         ConfigError::UnsupportedBitrate { min, max, .. } => {
@@ -190,8 +196,12 @@ fn describe(error: ConfigError, options: &Options, kbps: u32) -> String {
                 n => format!("{n} channels"),
             };
             if min > max {
+                let flag = match options.rate {
+                    Rate::Mean { .. } => "--abr",
+                    _ => "--bitrate",
+                };
                 return format!(
-                    "--abr: no whole bitrate in kbit/s is within the range at {} Hz in \
+                    "{flag}: no whole bitrate in kbit/s is within the range at {} Hz in \
                      {channels}",
                     options.sample_rate,
                 );
@@ -305,12 +315,33 @@ mod tests {
     }
 
     #[test]
-    fn a_mean_bitrate_is_refused_out_of_its_range_or_without_abr() {
+    fn codes_at_a_constant_bitrate_with_bitrate_alone() {
+        let rate = |args: &[&str]| parse(&[&STEREO[..], args].concat()).unwrap().rate;
+        let constant = |kbps: u32| Rate::Constant {
+            bits_per_second: kbps * 1000,
+        };
+        assert_eq!(rate(&["--bitrate", "128"]), constant(128));
+        assert_eq!(rate(&["--bitrate", "12"]), constant(12));
+        assert_eq!(rate(&["--bitrate", "529"]), constant(529));
         let error = |args: &[&str]| error(&[&STEREO[..], args].concat());
         assert_eq!(
-            error(&["--bitrate", "128"]),
-            "--bitrate needs --abr: Vorbis has no constant bitrate, only a mean one"
+            error(&["--bitrate", "530"]),
+            "unsupported bitrate at 44100 Hz in stereo: 530; it takes 12 to 529"
         );
+        assert_eq!(
+            error(&["--bitrate", "128", "--quality", "50"]),
+            "--bitrate and --abr exclude --quality and --vbr-noise"
+        );
+        let args = ["--sample-rate", "100", "--channels", "1", "--bitrate", "1"];
+        assert_eq!(
+            super::parse(args.map(str::to_owned)).err().unwrap(),
+            "--bitrate: no whole bitrate in kbit/s is within the range at 100 Hz in mono"
+        );
+    }
+
+    #[test]
+    fn a_mean_bitrate_is_refused_out_of_its_range() {
+        let error = |args: &[&str]| error(&[&STEREO[..], args].concat());
         assert_eq!(
             error(&["--bitrate", "11", "--abr"]),
             "unsupported bitrate at 44100 Hz in stereo: 11; it takes 12 to 529"
